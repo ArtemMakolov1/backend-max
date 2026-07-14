@@ -352,6 +352,7 @@ FROM posts WHERE owner_id = 'owner'`).Scan(&linkButtons, &messageURL, &isPinned)
 SELECT count(*)
 FROM pg_constraint
 WHERE conname = ANY($1)
+  AND connamespace = current_schema()::regnamespace
   AND convalidated`, constraintNames).Scan(&validated); err != nil {
 		t.Fatal(err)
 	}
