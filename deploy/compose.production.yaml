@@ -321,7 +321,6 @@ services:
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=30d
       - --storage.tsdb.retention.size=5GB
-      - --web.enable-admin-api=false
       - --log.level=warn
     expose:
       - "9090"

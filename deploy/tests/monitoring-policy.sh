@@ -26,6 +26,15 @@ done
 
 grep -F -- '--storage.tsdb.retention.time=30d' "$production_compose" >/dev/null
 grep -F -- '--storage.tsdb.retention.size=5GB' "$production_compose" >/dev/null
+if grep -E -- '--web\.(enable-admin-api|enable-lifecycle)=(true|false)' \
+  "$production_compose" "$local_compose" >/dev/null; then
+  echo "Prometheus boolean switches must not be passed as --flag=true/false arguments" >&2
+  exit 1
+fi
+if grep -F -- '--web.enable-admin-api' "$production_compose" "$local_compose" >/dev/null; then
+  echo "Prometheus admin API must remain disabled by its secure default" >&2
+  exit 1
+fi
 grep -F 'GF_AUTH_PROXY_ENABLED: "true"' "$production_compose" >/dev/null
 grep -F 'GF_AUTH_BASIC_ENABLED: "false"' "$production_compose" >/dev/null
 grep -F 'GF_AUTH_ANONYMOUS_ENABLED: "false"' "$production_compose" >/dev/null
