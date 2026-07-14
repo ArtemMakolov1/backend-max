@@ -1,0 +1,220 @@
+name: maxposty-backend
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_OWNER_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=100
+      - -c
+      - idle_in_transaction_session_timeout=60s
+    expose:
+      - "5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ../docker/postgres/init-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 128mb
+    stop_grace_period: 30s
+    logging: *default-logging
+    networks:
+      - database
+
+  pgbouncer:
+    image: percona/percona-pgbouncer:1.25.2@sha256:0da7c2501ebe8523f58f1e892bce0722b242300a769894c92b948d1bd48ca406
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/maxposty-pgbouncer-entrypoint"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      PGBOUNCER_DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE}
+      PGBOUNCER_MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE}
+      PGBOUNCER_RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE}
+      PGBOUNCER_MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN}
+    expose:
+      - "6432"
+    volumes:
+      - ../docker/pgbouncer/entrypoint.sh:/usr/local/bin/maxposty-pgbouncer-entrypoint:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U $${POSTGRES_APP_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - pool
+      - database
+
+  migrate:
+    image: ${BACKEND_IMAGE}
+    restart: "no"
+    entrypoint: ["/app/migrate"]
+    environment:
+      DIRECT_DATABASE_URL: postgresql://${POSTGRES_OWNER_USER}:${POSTGRES_OWNER_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - database
+
+  backend:
+    image: ${BACKEND_IMAGE}
+    restart: unless-stopped
+    init: true
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+      DATABASE_URL: postgresql://${POSTGRES_APP_USER}:${POSTGRES_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}?sslmode=disable
+      MEDIA_DIR: /app/media
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
+      AUTH_BOOTSTRAP_MODE: ${AUTH_BOOTSTRAP_MODE}
+      OAUTH_TRUST_X_REAL_IP: ${OAUTH_TRUST_X_REAL_IP}
+      OAUTH_RATE_LIMIT_AT_EDGE: ${OAUTH_RATE_LIMIT_AT_EDGE}
+      YANDEX_CLIENT_ID: ${YANDEX_CLIENT_ID}
+      YANDEX_CLIENT_SECRET: ${YANDEX_CLIENT_SECRET}
+      YANDEX_REDIRECT_URI: ${YANDEX_REDIRECT_URI}
+      YANDEX_ALLOWED_USERS: ${YANDEX_ALLOWED_USERS}
+      AUTH_SESSION_TTL: ${AUTH_SESSION_TTL}
+      MAX_API_BASE_URL: ${MAX_API_BASE_URL}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN}
+      MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET}
+      MAX_CA_CERT_FILE: ${MAX_CA_CERT_FILE}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_RESEARCH_MODEL: ${OPENAI_RESEARCH_MODEL}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL}
+      AI_GLOBAL_MAX_CONCURRENT: ${AI_GLOBAL_MAX_CONCURRENT}
+      AI_USER_MAX_CONCURRENT: ${AI_USER_MAX_CONCURRENT}
+      AI_IMAGE_PER_MINUTE: ${AI_IMAGE_PER_MINUTE}
+      AI_IMAGE_PER_DAY: ${AI_IMAGE_PER_DAY}
+      AI_RESEARCH_PER_MINUTE: ${AI_RESEARCH_PER_MINUTE}
+      AI_RESEARCH_PER_DAY: ${AI_RESEARCH_PER_DAY}
+      AI_LEASE_TTL: ${AI_LEASE_TTL}
+      SCHEDULER_INTERVAL: ${SCHEDULER_INTERVAL}
+    expose:
+      - "8080"
+    volumes:
+      - media-data:/app/media
+      - ../certs:/app/certs:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    read_only: true
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+    stop_grace_period: 30s
+    logging: *default-logging
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      edge:
+        aliases:
+          - backend
+          - maxposty-backend
+      pool:
+
+  setup-max-webhook:
+    image: ${BACKEND_IMAGE}
+    profiles: ["ops"]
+    restart: "no"
+    entrypoint: ["/app/setup-max-webhook"]
+    environment:
+      MAX_API_BASE_URL: ${MAX_API_BASE_URL}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN}
+      MAX_WEBHOOK_URL: ${MAX_WEBHOOK_URL}
+      MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET}
+      MAX_CA_CERT_FILE: ${MAX_CA_CERT_FILE}
+    volumes:
+      - ../certs:/app/certs:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks:
+      - edge
+
+  media-backup:
+    image: ${BACKEND_IMAGE}
+    profiles: ["ops"]
+    restart: "no"
+    entrypoint: ["/bin/tar"]
+    volumes:
+      - media-data:/source:ro
+    network_mode: "none"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+
+volumes:
+  postgres-data:
+  media-data:
+
+networks:
+  edge:
+    name: maxposty-edge
+    external: true
+  pool:
+    internal: true
+  database:
+    internal: true

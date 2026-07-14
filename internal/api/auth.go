@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,9 +22,11 @@ import (
 )
 
 const (
-	sessionCookieName = "maxstudio_session"
-	stateCookieName   = "maxstudio_oauth_state"
-	oauthStateTTL     = 10 * time.Minute
+	sessionCookieName   = "maxstudio_session"
+	stateCookieName     = "maxstudio_oauth_state"
+	oauthStateTTL       = 10 * time.Minute
+	termsVersion        = "2026-07-14"
+	personalDataVersion = "2026-07-14"
 )
 
 type authUser struct {
@@ -39,42 +43,38 @@ type authPrincipal struct {
 }
 
 type authStatusPayload struct {
-	Required         bool            `json:"auth_required"`
-	Authenticated    bool            `json:"authenticated"`
-	Methods          map[string]bool `json:"auth_methods"`
-	Method           string          `json:"auth_method"`
-	User             *authUser       `json:"user"`
-	SessionExpiresAt *time.Time      `json:"session_expires_at,omitempty"`
+	Required         bool              `json:"auth_required"`
+	Authenticated    bool              `json:"authenticated"`
+	Methods          map[string]bool   `json:"auth_methods"`
+	Method           string            `json:"auth_method"`
+	User             *authUser         `json:"user"`
+	SessionExpiresAt *time.Time        `json:"session_expires_at,omitempty"`
+	DocumentVersions map[string]string `json:"document_versions"`
+}
+
+type yandexAuthStartRequest struct {
+	ReturnTo             string `json:"return_to"`
+	TermsAccepted        bool   `json:"terms_accepted"`
+	PersonalDataAccepted bool   `json:"personal_data_accepted"`
 }
 
 func (s *Server) authRequired() bool {
-	return s.adminAPIKey != "" || s.yandexClient != nil
-}
-
-func (s *Server) validAdminKey(r *http.Request) bool {
-	if s.adminAPIKey == "" {
-		return false
-	}
-	provided := r.Header.Get("X-Admin-Key")
-	return len(provided) == len(s.adminAPIKey) && subtle.ConstantTimeCompare([]byte(provided), []byte(s.adminAPIKey)) == 1
+	return true
 }
 
 func (s *Server) authenticate(r *http.Request) (authPrincipal, bool) {
-	if s.validAdminKey(r) {
-		return authPrincipal{Method: "admin_key", User: &authUser{
-			ID: "admin", Provider: "admin_key", DisplayName: "Администратор",
-		}}, true
-	}
 	if s.yandexClient != nil {
 		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
 			tokenHash := sha256Hex(cookie.Value)
 			session, err := s.app.Store().GetAuthSession(r.Context(), tokenHash, s.now().UTC())
 			if err == nil {
-				if _, allowed := s.yandexAllowed[strings.ToLower(strings.TrimSpace(session.AllowlistIdentity))]; !allowed {
-					if deleteErr := s.app.Store().DeleteAuthSession(r.Context(), tokenHash); deleteErr != nil {
-						s.logger.Warn("revoked auth session cleanup failed", "error", deleteErr)
+				if len(s.yandexAllowed) > 0 {
+					if _, allowed := s.yandexAllowed[strings.ToLower(strings.TrimSpace(session.AllowlistIdentity))]; !allowed {
+						if deleteErr := s.app.Store().DeleteAuthSession(r.Context(), tokenHash); deleteErr != nil {
+							s.logger.Warn("revoked auth session cleanup failed", "error", deleteErr)
+						}
+						return authPrincipal{}, false
 					}
-					return authPrincipal{}, false
 				}
 				expiresAt := session.ExpiresAt
 				return authPrincipal{Method: "yandex", ExpiresAt: &expiresAt, User: &authUser{
@@ -87,18 +87,19 @@ func (s *Server) authenticate(r *http.Request) (authPrincipal, bool) {
 			}
 		}
 	}
-	if !s.authRequired() {
-		return authPrincipal{Method: "none"}, true
-	}
 	return authPrincipal{}, false
 }
 
 func (s *Server) authenticationStatus(r *http.Request) authStatusPayload {
 	principal, authenticated := s.authenticate(r)
+	if !authenticated {
+		principal.Method = "none"
+	}
 	return authStatusPayload{
 		Required: s.authRequired(), Authenticated: authenticated,
-		Methods: map[string]bool{"yandex": s.yandexClient != nil, "admin_key": s.adminAPIKey != ""},
+		Methods: map[string]bool{"yandex": s.yandexClient != nil},
 		Method:  principal.Method, User: principal.User, SessionExpiresAt: principal.ExpiresAt,
+		DocumentVersions: map[string]string{"terms": termsVersion, "personal_data": personalDataVersion},
 	}
 }
 
@@ -110,8 +111,22 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request) {
 func (s *Server) startYandexAuth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	if r.Header.Get("Origin") != s.frontendOrigin {
+		s.problem(w, http.StatusForbidden, "origin_required", "An exact frontend Origin is required to start sign-in", nil)
+		return
+	}
 	if s.yandexClient == nil {
 		s.problem(w, http.StatusServiceUnavailable, "yandex_auth_not_configured", "Yandex authentication is not configured", nil)
+		return
+	}
+	var input yandexAuthStartRequest
+	if !s.decodeJSON(w, r, &input) {
+		return
+	}
+	if !input.TermsAccepted || !input.PersonalDataAccepted {
+		s.problem(w, http.StatusBadRequest, "consent_required", "Accept the user agreement and personal data consent before signing in", map[string]string{
+			"terms_version": termsVersion, "personal_data_version": personalDataVersion,
+		})
 		return
 	}
 	if allowed, retryAfter := s.oauthStartLimiter.Allow(s.oauthClientKey(r), s.now().UTC()); !allowed {
@@ -131,9 +146,10 @@ func (s *Server) startYandexAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.now().UTC()
-	returnTo := safeReturnTo(r.URL.Query().Get("return_to"))
+	returnTo := safeReturnTo(input.ReturnTo)
 	if err := s.app.Store().CreateOAuthState(r.Context(), store.OAuthState{
 		StateHash: sha256Hex(state), PKCEVerifier: verifier, ReturnTo: returnTo,
+		TermsVersion: termsVersion, PersonalDataVersion: personalDataVersion, ConsentAt: now,
 		CreatedAt: now, ExpiresAt: now.Add(oauthStateTTL),
 	}); err != nil {
 		s.writeError(w, err)
@@ -142,7 +158,9 @@ func (s *Server) startYandexAuth(w http.ResponseWriter, r *http.Request) {
 	s.setStateCookie(w, state, int(oauthStateTTL.Seconds()))
 	challengeBytes := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(challengeBytes[:])
-	http.Redirect(w, r, s.yandexClient.AuthorizationURL(s.yandexRedirect, state, challenge), http.StatusFound)
+	s.writeJSON(w, http.StatusOK, map[string]string{
+		"authorization_url": s.yandexClient.AuthorizationURL(s.yandexRedirect, state, challenge),
+	})
 }
 
 func (s *Server) oauthClientKey(r *http.Request) string {
@@ -218,7 +236,12 @@ func (s *Server) finishYandexAuth(w http.ResponseWriter, r *http.Request) {
 	yandexUserID := firstNonEmpty(profile.PSUID, profile.ID)
 	displayName := firstNonEmpty(profile.DisplayName, profile.RealName,
 		strings.TrimSpace(profile.FirstName+" "+profile.LastName), profile.Login, "Пользователь Яндекса")
-	if err := s.app.Store().CreateAuthSession(r.Context(), store.AuthSession{
+	if err := s.app.Store().CreateAuthenticatedSession(r.Context(), store.User{
+		ID: yandexUserID, Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName,
+	}, []store.Consent{
+		{Document: "terms", Version: state.TermsVersion, AcceptedAt: state.ConsentAt, Source: "yandex_oauth"},
+		{Document: "personal_data", Version: state.PersonalDataVersion, AcceptedAt: state.ConsentAt, Source: "yandex_oauth"},
+	}, store.AuthSession{
 		TokenHash: sha256Hex(sessionToken), YandexUserID: yandexUserID,
 		Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName,
 		AllowlistIdentity: allowlistIdentity,
@@ -251,6 +274,9 @@ func (s *Server) yandexProfileAllowed(profile yandexauth.Profile) (string, bool)
 			return normalized, true
 		}
 	}
+	if len(s.yandexAllowed) == 0 {
+		return "", true
+	}
 	return "", false
 }
 
@@ -261,7 +287,7 @@ func (s *Server) redirectAuthError(w http.ResponseWriter, r *http.Request, code 
 }
 
 func (s *Server) setStateCookie(w http.ResponseWriter, value string, maxAge int) {
-	//nolint:gosec // G124: Secure is runtime-derived; config requires HTTPS outside explicit loopback development.
+	// #nosec G124 -- HttpOnly and SameSite=Lax are always set; Secure is disabled only for validated loopback HTTP development redirects.
 	http.SetCookie(w, &http.Cookie{
 		Name: stateCookieName, Value: value, Path: "/api/v1/auth/yandex/callback",
 		MaxAge: maxAge, HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,
@@ -269,7 +295,7 @@ func (s *Server) setStateCookie(w http.ResponseWriter, value string, maxAge int)
 }
 
 func (s *Server) clearStateCookie(w http.ResponseWriter) {
-	//nolint:gosec // G124: Secure mirrors the validated state cookie policy, including the localhost-only HTTP exception.
+	// #nosec G124 -- the deletion cookie must match the original cookie attributes; production OAuth always sets Secure through validated HTTPS configuration.
 	http.SetCookie(w, &http.Cookie{
 		Name: stateCookieName, Path: "/api/v1/auth/yandex/callback", MaxAge: -1,
 		Expires: time.Unix(1, 0), HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,
@@ -277,7 +303,7 @@ func (s *Server) clearStateCookie(w http.ResponseWriter) {
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, value string, maxAge int) {
-	//nolint:gosec // G124: Secure is runtime-derived; config requires HTTPS outside explicit loopback development.
+	// #nosec G124 -- HttpOnly and SameSite=Lax are always set; Secure is disabled only for validated loopback HTTP development redirects.
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookieName, Value: value, Path: "/", MaxAge: maxAge,
 		HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,
@@ -285,7 +311,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, value string, maxAge in
 }
 
 func (s *Server) clearSessionCookie(w http.ResponseWriter) {
-	//nolint:gosec // G124: Secure mirrors the validated session cookie policy, including the localhost-only HTTP exception.
+	// #nosec G124 -- the deletion cookie must match the original cookie attributes; production OAuth always sets Secure through validated HTTPS configuration.
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookieName, Path: "/", MaxAge: -1, Expires: time.Unix(1, 0),
 		HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,
@@ -298,6 +324,14 @@ func randomURLToken(byteCount int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func randomComparisonCode() (string, error) {
+	value, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", value.Int64()), nil
 }
 
 func sha256Hex(value string) string {

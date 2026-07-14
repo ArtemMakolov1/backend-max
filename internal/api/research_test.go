@@ -41,7 +41,7 @@ func (f *fakeResearchClient) Generate(ctx context.Context, request openairesearc
 	return f.result, f.err
 }
 
-func TestResearchGenerateReturnsExactContractUnderAdminAuth(t *testing.T) {
+func TestResearchGenerateReturnsExactContractUnderYandexSession(t *testing.T) {
 	t.Parallel()
 	fake := &fakeResearchClient{result: openairesearch.Result{
 		Topic:   "ИИ для бизнеса",
@@ -54,15 +54,8 @@ func TestResearchGenerateReturnsExactContractUnderAdminAuth(t *testing.T) {
 	handler := newResearchTestHandler(t, fake, "0123456789abcdefghijklmn")
 	body := `{"topic":"ИИ для бизнеса","angle":"Практика","audience":"Предприниматели","tone":"Деловой","format":"markdown","include_sources":true}`
 
-	unauthorized := httptest.NewRecorder()
-	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodPost, "/api/v1/research/generate", strings.NewReader(body)))
-	if unauthorized.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthorized status = %d", unauthorized.Code)
-	}
-
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/research/generate", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Admin-Key", "0123456789abcdefghijklmn")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -178,7 +171,7 @@ func TestHealthExposesResearchConfigurationSeparately(t *testing.T) {
 	}
 }
 
-func newResearchTestHandler(t *testing.T, research app.ResearchClient, adminKey string) http.Handler {
+func newResearchTestHandler(t *testing.T, research app.ResearchClient, _ string) http.Handler {
 	t.Helper()
 	storage, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "research.db"))
 	if err != nil {
@@ -191,7 +184,8 @@ func newResearchTestHandler(t *testing.T, research app.ResearchClient, adminKey 
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application := app.New(storage, mediaStore, nil, nil, research, logger)
-	return New(application, logger, "http://localhost:4321", "webhook-secret", adminKey).Handler()
+	server := New(application, logger, "http://localhost:4321", "webhook-secret", AuthOptions{YandexClient: &fakeYandexOAuth{}})
+	return withTestSession(t, storage, server.Handler(), "research-user")
 }
 
 func sortedJSONKeys[T any](values map[string]T) []string {

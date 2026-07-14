@@ -16,7 +16,7 @@ import (
 	"maxpilot/backend/internal/store"
 )
 
-func TestAdminKeyProtectsManagementAPI(t *testing.T) {
+func TestManagementAPIRequiresYandexSessionAndRejectsAdminKeyFallback(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -35,7 +35,7 @@ func TestAdminKeyProtectsManagementAPI(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application := app.New(storage, mediaStore, nil, nil, nil, logger)
-	handler := New(application, logger, "http://localhost:4321", "webhook-secret", "0123456789abcdefghijklmn").Handler()
+	handler := New(application, logger, "http://localhost:4321", "webhook-secret").Handler()
 
 	healthRequest := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
 	healthResponse := httptest.NewRecorder()
@@ -57,31 +57,30 @@ func TestAdminKeyProtectsManagementAPI(t *testing.T) {
 		t.Fatalf("unauthorized status = %d, want 401", unauthorized.Code)
 	}
 
-	authorizedRequest := httptest.NewRequest(http.MethodGet, "/api/v1/posts", nil)
-	authorizedRequest.Header.Set("X-Admin-Key", "0123456789abcdefghijklmn")
-	authorized := httptest.NewRecorder()
-	handler.ServeHTTP(authorized, authorizedRequest)
-	if authorized.Code != http.StatusOK {
-		t.Fatalf("authorized status = %d, body = %s", authorized.Code, authorized.Body.String())
+	legacyRequest := httptest.NewRequest(http.MethodGet, "/api/v1/posts", nil)
+	legacyRequest.Header.Set("X-Admin-Key", "test-only-legacy-admin-key")
+	legacy := httptest.NewRecorder()
+	handler.ServeHTTP(legacy, legacyRequest)
+	if legacy.Code != http.StatusUnauthorized {
+		t.Fatalf("legacy admin key status = %d, want 401", legacy.Code)
 	}
 }
 
-func TestCORSAllowsAdminHeaderAndCredentialCookies(t *testing.T) {
+func TestCORSAllowsCredentialCookiesWithoutAdminHeader(t *testing.T) {
 	t.Parallel()
 
 	server := &Server{frontendOrigin: "http://localhost:4321"}
 	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	request := httptest.NewRequest(http.MethodOptions, "/api/v1/posts", nil)
 	request.Header.Set("Origin", "http://localhost:4321")
-	request.Header.Set("Access-Control-Request-Headers", "x-admin-key")
 	response := httptest.NewRecorder()
 	server.cors(next).ServeHTTP(response, request)
 
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("preflight status = %d", response.Code)
 	}
-	if !strings.Contains(response.Header().Get("Access-Control-Allow-Headers"), "X-Admin-Key") {
-		t.Fatalf("allow headers = %q", response.Header().Get("Access-Control-Allow-Headers"))
+	if strings.Contains(response.Header().Get("Access-Control-Allow-Headers"), "X-Admin-Key") {
+		t.Fatalf("legacy admin header is still allowed: %q", response.Header().Get("Access-Control-Allow-Headers"))
 	}
 	if got := response.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 		t.Fatalf("allow credentials = %q, want true", got)

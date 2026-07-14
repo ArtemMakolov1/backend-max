@@ -31,8 +31,10 @@ var (
 type MAXClient interface {
 	GetMe(context.Context) (maxclient.BotInfo, error)
 	GetChat(context.Context, string) (maxclient.ChatInfo, error)
-	ResolveChat(context.Context, string) (maxclient.ChatInfo, error)
+	GetChatByLink(context.Context, string) (maxclient.ChatInfo, error)
 	GetMembership(context.Context, string) (maxclient.Membership, error)
+	SendClaimConfirmation(context.Context, string, string, string, string, string, string, string) error
+	AnswerCallback(context.Context, string, string) error
 	UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error)
 	Publish(context.Context, maxclient.PublishRequest) (maxclient.Message, error)
 	Edit(context.Context, maxclient.EditRequest) error
@@ -72,6 +74,10 @@ type ImageClient interface {
 	Generate(context.Context, openaiimg.GenerateRequest) (openaiimg.Result, error)
 }
 
+type imageRequestValidator interface {
+	Validate(openaiimg.GenerateRequest) error
+}
+
 type ResearchClient interface {
 	Generate(context.Context, openairesearch.Request) (openairesearch.Result, error)
 }
@@ -106,6 +112,20 @@ func (a *App) OpenAIConfigured() bool { return a.images != nil || a.research != 
 
 func (a *App) ResearchConfigured() bool { return a.research != nil }
 
+// ValidateImageRequest performs every available local check before an API
+// handler reserves quota. The real OpenAI client validates its configured
+// model's size rules; test or alternative clients still receive the common
+// prompt and quality checks.
+func (a *App) ValidateImageRequest(request openaiimg.GenerateRequest) error {
+	if a.images == nil {
+		return ErrOpenAINotConfigured
+	}
+	if validator, ok := a.images.(imageRequestValidator); ok {
+		return validator.Validate(request)
+	}
+	return openaiimg.ValidateRequest(request)
+}
+
 func (a *App) TestMAX(ctx context.Context) (maxclient.BotInfo, error) {
 	if a.max == nil {
 		return maxclient.BotInfo{}, ErrMAXNotConfigured
@@ -113,33 +133,44 @@ func (a *App) TestMAX(ctx context.Context) (maxclient.BotInfo, error) {
 	return a.max.GetMe(ctx)
 }
 
+func (a *App) ObserveMAXChat(ctx context.Context, maxChatID string, active bool, eventAt time.Time) error {
+	if a.max == nil {
+		return ErrMAXNotConfigured
+	}
+	now := eventAt.UTC()
+	if !active {
+		return a.store.MarkObservedBotChatRemoved(ctx, maxChatID, now)
+	}
+	info, err := a.max.GetChat(ctx, maxChatID)
+	if err != nil {
+		return err
+	}
+	return a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
+		MAXChatID: info.ChatID, PublicLink: strings.TrimRight(strings.TrimSpace(info.Link), "/"),
+		Title: info.Title, MAXOwnerID: info.OwnerID, Active: true, LastSeenAt: now,
+	})
+}
+
 func (a *App) ConnectChannel(ctx context.Context, publicLink, maxChatID, requestedTitle string) (ChannelCheck, error) {
 	if a.max == nil {
 		return ChannelCheck{}, ErrMAXNotConfigured
 	}
-	publicLink = strings.TrimSpace(publicLink)
+	publicLink = strings.TrimRight(strings.TrimSpace(publicLink), "/")
 	maxChatID = strings.TrimSpace(maxChatID)
-	var info maxclient.ChatInfo
-	var err error
-	if publicLink != "" {
-		info, err = a.max.ResolveChat(ctx, publicLink)
-	} else if maxChatID != "" {
-		info, err = a.max.GetChat(ctx, maxChatID)
-	} else {
-		return ChannelCheck{}, errors.New("public_link or max_chat_id is required")
+	observed, err := a.store.GetActiveObservedBotChat(ctx, publicLink, maxChatID)
+	if err != nil {
+		return ChannelCheck{}, errors.New("the shared bot must be added to the channel as an administrator before connecting")
 	}
+	info, err := a.max.GetChat(ctx, observed.MAXChatID)
 	if err != nil {
 		return ChannelCheck{}, err
-	}
-	if maxChatID != "" && info.ChatID != maxChatID {
-		return ChannelCheck{}, errors.New("public_link and max_chat_id resolve to different channels")
 	}
 	membership, err := a.max.GetMembership(ctx, info.ChatID)
 	if err != nil {
 		return ChannelCheck{}, err
 	}
 	diagnostics := channelDiagnostics(info, membership)
-	if !diagnostics.CanPublish {
+	if !diagnostics.CanPublish || !diagnostics.CanEdit || !diagnostics.CanDelete {
 		return ChannelCheck{}, &ChannelAccessError{
 			Diagnostics: diagnostics,
 			Message:     "The bot must be an active channel administrator with read_all_messages and write permissions",
@@ -160,13 +191,151 @@ func (a *App) ConnectChannel(ctx context.Context, publicLink, maxChatID, request
 		}
 	}
 	channel, err := a.store.UpsertConnectedChannel(ctx, store.Channel{
-		MAXChatID: info.ChatID, Title: title, PublicLink: canonicalLink, IconURL: info.Icon.URL,
+		VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title, PublicLink: canonicalLink, IconURL: info.Icon.URL,
 		ParticipantsCount: info.ParticipantsCount, IsChannel: true, Active: true,
 	})
 	if err != nil {
 		return ChannelCheck{}, err
 	}
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
+}
+
+type ChannelClaimCandidate struct {
+	Info        maxclient.ChatInfo
+	Bot         maxclient.BotInfo
+	Diagnostics ChannelDiagnostics
+}
+
+func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID string) (ChannelClaimCandidate, error) {
+	if a.max == nil {
+		return ChannelClaimCandidate{}, ErrMAXNotConfigured
+	}
+	publicLink = strings.TrimRight(strings.TrimSpace(publicLink), "/")
+	maxChatID = strings.TrimSpace(maxChatID)
+	var slug string
+	if publicLink != "" {
+		var normalizeErr error
+		slug, normalizeErr = maxclient.NormalizeChatLink(publicLink)
+		if normalizeErr != nil {
+			return ChannelClaimCandidate{}, normalizeErr
+		}
+		publicLink = "https://max.ru/" + strings.TrimPrefix(slug, "@")
+	}
+
+	observed, observedErr := a.store.GetActiveObservedBotChat(ctx, publicLink, maxChatID)
+	var info maxclient.ChatInfo
+	discoveredByLink := false
+	if observedErr == nil {
+		var err error
+		info, err = a.max.GetChat(ctx, observed.MAXChatID)
+		if err != nil {
+			return ChannelClaimCandidate{}, err
+		}
+	} else {
+		if !errors.Is(observedErr, store.ErrNotFound) {
+			return ChannelClaimCandidate{}, observedErr
+		}
+		// Numeric IDs remain registry-only. The public-link fallback supports a
+		// channel where the shared bot was already an administrator before the
+		// webhook inventory was enabled.
+		if publicLink == "" || maxChatID != "" {
+			return ChannelClaimCandidate{}, errors.New("first add the MaxPosty bot to the channel as an administrator, then retry")
+		}
+		var err error
+		info, err = a.max.GetChatByLink(ctx, slug)
+		if err != nil {
+			return ChannelClaimCandidate{}, err
+		}
+		if info.Type != "channel" || info.Status != "active" {
+			return ChannelClaimCandidate{}, &ChannelAccessError{
+				Diagnostics: ChannelDiagnostics{ChatID: info.ChatID, Type: info.Type, Status: info.Status},
+				Message:     "The public link must point to an active MAX channel",
+			}
+		}
+		discoveredByLink = true
+	}
+	membership, err := a.max.GetMembership(ctx, info.ChatID)
+	if err != nil {
+		return ChannelClaimCandidate{}, err
+	}
+	diagnostics := channelDiagnostics(info, membership)
+	if !diagnostics.CanPublish || !diagnostics.CanEdit || !diagnostics.CanDelete {
+		return ChannelClaimCandidate{}, &ChannelAccessError{Diagnostics: diagnostics,
+			Message: "The shared bot must be an active channel administrator with read_all_messages and write permissions"}
+	}
+	if discoveredByLink {
+		canonicalLink := strings.TrimRight(strings.TrimSpace(info.Link), "/")
+		if canonicalLink == "" {
+			canonicalLink = publicLink
+		} else if normalized, normalizeErr := maxclient.NormalizeChatLink(canonicalLink); normalizeErr == nil {
+			canonicalLink = "https://max.ru/" + strings.TrimPrefix(normalized, "@")
+		} else {
+			// Never persist an unexpected URL returned by the upstream API.
+			canonicalLink = publicLink
+		}
+		info.Link = canonicalLink
+		if err := a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
+			MAXChatID: info.ChatID, PublicLink: canonicalLink, Title: info.Title, MAXOwnerID: info.OwnerID,
+			Active: true, LastSeenAt: a.now().UTC(),
+		}); err != nil {
+			return ChannelClaimCandidate{}, err
+		}
+	}
+	bot, err := a.max.GetMe(ctx)
+	if err != nil {
+		return ChannelClaimCandidate{}, err
+	}
+	if strings.TrimSpace(bot.Username) == "" {
+		return ChannelClaimCandidate{}, errors.New("MAX bot username is missing")
+	}
+	return ChannelClaimCandidate{Info: info, Bot: bot, Diagnostics: diagnostics}, nil
+}
+
+func (a *App) CompleteChannelClaim(ctx context.Context, claim store.ChannelClaim) (store.Channel, ChannelDiagnostics, error) {
+	if a.max == nil {
+		return store.Channel{}, ChannelDiagnostics{}, ErrMAXNotConfigured
+	}
+	info, err := a.max.GetChat(ctx, claim.MAXChatID)
+	if err != nil {
+		return store.Channel{}, ChannelDiagnostics{}, err
+	}
+	membership, err := a.max.GetMembership(ctx, claim.MAXChatID)
+	if err != nil {
+		return store.Channel{}, ChannelDiagnostics{}, err
+	}
+	diagnostics := channelDiagnostics(info, membership)
+	if info.OwnerID == "" || info.OwnerID != claim.MAXUserID {
+		return store.Channel{}, diagnostics, &ChannelAccessError{Diagnostics: diagnostics,
+			Message: "Channel connection must be confirmed by its current MAX owner"}
+	}
+	if !diagnostics.CanPublish || !diagnostics.CanEdit || !diagnostics.CanDelete {
+		return store.Channel{}, diagnostics, &ChannelAccessError{Diagnostics: diagnostics,
+			Message: "The shared bot needs read, publish, edit, and delete permissions"}
+	}
+	title := strings.TrimSpace(info.Title)
+	if title == "" {
+		title = strings.TrimSpace(claim.RequestedTitle)
+	}
+	channel, err := a.store.CompleteChannelClaim(ctx, claim, store.Channel{
+		UserID: claim.UserID, VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title,
+		PublicLink: strings.TrimSpace(info.Link), IconURL: info.Icon.URL, ParticipantsCount: info.ParticipantsCount,
+		IsChannel: true, Active: true,
+	})
+	return channel, diagnostics, err
+}
+
+func (a *App) SendChannelClaimConfirmation(ctx context.Context, maxUserID, title, link, requesterLabel, comparisonCode, confirmPayload, cancelPayload string) error {
+	if a.max == nil {
+		return ErrMAXNotConfigured
+	}
+	return a.max.SendClaimConfirmation(ctx, maxUserID, title, link, requesterLabel, comparisonCode, confirmPayload, cancelPayload)
+}
+
+func (a *App) AnswerMAXCallback(ctx context.Context, callbackID, notification string) error {
+	if a.max == nil {
+		return ErrMAXNotConfigured
+	}
+	return a.max.AnswerCallback(ctx, callbackID, notification)
 }
 
 func (a *App) TestChannel(ctx context.Context, channelID int64) (ChannelCheck, error) {
@@ -186,6 +355,25 @@ func (a *App) TestChannel(ctx context.Context, channelID int64) (ChannelCheck, e
 		diagnostics.CanPublish = false
 		diagnostics.CanEdit = false
 		diagnostics.CanDelete = false
+	}
+	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
+}
+
+func (a *App) TestChannelForUser(ctx context.Context, userID string, channelID int64) (ChannelCheck, error) {
+	channel, err := a.store.GetChannelForUser(ctx, userID, channelID)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	if a.max == nil {
+		return ChannelCheck{}, ErrMAXNotConfigured
+	}
+	info, membership, err := a.inspectChannel(ctx, channel)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	diagnostics := channelDiagnostics(info, membership)
+	if !channel.Active {
+		diagnostics.CanPublish, diagnostics.CanEdit, diagnostics.CanDelete = false, false, false
 	}
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
@@ -498,6 +686,9 @@ func (a *App) validateForPublish(ctx context.Context, post store.Post) (store.Ch
 	if !channel.Active {
 		return store.Channel{}, errors.New("selected MAX channel is inactive")
 	}
+	if post.UserID == "" || channel.UserID != post.UserID {
+		return store.Channel{}, errors.New("post and channel ownership do not match")
+	}
 	return channel, nil
 }
 
@@ -505,6 +696,12 @@ func (a *App) inspectChannel(ctx context.Context, channel store.Channel) (maxcli
 	info, err := a.max.GetChat(ctx, channel.MAXChatID)
 	if err != nil {
 		return maxclient.ChatInfo{}, maxclient.Membership{}, err
+	}
+	if channel.VerifiedMAXOwnerID == "" || info.OwnerID == "" || info.OwnerID != channel.VerifiedMAXOwnerID {
+		return maxclient.ChatInfo{}, maxclient.Membership{}, &ChannelAccessError{
+			Diagnostics: ChannelDiagnostics{ChatID: info.ChatID, Type: info.Type, Status: info.Status},
+			Message:     "MAX channel ownership changed; reconnect the channel before publishing",
+		}
 	}
 	membership, err := a.max.GetMembership(ctx, channel.MAXChatID)
 	if err != nil {
@@ -518,7 +715,7 @@ func channelDiagnostics(info maxclient.ChatInfo, membership maxclient.Membership
 	for i, permission := range membership.Permissions {
 		permissions[i] = string(permission)
 	}
-	missing := make([]string, 0, 3)
+	missing := make([]string, 0, 5)
 	if !membership.IsAdmin {
 		missing = append(missing, "admin")
 	}
@@ -530,13 +727,21 @@ func channelDiagnostics(info maxclient.ChatInfo, membership maxclient.Membership
 	if !hasWrite {
 		missing = append(missing, string(maxclient.PermissionWrite))
 	}
+	hasEdit := membership.HasPermission(maxclient.PermissionEdit)
+	hasDelete := membership.HasPermission(maxclient.PermissionDelete)
+	if !hasEdit {
+		missing = append(missing, string(maxclient.PermissionEdit))
+	}
+	if !hasDelete {
+		missing = append(missing, string(maxclient.PermissionDelete))
+	}
 	activeChannel := info.Type == "channel" && info.Status == "active"
 	return ChannelDiagnostics{
 		ChatID: info.ChatID, Type: info.Type, Status: info.Status, IsAdmin: membership.IsAdmin,
 		Permissions:                permissions,
 		CanPublish:                 activeChannel && membership.IsAdmin && hasRead && hasWrite,
-		CanEdit:                    activeChannel && membership.IsAdmin && hasRead && membership.HasPermission(maxclient.PermissionEdit),
-		CanDelete:                  activeChannel && membership.IsAdmin && hasRead && membership.HasPermission(maxclient.PermissionDelete),
+		CanEdit:                    activeChannel && membership.IsAdmin && hasRead && hasEdit,
+		CanDelete:                  activeChannel && membership.IsAdmin && hasRead && hasDelete,
 		MissingRequiredPermissions: missing,
 	}
 }

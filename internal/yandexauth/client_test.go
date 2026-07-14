@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -89,5 +90,39 @@ func TestUserInfoRejectsTokenForAnotherClient(t *testing.T) {
 	_, err := client.UserInfo(context.Background(), "token")
 	if err == nil || !strings.Contains(err.Error(), "user info") {
 		t.Fatalf("UserInfo() error = %v", err)
+	}
+}
+
+func TestOAuthSecretsNeverFollowRedirects(t *testing.T) {
+	t.Parallel()
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalls.Add(1)
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			t.Errorf("redirect target received Authorization %q", authorization)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/secret")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client, err := New("client-id", "client-secret", origin.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.tokenURL = origin.URL + "/token"
+	client.userInfoURL = origin.URL + "/info"
+	if _, err := client.ExchangeCode(context.Background(), "code", "verifier"); err == nil {
+		t.Fatal("ExchangeCode followed or accepted redirect")
+	}
+	if _, err := client.UserInfo(context.Background(), "access-secret"); err == nil {
+		t.Fatal("UserInfo followed or accepted redirect")
+	}
+	if targetCalls.Load() != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", targetCalls.Load())
 	}
 }

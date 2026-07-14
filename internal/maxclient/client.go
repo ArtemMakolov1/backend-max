@@ -86,9 +86,10 @@ func (c *Client) GetChat(ctx context.Context, chatID string) (ChatInfo, error) {
 	return c.getChat(ctx, chatID)
 }
 
-// ResolveChat resolves a public max.ru link or channel slug without changing
-// any MAX state.
-func (c *Client) ResolveChat(ctx context.Context, publicLink string) (ChatInfo, error) {
+// GetChatByLink resolves only a validated public MAX slug. Normalization strips
+// URL query/fragment data and rejects alternate hosts, userinfo and nested or
+// escaped paths before anything is appended to the API URL.
+func (c *Client) GetChatByLink(ctx context.Context, publicLink string) (ChatInfo, error) {
 	slug, err := NormalizeChatLink(publicLink)
 	if err != nil {
 		return ChatInfo{}, err
@@ -99,6 +100,7 @@ func (c *Client) ResolveChat(ctx context.Context, publicLink string) (ChatInfo, 
 func (c *Client) getChat(ctx context.Context, identifier string) (ChatInfo, error) {
 	var response struct {
 		ChatID            json.RawMessage `json:"chat_id"`
+		OwnerID           json.RawMessage `json:"owner_id"`
 		Type              string          `json:"type"`
 		Status            string          `json:"status"`
 		Title             string          `json:"title"`
@@ -110,7 +112,7 @@ func (c *Client) getChat(ctx context.Context, identifier string) (ChatInfo, erro
 		return ChatInfo{}, err
 	}
 	chat := ChatInfo{
-		ChatID: jsonCode(response.ChatID), Type: response.Type, Status: response.Status,
+		ChatID: jsonCode(response.ChatID), OwnerID: jsonCode(response.OwnerID), Type: response.Type, Status: response.Status,
 		Title: response.Title, Link: response.Link, Icon: response.Icon,
 		ParticipantsCount: response.ParticipantsCount,
 	}
@@ -130,6 +132,55 @@ func (c *Client) GetMembership(ctx context.Context, chatID string) (Membership, 
 		return Membership{}, err
 	}
 	return membership, nil
+}
+
+// SendClaimConfirmation asks the MAX account that opened the deep link to
+// explicitly approve or cancel connecting the named channel. Callback payloads
+// are opaque one-time values and are never included in application logs.
+func (c *Client) SendClaimConfirmation(ctx context.Context, userID, channelTitle, channelLink, requesterLabel, comparisonCode, confirmPayload, cancelPayload string) error {
+	if !numericID(userID) {
+		return errors.New("send claim confirmation: MAX user ID must be numeric")
+	}
+	for _, payload := range []string{confirmPayload, cancelPayload} {
+		if payload == "" || len(payload) > 128 {
+			return errors.New("send claim confirmation: callback payload must contain 1 to 128 bytes")
+		}
+	}
+	title := strings.TrimSpace(channelTitle)
+	if title == "" {
+		title = "канал MAX"
+	}
+	requesterLabel = strings.TrimSpace(requesterLabel)
+	if requesterLabel == "" || len(comparisonCode) != 6 {
+		return errors.New("send claim confirmation: requester label and six-digit comparison code are required")
+	}
+	text := "Подключить канал «" + title + "» к аккаунту MaxPosty «" + requesterLabel + "»?\n\n" +
+		"Код проверки: " + comparisonCode + "\nПодтвердите только если такой же код показан в MaxPosty."
+	if link := strings.TrimSpace(channelLink); link != "" {
+		text += "\n" + link
+	}
+	body := struct {
+		Text        string `json:"text"`
+		Attachments []any  `json:"attachments"`
+	}{
+		Text: text,
+		Attachments: []any{map[string]any{
+			"type": "inline_keyboard",
+			"payload": map[string]any{"buttons": [][]map[string]string{{
+				{"type": "callback", "text": "Подключить", "payload": confirmPayload},
+				{"type": "callback", "text": "Отмена", "payload": cancelPayload},
+			}}},
+		}},
+	}
+	return c.doJSON(ctx, http.MethodPost, "/messages", url.Values{"user_id": {userID}}, body, nil)
+}
+
+func (c *Client) AnswerCallback(ctx context.Context, callbackID, notification string) error {
+	if strings.TrimSpace(callbackID) == "" {
+		return errors.New("answer callback: callback ID is required")
+	}
+	body := map[string]string{"notification": notification}
+	return c.doJSON(ctx, http.MethodPost, "/answers", url.Values{"callback_id": {callbackID}}, body, nil)
 }
 
 // UploadImage reserves an image upload, sends multipart field "data" to the
@@ -210,6 +261,7 @@ func (c *Client) UploadImage(ctx context.Context, filename string, image io.Read
 		return nil
 	}
 
+	// #nosec G704 -- validateUploadURL requires an absolute HTTPS URL without userinfo/fragment, every redirect is revalidated, and Authorization is removed.
 	resp, err := uploadClient.Do(req)
 	if err != nil {
 		return UploadResult{}, fmt.Errorf("upload image to MAX storage: %w", err)
@@ -364,7 +416,16 @@ func (c *Client) doJSON(ctx context.Context, method, endpointPath string, query 
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.httpClient.Do(req)
+	// MAX API calls carry the shared bot credential. Do not follow redirects:
+	// even a same-host HTTPS redirect can later be misconfigured into a
+	// cross-origin or scheme-downgrade credential leak. Signed media uploads use
+	// their own redirect policy in UploadImage and never carry Authorization.
+	apiClient := *c.httpClient
+	apiClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	// #nosec G704 -- New validates the absolute API base URL and rejects userinfo/query/fragment; production config pins the official MAX origin and redirects are disabled here.
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("MAX API %s %s: %w", method, endpointPath, err)
 	}

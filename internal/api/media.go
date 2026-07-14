@@ -52,8 +52,20 @@ func (s *Server) uploadMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, postID *int64) (store.Post, media.File, error) {
+	userID, err := authenticatedUserID(r)
+	if err != nil {
+		return store.Post{}, media.File{}, err
+	}
+	// Route and query post IDs are known before multipart parsing. Authorize
+	// them first so a foreign resource consistently looks absent regardless of
+	// whether the request body is valid.
+	if postID != nil {
+		if _, err := s.app.Store().GetPostForUser(r.Context(), userID, *postID); err != nil {
+			return store.Post{}, media.File{}, err
+		}
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, media.MaxImageBytes+(1<<20))
-	//nolint:gosec // G120: MaxBytesReader caps the entire request body before multipart parsing.
+	// #nosec G120 -- MaxBytesReader above bounds the entire multipart request before ParseMultipartForm allocates memory or temporary files.
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		return store.Post{}, media.File{}, errors.New("invalid multipart upload or image is too large")
 	}
@@ -71,6 +83,11 @@ func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, post
 			postID = &id
 		}
 	}
+	if postID != nil {
+		if _, err := s.app.Store().GetPostForUser(r.Context(), userID, *postID); err != nil {
+			return store.Post{}, media.File{}, err
+		}
+	}
 	fileHeader, err := firstFile(r, "file", "image")
 	if err != nil {
 		return store.Post{}, media.File{}, err
@@ -86,11 +103,11 @@ func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, post
 	if err != nil {
 		return store.Post{}, media.File{}, err
 	}
+	if err := s.app.Store().RegisterMedia(r.Context(), userID, file.Filename, s.now().UTC()); err != nil {
+		return store.Post{}, media.File{}, err
+	}
 	if postID == nil {
 		return store.Post{}, file, nil
-	}
-	if _, err := s.app.Store().GetPost(r.Context(), *postID); err != nil {
-		return store.Post{}, media.File{}, err
 	}
 	emptyPrompt := ""
 	post, err := s.app.Store().UpdatePost(r.Context(), *postID, store.PostChanges{
@@ -109,7 +126,22 @@ func firstFile(r *http.Request, fieldNames ...string) (*multipart.FileHeader, er
 }
 
 func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request) {
-	file, info, err := s.app.Media().Open(chi.URLParam(r, "filename"))
+	userID, err := authenticatedUserID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	filename := chi.URLParam(r, "filename")
+	owned, err := s.app.Store().UserOwnsMedia(r.Context(), userID, filename)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if !owned {
+		s.problem(w, http.StatusNotFound, "not_found", "Media file was not found", nil)
+		return
+	}
+	file, info, err := s.app.Media().Open(filename)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			s.problem(w, http.StatusNotFound, "not_found", "Media file was not found", nil)
@@ -125,7 +157,9 @@ func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request) {
 	n, _ := io.ReadFull(file, header)
 	_, _ = file.Seek(0, io.SeekStart)
 	w.Header().Set("Content-Type", http.DetectContentType(header[:n]))
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	// The URL is tenant-scoped by the session, so it must not survive logout or
+	// be replayed from a browser/CDN cache under another account.
+	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)

@@ -96,6 +96,7 @@ func (s *Store) Save(originalName string, reader io.Reader) (File, error) {
 		return File{}, fmt.Errorf("image exceeds %d bytes", s.maxImageBytes)
 	}
 
+	// #nosec G703 -- tmpName is returned by os.CreateTemp inside the configured private media directory.
 	file, err := os.Open(tmpName)
 	if err != nil {
 		return File{}, fmt.Errorf("inspect image: %w", err)
@@ -140,9 +141,11 @@ func (s *Store) Save(originalName string, reader io.Reader) (File, error) {
 	filename := hex.EncodeToString(hash.Sum(nil)) + ext
 	destination := filepath.Join(s.dir, filename)
 	if _, err := os.Stat(destination); errors.Is(err, os.ErrNotExist) {
+		// #nosec G703 -- tmpName is returned by os.CreateTemp inside the configured private media directory.
 		if err := os.Chmod(tmpName, 0o600); err != nil {
 			return File{}, fmt.Errorf("set media permissions: %w", err)
 		}
+		// #nosec G703 -- source is a CreateTemp path and destination is a SHA-256 filename joined to the private media directory.
 		if err := os.Rename(tmpName, destination); err != nil {
 			return File{}, fmt.Errorf("store media: %w", err)
 		}
@@ -162,6 +165,22 @@ func (s *Store) URL(filename string) string {
 }
 
 func (s *Store) ResolveURL(rawURL string) (string, error) {
+	filename, err := s.FilenameFromURL(rawURL)
+	if err != nil {
+		return "", err
+	}
+	fullPath := filepath.Join(s.dir, filename)
+	info, err := os.Stat(fullPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", errors.New("media file does not exist")
+	}
+	return fullPath, nil
+}
+
+// FilenameFromURL validates that rawURL refers to this media store without
+// touching the filesystem. This lets callers enforce tenant ownership before
+// revealing whether the underlying private file exists.
+func (s *Store) FilenameFromURL(rawURL string) (string, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return "", errors.New("invalid image URL")
@@ -178,12 +197,7 @@ func (s *Store) ResolveURL(rawURL string) (string, error) {
 	if err != nil || filename == "" || filename != path.Base(filename) || strings.ContainsAny(filename, `/\\`) {
 		return "", errors.New("invalid media filename")
 	}
-	fullPath := filepath.Join(s.dir, filename)
-	info, err := os.Stat(fullPath)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", errors.New("media file does not exist")
-	}
-	return fullPath, nil
+	return filename, nil
 }
 
 func (s *Store) Open(filename string) (*os.File, os.FileInfo, error) {

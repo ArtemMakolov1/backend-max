@@ -46,6 +46,36 @@ func TestGetMeUsesRawAuthorizationToken(t *testing.T) {
 	}
 }
 
+func TestAPICredentialNeverFollowsRedirect(t *testing.T) {
+	t.Parallel()
+
+	var redirectedCalls atomic.Int32
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedCalls.Add(1)
+		if authorization := r.Header.Get("Authorization"); authorization != "" {
+			t.Errorf("redirect target received Authorization %q", authorization)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer redirectTarget.Close()
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", redirectTarget.URL+"/stolen")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client := mustClient(t, origin.URL, "shared-bot-secret", origin.Client())
+	err := client.Test(context.Background())
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusTemporaryRedirect {
+		t.Fatalf("Test() error = %v, want un-followed 307", err)
+	}
+	if redirectedCalls.Load() != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", redirectedCalls.Load())
+	}
+}
+
 func TestGetChatIsReadOnlyAndPreservesLargeID(t *testing.T) {
 	t.Parallel()
 
@@ -72,7 +102,7 @@ func TestGetChatIsReadOnlyAndPreservesLargeID(t *testing.T) {
 	}
 }
 
-func TestResolveChatAndMembershipAreReadOnly(t *testing.T) {
+func TestGetChatAndMembershipAreReadOnly(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int32
@@ -86,8 +116,8 @@ func TestResolveChatAndMembershipAreReadOnly(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/chats/news-room":
-			_, _ = io.WriteString(w, `{"chat_id":-9223372036854775807,"type":"channel","status":"active","title":"News","link":"https://max.ru/news-room"}`)
+		case "/chats/-9223372036854775807":
+			_, _ = io.WriteString(w, `{"chat_id":-9223372036854775807,"owner_id":777,"type":"channel","status":"active","title":"News","link":"https://max.ru/news-room"}`)
 		case "/chats/-9223372036854775807/members/me":
 			_, _ = io.WriteString(w, `{"user_id":42,"first_name":"Bot","is_bot":true,"is_admin":true,"permissions":["read_all_messages","post_edit_delete_message","edit_message","delete_message"]}`)
 		default:
@@ -98,12 +128,12 @@ func TestResolveChatAndMembershipAreReadOnly(t *testing.T) {
 	defer server.Close()
 
 	client := mustClient(t, server.URL, "token", server.Client())
-	chat, err := client.ResolveChat(context.Background(), "https://max.ru/news-room?from=test")
+	chat, err := client.GetChat(context.Background(), "-9223372036854775807")
 	if err != nil {
-		t.Fatalf("ResolveChat() error = %v", err)
+		t.Fatalf("GetChat() error = %v", err)
 	}
-	if chat.ChatID != "-9223372036854775807" || chat.Type != "channel" || chat.Status != "active" {
-		t.Fatalf("ResolveChat() = %#v", chat)
+	if chat.ChatID != "-9223372036854775807" || chat.OwnerID != "777" || chat.Type != "channel" || chat.Status != "active" {
+		t.Fatalf("GetChat() = %#v", chat)
 	}
 	membership, err := client.GetMembership(context.Background(), chat.ChatID)
 	if err != nil {
@@ -119,12 +149,12 @@ func TestResolveChatAndMembershipAreReadOnly(t *testing.T) {
 	}
 }
 
-func TestResolveChatRejectsInvalidLinksAndMalformedChatID(t *testing.T) {
+func TestGetChatRejectsInvalidAndMalformedChatID(t *testing.T) {
 	t.Parallel()
 	client := mustClient(t, "https://platform-api2.max.ru", "token", http.DefaultClient)
-	for _, input := range []string{"", "http://max.ru/news", "https://evil.example/news", "https://max.ru/a/b", "123"} {
-		if _, err := client.ResolveChat(context.Background(), input); err == nil {
-			t.Errorf("ResolveChat(%q) accepted invalid link", input)
+	for _, input := range []string{"", "not-a-number", "1.5"} {
+		if _, err := client.GetChat(context.Background(), input); err == nil {
+			t.Errorf("GetChat(%q) accepted invalid id", input)
 		}
 	}
 
@@ -133,8 +163,57 @@ func TestResolveChatRejectsInvalidLinksAndMalformedChatID(t *testing.T) {
 	}))
 	defer server.Close()
 	client = mustClient(t, server.URL, "token", server.Client())
-	if _, err := client.ResolveChat(context.Background(), "news"); err == nil || !strings.Contains(err.Error(), "numeric chat_id") {
-		t.Fatalf("ResolveChat malformed response error = %v", err)
+	if _, err := client.GetChat(context.Background(), "123"); err == nil || !strings.Contains(err.Error(), "numeric chat_id") {
+		t.Fatalf("GetChat malformed response error = %v", err)
+	}
+}
+
+func TestGetChatByLinkNormalizesWithoutURLInjection(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method != http.MethodGet || r.RequestURI != "/chats/se13549123_biz" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.RequestURI)
+		}
+		_, _ = io.WriteString(w, `{"chat_id":-13549123,"owner_id":777,"type":"channel","status":"active","title":"Test"}`)
+	}))
+	defer server.Close()
+	client := mustClient(t, server.URL, "token", server.Client())
+	chat, err := client.GetChatByLink(context.Background(),
+		"https://max.ru/se13549123_biz?chat_id=-1&access_token=stolen#ignored")
+	if err != nil || chat.ChatID != "-13549123" || chat.OwnerID != "777" {
+		t.Fatalf("GetChatByLink() = %#v, %v", chat, err)
+	}
+	for _, input := range []string{
+		"https://user@max.ru/se13549123_biz",
+		"https://evil.example/se13549123_biz",
+		"https://max.ru/se13549123_biz/other",
+		"https://max.ru/se13549123_biz%2Fother",
+		"https://max.ru/%2e%2e%2Fsubscriptions",
+	} {
+		if _, err := client.GetChatByLink(context.Background(), input); err == nil {
+			t.Errorf("GetChatByLink(%q) accepted unsafe link", input)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("unsafe links reached MAX API; calls=%d", calls.Load())
+	}
+}
+
+func TestMembershipWritePermissionCoversPublicationManagement(t *testing.T) {
+	t.Parallel()
+	membership := Membership{Permissions: []Permission{PermissionReadAllMessages, PermissionWrite}}
+	for _, permission := range []Permission{PermissionReadAllMessages, PermissionWrite, PermissionEdit, PermissionDelete} {
+		if !membership.HasPermission(permission) {
+			t.Errorf("write permission does not satisfy %q", permission)
+		}
+	}
+	legacy := Membership{Permissions: []Permission{PermissionReadAllMessages, "post_edit_delete_message"}}
+	for _, permission := range []Permission{PermissionWrite, PermissionEdit, PermissionDelete} {
+		if !legacy.HasPermission(permission) {
+			t.Errorf("legacy combined permission does not satisfy %q", permission)
+		}
 	}
 }
 

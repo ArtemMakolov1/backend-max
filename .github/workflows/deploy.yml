@@ -1,0 +1,295 @@
+name: Backend production deploy
+
+on:
+  workflow_run:
+    # Trigger from one workflow only: GitHub treats a multi-workflow list as
+    # OR, not AND. The release-gate job verifies both exact-SHA workflows.
+    workflows: ["Backend Security"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      configure_max_webhook:
+        description: Configure the shared MAX bot webhook after a healthy deploy
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxposty-backend-production
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+jobs:
+  release-gate:
+    name: Require exact-commit CI and security workflows
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Verify successful release gates for the exact commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./deploy/verify-release-gates.sh "$GITHUB_REPOSITORY" "$SOURCE_SHA"
+
+  image:
+    name: Build immutable production image
+    needs: release-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.build.outputs.immutable_ref }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.25.12"
+          cache: true
+      - name: Verify dependencies and reachable vulnerabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod verify
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+          ./deploy/validate-expand-contract-migrations.sh internal/store/migrations
+      - name: Resolve immutable image name
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          image="${image_repository}:${SOURCE_SHA}"
+          echo "image=$image" >>"$GITHUB_OUTPUT"
+          echo "repository=$image_repository" >>"$GITHUB_OUTPUT"
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push image with provenance and SBOM
+        id: build
+        shell: bash
+        env:
+          IMAGE: ${{ steps.metadata.outputs.image }}
+          IMAGE_REPOSITORY: ${{ steps.metadata.outputs.repository }}
+        run: |
+          set -euo pipefail
+          metadata_file="$RUNNER_TEMP/maxposty-build-metadata.json"
+          docker buildx create --name maxposty-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --tag "$IMAGE" \
+            --tag "${IMAGE_REPOSITORY}:latest" \
+            --provenance=mode=max \
+            --sbom=true \
+            --metadata-file "$metadata_file" \
+            --push \
+            .
+
+          digest=$(jq -er '."containerimage.digest"' "$metadata_file")
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "Build did not return an immutable OCI digest" >&2; exit 1; }
+          immutable_ref="${IMAGE_REPOSITORY}@${digest}"
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+          echo "immutable_ref=$immutable_ref" >>"$GITHUB_OUTPUT"
+      - name: Remove registry write credentials
+        if: ${{ always() }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
+
+  scan:
+    name: Scan exact pushed digest (${{ matrix.platform }})
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    env:
+      TRIVY_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - name: Log in to GitHub Container Registry with read-only token
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Block vulnerable pushed image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0, post-2026 incident immutable commit
+        with:
+          scan-type: image
+          image-ref: ${{ needs.image.outputs.image }}
+          version: v0.72.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: "false"
+          exit-code: "1"
+          format: table
+          timeout: 10m
+      - name: Remove registry read credentials
+        if: ${{ always() }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
+
+  deploy:
+    name: Deploy MaxPosty backend
+    needs: [image, scan]
+    if: ${{ vars.DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    environment:
+      name: ${{ vars.DEPLOY_STAGE == 'production' && 'production' || 'bootstrap' }}
+      url: ${{ vars.DEPLOY_STAGE == 'production' && 'https://maxposty.ru' || 'http://178.159.94.83' }}
+    env:
+      VPS_HOST: ${{ vars.VPS_HOST || '178.159.94.83' }}
+      VPS_PORT: ${{ vars.VPS_PORT || '22' }}
+      VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
+      DEPLOY_STAGE: ${{ vars.DEPLOY_STAGE || 'bootstrap' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Validate deployment target
+        shell: bash
+        env:
+          CONFIGURE_MAX_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && inputs.configure_max_webhook || false }}
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_STAGE" == "bootstrap" || "$DEPLOY_STAGE" == "production" ]] || { echo "DEPLOY_STAGE must be bootstrap or production" >&2; exit 1; }
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Invalid VPS_HOST" >&2; exit 1; }
+          [[ "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "Invalid VPS_PORT" >&2; exit 1; }
+          (( VPS_PORT <= 65535 )) || { echo "Invalid VPS_PORT" >&2; exit 1; }
+          [[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid VPS_USER" >&2; exit 1; }
+          if [[ "$DEPLOY_STAGE" == "bootstrap" && "$CONFIGURE_MAX_WEBHOOK" == "true" ]]; then
+            echo "MAX webhook cannot be configured in bootstrap mode" >&2
+            exit 1
+          fi
+      - name: Render fail-closed bootstrap environment
+        if: ${{ env.DEPLOY_STAGE == 'bootstrap' }}
+        shell: bash
+        env:
+          POSTGRES_OWNER_PASSWORD: ${{ secrets.POSTGRES_OWNER_PASSWORD }}
+          POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '14' }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/maxposty-backend.env"
+          ./deploy/render-production-env.sh "$output"
+      - name: Render protected production environment
+        if: ${{ env.DEPLOY_STAGE == 'production' }}
+        shell: bash
+        env:
+          POSTGRES_OWNER_PASSWORD: ${{ secrets.POSTGRES_OWNER_PASSWORD }}
+          POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          YANDEX_CLIENT_ID: ${{ secrets.YANDEX_CLIENT_ID }}
+          YANDEX_CLIENT_SECRET: ${{ secrets.YANDEX_CLIENT_SECRET }}
+          YANDEX_ALLOWED_USERS: ${{ vars.YANDEX_ALLOWED_USERS }}
+          MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+          MAX_WEBHOOK_SECRET: ${{ secrets.MAX_WEBHOOK_SECRET }}
+          MAX_CA_CERT_FILE: ${{ vars.MAX_CA_CERT_FILE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '14' }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/maxposty-backend.env"
+          ./deploy/render-production-env.sh "$output"
+      - name: Configure pinned SSH host identity
+        shell: bash
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VPS_SSH_PRIVATE_KEY" ]] || { echo "Missing VPS_SSH_PRIVATE_KEY" >&2; exit 1; }
+          [[ -n "$VPS_SSH_KNOWN_HOSTS" ]] || { echo "Missing VPS_SSH_KNOWN_HOSTS" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
+      - name: Upload deployment bundle and activate healthy release
+        shell: bash
+        env:
+          PRODUCTION_ENV_PATH: ${{ runner.temp }}/maxposty-backend.env
+          GHCR_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          CONFIGURE_MAX_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && inputs.configure_max_webhook || false }}
+        run: |
+          set -euo pipefail
+          install_dir=/opt/maxposty/backend
+          release_dir="$install_dir/releases/$SOURCE_SHA"
+          artifact="$RUNNER_TEMP/maxposty-backend-deploy.tgz"
+          remote_artifact="/tmp/maxposty-backend-${SOURCE_SHA}.tgz"
+          target="${VPS_USER}@${VPS_HOST}"
+          ssh_options=(
+            -i "$HOME/.ssh/id_deploy"
+            -p "$VPS_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+          scp_options=(
+            -i "$HOME/.ssh/id_deploy"
+            -P "$VPS_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+          )
+
+          tar -czf "$artifact" deploy docker
+          ssh "${ssh_options[@]}" "$target" \
+            "install -d -m 750 '$install_dir' '$install_dir/releases' '$release_dir' '$install_dir/certs' '$install_dir/backups'; install -d -m 755 '$install_dir/hooks'"
+          scp "${scp_options[@]}" "$artifact" "$target:$remote_artifact"
+          ssh "${ssh_options[@]}" "$target" \
+            "set -eu; trap \"rm -f '$remote_artifact'\" 0; tar -xzf '$remote_artifact' --no-same-owner -C '$release_dir'; if [ -e '$release_dir/certs' ] && [ ! -L '$release_dir/certs' ]; then rmdir '$release_dir/certs'; fi; ln -sfn '$install_dir/certs' '$release_dir/certs'"
+          scp "${scp_options[@]}" "$PRODUCTION_ENV_PATH" "$target:$release_dir/.env.production.next"
+          printf '%s\n' "$GHCR_TOKEN" | ssh "${ssh_options[@]}" "$target" \
+            "set -eu; trap \"rm -f '$release_dir/.env.production.next' '$release_dir/.release.next'\" 0; chmod 600 '$release_dir/.env.production.next'; '$release_dir/deploy/run-from-ci.sh' '$IMAGE' '$GITHUB_ACTOR' '$CONFIGURE_MAX_WEBHOOK'"
+          rm -f "$PRODUCTION_ENV_PATH" "$artifact"
+      - name: Remove runner deployment credentials
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts" \
+            "$RUNNER_TEMP/maxposty-backend.env" "$RUNNER_TEMP/maxposty-backend-deploy.tgz"

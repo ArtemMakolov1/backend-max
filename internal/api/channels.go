@@ -2,15 +2,24 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
+
+	"github.com/go-chi/chi/v5"
+
+	"maxpilot/backend/internal/store"
 )
 
 var maxChatIDPattern = regexp.MustCompile(`^-?[0-9]+$`)
+
+const channelClaimTTL = 10 * time.Minute
 
 type createChannelRequest struct {
 	PublicLink string `json:"public_link,omitempty"`
@@ -25,7 +34,12 @@ type updateChannelRequest struct {
 }
 
 func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
-	channels, err := s.app.Store().ListChannels(r.Context())
+	userID, err := authenticatedUserID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	channels, err := s.app.Store().ListChannelsForUser(r.Context(), userID)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -33,43 +47,174 @@ func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, channels)
 }
 
-func (s *Server) createChannel(w http.ResponseWriter, r *http.Request) {
-	var request createChannelRequest
-	if !s.decodeJSON(w, r, &request) {
-		return
-	}
-	request.MAXChatID = strings.TrimSpace(request.MAXChatID)
-	request.PublicLink = strings.TrimSpace(request.PublicLink)
-	request.Title = strings.TrimSpace(request.Title)
-	if request.PublicLink == "" && !validMAXChatID(request.MAXChatID) {
-		s.problem(w, http.StatusBadRequest, "validation_error", "max_chat_id must be a numeric string", nil)
-		return
-	}
-	if request.MAXChatID != "" && !validMAXChatID(request.MAXChatID) {
-		s.problem(w, http.StatusBadRequest, "validation_error", "max_chat_id must be a numeric string", nil)
-		return
-	}
-	if utf8.RuneCountInString(request.Title) > 200 {
-		s.problem(w, http.StatusBadRequest, "validation_error", "title must not exceed 200 characters", nil)
-		return
-	}
-	ctx, cancel := contextWithTimeout(r, 20*time.Second)
-	defer cancel()
-	check, err := s.app.ConnectChannel(ctx, request.PublicLink, request.MAXChatID, request.Title)
+func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
+	userID, err := authenticatedUserID(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusCreated, check.Channel)
+	var request createChannelRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	request.PublicLink = strings.TrimRight(strings.TrimSpace(request.PublicLink), "/")
+	request.MAXChatID = strings.TrimSpace(request.MAXChatID)
+	request.Title = strings.TrimSpace(request.Title)
+	if request.PublicLink == "" && !validMAXChatID(request.MAXChatID) {
+		s.problem(w, http.StatusBadRequest, "validation_error", "public_link or numeric max_chat_id is required", nil)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	defer cancel()
+	candidate, err := s.app.PrepareChannelClaim(ctx, request.PublicLink, request.MAXChatID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || strings.Contains(err.Error(), "first add") {
+			s.problem(w, http.StatusUnprocessableEntity, "bot_not_observed",
+				"Сначала добавьте помощника MaxPosty администратором канала и повторите подключение", nil)
+			return
+		}
+		s.writeError(w, err)
+		return
+	}
+	if existing, getErr := s.app.Store().GetChannelByMAXChatID(r.Context(), candidate.Info.ChatID); getErr == nil {
+		if existing.UserID != userID {
+			s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к другому аккаунту", nil)
+			return
+		}
+		s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к вашему аккаунту", map[string]any{"channel_id": existing.ID})
+		return
+	} else if !errors.Is(getErr, store.ErrNotFound) {
+		s.writeError(w, getErr)
+		return
+	}
+	claimID, err := randomURLToken(32)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	deepToken, err := randomURLToken(32)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	comparisonCode, err := randomComparisonCode()
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	user, err := s.app.Store().GetUser(r.Context(), userID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	requesterLabel := safeRequesterLabel(firstNonEmpty(user.Login, user.Email, user.DisplayName, user.ID))
+	now := s.now().UTC()
+	claimTitle := firstNonEmpty(strings.TrimSpace(candidate.Info.Title), request.Title, "MAX "+candidate.Info.ChatID)
+	claim := store.ChannelClaim{
+		ID: claimID, TokenHash: sha256Hex(deepToken), UserID: userID, MAXChatID: candidate.Info.ChatID,
+		PublicLink: candidate.Info.Link, RequestedTitle: claimTitle, Status: store.ChannelClaimPending,
+		RequesterLabel: requesterLabel, ComparisonCode: comparisonCode,
+		CreatedAt: now, ExpiresAt: now.Add(channelClaimTTL), UpdatedAt: now,
+	}
+	if err := s.app.Store().CreateChannelClaim(r.Context(), claim); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	username := strings.TrimPrefix(strings.TrimSpace(candidate.Bot.Username), "@")
+	botURL := "https://max.ru/" + url.PathEscape(username) + "?start=" + url.QueryEscape("claim_"+deepToken)
+	s.writeJSON(w, http.StatusCreated, map[string]any{
+		"claim_id": claim.ID, "status": claim.Status, "expires_at": claim.ExpiresAt, "bot_url": botURL,
+		"comparison_code": claim.ComparisonCode, "requester_label": claim.RequesterLabel,
+		"channel": map[string]any{"max_chat_id": candidate.Info.ChatID, "title": candidate.Info.Title,
+			"public_link": candidate.Info.Link, "icon_url": candidate.Info.Icon.URL},
+		"message": "Откройте помощника в MAX и подтвердите подключение в личном сообщении",
+	})
+}
+
+func safeRequesterLabel(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(value))
+	runes := []rune(value)
+	if len(runes) > 120 {
+		value = string(runes[:120])
+	}
+	return firstNonEmpty(value, "Пользователь MaxPosty")
+}
+
+func (s *Server) getChannelConnect(w http.ResponseWriter, r *http.Request) {
+	userID, err := authenticatedUserID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	claimID := strings.TrimSpace(chi.URLParam(r, "claim_id"))
+	if claimID == "" || len(claimID) > 128 {
+		s.problem(w, http.StatusNotFound, "not_found", "Connection attempt was not found", nil)
+		return
+	}
+	claim, err := s.app.Store().GetChannelClaimForUser(r.Context(), userID, claimID, s.now().UTC())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	var channel any
+	var diagnostics any
+	if claim.Status == store.ChannelClaimIdentityVerified {
+		ctx, cancel := contextWithTimeout(r, 15*time.Second)
+		connected, checked, completeErr := s.app.CompleteChannelClaim(ctx, claim)
+		cancel()
+		if completeErr != nil {
+			if errors.Is(completeErr, store.ErrChannelOwned) {
+				_ = s.app.Store().FailChannelClaim(r.Context(), userID, claim.ID, "channel_already_connected", s.now().UTC())
+				s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к другому аккаунту", nil)
+				return
+			}
+			if strings.Contains(strings.ToLower(completeErr.Error()), "owner") {
+				_ = s.app.Store().FailChannelClaim(r.Context(), userID, claim.ID, "owner_verification_failed", s.now().UTC())
+			}
+			s.writeError(w, completeErr)
+			return
+		}
+		claim, err = s.app.Store().GetChannelClaimForUser(r.Context(), userID, claimID, s.now().UTC())
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		channel, diagnostics = connected, checked
+	} else if claim.Status == store.ChannelClaimConnected && claim.ChannelID != nil {
+		connected, getErr := s.app.Store().GetChannelForUser(r.Context(), userID, *claim.ChannelID)
+		if getErr == nil {
+			channel = connected
+		}
+	}
+	publicStatus := claim.Status
+	step := claim.Status
+	if publicStatus == store.ChannelClaimAwaitingConfirmation {
+		publicStatus = store.ChannelClaimPending
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"claim_id": claim.ID, "status": publicStatus, "step": step, "expires_at": claim.ExpiresAt,
+		"comparison_code": claim.ComparisonCode, "requester_label": claim.RequesterLabel,
+		"error_code": claim.ErrorCode, "channel": channel, "diagnostics": diagnostics,
+	})
 }
 
 func (s *Server) getChannel(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	channel, err := s.app.Store().GetChannel(r.Context(), id)
+	channel, err := s.app.Store().GetChannelForUser(r.Context(), userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -78,6 +223,11 @@ func (s *Server) getChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
@@ -93,7 +243,7 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 			s.problem(w, http.StatusBadRequest, "validation_error", "max_chat_id must be a numeric string", nil)
 			return
 		}
-		current, getErr := s.app.Store().GetChannel(r.Context(), id)
+		current, getErr := s.app.Store().GetChannelForUser(r.Context(), userID, id)
 		if getErr != nil {
 			s.writeError(w, getErr)
 			return
@@ -112,7 +262,7 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 		}
 		request.Title = &trimmed
 	}
-	channel, err := s.app.Store().UpdateChannel(r.Context(), id, request.MAXChatID, request.Title, request.Active)
+	channel, err := s.app.Store().UpdateChannelForUser(r.Context(), userID, id, request.Title, request.Active)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			s.problem(w, http.StatusConflict, "channel_exists", "A channel with this max_chat_id already exists", nil)
@@ -125,12 +275,17 @@ func (s *Server) updateChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	if err := s.app.Store().DeleteChannel(r.Context(), id); err != nil {
+	if err := s.app.Store().DeleteChannelForUser(r.Context(), userID, id); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -138,6 +293,11 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
@@ -145,7 +305,7 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := contextWithTimeout(r, 30*time.Second)
 	defer cancel()
-	check, err := s.app.TestChannel(ctx, id)
+	check, err := s.app.TestChannelForUser(ctx, userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return

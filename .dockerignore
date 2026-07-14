@@ -1,4 +1,11 @@
+.git/
+.github/
 .env
+.env.*
+!.env.example
+certs/
+*.pem
+*.key
 data/
 media/
 bin/

@@ -13,20 +13,49 @@ concurrency:
 
 jobs:
   test:
-    name: Test
+    name: Test with PostgreSQL 18.4
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_DB: maxstudio_test
+          POSTGRES_USER: maxstudio_test
+          POSTGRES_PASSWORD: maxstudio_test_ci_only
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U maxstudio_test -d maxstudio_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql://maxstudio_test:maxstudio_test_ci_only@127.0.0.1:5432/maxstudio_test?sslmode=disable
+      DIRECT_DATABASE_URL: postgresql://maxstudio_test:maxstudio_test_ci_only@127.0.0.1:5432/maxstudio_test?sslmode=disable
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: "1.25.x"
+          go-version: "1.25.12"
           cache: true
-      - run: go test -race ./...
+      - name: Build and run migrations against PostgreSQL
+        run: go run ./cmd/migrate
+      - name: Enforce expand-contract migration safety
+        run: ./deploy/validate-expand-contract-migrations.sh internal/store/migrations
+      - name: Verify release and deployment rollback policies
+        run: |
+          ./deploy/tests/release-gate-policy.sh
+          ./deploy/tests/rollback-policy.sh
+      - name: Run all tests with the race detector
+        run: go test -race ./...
       - run: go vet ./...
       - run: go build -trimpath -o /tmp/max-studio-backend ./cmd/server
+      - run: go build -trimpath -o /tmp/max-studio-migrate ./cmd/migrate
+      - run: go build -trimpath -o /tmp/max-studio-setup-max-webhook ./cmd/setup-max-webhook
 
   lint:
     name: Lint
@@ -38,7 +67,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: "1.25.x"
+          go-version: "1.25.12"
           cache: true
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:

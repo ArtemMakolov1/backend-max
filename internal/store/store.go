@@ -2,193 +2,542 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"embed"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
-	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 var (
-	ErrNotFound       = errors.New("not found")
-	ErrConflict       = errors.New("state conflict")
-	ErrScheduleNotDue = errors.New("scheduled post is not due")
+	ErrNotFound           = errors.New("not found")
+	ErrConflict           = errors.New("state conflict")
+	ErrChannelOwned       = errors.New("channel is already connected to another account")
+	ErrScheduleNotDue     = errors.New("scheduled post is not due")
+	ErrMigrationIntegrity = errors.New("migration integrity check failed")
 )
 
 type Store struct {
-	db *sql.DB
+	db             *postgresDB
+	cleanup        func(context.Context) error
+	defaultOwnerID string
 }
 
-func Open(ctx context.Context, databasePath string) (*Store, error) {
-	if err := os.MkdirAll(filepath.Dir(databasePath), 0o750); err != nil {
-		return nil, fmt.Errorf("create database directory: %w", err)
-	}
+type postgresDB struct{ *sql.DB }
 
-	db, err := sql.Open("sqlite", databasePath)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+func (db *postgresDB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return db.DB.ExecContext(ctx, bindSQL(query), args...)
+}
 
-	for _, pragma := range []string{
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-		"PRAGMA synchronous = NORMAL",
-	} {
-		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			resultErr := fmt.Errorf("configure sqlite (%s): %w", pragma, err)
-			if closeErr := db.Close(); closeErr != nil {
-				resultErr = errors.Join(resultErr, fmt.Errorf("close sqlite: %w", closeErr))
-			}
-			return nil, resultErr
-		}
-	}
+func (db *postgresDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return db.DB.QueryContext(ctx, bindSQL(query), args...)
+}
 
-	s := &Store{db: db}
-	if err := s.migrate(ctx); err != nil {
-		if closeErr := db.Close(); closeErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("close sqlite: %w", closeErr))
-		}
+func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return db.DB.QueryRowContext(ctx, bindSQL(query), args...)
+}
+
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
+
+const RequiredSchemaVersion = "002_ai_limits.sql"
+
+type schemaMigration struct {
+	version        string
+	contents       []byte
+	checksumSHA256 string
+}
+
+// Open remains convenient for tests and simple deployments. Production should
+// use OpenWithMigrationURL so runtime traffic goes through PgBouncer while DDL
+// uses a direct PostgreSQL connection.
+func Open(ctx context.Context, databaseURL string) (*Store, error) {
+	if strings.HasPrefix(databaseURL, "postgres://") || strings.HasPrefix(databaseURL, "postgresql://") {
+		return OpenWithMigrationURL(ctx, databaseURL, databaseURL)
+	}
+	return openIsolatedTestStore(ctx, databaseURL)
+}
+
+func OpenWithMigrationURL(ctx context.Context, databaseURL, directDatabaseURL string) (*Store, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return nil, errors.New("DATABASE_URL is required")
+	}
+	if strings.TrimSpace(directDatabaseURL) == "" {
+		return nil, errors.New("DIRECT_DATABASE_URL is required for migrations")
+	}
+	if err := Migrate(ctx, directDatabaseURL); err != nil {
 		return nil, err
 	}
-	return s, nil
+	db, err := openPostgres(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+	return &Store{db: &postgresDB{DB: db}}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+// Migrate is intended for the short-lived cmd/migrate process. The runtime
+// server never receives or uses the DDL-capable direct database credential.
+func Migrate(ctx context.Context, directDatabaseURL string) error {
+	if strings.TrimSpace(directDatabaseURL) == "" {
+		return errors.New("DIRECT_DATABASE_URL is required for migrations")
+	}
+	return runMigrations(ctx, directDatabaseURL)
+}
+
+func OpenRuntime(ctx context.Context, databaseURL string) (*Store, error) {
+	if strings.TrimSpace(databaseURL) == "" {
+		return nil, errors.New("DATABASE_URL is required")
+	}
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		return nil, err
+	}
+	db, err := openPostgres(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+	if err := verifyRuntimeMigrations(ctx, db, migrations); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("check database schema (run cmd/migrate first): %w", err)
+	}
+	return &Store{db: &postgresDB{DB: db}}, nil
+}
+
+func openPostgres(databaseURL string) (*sql.DB, error) {
+	config, err := pgx.ParseConfig(strings.TrimSpace(databaseURL))
+	if err != nil {
+		return nil, fmt.Errorf("parse PostgreSQL URL: %w", err)
+	}
+	// PgBouncer transaction pooling cannot safely retain server-side prepared
+	// statements between transactions. Exec uses the extended protocol without
+	// preparing or caching statements on a server connection.
+	config.DefaultQueryExecMode = pgx.QueryExecModeExec
+	db := stdlib.OpenDB(*config)
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	return db, nil
+}
+
+func openIsolatedTestStore(ctx context.Context, testID string) (*Store, error) {
+	baseURL := strings.TrimSpace(os.Getenv("TEST_DATABASE_URL"))
+	if baseURL == "" {
+		return nil, errors.New("TEST_DATABASE_URL is required for PostgreSQL-backed tests")
+	}
+	digest := sha256.Sum256([]byte(testID + time.Now().UTC().String()))
+	schema := "test_" + hex.EncodeToString(digest[:12])
+	admin, err := openPostgres(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+quoteIdentifier(schema)); err != nil {
+		_ = admin.Close()
+		return nil, fmt.Errorf("create test schema: %w", err)
+	}
+	if err := admin.Close(); err != nil {
+		return nil, fmt.Errorf("close test schema connection: %w", err)
+	}
+	testURL, err := withSearchPath(baseURL, schema)
+	if err != nil {
+		return nil, err
+	}
+	storage, err := OpenWithMigrationURL(ctx, testURL, testURL)
+	if err != nil {
+		return nil, err
+	}
+	storage.defaultOwnerID = "test-owner"
+	if err := storage.UpsertUser(ctx, User{ID: storage.defaultOwnerID, DisplayName: "Test Owner"}); err != nil {
+		_ = storage.Close()
+		return nil, err
+	}
+	storage.cleanup = func(cleanupCtx context.Context) error {
+		db, openErr := openPostgres(baseURL)
+		if openErr != nil {
+			return openErr
+		}
+		defer func() { _ = db.Close() }()
+		_, dropErr := db.ExecContext(cleanupCtx, `DROP SCHEMA IF EXISTS `+quoteIdentifier(schema)+` CASCADE`)
+		return dropErr
+	}
+	return storage, nil
+}
+
+func withSearchPath(databaseURL, schema string) (string, error) {
+	parsed, err := url.Parse(databaseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse test PostgreSQL URL: %w", err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func quoteIdentifier(value string) string { return `"` + strings.ReplaceAll(value, `"`, `""`) + `"` }
+
+func (s *Store) Close() error {
+	closeErr := s.db.Close()
+	if s.cleanup != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.cleanup(cleanupCtx); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("drop test schema: %w", err))
+		}
+	}
+	return closeErr
+}
 
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
-func (s *Store) migrate(ctx context.Context) error {
-	const schema = `
-CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    max_chat_id TEXT NOT NULL UNIQUE,
-    title TEXT NOT NULL,
-	public_link TEXT NOT NULL DEFAULT '',
-	icon_url TEXT NOT NULL DEFAULT '',
-	participants_count INTEGER NOT NULL DEFAULT 0,
-    is_channel INTEGER NOT NULL DEFAULT 1,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS posts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL DEFAULT '',
-    content TEXT NOT NULL DEFAULT '',
-    format TEXT NOT NULL DEFAULT 'markdown' CHECK (format IN ('markdown', 'html')),
-    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'scheduled', 'publishing', 'published', 'failed')),
-    channel_id INTEGER REFERENCES channels(id) ON DELETE SET NULL,
-    image_url TEXT NOT NULL DEFAULT '',
-    image_path TEXT NOT NULL DEFAULT '',
-    image_prompt TEXT NOT NULL DEFAULT '',
-    notify INTEGER NOT NULL DEFAULT 1,
-    disable_link_preview INTEGER NOT NULL DEFAULT 0,
-    scheduled_at TEXT,
-    max_message_id TEXT NOT NULL DEFAULT '',
-    last_error TEXT NOT NULL DEFAULT '',
-    published_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_posts_status_scheduled_at ON posts(status, scheduled_at);
-CREATE INDEX IF NOT EXISTS idx_posts_channel_id ON posts(channel_id);
-
-CREATE TABLE IF NOT EXISTS auth_sessions (
-    token_hash TEXT PRIMARY KEY
-        CHECK (length(token_hash) = 64 AND token_hash NOT GLOB '*[^0-9A-Fa-f]*'),
-    yandex_user_id TEXT NOT NULL,
-    login TEXT NOT NULL DEFAULT '',
-    email TEXT NOT NULL DEFAULT '',
-    display_name TEXT NOT NULL DEFAULT '',
-    allowlist_identity TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at ON auth_sessions(expires_at);
-
-CREATE TABLE IF NOT EXISTS oauth_states (
-    state_hash TEXT PRIMARY KEY
-        CHECK (length(state_hash) = 64 AND state_hash NOT GLOB '*[^0-9A-Fa-f]*'),
-    pkce_verifier TEXT NOT NULL,
-    return_to TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_oauth_states_expires_at ON oauth_states(expires_at);
-`
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
-		return fmt.Errorf("migrate database: %w", err)
+func runMigrations(ctx context.Context, directDatabaseURL string) error {
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE channels ADD COLUMN public_link TEXT NOT NULL DEFAULT ''`); err != nil &&
-		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return fmt.Errorf("migrate channels.public_link: %w", err)
+	return runMigrationSet(ctx, directDatabaseURL, migrations)
+}
+
+func runMigrationSet(ctx context.Context, directDatabaseURL string, migrations []schemaMigration) error {
+	db, err := openPostgres(directDatabaseURL)
+	if err != nil {
+		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE channels ADD COLUMN icon_url TEXT NOT NULL DEFAULT ''`); err != nil &&
-		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return fmt.Errorf("migrate channels.icon_url: %w", err)
+	defer func() { _ = db.Close() }()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire migration connection: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE channels ADD COLUMN participants_count INTEGER NOT NULL DEFAULT 0`); err != nil &&
-		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return fmt.Errorf("migrate channels.participants_count: %w", err)
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(hashtext('maxstudio_schema_migrations'))`); err != nil {
+		return fmt.Errorf("lock migrations: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE auth_sessions ADD COLUMN allowlist_identity TEXT NOT NULL DEFAULT ''`); err != nil &&
-		!strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return fmt.Errorf("migrate auth_sessions.allowlist_identity: %w", err)
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(hashtext('maxstudio_schema_migrations'))`)
+	}()
+	applied, err := prepareMigrationTable(ctx, conn, migrations)
+	if err != nil {
+		return err
 	}
-	// Older builds allowed scheduled_at to drift away from status through the
-	// generic post update endpoint. Repair those legacy rows conservatively:
-	// never turn a draft into an automatic publication, and never leave a
-	// scheduled row that the worker can never claim.
-	if _, err := s.db.ExecContext(ctx, `
-UPDATE posts
-SET status = ?, scheduled_at = NULL, updated_at = ?
-WHERE status = ? AND (scheduled_at IS NULL OR julianday(scheduled_at) IS NULL)`,
-		PostStatusDraft, nowText(), PostStatusScheduled); err != nil {
-		return fmt.Errorf("repair invalid scheduled posts: %w", err)
+	for _, migration := range migrations {
+		if _, ok := applied[migration.version]; ok {
+			continue
+		}
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin migration %s: %w", migration.version, err)
+		}
+		if _, err := tx.ExecContext(ctx, string(migration.contents)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("apply migration %s: %w", migration.version, err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
+			migration.version, migration.checksumSHA256); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("record migration %s: %w", migration.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %s: %w", migration.version, err)
+		}
 	}
-	if _, err := s.db.ExecContext(ctx, `
-UPDATE posts
-SET scheduled_at = NULL, updated_at = ?
-WHERE status != ? AND scheduled_at IS NOT NULL`, nowText(), PostStatusScheduled); err != nil {
-		return fmt.Errorf("repair orphan scheduled_at values: %w", err)
+	if err := verifyAppliedMigrations(ctx, conn, migrations); err != nil {
+		return fmt.Errorf("verify migrations after apply: %w", err)
 	}
 	return nil
 }
 
+func loadEmbeddedMigrations() ([]schemaMigration, error) {
+	entries, err := migrationFiles.ReadDir("migrations")
+	if err != nil {
+		return nil, fmt.Errorf("list migrations: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	migrations := make([]schemaMigration, 0, len(entries))
+	requiredFound := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		contents, err := migrationFiles.ReadFile("migrations/" + entry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("read migration %s: %w", entry.Name(), err)
+		}
+		migrations = append(migrations, schemaMigration{
+			version:        entry.Name(),
+			contents:       contents,
+			checksumSHA256: migrationChecksumSHA256(contents),
+		})
+		if entry.Name() == RequiredSchemaVersion {
+			requiredFound = true
+		}
+	}
+	if len(migrations) == 0 {
+		return nil, errors.New("no embedded SQL migrations found")
+	}
+	if !requiredFound {
+		return nil, fmt.Errorf("required schema migration %s is not embedded", RequiredSchemaVersion)
+	}
+	return migrations, nil
+}
+
+func migrationChecksumSHA256(contents []byte) string {
+	digest := sha256.Sum256(contents)
+	return hex.EncodeToString(digest[:])
+}
+
+func prepareMigrationTable(ctx context.Context, conn *sql.Conn, migrations []schemaMigration) (map[string]struct{}, error) {
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin schema_migrations upgrade: %w", err)
+	}
+	rollback := func(resultErr error) (map[string]struct{}, error) {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("rollback schema_migrations upgrade: %w", rollbackErr))
+		}
+		return nil, resultErr
+	}
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+	version TEXT PRIMARY KEY,
+	checksum_sha256 TEXT NOT NULL,
+	applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	CONSTRAINT schema_migrations_checksum_sha256 CHECK (checksum_sha256 ~ '^[0-9a-f]{64}$')
+)`); err != nil {
+		return rollback(fmt.Errorf("create schema_migrations: %w", err))
+	}
+	// Existing installations created this table without a checksum column. Add
+	// it as nullable first so the existing rows can be backfilled atomically.
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum_sha256 TEXT`); err != nil {
+		return rollback(fmt.Errorf("add schema_migrations checksum: %w", err))
+	}
+	expected := make(map[string]string, len(migrations))
+	for _, migration := range migrations {
+		expected[migration.version] = migration.checksumSHA256
+	}
+	applied := make(map[string]struct{}, len(migrations))
+	records, err := readAppliedMigrationRecords(ctx, tx)
+	if err != nil {
+		return rollback(err)
+	}
+	for _, record := range records {
+		expectedChecksum, ok := expected[record.version]
+		if !ok {
+			return rollback(fmt.Errorf("%w: database contains unknown migration %q", ErrMigrationIntegrity, record.version))
+		}
+		if record.checksum.Valid && record.checksum.String != expectedChecksum {
+			return rollback(migrationChecksumMismatch(record.version, record.checksum.String, expectedChecksum))
+		}
+		if !record.checksum.Valid {
+			result, err := tx.ExecContext(ctx,
+				`UPDATE schema_migrations SET checksum_sha256 = $1 WHERE version = $2 AND checksum_sha256 IS NULL`,
+				expectedChecksum, record.version)
+			if err != nil {
+				return rollback(fmt.Errorf("backfill checksum for migration %s: %w", record.version, err))
+			}
+			updated, err := result.RowsAffected()
+			if err != nil {
+				return rollback(fmt.Errorf("count checksum backfill for migration %s: %w", record.version, err))
+			}
+			if updated != 1 {
+				return rollback(fmt.Errorf("%w: checksum backfill for migration %q updated %d rows", ErrMigrationIntegrity, record.version, updated))
+			}
+		}
+		applied[record.version] = struct{}{}
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE schema_migrations ALTER COLUMN checksum_sha256 SET NOT NULL`); err != nil {
+		return rollback(fmt.Errorf("require schema_migrations checksum: %w", err))
+	}
+	if _, err := tx.ExecContext(ctx, `
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_constraint
+		WHERE conrelid = 'schema_migrations'::regclass
+		  AND conname = 'schema_migrations_checksum_sha256'
+	) THEN
+		ALTER TABLE schema_migrations
+			ADD CONSTRAINT schema_migrations_checksum_sha256
+			CHECK (checksum_sha256 ~ '^[0-9a-f]{64}$') NOT VALID;
+	END IF;
+END
+$$`); err != nil {
+		return rollback(fmt.Errorf("add schema_migrations checksum constraint: %w", err))
+	}
+	if _, err := tx.ExecContext(ctx,
+		`ALTER TABLE schema_migrations VALIDATE CONSTRAINT schema_migrations_checksum_sha256`); err != nil {
+		return rollback(fmt.Errorf("validate schema_migrations checksum constraint: %w", err))
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit schema_migrations upgrade: %w", err)
+	}
+	return applied, nil
+}
+
+type migrationRowsQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+type appliedMigrationRecord struct {
+	version  string
+	checksum sql.NullString
+}
+
+func readAppliedMigrationRecords(ctx context.Context, queryer migrationRowsQueryer) ([]appliedMigrationRecord, error) {
+	rows, err := queryer.QueryContext(ctx, `SELECT version, checksum_sha256 FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		return nil, fmt.Errorf("read applied migration checksums: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	records := make([]appliedMigrationRecord, 0)
+	for rows.Next() {
+		var record appliedMigrationRecord
+		if err := rows.Scan(&record.version, &record.checksum); err != nil {
+			return nil, fmt.Errorf("scan applied migration checksum: %w", err)
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate applied migration checksums: %w", err)
+	}
+	return records, nil
+}
+
+func verifyAppliedMigrations(ctx context.Context, queryer migrationRowsQueryer, migrations []schemaMigration) error {
+	return verifyAppliedMigrationSet(ctx, queryer, migrations, false)
+}
+
+func verifyRuntimeMigrations(ctx context.Context, queryer migrationRowsQueryer, migrations []schemaMigration) error {
+	return verifyAppliedMigrationSet(ctx, queryer, migrations, true)
+}
+
+func verifyAppliedMigrationSet(
+	ctx context.Context,
+	queryer migrationRowsQueryer,
+	migrations []schemaMigration,
+	allowNewerMigrations bool,
+) error {
+	expected := make(map[string]string, len(migrations))
+	maxKnownVersion := ""
+	for _, migration := range migrations {
+		expected[migration.version] = migration.checksumSHA256
+		if migration.version > maxKnownVersion {
+			maxKnownVersion = migration.version
+		}
+	}
+	if maxKnownVersion == "" {
+		return fmt.Errorf("%w: binary contains no known migrations", ErrMigrationIntegrity)
+	}
+	applied := make(map[string]struct{}, len(migrations))
+	records, err := readAppliedMigrationRecords(ctx, queryer)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		expectedChecksum, ok := expected[record.version]
+		if !ok && (!allowNewerMigrations || record.version <= maxKnownVersion) {
+			return fmt.Errorf("%w: database contains unknown migration %q", ErrMigrationIntegrity, record.version)
+		}
+		if !record.checksum.Valid {
+			return fmt.Errorf("%w: migration %q has no SHA-256 checksum; run cmd/migrate to upgrade metadata", ErrMigrationIntegrity, record.version)
+		}
+		if !ok {
+			continue
+		}
+		if record.checksum.String != expectedChecksum {
+			return migrationChecksumMismatch(record.version, record.checksum.String, expectedChecksum)
+		}
+		applied[record.version] = struct{}{}
+	}
+	for _, migration := range migrations {
+		if _, ok := applied[migration.version]; !ok {
+			return fmt.Errorf("database schema %s is not applied; run cmd/migrate first", migration.version)
+		}
+	}
+	return nil
+}
+
+func migrationChecksumMismatch(version, stored, expected string) error {
+	return fmt.Errorf(
+		"%w: migration %q SHA-256 checksum mismatch (database %s, binary %s)",
+		ErrMigrationIntegrity, version, stored, expected,
+	)
+}
+
+func bindSQL(query string) string {
+	var builder strings.Builder
+	builder.Grow(len(query) + 16)
+	parameter := 1
+	for _, r := range query {
+		if r == '?' {
+			fmt.Fprintf(&builder, "$%d", parameter)
+			parameter++
+			continue
+		}
+		builder.WriteRune(r)
+	}
+	return builder.String()
+}
+
 func nowText() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
+const channelColumns = `id, owner_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url,
+participants_count, is_channel, active, created_at, updated_at`
+
 func (s *Store) CreateChannel(ctx context.Context, channel Channel) (Channel, error) {
+	if channel.UserID == "" {
+		channel.UserID = s.defaultOwnerID
+	}
+	if channel.VerifiedMAXOwnerID == "" && s.defaultOwnerID != "" {
+		channel.VerifiedMAXOwnerID = "test-max-owner"
+	}
+	if channel.UserID == "" || channel.VerifiedMAXOwnerID == "" {
+		return Channel{}, errors.New("channel owner and verified MAX owner are required")
+	}
 	now := nowText()
-	result, err := s.db.ExecContext(ctx, `
-INSERT INTO channels(max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, channel.MAXChatID, channel.Title, channel.PublicLink, channel.IconURL,
-		channel.ParticipantsCount, channel.IsChannel, channel.Active, now, now)
+	var id int64
+	err := s.db.QueryRowContext(ctx, `
+INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, channel.UserID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title,
+		channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsChannel, channel.Active, now, now).Scan(&id)
 	if err != nil {
 		return Channel{}, fmt.Errorf("create channel: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return Channel{}, fmt.Errorf("channel id: %w", err)
 	}
 	return s.GetChannel(ctx, id)
 }
 
 func (s *Store) UpsertConnectedChannel(ctx context.Context, channel Channel) (Channel, error) {
+	if channel.UserID == "" {
+		channel.UserID = s.defaultOwnerID
+	}
+	if channel.VerifiedMAXOwnerID == "" && s.defaultOwnerID != "" {
+		channel.VerifiedMAXOwnerID = "test-max-owner"
+	}
+	if channel.UserID == "" || channel.VerifiedMAXOwnerID == "" {
+		return Channel{}, errors.New("channel owner and verified MAX owner are required")
+	}
 	now := nowText()
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO channels(max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(max_chat_id) DO UPDATE SET
 	title = excluded.title,
 	public_link = excluded.public_link,
@@ -197,7 +546,7 @@ ON CONFLICT(max_chat_id) DO UPDATE SET
 	is_channel = excluded.is_channel,
 	active = excluded.active,
 	updated_at = excluded.updated_at`,
-		channel.MAXChatID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
+		channel.UserID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
 		channel.IsChannel, channel.Active, now, now)
 	if err != nil {
 		return Channel{}, fmt.Errorf("connect channel: %w", err)
@@ -207,30 +556,20 @@ ON CONFLICT(max_chat_id) DO UPDATE SET
 
 func (s *Store) UpsertDiscoveredChannel(ctx context.Context, maxChatID, title string, isChannel bool, active bool) (Channel, error) {
 	providedTitle := strings.TrimSpace(title)
-	if providedTitle == "" {
-		title = "MAX " + maxChatID
-	} else {
-		title = providedTitle
-	}
-	now := nowText()
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO channels(max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES (?, ?, '', '', 0, ?, ?, ?, ?)
-ON CONFLICT(max_chat_id) DO UPDATE SET
-    title = CASE WHEN ? = '' THEN channels.title ELSE excluded.title END,
-    is_channel = excluded.is_channel,
-    active = excluded.active,
-		updated_at = excluded.updated_at`, maxChatID, title, isChannel, active, now, now, providedTitle)
+UPDATE channels SET
+    title = CASE WHEN ? = '' THEN title ELSE ? END,
+    is_channel = ?, active = ?, updated_at = ?
+WHERE max_chat_id = ?`, providedTitle, providedTitle, isChannel, active, nowText(), maxChatID)
 	if err != nil {
-		return Channel{}, fmt.Errorf("upsert discovered channel: %w", err)
+		return Channel{}, fmt.Errorf("refresh discovered channel: %w", err)
 	}
 	return s.GetChannelByMAXChatID(ctx, maxChatID)
 }
 
 func (s *Store) ListChannels(ctx context.Context) ([]Channel, error) {
-	rows, err := s.db.QueryContext(ctx, `
-SELECT id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at
-FROM channels ORDER BY active DESC, title COLLATE NOCASE, id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+channelColumns+`
+FROM channels ORDER BY active DESC, lower(title), id`)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
 	}
@@ -249,17 +588,44 @@ FROM channels ORDER BY active DESC, title COLLATE NOCASE, id`)
 	return channels, rows.Err()
 }
 
+func (s *Store) ListChannelsForUser(ctx context.Context, userID string) ([]Channel, error) {
+	if strings.TrimSpace(userID) == "" {
+		return nil, errors.New("user id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+channelColumns+`
+FROM channels WHERE owner_id = ? ORDER BY active DESC, lower(title), id`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list user channels: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	channels := make([]Channel, 0)
+	for rows.Next() {
+		channel, scanErr := scanChannel(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		channels = append(channels, channel)
+	}
+	return channels, rows.Err()
+}
+
 func (s *Store) GetChannel(ctx context.Context, id int64) (Channel, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at
-FROM channels WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT `+channelColumns+` FROM channels WHERE id = ?`, id)
 	return scanChannel(row)
 }
 
+func (s *Store) GetChannelForUser(ctx context.Context, userID string, id int64) (Channel, error) {
+	return scanChannel(s.db.QueryRowContext(ctx, `SELECT `+channelColumns+
+		` FROM channels WHERE owner_id = ? AND id = ?`, userID, id))
+}
+
+func (s *Store) GetChannelByMAXChatIDForUser(ctx context.Context, userID, maxChatID string) (Channel, error) {
+	return scanChannel(s.db.QueryRowContext(ctx, `SELECT `+channelColumns+
+		` FROM channels WHERE owner_id = ? AND max_chat_id = ?`, userID, maxChatID))
+}
+
 func (s *Store) GetChannelByMAXChatID(ctx context.Context, maxChatID string) (Channel, error) {
-	row := s.db.QueryRowContext(ctx, `
-SELECT id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at
-FROM channels WHERE max_chat_id = ?`, maxChatID)
+	row := s.db.QueryRowContext(ctx, `SELECT `+channelColumns+` FROM channels WHERE max_chat_id = ?`, maxChatID)
 	return scanChannel(row)
 }
 
@@ -288,6 +654,28 @@ UPDATE channels SET max_chat_id = ?, title = ?, public_link = ?, icon_url = ?, p
 		return Channel{}, ErrNotFound
 	}
 	return s.GetChannel(ctx, id)
+}
+
+func (s *Store) UpdateChannelForUser(ctx context.Context, userID string, id int64, title *string, active *bool) (Channel, error) {
+	current, err := s.GetChannelForUser(ctx, userID, id)
+	if err != nil {
+		return Channel{}, err
+	}
+	if title != nil {
+		current.Title = *title
+	}
+	if active != nil {
+		current.Active = *active
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE channels SET title = ?, active = ?, updated_at = ?
+WHERE owner_id = ? AND id = ?`, current.Title, current.Active, nowText(), userID, id)
+	if err != nil {
+		return Channel{}, fmt.Errorf("update user channel: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return Channel{}, ErrNotFound
+	}
+	return s.GetChannelForUser(ctx, userID, id)
 }
 
 func (s *Store) DeleteChannel(ctx context.Context, id int64) error {
@@ -320,6 +708,27 @@ WHERE id = ?
 	return fmt.Errorf("%w: channel has %d scheduled, publishing, or published post(s)", ErrConflict, count)
 }
 
+func (s *Store) DeleteChannelForUser(ctx context.Context, userID string, id int64) error {
+	result, err := s.db.ExecContext(ctx, `
+DELETE FROM channels
+WHERE owner_id = ? AND id = ?
+  AND NOT EXISTS (
+	SELECT 1 FROM posts
+	WHERE owner_id = ? AND channel_id = ?
+	  AND (max_message_id != '' OR status IN (?, ?, ?))
+  )`, userID, id, userID, id, PostStatusScheduled, PostStatusPublishing, PostStatusPublished)
+	if err != nil {
+		return fmt.Errorf("delete user channel: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n != 0 {
+		return nil
+	}
+	if _, err := s.GetChannelForUser(ctx, userID, id); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: channel has scheduled, publishing, or published posts", ErrConflict)
+}
+
 // CountChannelBlockingPosts reports posts whose MAX publication lifecycle
 // would become unmanageable if the channel foreign key were cleared.
 func (s *Store) CountChannelBlockingPosts(ctx context.Context, id int64) (int64, error) {
@@ -336,6 +745,12 @@ WHERE channel_id = ?
 }
 
 func (s *Store) CreatePost(ctx context.Context, post Post) (Post, error) {
+	if post.UserID == "" {
+		post.UserID = s.defaultOwnerID
+	}
+	if post.UserID == "" {
+		return Post{}, errors.New("post owner is required")
+	}
 	if post.Format == "" {
 		post.Format = FormatMarkdown
 	}
@@ -349,20 +764,17 @@ func (s *Store) CreatePost(ctx context.Context, post Post) (Post, error) {
 		return Post{}, errors.New("scheduled_at requires scheduled status")
 	}
 	now := nowText()
-	result, err := s.db.ExecContext(ctx, `
-INSERT INTO posts(title, content, format, status, channel_id, image_url, image_path, image_prompt,
+	var id int64
+	err := s.db.QueryRowContext(ctx, `
+INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt,
                   notify, disable_link_preview, scheduled_at, max_message_id, last_error, published_at,
                   created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		post.Title, post.Content, post.Format, post.Status, nullableInt64(post.ChannelID), post.ImageURL,
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+		post.UserID, post.Title, post.Content, post.Format, post.Status, nullableInt64(post.ChannelID), post.ImageURL,
 		post.ImagePath, post.ImagePrompt, post.Notify, post.DisableLinkPreview, nullableTime(post.ScheduledAt),
-		post.MAXMessageID, post.LastError, nullableTime(post.PublishedAt), now, now)
+		post.MAXMessageID, post.LastError, nullableTime(post.PublishedAt), now, now).Scan(&id)
 	if err != nil {
 		return Post{}, fmt.Errorf("create post: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return Post{}, fmt.Errorf("post id: %w", err)
 	}
 	return s.GetPost(ctx, id)
 }
@@ -379,7 +791,7 @@ func (s *Store) ListPosts(ctx context.Context, status string, channelID *int64) 
 		args = append(args, *channelID)
 	}
 	if status == PostStatusScheduled {
-		query += ` ORDER BY julianday(scheduled_at), id`
+		query += ` ORDER BY scheduled_at, id`
 	} else {
 		query += ` ORDER BY created_at DESC, id DESC`
 	}
@@ -403,8 +815,44 @@ func (s *Store) ListPosts(ctx context.Context, status string, channelID *int64) 
 	return posts, rows.Err()
 }
 
+func (s *Store) ListPostsForUser(ctx context.Context, userID, status string, channelID *int64) ([]Post, error) {
+	query := `SELECT ` + postColumns + ` FROM posts WHERE owner_id = ?`
+	args := []any{userID}
+	if status != "" {
+		query += ` AND status = ?`
+		args = append(args, status)
+	}
+	if channelID != nil {
+		query += ` AND channel_id = ?`
+		args = append(args, *channelID)
+	}
+	if status == PostStatusScheduled {
+		query += ` ORDER BY scheduled_at, id`
+	} else {
+		query += ` ORDER BY created_at DESC, id DESC`
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list user posts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	posts := make([]Post, 0)
+	for rows.Next() {
+		post, scanErr := scanPost(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		posts = append(posts, post)
+	}
+	return posts, rows.Err()
+}
+
 func (s *Store) GetPost(ctx context.Context, id int64) (Post, error) {
 	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE id = ?`, id))
+}
+
+func (s *Store) GetPostForUser(ctx context.Context, userID string, id int64) (Post, error) {
+	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE owner_id = ? AND id = ?`, userID, id))
 }
 
 func (s *Store) UpdatePost(ctx context.Context, id int64, changes PostChanges) (Post, error) {
@@ -519,24 +967,28 @@ func (s *Store) DeletePost(ctx context.Context, id int64) error {
 
 func (s *Store) DuplicatePost(ctx context.Context, id int64) (Post, error) {
 	now := nowText()
-	result, err := s.db.ExecContext(ctx, `
-INSERT INTO posts(title, content, format, status, channel_id, image_url, image_path, image_prompt,
+	var copyID int64
+	err := s.db.QueryRowContext(ctx, `
+INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt,
 	              notify, disable_link_preview, scheduled_at, max_message_id, last_error, published_at,
 	              created_at, updated_at)
-SELECT trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt,
+SELECT owner_id, trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt,
 	   notify, disable_link_preview, NULL, '', '', NULL, ?, ?
-FROM posts WHERE id = ? AND status != ?`, PostStatusDraft, now, now, id, PostStatusPublishing)
+FROM posts WHERE id = ? AND status != ? RETURNING id`, PostStatusDraft, now, now, id, PostStatusPublishing).Scan(&copyID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Post{}, s.postWriteMiss(ctx, id, "post is currently publishing")
+	}
 	if err != nil {
 		return Post{}, fmt.Errorf("duplicate post: %w", err)
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
-		return Post{}, s.postWriteMiss(ctx, id, "post is currently publishing")
-	}
-	copyID, err := result.LastInsertId()
-	if err != nil {
-		return Post{}, fmt.Errorf("duplicate post id: %w", err)
-	}
 	return s.GetPost(ctx, copyID)
+}
+
+func (s *Store) DuplicatePostForUser(ctx context.Context, userID string, id int64) (Post, error) {
+	if _, err := s.GetPostForUser(ctx, userID, id); err != nil {
+		return Post{}, err
+	}
+	return s.DuplicatePost(ctx, id)
 }
 
 func (s *Store) SetPostScheduled(ctx context.Context, id int64, at time.Time) (Post, error) {
@@ -607,7 +1059,7 @@ UPDATE posts SET status = ?, scheduled_at = NULL, updated_at = ? WHERE id = ? AN
 
 func (s *Store) ClaimForPublishing(ctx context.Context, id int64) (Post, error) {
 	result, err := s.db.ExecContext(ctx, `
-UPDATE posts SET status = ?, last_error = '', updated_at = ?
+UPDATE posts SET status = ?, scheduled_at = NULL, last_error = '', updated_at = ?
 WHERE id = ? AND status IN (?, ?, ?)`,
 		PostStatusPublishing, nowText(), id, PostStatusDraft, PostStatusScheduled, PostStatusFailed)
 	if err != nil {
@@ -627,11 +1079,11 @@ WHERE id = ? AND status IN (?, ?, ?)`,
 // lists an ID and the user cancels or postpones it before publication starts.
 func (s *Store) ClaimScheduledForPublishing(ctx context.Context, id int64, now time.Time) (Post, error) {
 	result, err := s.db.ExecContext(ctx, `
-UPDATE posts SET status = ?, last_error = '', updated_at = ?
+UPDATE posts SET status = ?, scheduled_at = NULL, last_error = '', updated_at = ?
 WHERE id = ?
   AND status = ?
   AND scheduled_at IS NOT NULL
-  AND julianday(scheduled_at) <= julianday(?)`,
+  AND scheduled_at <= ?`,
 		PostStatusPublishing, nowText(), id, PostStatusScheduled, now.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return Post{}, fmt.Errorf("claim scheduled post: %w", err)
@@ -654,8 +1106,8 @@ func (s *Store) DuePostIDs(ctx context.Context, now time.Time, limit int) ([]int
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id FROM posts
-WHERE status = ? AND scheduled_at IS NOT NULL AND julianday(scheduled_at) <= julianday(?)
-ORDER BY julianday(scheduled_at), id LIMIT ?`, PostStatusScheduled, now.UTC().Format(time.RFC3339Nano), limit)
+WHERE owner_id <> '' AND status = ? AND scheduled_at IS NOT NULL AND scheduled_at <= ?
+ORDER BY scheduled_at, id LIMIT ?`, PostStatusScheduled, now.UTC().Format(time.RFC3339Nano), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list due posts: %w", err)
 	}
@@ -677,7 +1129,7 @@ func (s *Store) RecoverStalePublishing(ctx context.Context, staleBefore time.Tim
 	const warning = "Previous publication was interrupted; check the MAX channel before retrying to avoid a duplicate post."
 	result, err := s.db.ExecContext(ctx, `
 UPDATE posts SET status = ?, last_error = ?, scheduled_at = NULL, updated_at = ?
-WHERE status = ? AND julianday(updated_at) < julianday(?)`, PostStatusFailed, warning, nowText(), PostStatusPublishing,
+WHERE owner_id <> '' AND status = ? AND updated_at < ?`, PostStatusFailed, warning, nowText(), PostStatusPublishing,
 		staleBefore.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return 0, fmt.Errorf("recover stale publishing posts: %w", err)
@@ -730,7 +1182,7 @@ WHERE id = ? AND status != ?`, PostStatusDraft, nowText(), id, PostStatusPublish
 	return s.GetPost(ctx, id)
 }
 
-const postColumns = `id, title, content, format, status, channel_id, image_url, image_path, image_prompt,
+const postColumns = `id, owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt,
 notify, disable_link_preview, scheduled_at, max_message_id, last_error, created_at, updated_at, published_at`
 
 type scanner interface {
@@ -739,16 +1191,16 @@ type scanner interface {
 
 func scanChannel(row scanner) (Channel, error) {
 	var channel Channel
-	var createdAt, updatedAt string
-	if err := row.Scan(&channel.ID, &channel.MAXChatID, &channel.Title, &channel.PublicLink, &channel.IconURL,
-		&channel.ParticipantsCount, &channel.IsChannel, &channel.Active, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&channel.ID, &channel.UserID, &channel.VerifiedMAXOwnerID, &channel.MAXChatID, &channel.Title,
+		&channel.PublicLink, &channel.IconURL, &channel.ParticipantsCount, &channel.IsChannel, &channel.Active,
+		&channel.CreatedAt, &channel.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Channel{}, ErrNotFound
 		}
 		return Channel{}, fmt.Errorf("scan channel: %w", err)
 	}
-	channel.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
-	channel.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	channel.CreatedAt = channel.CreatedAt.UTC()
+	channel.UpdatedAt = channel.UpdatedAt.UTC()
 	return channel, nil
 }
 
@@ -762,11 +1214,10 @@ func (s *Store) postWriteMiss(ctx context.Context, id int64, message string) err
 func scanPost(row scanner) (Post, error) {
 	var post Post
 	var channelID sql.NullInt64
-	var scheduledAt, publishedAt sql.NullString
-	var createdAt, updatedAt string
-	if err := row.Scan(&post.ID, &post.Title, &post.Content, &post.Format, &post.Status, &channelID,
+	var scheduledAt, publishedAt sql.NullTime
+	if err := row.Scan(&post.ID, &post.UserID, &post.Title, &post.Content, &post.Format, &post.Status, &channelID,
 		&post.ImageURL, &post.ImagePath, &post.ImagePrompt, &post.Notify, &post.DisableLinkPreview,
-		&scheduledAt, &post.MAXMessageID, &post.LastError, &createdAt, &updatedAt, &publishedAt); err != nil {
+		&scheduledAt, &post.MAXMessageID, &post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Post{}, ErrNotFound
 		}
@@ -777,8 +1228,8 @@ func scanPost(row scanner) (Post, error) {
 	}
 	post.ScheduledAt = parseNullableTime(scheduledAt)
 	post.PublishedAt = parseNullableTime(publishedAt)
-	post.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
-	post.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	post.CreatedAt = post.CreatedAt.UTC()
+	post.UpdatedAt = post.UpdatedAt.UTC()
 	return post, nil
 }
 
@@ -796,15 +1247,11 @@ func nullableInt64(value *int64) any {
 	return *value
 }
 
-func parseNullableTime(value sql.NullString) *time.Time {
-	if !value.Valid || value.String == "" {
+func parseNullableTime(value sql.NullTime) *time.Time {
+	if !value.Valid {
 		return nil
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, value.String)
-	if err != nil {
-		return nil
-	}
-	parsed = parsed.UTC()
+	parsed := value.Time.UTC()
 	return &parsed
 }
 

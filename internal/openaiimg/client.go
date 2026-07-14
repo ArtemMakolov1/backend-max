@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 )
 
 const maxResponseBytes = 80 << 20
@@ -70,23 +69,14 @@ func New(baseURL, apiKey, model string, httpClient *http.Client) (*Client, error
 
 func (c *Client) Generate(ctx context.Context, request GenerateRequest) (Result, error) {
 	request.Prompt = strings.TrimSpace(request.Prompt)
-	if request.Prompt == "" {
-		return Result{}, errors.New("image prompt is required")
-	}
-	if utf8.RuneCountInString(request.Prompt) > 32000 {
-		return Result{}, errors.New("image prompt is too long")
+	if err := c.Validate(request); err != nil {
+		return Result{}, err
 	}
 	if request.Size == "" {
 		request.Size = "1024x1024"
 	}
-	if err := validateSize(c.model, request.Size); err != nil {
-		return Result{}, err
-	}
 	if request.Quality == "" {
 		request.Quality = "medium"
-	}
-	if request.Quality != "auto" && request.Quality != "low" && request.Quality != "medium" && request.Quality != "high" {
-		return Result{}, errors.New("image quality must be auto, low, medium or high")
 	}
 
 	payload := struct {
@@ -109,7 +99,12 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (Result,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	requestClient := *c.httpClient
+	requestClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	// #nosec G704 -- baseURL is deployment-owned configuration validated as an absolute URL in New, never HTTP request input; redirects are disabled above.
+	resp, err := requestClient.Do(req)
 	if err != nil {
 		return Result{}, fmt.Errorf("call OpenAI image API: %w", err)
 	}

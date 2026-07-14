@@ -19,6 +19,8 @@ type fakeMAX struct {
 	chat         maxclient.ChatInfo
 	membership   maxclient.Membership
 	getChatCalls int
+	getLinkCalls int
+	lastChatLink string
 	memberCalls  int
 	resolveCalls int
 	publishCalls int
@@ -27,11 +29,24 @@ type fakeMAX struct {
 }
 
 func (f *fakeMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
-	return maxclient.BotInfo{UserID: 1, IsBot: true}, nil
+	return maxclient.BotInfo{UserID: 1, Username: "studio_bot", IsBot: true}, nil
 }
 func (f *fakeMAX) GetChat(context.Context, string) (maxclient.ChatInfo, error) {
 	f.getChatCalls++
-	return f.chat, nil
+	chat := f.chat
+	if chat.OwnerID == "" {
+		chat.OwnerID = "test-max-owner"
+	}
+	return chat, nil
+}
+func (f *fakeMAX) GetChatByLink(_ context.Context, link string) (maxclient.ChatInfo, error) {
+	f.getLinkCalls++
+	f.lastChatLink = link
+	chat := f.chat
+	if chat.OwnerID == "" {
+		chat.OwnerID = "test-max-owner"
+	}
+	return chat, nil
 }
 func (f *fakeMAX) ResolveChat(context.Context, string) (maxclient.ChatInfo, error) {
 	f.resolveCalls++
@@ -41,6 +56,10 @@ func (f *fakeMAX) GetMembership(context.Context, string) (maxclient.Membership, 
 	f.memberCalls++
 	return f.membership, nil
 }
+func (f *fakeMAX) SendClaimConfirmation(context.Context, string, string, string, string, string, string, string) error {
+	return nil
+}
+func (f *fakeMAX) AnswerCallback(context.Context, string, string) error { return nil }
 func (f *fakeMAX) UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error) {
 	return maxclient.UploadResult{Token: "image-token"}, nil
 }
@@ -67,7 +86,7 @@ func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
 		membership: maxclient.Membership{
 			IsAdmin: true,
 			Permissions: []maxclient.Permission{
-				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionEdit,
+				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionEdit, maxclient.PermissionDelete,
 			},
 		},
 	}
@@ -81,10 +100,10 @@ func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
 		check.Channel.IconURL != "https://cdn.max.ru/official.png" || check.Channel.ParticipantsCount != 3210 {
 		t.Fatalf("unexpected channel: %#v", check.Channel)
 	}
-	if !check.Diagnostics.CanPublish || !check.Diagnostics.CanEdit || check.Diagnostics.CanDelete {
+	if !check.Diagnostics.CanPublish || !check.Diagnostics.CanEdit || !check.Diagnostics.CanDelete {
 		t.Fatalf("unexpected diagnostics: %#v", check.Diagnostics)
 	}
-	if fake.resolveCalls != 1 || fake.memberCalls != 1 || fake.publishCalls != 0 {
+	if fake.resolveCalls != 0 || fake.getChatCalls != 1 || fake.memberCalls != 1 || fake.publishCalls != 0 {
 		t.Fatalf("unexpected MAX calls: %#v", fake)
 	}
 
@@ -92,7 +111,7 @@ func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !readOnlyCheck.Diagnostics.CanPublish || fake.publishCalls != 0 || fake.getChatCalls != 1 {
+	if !readOnlyCheck.Diagnostics.CanPublish || fake.publishCalls != 0 || fake.getChatCalls != 2 {
 		t.Fatalf("test channel was not read-only: check=%#v fake=%#v", readOnlyCheck, fake)
 	}
 	stored, err := storage.GetChannel(context.Background(), check.Channel.ID)
@@ -110,7 +129,7 @@ func TestConnectChannelRejectsMissingRequiredPermissions(t *testing.T) {
 		},
 	}
 	application, storage := newTestApp(t, fake)
-	_, err := application.ConnectChannel(context.Background(), "news", "", "")
+	_, err := application.ConnectChannel(context.Background(), "", "10", "")
 	var accessErr *ChannelAccessError
 	if !errors.As(err, &accessErr) || accessErr.Diagnostics.CanPublish ||
 		!contains(accessErr.Diagnostics.MissingRequiredPermissions, "write") {
@@ -119,6 +138,83 @@ func TestConnectChannelRejectsMissingRequiredPermissions(t *testing.T) {
 	channels, listErr := storage.ListChannels(context.Background())
 	if listErr != nil || len(channels) != 0 {
 		t.Fatalf("channel was stored despite failed permissions: %#v, %v", channels, listErr)
+	}
+}
+
+func TestPrepareChannelClaimDiscoversPublicLinkAndCachesObservedChat(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		membership: maxclient.Membership{
+			IsAdmin: true,
+			Permissions: []maxclient.Permission{
+				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+			},
+		},
+	}
+	application, storage := newTestApp(t, fake)
+	fake.chat = maxclient.ChatInfo{
+		ChatID: "-13549123", OwnerID: "777", Type: "channel", Status: "active", Title: "Тестовый канал",
+		Link: "https://max.ru/se13549123_biz", Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/icon.png"},
+	}
+
+	candidate, err := application.PrepareChannelClaim(context.Background(),
+		"https://max.ru/se13549123_biz?from=studio#channel", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Info.ChatID != "-13549123" || candidate.Bot.Username != "studio_bot" ||
+		!candidate.Diagnostics.CanPublish || !candidate.Diagnostics.CanEdit || !candidate.Diagnostics.CanDelete {
+		t.Fatalf("unexpected claim candidate: %#v", candidate)
+	}
+	if fake.getLinkCalls != 1 || fake.lastChatLink != "se13549123_biz" || fake.getChatCalls != 0 || fake.memberCalls != 1 {
+		t.Fatalf("unexpected discovery calls: %#v", fake)
+	}
+	observed, err := storage.GetActiveObservedBotChat(context.Background(), "https://max.ru/se13549123_biz", "")
+	if err != nil || observed.MAXChatID != "-13549123" || observed.MAXOwnerID != "777" {
+		t.Fatalf("discovered chat was not cached: %#v, %v", observed, err)
+	}
+
+	if _, err := application.PrepareChannelClaim(context.Background(), "https://max.ru/se13549123_biz", ""); err != nil {
+		t.Fatal(err)
+	}
+	if fake.getLinkCalls != 1 || fake.getChatCalls != 1 || fake.memberCalls != 2 {
+		t.Fatalf("cached discovery was not reused: %#v", fake)
+	}
+}
+
+func TestPrepareChannelClaimKeepsNumericIDRegistryOnly(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+		}},
+	}
+	application, _ := newTestApp(t, fake)
+	fake.chat = maxclient.ChatInfo{ChatID: "123", Type: "channel", Status: "active"}
+	if _, err := application.PrepareChannelClaim(context.Background(), "", "123"); err == nil {
+		t.Fatal("numeric MAX ID bypassed the observed-chat registry")
+	}
+	if fake.getLinkCalls != 0 || fake.getChatCalls != 0 || fake.memberCalls != 0 {
+		t.Fatalf("numeric registry miss reached MAX API: %#v", fake)
+	}
+}
+
+func TestPrepareChannelClaimRejectsNonChannelBeforeCaching(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{}
+	application, storage := newTestApp(t, fake)
+	fake.chat = maxclient.ChatInfo{
+		ChatID: "321", OwnerID: "777", Type: "chat", Status: "active", Title: "Not a channel",
+		Link: "https://max.ru/not_channel",
+	}
+	if _, err := application.PrepareChannelClaim(context.Background(), "https://max.ru/not_channel", ""); err == nil {
+		t.Fatal("public group chat was accepted as a channel")
+	}
+	if fake.getLinkCalls != 1 || fake.memberCalls != 0 {
+		t.Fatalf("non-channel discovery continued to membership: %#v", fake)
+	}
+	if _, err := storage.GetActiveObservedBotChat(context.Background(), "https://max.ru/not_channel", ""); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("rejected non-channel was cached: %v", err)
 	}
 }
 
@@ -186,7 +282,7 @@ func TestPublishedMutationsRecheckEditAndDeletePermissions(t *testing.T) {
 		chat: maxclient.ChatInfo{ChatID: "30", Type: "channel", Status: "active", Title: "Channel"},
 		membership: maxclient.Membership{
 			IsAdmin:     true,
-			Permissions: []maxclient.Permission{maxclient.PermissionReadAllMessages, maxclient.PermissionWrite},
+			Permissions: []maxclient.Permission{maxclient.PermissionReadAllMessages},
 		},
 	}
 	application, storage := newTestApp(t, fake)
@@ -383,6 +479,14 @@ func newTestApp(t *testing.T, maxClient MAXClient) (*App, *store.Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = storage.Close() })
+	if fake, ok := maxClient.(*fakeMAX); ok && fake.chat.ChatID != "" {
+		if err := storage.UpsertObservedBotChat(ctx, store.ObservedBotChat{
+			MAXChatID: fake.chat.ChatID, PublicLink: fake.chat.Link, Title: fake.chat.Title,
+			MAXOwnerID: "test-max-owner", Active: true, LastSeenAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
 	if err != nil {
 		t.Fatal(err)

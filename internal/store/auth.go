@@ -6,14 +6,110 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
 const (
 	authSessionColumns   = `token_hash, yandex_user_id, login, email, display_name, allowlist_identity, created_at, expires_at`
-	oauthStateColumns    = `state_hash, pkce_verifier, return_to, created_at, expires_at`
+	oauthStateColumns    = `state_hash, pkce_verifier, return_to, terms_version, personal_data_version, consent_at, created_at, expires_at`
 	maxActiveOAuthStates = 1024
 )
+
+// CreateAuthenticatedSession atomically upserts the local account, records
+// versioned consent evidence, and creates the browser session. A callback can
+// therefore never expose an authenticated session without its audit evidence.
+func (s *Store) CreateAuthenticatedSession(ctx context.Context, user User, consents []Consent, session AuthSession) error {
+	if strings.TrimSpace(user.ID) == "" || user.ID != session.YandexUserID {
+		return errors.New("session user id must match the local user")
+	}
+	if err := validateSHA256Hex("token hash", session.TokenHash); err != nil {
+		return err
+	}
+	if err := validateLifetime(session.CreatedAt, session.ExpiresAt); err != nil {
+		return fmt.Errorf("auth session: %w", err)
+	}
+	if len(consents) != 2 {
+		return errors.New("terms and personal data consent evidence are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin authenticated session transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := session.CreatedAt.UTC()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO users(id, login, email, display_name, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $5)
+ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
+display_name = excluded.display_name, updated_at = excluded.updated_at`,
+		user.ID, user.Login, user.Email, user.DisplayName, now); err != nil {
+		return fmt.Errorf("upsert authenticated user: %w", err)
+	}
+	for _, consent := range consents {
+		if consent.Document != "terms" && consent.Document != "personal_data" {
+			return fmt.Errorf("unsupported consent document %q", consent.Document)
+		}
+		if strings.TrimSpace(consent.Version) == "" || consent.AcceptedAt.IsZero() {
+			return errors.New("consent version and accepted_at are required")
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO user_consents(owner_id, document, version, accepted_at, source)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT(owner_id, document, version) DO NOTHING`, user.ID, consent.Document,
+			consent.Version, consent.AcceptedAt.UTC(), consent.Source); err != nil {
+			return fmt.Errorf("record %s consent: %w", consent.Document, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at <= $1`, now); err != nil {
+		return fmt.Errorf("delete expired auth sessions: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, allowlist_identity, created_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, session.TokenHash, session.YandexUserID,
+		session.Login, session.Email, session.DisplayName, session.AllowlistIdentity, now, session.ExpiresAt.UTC()); err != nil {
+		return fmt.Errorf("create auth session: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit authenticated session: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UpsertUser(ctx context.Context, user User) error {
+	if strings.TrimSpace(user.ID) == "" {
+		return errors.New("user id is required")
+	}
+	now := time.Now().UTC()
+	if !user.CreatedAt.IsZero() {
+		now = user.CreatedAt.UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO users(id, login, email, display_name, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
+display_name = excluded.display_name, updated_at = excluded.updated_at`, user.ID, user.Login,
+		user.Email, user.DisplayName, now, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("upsert user: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetUser(ctx context.Context, userID string) (User, error) {
+	var user User
+	if err := s.db.QueryRowContext(ctx, `SELECT id, login, email, display_name, created_at, updated_at
+FROM users WHERE id = ?`, userID).Scan(&user.ID, &user.Login, &user.Email, &user.DisplayName,
+		&user.CreatedAt, &user.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, ErrNotFound
+		}
+		return User{}, fmt.Errorf("get user: %w", err)
+	}
+	user.CreatedAt = user.CreatedAt.UTC()
+	user.UpdatedAt = user.UpdatedAt.UTC()
+	return user, nil
+}
 
 // CreateAuthSession persists a session using a SHA-256 hex digest supplied by
 // the caller. It deliberately never accepts or derives the opaque browser
@@ -25,9 +121,6 @@ func (s *Store) CreateAuthSession(ctx context.Context, session AuthSession) erro
 	if session.YandexUserID == "" {
 		return errors.New("yandex user id is required")
 	}
-	if session.AllowlistIdentity == "" {
-		return errors.New("allowlist identity is required")
-	}
 	if err := validateLifetime(session.CreatedAt, session.ExpiresAt); err != nil {
 		return fmt.Errorf("auth session: %w", err)
 	}
@@ -37,15 +130,23 @@ func (s *Store) CreateAuthSession(ctx context.Context, session AuthSession) erro
 		return fmt.Errorf("begin auth session transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO users(id, login, email, display_name, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $5)
+ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
+display_name = excluded.display_name, updated_at = excluded.updated_at`, session.YandexUserID,
+		session.Login, session.Email, session.DisplayName, session.CreatedAt.UTC()); err != nil {
+		return fmt.Errorf("upsert auth session user: %w", err)
+	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at <= ?`, timeText(session.CreatedAt)); err != nil {
+	if _, err := tx.ExecContext(ctx, bindSQL(`DELETE FROM auth_sessions WHERE expires_at <= ?`), session.CreatedAt.UTC()); err != nil {
 		return fmt.Errorf("delete expired auth sessions: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, allowlist_identity, created_at, expires_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		session.TokenHash, session.YandexUserID, session.Login, session.Email, session.DisplayName,
-		session.AllowlistIdentity, timeText(session.CreatedAt), timeText(session.ExpiresAt)); err != nil {
+		session.AllowlistIdentity, session.CreatedAt.UTC(), session.ExpiresAt.UTC()); err != nil {
 		return fmt.Errorf("create auth session: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -77,7 +178,7 @@ func (s *Store) GetAuthSession(ctx context.Context, tokenHash string, now time.T
 	// between SELECT and DELETE is not removed.
 	if _, err := s.db.ExecContext(ctx,
 		`DELETE FROM auth_sessions WHERE token_hash = ? AND expires_at = ?`,
-		tokenHash, timeText(session.ExpiresAt)); err != nil {
+		tokenHash, session.ExpiresAt.UTC()); err != nil {
 		return AuthSession{}, fmt.Errorf("delete expired auth session: %w", err)
 	}
 	return AuthSession{}, ErrNotFound
@@ -113,13 +214,13 @@ func (s *Store) CreateOAuthState(ctx context.Context, state OAuthState) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_states WHERE expires_at <= ?`, timeText(state.CreatedAt)); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM oauth_states WHERE expires_at <= $1`, state.CreatedAt.UTC()); err != nil {
 		return fmt.Errorf("delete expired oauth states: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO oauth_states(state_hash, pkce_verifier, return_to, created_at, expires_at)
-VALUES (?, ?, ?, ?, ?)`, state.StateHash, state.PKCEVerifier, state.ReturnTo,
-		timeText(state.CreatedAt), timeText(state.ExpiresAt)); err != nil {
+INSERT INTO oauth_states(state_hash, pkce_verifier, return_to, terms_version, personal_data_version, consent_at, created_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, state.StateHash, state.PKCEVerifier, state.ReturnTo,
+		state.TermsVersion, state.PersonalDataVersion, state.ConsentAt.UTC(), state.CreatedAt.UTC(), state.ExpiresAt.UTC()); err != nil {
 		return fmt.Errorf("create oauth state: %w", err)
 	}
 	// The start endpoint is public. Keep the live-state table bounded even if a
@@ -130,7 +231,7 @@ WHERE state_hash IN (
 	SELECT state_hash
 	FROM oauth_states
 	ORDER BY created_at DESC, state_hash DESC
-	LIMIT -1 OFFSET ?
+	OFFSET $1
 )`, maxActiveOAuthStates); err != nil {
 		return fmt.Errorf("trim oauth states: %w", err)
 	}
@@ -164,46 +265,32 @@ func (s *Store) ConsumeOAuthState(ctx context.Context, stateHash string, now tim
 
 func scanAuthSession(row scanner) (AuthSession, error) {
 	var session AuthSession
-	var createdAt, expiresAt string
 	if err := row.Scan(&session.TokenHash, &session.YandexUserID, &session.Login, &session.Email,
-		&session.DisplayName, &session.AllowlistIdentity, &createdAt, &expiresAt); err != nil {
+		&session.DisplayName, &session.AllowlistIdentity, &session.CreatedAt, &session.ExpiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AuthSession{}, ErrNotFound
 		}
 		return AuthSession{}, fmt.Errorf("scan auth session: %w", err)
 	}
 
-	var err error
-	session.CreatedAt, err = parseStoredTime("auth session created_at", createdAt)
-	if err != nil {
-		return AuthSession{}, err
-	}
-	session.ExpiresAt, err = parseStoredTime("auth session expires_at", expiresAt)
-	if err != nil {
-		return AuthSession{}, err
-	}
+	session.CreatedAt = session.CreatedAt.UTC()
+	session.ExpiresAt = session.ExpiresAt.UTC()
 	return session, nil
 }
 
 func scanOAuthState(row scanner) (OAuthState, error) {
 	var state OAuthState
-	var createdAt, expiresAt string
-	if err := row.Scan(&state.StateHash, &state.PKCEVerifier, &state.ReturnTo, &createdAt, &expiresAt); err != nil {
+	if err := row.Scan(&state.StateHash, &state.PKCEVerifier, &state.ReturnTo, &state.TermsVersion,
+		&state.PersonalDataVersion, &state.ConsentAt, &state.CreatedAt, &state.ExpiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return OAuthState{}, ErrNotFound
 		}
 		return OAuthState{}, fmt.Errorf("scan oauth state: %w", err)
 	}
 
-	var err error
-	state.CreatedAt, err = parseStoredTime("oauth state created_at", createdAt)
-	if err != nil {
-		return OAuthState{}, err
-	}
-	state.ExpiresAt, err = parseStoredTime("oauth state expires_at", expiresAt)
-	if err != nil {
-		return OAuthState{}, err
-	}
+	state.ConsentAt = state.ConsentAt.UTC()
+	state.CreatedAt = state.CreatedAt.UTC()
+	state.ExpiresAt = state.ExpiresAt.UTC()
 	return state, nil
 }
 
@@ -232,12 +319,4 @@ func validateLifetime(createdAt, expiresAt time.Time) error {
 
 func timeText(value time.Time) string {
 	return value.UTC().Format(time.RFC3339Nano)
-}
-
-func parseStoredTime(name, value string) (time.Time, error) {
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("parse %s: %w", name, err)
-	}
-	return parsed.UTC(), nil
 }

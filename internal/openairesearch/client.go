@@ -325,7 +325,12 @@ func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnv
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	requestClient := *c.httpClient
+	requestClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	// #nosec G704 -- baseURL is deployment-owned configuration validated as an absolute HTTP(S) URL in New, never HTTP request input; redirects are disabled above.
+	resp, err := requestClient.Do(req)
 	if err != nil {
 		return responseEnvelope{}, fmt.Errorf("call OpenAI Responses API: %w", err)
 	}

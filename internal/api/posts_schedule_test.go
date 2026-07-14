@@ -183,7 +183,8 @@ func newCalendarTestHandler(t *testing.T) (http.Handler, *store.Store, store.Cha
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application := app.New(storage, mediaStore, nil, nil, nil, logger)
-	return New(application, logger, "http://localhost:4321", "", "").Handler(), storage, channel
+	server := New(application, logger, "http://localhost:4321", "", AuthOptions{YandexClient: &fakeYandexOAuth{}})
+	return withTestSession(t, storage, server.Handler(), "test-owner"), storage, channel
 }
 
 func performPostRequest(t *testing.T, handler http.Handler, method, path, body string, wantStatus int) store.Post {

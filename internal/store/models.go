@@ -14,20 +14,35 @@ const (
 )
 
 type Channel struct {
-	ID                int64     `json:"id"`
-	MAXChatID         string    `json:"max_chat_id"`
-	Title             string    `json:"title"`
-	PublicLink        string    `json:"public_link,omitempty"`
-	IconURL           string    `json:"icon_url,omitempty"`
-	ParticipantsCount int       `json:"participants_count"`
-	IsChannel         bool      `json:"is_channel"`
-	Active            bool      `json:"active"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                 int64     `json:"id"`
+	UserID             string    `json:"-"`
+	VerifiedMAXOwnerID string    `json:"-"`
+	MAXChatID          string    `json:"max_chat_id"`
+	Title              string    `json:"title"`
+	PublicLink         string    `json:"public_link,omitempty"`
+	IconURL            string    `json:"icon_url,omitempty"`
+	ParticipantsCount  int       `json:"participants_count"`
+	IsChannel          bool      `json:"is_channel"`
+	Active             bool      `json:"active"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+// ObservedBotChat is inventory learned from authenticated MAX bot_added and
+// bot_removed webhooks. It never grants a tenant ownership by itself.
+type ObservedBotChat struct {
+	MAXChatID  string
+	PublicLink string
+	Title      string
+	MAXOwnerID string
+	Active     bool
+	LastSeenAt time.Time
+	RemovedAt  *time.Time
 }
 
 type Post struct {
 	ID                 int64      `json:"id"`
+	UserID             string     `json:"-"`
 	Title              string     `json:"title"`
 	Content            string     `json:"content"`
 	Format             string     `json:"format"`
@@ -73,15 +88,70 @@ type AuthSession struct {
 	ExpiresAt         time.Time
 }
 
+// User is the local account attached to a Yandex identity. ID is the stable
+// app-scoped Yandex identifier and is the tenant key used by all user data.
+type User struct {
+	ID          string    `json:"id"`
+	Login       string    `json:"login,omitempty"`
+	Email       string    `json:"email,omitempty"`
+	DisplayName string    `json:"display_name"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type Consent struct {
+	UserID     string    `json:"-"`
+	Document   string    `json:"document"`
+	Version    string    `json:"version"`
+	AcceptedAt time.Time `json:"accepted_at"`
+	Source     string    `json:"source"`
+}
+
 // OAuthState stores the short-lived data needed to finish one Yandex OAuth
 // authorization. StateHash contains the SHA-256 hex digest of the opaque state
 // sent to the browser; the state itself must never be persisted.
 type OAuthState struct {
-	StateHash    string
-	PKCEVerifier string
-	ReturnTo     string
-	CreatedAt    time.Time
-	ExpiresAt    time.Time
+	StateHash           string
+	PKCEVerifier        string
+	ReturnTo            string
+	TermsVersion        string
+	PersonalDataVersion string
+	ConsentAt           time.Time
+	CreatedAt           time.Time
+	ExpiresAt           time.Time
+}
+
+const (
+	ChannelClaimPending              = "pending"
+	ChannelClaimAwaitingConfirmation = "awaiting_confirmation"
+	ChannelClaimIdentityVerified     = "identity_verified"
+	ChannelClaimConnected            = "connected"
+	ChannelClaimFailed               = "failed"
+	ChannelClaimExpired              = "expired"
+)
+
+// ChannelClaim binds one opaque MAX deep-link proof to one authenticated
+// tenant and one resolved MAX channel. TokenHash is persisted instead of the
+// raw deep-link token.
+type ChannelClaim struct {
+	ID               string     `json:"claim_id"`
+	TokenHash        string     `json:"-"`
+	ConfirmTokenHash string     `json:"-"`
+	CancelTokenHash  string     `json:"-"`
+	UserID           string     `json:"-"`
+	MAXChatID        string     `json:"max_chat_id"`
+	PublicLink       string     `json:"public_link,omitempty"`
+	RequestedTitle   string     `json:"-"`
+	RequesterLabel   string     `json:"requester_label"`
+	ComparisonCode   string     `json:"comparison_code"`
+	Status           string     `json:"status"`
+	MAXUserID        string     `json:"-"`
+	ChannelID        *int64     `json:"channel_id,omitempty"`
+	ErrorCode        string     `json:"error_code,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ExpiresAt        time.Time  `json:"expires_at"`
+	ConsumedAt       *time.Time `json:"-"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 func ValidFormat(format string) bool {

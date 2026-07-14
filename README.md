@@ -1,212 +1,253 @@
-# MAX Studio backend
+# Backend MaxPosty
 
-Go API for channel discovery, web-grounded post research, post drafts,
-scheduling, GPT Image 2 generation, local media storage and
-publishing/editing/deleting MAX channel messages.
+Это сервер MaxPosty. Он хранит пользователей, каналы и публикации, выполняет
+исследования и генерацию изображений, запускает календарь публикаций и работает
+с одним общим ботом MAX. Токены MAX и OpenAI остаются только на сервере.
 
-This directory is a standalone repository. It does not import or build the
-Astro/React frontend. A browser client may call the API directly during local
-development, while production should normally expose the API and media through
-an external HTTPS reverse proxy under the frontend's public origin.
+Фронтенд находится в отдельном репозитории. Для обычного локального запуска
+backend не требует установленного Go: достаточно Docker Engine с Compose.
+Команды `make compose-*` автоматически поддерживают как современный
+`docker compose`, так и старое имя `docker-compose`.
 
-## Run locally
+## Быстрый запуск
 
-Requirements: Go 1.25 or newer.
+1. Создайте файл настроек:
+
+   ```sh
+   cp .env.example .env
+   ```
+
+2. Сгенерируйте два разных пароля PostgreSQL:
+
+   ```sh
+   openssl rand -hex 32
+   openssl rand -hex 32
+   ```
+
+   Запишите их в `POSTGRES_OWNER_PASSWORD` и `POSTGRES_APP_PASSWORD`. Используйте
+   только сгенерированные URL-safe значения: Compose собирает из них адреса
+   подключения.
+
+3. Создайте web-приложение в Яндекс OAuth и заполните:
+
+   ```dotenv
+   YANDEX_CLIENT_ID=...
+   YANDEX_CLIENT_SECRET=...
+   YANDEX_REDIRECT_URI=http://localhost:8080/api/v1/auth/yandex/callback
+   ```
+
+   Redirect URI должен в точности совпадать с адресом, указанным в настройках
+   приложения Яндекса. Авторизация через Яндекс ID обязательна: режима без входа
+   и пользовательского ключа администратора нет.
+
+   Для закрытой беты можно задать `YANDEX_ALLOWED_USERS` — список точных ID,
+   логинов или email через запятую. Пустое значение разрешает вход любому
+   пользователю, который успешно прошёл Яндекс OAuth.
+
+4. Добавьте новый токен общего бота MAX и секрет webhook. Username сервер
+   получает через MAX API автоматически. Если токен когда-либо отправлялся в
+   чат, задачу или issue, сначала перевыпустите его в MAX:
+
+   ```dotenv
+   MAX_BOT_TOKEN=...
+   MAX_WEBHOOK_SECRET=...
+   MAX_WEBHOOK_URL=https://maxposty.ru/api/v1/webhooks/max
+   ```
+
+   Секрет webhook удобно создать командой `openssl rand -hex 32`.
+
+5. Запустите сервисы:
+
+   ```sh
+   make compose-up
+   make compose-logs
+   ```
+
+API откроется на [http://localhost:8080/api/v1/health](http://localhost:8080/api/v1/health).
+Одноразовый контейнер `migrate` сначала применит миграции напрямую к PostgreSQL,
+и только после его успешного завершения запустится backend.
+
+Остановить сервисы:
 
 ```sh
-cp .env.example .env
-# Add Yandex OAuth credentials or generate ADMIN_API_KEY with:
-# openssl rand -hex 32
-make dev
+make compose-down
 ```
 
-The API is served at `http://localhost:8080/api/v1`; immutable media is served
-under `/media/{filename}`. SQLite data and media directories are created on
-startup.
+Команда сохраняет базу и изображения. Полное удаление локальных данных требует
+явного подтверждения действием `docker compose down -v` (или
+`docker-compose down -v` в старой установке).
 
-Secrets are read only from environment variables. Never put `MAX_BOT_TOKEN` or
-`OPENAI_API_KEY` into the frontend, SQLite database, logs, or source control.
-Any token pasted into a chat or issue must be rotated before use.
+## Как устроена база данных
 
-Useful repository-local commands:
+Локальный Compose использует:
 
-```sh
-make test       # unit tests
-make test-race  # tests with the race detector
-make vet        # Go static checks
-make lint-install # install the pinned golangci-lint release into bin/
-make lint       # golangci-lint checks and formatting
-make lint-config # validate .golangci.yml against its v2 schema
-make ci         # local lint + race tests + vet gate
-make build      # bin/maxpilot
-make docker-build
-```
+- PostgreSQL `18.4` для постоянного хранения;
+- PgBouncer `1.25.2` в режиме `transaction` для запросов приложения;
+- отдельную роль владельца для миграций;
+- отдельную runtime-роль без прав DDL для backend.
 
-The linter version is pinned in `.golangci-lint-version`. Run
-`make lint-install` once to install that exact release into the ignored local
-`bin/` directory through the official golangci-lint installer. `make lint`
-prefers that binary and can also use an already installed compatible v2 binary;
-it parses the configuration and analyzes production and test code. The explicit
-`make lint-config` schema check requires access to `golangci-lint.run`. GitHub
-Actions always runs the exact pinned version on every push and pull request,
-together with race tests, `go vet`, and a production build.
+Порты PostgreSQL `5432` и PgBouncer `6432` не публикуются на компьютере. Они
+доступны только контейнерам во внутренних Docker-сетях. Backend видит PgBouncer,
+но не подключён к сети PostgreSQL и не может обойти пулер. Наружу публикуется
+только HTTP-порт backend.
 
-## Docker Compose
+`DATABASE_URL` ведёт через PgBouncer и доступен только backend. Секретный
+`DIRECT_DATABASE_URL` ведёт прямо в PostgreSQL и передаётся только контейнеру
+миграций. Не добавляйте owner URL в окружение основного приложения.
 
-The repository includes a backend-only `compose.yaml`:
+PgBouncer использует SCRAM-SHA-256 в обе стороны. В локальном Compose трафик
+идёт по закрытой Docker-сети с `sslmode=disable`. В production используйте TLS с
+проверкой сертификата (`verify-full`) между приложением, пулером и внешней БД.
 
-```sh
-cp .env.example .env
-# Fill ADMIN_API_KEY or the complete Yandex OAuth configuration in .env.
-docker compose up --build
-```
+Режим transaction pooling не сохраняет состояние сессии. Код приложения не
+должен полагаться на session-level `SET`, временные таблицы, `LISTEN/NOTIFY` или
+session advisory locks. Миграции используют direct-соединение.
 
-By default it publishes the API on `http://localhost:8080`. SQLite data and
-media are stored in named volumes. A local certificate bundle can be mounted
-from `certs/`; real PEM files are ignored by Git and must be provisioned by the
-deployment environment.
+Именованный volume PostgreSQL смонтирован в `/var/lib/postgresql`, как требует
+официальный образ PostgreSQL 18. Именованный volume — не резервная копия:
+настройте регулярный `pg_dump` или резервные копии провайдера до production.
 
-The Compose service intentionally keeps `OAUTH_TRUST_X_REAL_IP=false`. Set it
-to `true` only when a trusted reverse proxy overwrites `X-Real-IP` and direct
-external access to the backend port is blocked.
+## Обязательный вход через Яндекс
 
-## Frontend and reverse proxy
+Публичными остаются только технические маршруты входа, минимальная проверка
+состояния и webhook MAX. Все кабинеты, каналы, черновики, изображения и действия
+публикации требуют серверную сессию Яндекс ID.
 
-For local development, run the frontend separately on
-`http://localhost:4321` and keep:
+В production используйте один публичный HTTPS-домен: frontend обслуживает сайт
+и проксирует `/api/v1` и `/media` на backend. Укажите этот origin в
+`FRONTEND_ORIGIN`, `PUBLIC_BASE_URL` и в зарегистрированном callback Яндекса:
 
 ```dotenv
-PUBLIC_BASE_URL=http://localhost:8080
-FRONTEND_ORIGIN=http://localhost:4321
+FRONTEND_ORIGIN=https://maxposty.ru
+PUBLIC_BASE_URL=https://maxposty.ru
+YANDEX_REDIRECT_URI=https://maxposty.ru/api/v1/auth/yandex/callback
 ```
 
-For production, the recommended topology is one public HTTPS origin: an
-external ingress serves the frontend and proxies `/api/v1` and `/media` to this
-service. Set `PUBLIC_BASE_URL` and `FRONTEND_ORIGIN` to that exact public origin,
-and register the same origin plus `/api/v1/auth/yandex/callback` as the Yandex
-Redirect URI. The frontend and backend may live in separate repositories and
-containers; they only share the documented HTTP contract.
+Не включайте `OAUTH_TRUST_X_REAL_IP`, пока прямой доступ к Go-порту не закрыт, а
+доверенный reverse proxy не перезаписывает `X-Real-IP` сам.
 
-If two independent Compose projects are used, they do not share a network by
-default. Attach their services to an explicit external Docker network or point
-the reverse proxy at a published backend hostname. Do not rely on the service
-name `backend` resolving across separate default networks.
+## Общий бот MAX и подтверждение канала
 
-## Yandex ID authentication
+Пользователям не нужно создавать собственных ботов. Сначала они добавляют
+общего бота администратором канала, затем запускают в кабинете персональное
+одноразовое подтверждение и подтверждают свой MAX-профиль. Сервер связывает
+событие `bot_started` только с авторизованным кабинетом и затем проверяет
+владельца канала и права бота через MAX API.
 
-The management API accepts either a server-side Yandex session or the optional
-`X-Admin-Key` break-glass credential. Configure Yandex OAuth with:
-
-```dotenv
-YANDEX_CLIENT_ID=...
-YANDEX_CLIENT_SECRET=...
-YANDEX_REDIRECT_URI=http://localhost:8080/api/v1/auth/yandex/callback
-YANDEX_ALLOWED_USERS=123456789,editor@example.ru
-AUTH_SESSION_TTL=12h
-```
-
-All three OAuth values and a non-empty comma-separated allowlist are required
-together. Allowed entries are exact, case-insensitive Yandex IDs, app-scoped
-PSUIDs, logins, or email addresses. Outside localhost, the Redirect URI must use
-HTTPS and must exactly match the URI registered in the Yandex web application.
-
-The Go server uses Authorization Code Flow with random `state` and PKCE S256.
-OAuth states are one-time values with a ten-minute lifetime. The provider token
-is used only to request `https://login.yandex.ru/info` and is then discarded.
-The browser receives an opaque `HttpOnly`, `SameSite=Lax` session cookie; only
-its SHA-256 digest and the minimal user profile are stored in SQLite. Logout
-deletes the server-side session. `ADMIN_API_KEY` remains available for CLI and
-emergency access and is accepted in parallel with a valid session.
-
-The exact allowlist identity that admitted the account is rechecked for every
-session request, so removing it and restarting the service revokes the session
-immediately. OAuth starts are limited per verified client IP, with a much higher
-process-wide emergency ceiling. The external TLS edge must disable access and
-error logging for the exact callback path (or log `$uri` without `$args`) and
-preserve `Cache-Control: no-store` plus `Referrer-Policy: no-referrer`. Set
-`OAUTH_TRUST_X_REAL_IP=true` only when that trusted proxy overwrites the header
-and direct access to the Go port is blocked. Set
-`OAUTH_RATE_LIMIT_AT_EDGE=true` only when the edge enforces the verified
-client-IP limit itself. An inner proxy cannot erase OAuth query parameters that
-an outer proxy has already logged.
-
-The server fails closed when neither authentication method is configured. For
-an intentionally unauthenticated loopback-only development server, opt in with
-`ALLOW_INSECURE_NO_AUTH=true`; the option is rejected on a non-loopback bind.
-
-Public auth routes:
+Для production укажите публичный HTTPS webhook на порту 443 без номера порта:
 
 ```text
-GET  /api/v1/auth/yandex/start
-GET  /api/v1/auth/yandex/callback
-GET  /api/v1/auth/session
-POST /api/v1/auth/logout
+POST https://maxposty.ru/api/v1/webhooks/max
 ```
 
-For cross-origin local development, requests use credential cookies and the API
-allows them only for the exact `FRONTEND_ORIGIN`. Cookie-authenticated mutating
-requests with a missing or different Origin are rejected.
+Настройте подписку общего бота один раз от имени оператора:
 
-## Publication calendar
-
-`scheduled_at` is an RFC3339 timestamp with an explicit offset. The API converts
-it to UTC before storing and returning it. A post can enter the calendar in any
-of these ways:
-
-- include `scheduled_at` in `POST /api/v1/posts` to create a scheduled post;
-- call `POST /api/v1/posts/{id}/schedule` to schedule or postpone a draft,
-  failed, or already scheduled post;
-- send a future `scheduled_at` through `PATCH /api/v1/posts/{id}`; send `null`
-  to cancel it;
-- call `POST /api/v1/posts/{id}/cancel-schedule` to cancel explicitly.
-
-Calendar operations require a future timestamp, an active channel, and valid
-MAX-ready content. Scheduling itself is local and makes no MAX request. The
-worker rechecks channel permissions only when the time arrives. It atomically
-claims a post only while its status is still `scheduled` and its timestamp is
-due, so a cancellation or postponement that wins the database race cannot be
-published from an older worker snapshot. Scheduled list queries are returned in
-publication-time order.
-
-## AI research and post drafting
-
-Set `OPENAI_API_KEY` on the server and optionally override
-`OPENAI_RESEARCH_MODEL` (the default is `gpt-5.4-mini`). The protected endpoint
-`POST /api/v1/research/generate` first calls the Responses API with the required
-`web_search` tool and high search context, then uses Structured Outputs to turn
-the cited report into a MAX-ready post. The OpenAI key is never sent to the
-browser.
-
-Example request:
-
-```json
-{
-  "topic": "Как малому бизнесу использовать ИИ в 2026 году",
-  "angle": "Практические сценарии без большой команды",
-  "audience": "Владельцы малого бизнеса",
-  "tone": "Деловой и понятный",
-  "format": "markdown",
-  "include_sources": true
-}
+```sh
+make setup-max-webhook
+# либо тем же собранным образом:
+docker compose --profile ops run --rm --build setup-max-webhook
 ```
 
-The response contains `report`, a `sources` array of cited HTTPS pages, and a
-strict `draft` object with `title`, `content`, `format`, and `image_prompt`.
-Citation links in `report` are rendered as visible Markdown links. Source cards
-are always returned; `include_sources` only controls whether the generated post
-itself ends with a compact source list. Draft content is rejected if it exceeds
-MAX's 4000 Unicode-character limit, so markup is never cut mid-structure.
+Команда создаёт или обновляет подписку через `platform-api2.max.ru`, передаёт
+значение `MAX_WEBHOOK_SECRET` в поле `secret` и подписывается на события:
 
-The endpoint is covered by the same Yandex session or `X-Admin-Key` protection as
-other management routes. Research has an overall three-minute deadline, accepts only `markdown`
-or `html`, and does not publish anything to MAX.
+```text
+bot_started, message_callback, bot_added, bot_removed
+```
 
-MAX now uses `https://platform-api2.max.ru`. If its certificate chain is not in
-the operating system trust store, set `MAX_CA_CERT_FILE` to a PEM bundle with
-the required MinTsifry CA certificate. The bundle is appended to system roots;
-TLS hostname and chain verification are never disabled.
+MAX отправляет секрет в `X-Max-Bot-Api-Secret`. Webhook без правильного секрета
+отклоняется. Токен общего бота нельзя передавать браузеру или пользователям.
 
-For production channel discovery, configure an HTTPS MAX subscription pointing
-to `POST /api/v1/webhooks/max` and use the same random value in the subscription
-`secret` and `MAX_WEBHOOK_SECRET`. The endpoint validates
-`X-Max-Bot-Api-Secret`.
+Перед успешным завершением команда сама отправляет безопасное контрольное
+событие на публичный endpoint и требует точный HTTP `200` без redirect. До
+запуска проверьте, что домен доступен по HTTPS на неявном порту 443, сертификат
+выдан доверенным центром, его CN/SAN совпадает с доменом и сервер отдаёт полную
+цепочку. MAX ждёт ответ не дольше 30 секунд; если ни одна доставка не была
+успешной в течение 8 часов, подписка автоматически отключается. Поэтому в
+production проверяйте `GET /subscriptions` и настройте оповещение.
+
+API MAX работает только через `https://platform-api2.max.ru`. До 19 июля 2026
+проверьте, что trust store окружения доверяет новой цепочке MAX. Если системных
+корней недостаточно, укажите проверенный официальный PEM Минцифры в
+`MAX_CA_CERT_FILE`; он добавится к системным корням, а TLS-проверка останется
+включённой. Не заменяйте весь trust store случайным файлом: берите PEM только из
+официального источника и сверяйте отпечаток перед размещением в `./certs`.
+
+## Защита от лишних расходов на ИИ
+
+У всех кабинетов один серверный OpenAI-аккаунт, поэтому backend ограничивает
+генерацию до обращения к OpenAI. По умолчанию один пользователь может выполнять
+только один AI-запрос одновременно, создать до 2 изображений и до 2 исследований
+в минуту, а дневной предел каждой операции — 20. Оба способа создать картинку —
+отдельная генерация и картинка для поста — расходуют один общий image-лимит.
+
+Лимиты хранятся в PostgreSQL отдельно для каждого пользователя и операции, поэтому
+перезапуск backend или несколько его реплик не обнуляют счётчики. Короткий
+transaction-scoped advisory lock безопасен с PgBouncer в режиме `transaction`.
+Активный запрос держит lease; backend удаляет его после ответа, а после аварии он
+истекает автоматически. Общий неблокирующий предел не позволяет очереди дорогих
+запросов занять все ресурсы процесса. При превышении API отвечает `429` и передаёт
+`Retry-After`; запрос к OpenAI при этом не выполняется.
+
+Безопасные значения можно уменьшить или осознанно увеличить в `.env`:
+
+```dotenv
+AI_GLOBAL_MAX_CONCURRENT=4
+AI_USER_MAX_CONCURRENT=1
+AI_IMAGE_PER_MINUTE=2
+AI_IMAGE_PER_DAY=20
+AI_RESEARCH_PER_MINUTE=2
+AI_RESEARCH_PER_DAY=20
+AI_LEASE_TTL=4m
+```
+
+`AI_LEASE_TTL` должен быть больше таймаута AI-обработчика `3m`. Нулевые,
+отрицательные и чрезмерные значения отклоняются при запуске.
+
+## Разработка без Docker для backend
+
+Нужны Go 1.25.12+ и доступный PostgreSQL. Укажите адреса вручную:
+
+```dotenv
+DATABASE_URL=postgresql://maxstudio_app:...@localhost:6432/maxstudio?sslmode=disable
+DIRECT_DATABASE_URL=postgresql://maxstudio_owner:...@localhost:5432/maxstudio?sslmode=disable
+TEST_DATABASE_URL=postgresql://maxstudio_test:...@localhost:5432/maxstudio_test?sslmode=disable
+```
+
+Затем доступны команды:
+
+```sh
+make migrate      # применить миграции через direct URL
+make dev          # запустить API через PgBouncer
+make setup-max-webhook # один раз настроить production webhook общего бота
+make test         # тесты на PostgreSQL
+make test-race    # тесты с race detector
+make vet
+make lint-install
+make lint
+make build        # server + migration + операторская настройка webhook
+make docker-build
+make compose-config
+```
+
+Тесты намеренно не переходят на SQLite и не пропускаются без базы. Каждый тест
+создаёт изолированную PostgreSQL-схему через `TEST_DATABASE_URL`. GitHub Actions
+запускает PostgreSQL 18.4, миграции, все race-тесты, `go vet`, сборку
+исполняемых файлов и golangci-lint.
+
+Production-деплой на один VPS, GHCR, PostgreSQL/PgBouncer, временный
+fail-closed запуск через `http://178.159.94.83` и последующее переключение на
+`https://maxposty.ru` описаны в [`deploy/README.md`](deploy/README.md). В
+bootstrap-режиме провайдер входа отключён, но авторизация не обходится: все
+приватные маршруты продолжают отвечать `401`.
+
+## Секреты и production
+
+- Не коммитьте `.env` и дампы базы.
+- Храните DB, Yandex, MAX и OpenAI credentials в secret manager платформы.
+- Используйте разные owner/runtime-пароли и регулярно их меняйте.
+- Не публикуйте `5432` и `6432` в интернет.
+- Ограничьте доступ к административной консоли PgBouncer; в этой конфигурации
+  admin users намеренно не назначены.
+- Настройте TLS, резервные копии, мониторинг миграций и оповещение об отписке
+  webhook до публичного запуска.

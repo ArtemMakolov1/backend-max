@@ -13,7 +13,7 @@ if [ -z "$version" ]; then
 fi
 
 if [ -x "$binary" ]; then
-  installed_version=$($binary version 2>/dev/null || true)
+  installed_version=$("$binary" version 2>/dev/null || true)
   case "$installed_version" in
     *"version ${version#v} "*) exit 0 ;;
   esac
@@ -33,7 +33,7 @@ curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
   --output "$installer"
 sh "$installer" -b "$bin_dir" "$version"
 
-installed_version=$($binary version)
+installed_version=$("$binary" version)
 case "$installed_version" in
   *"version ${version#v} "*) ;;
   *)

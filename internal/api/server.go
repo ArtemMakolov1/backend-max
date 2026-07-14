@@ -36,6 +36,7 @@ type AuthOptions struct {
 	SecureCookies   bool
 	TrustXRealIP    bool
 	RateLimitAtEdge bool
+	AILimits        *AILimitOptions
 }
 
 type Server struct {
@@ -43,25 +44,28 @@ type Server struct {
 	logger            *slog.Logger
 	frontendOrigin    string
 	webhookSecret     string
-	adminAPIKey       string
 	yandexClient      YandexOAuthClient
 	yandexRedirect    string
 	yandexAllowed     map[string]struct{}
 	sessionTTL        time.Duration
 	secureCookies     bool
 	oauthStartLimiter *keyedWindowLimiter
+	aiLimiter         *aiRequestLimiter
 	trustXRealIP      bool
 	now               func() time.Time
 }
 
-func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecret, adminAPIKey string, authOptions ...AuthOptions) *Server {
+type principalContextKey struct{}
+
+func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecret string, authOptions ...AuthOptions) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	aiLimits := DefaultAILimitOptions()
 	server := &Server{
 		app: application, logger: logger,
 		frontendOrigin: strings.TrimRight(frontendOrigin, "/"), webhookSecret: webhookSecret,
-		adminAPIKey: adminAPIKey, sessionTTL: 12 * time.Hour,
+		sessionTTL:        12 * time.Hour,
 		oauthStartLimiter: newKeyedWindowLimiter(12, 600, time.Minute, 4096), now: time.Now,
 	}
 	if len(authOptions) != 0 {
@@ -82,7 +86,11 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		if options.RateLimitAtEdge {
 			server.oauthStartLimiter = newKeyedWindowLimiter(0, 600, time.Minute, 0)
 		}
+		if options.AILimits != nil {
+			aiLimits = *options.AILimits
+		}
 	}
+	server.aiLimiter = newAIRequestLimiter(application.Store(), logger, aiLimits)
 	return server
 }
 
@@ -93,20 +101,21 @@ func (s *Server) Handler() http.Handler {
 	router.Use(s.cors)
 	router.Use(s.requestLogger)
 
-	router.Get("/media/{filename}", s.serveMedia)
+	router.With(s.requireSession).Get("/media/{filename}", s.serveMedia)
 	router.Route("/api/v1", func(r chi.Router) {
 		r.Get("/health", s.health)
 		r.Post("/webhooks/max", s.maxWebhook)
 		r.Get("/auth/session", s.authSession)
-		r.Get("/auth/yandex/start", s.startYandexAuth)
+		r.Post("/auth/yandex/start", s.startYandexAuth)
 		r.Get("/auth/yandex/callback", s.finishYandexAuth)
 		r.Post("/auth/logout", s.logout)
 
 		r.Group(func(r chi.Router) {
-			r.Use(s.requireAdmin)
+			r.Use(s.requireSession)
 
 			r.Get("/channels", s.listChannels)
-			r.Post("/channels", s.createChannel)
+			r.Post("/channels/connect/start", s.startChannelConnect)
+			r.Get("/channels/connect/{claim_id}", s.getChannelConnect)
 			r.Get("/channels/{id}", s.getChannel)
 			r.Patch("/channels/{id}", s.updateChannel)
 			r.Put("/channels/{id}", s.updateChannel)
@@ -163,15 +172,25 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) requireAdmin(next http.Handler) http.Handler {
+func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, ok := s.authenticate(r); !ok {
+		principal, ok := s.authenticate(r)
+		if !ok || principal.Method != "yandex" || principal.User == nil || principal.User.ID == "" {
 			w.Header().Set("Cache-Control", "no-store")
-			s.problem(w, http.StatusUnauthorized, "admin_auth_required", "A valid Yandex session or admin access key is required", nil)
+			s.problem(w, http.StatusUnauthorized, "authentication_required", "A valid Yandex session is required", nil)
 			return
 		}
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), principalContextKey{}, principal)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func authenticatedUserID(r *http.Request) (string, error) {
+	principal, ok := r.Context().Value(principalContextKey{}).(authPrincipal)
+	if !ok || principal.User == nil || principal.User.ID == "" {
+		return "", errors.New("authenticated user is missing")
+	}
+	return principal.User.ID, nil
 }
 
 func (s *Server) cors(next http.Handler) http.Handler {
@@ -184,7 +203,7 @@ func (s *Server) cors(next http.Handler) http.Handler {
 		if origin == s.frontendOrigin && origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept, X-Admin-Key")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Accept")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 			w.Header().Set("Access-Control-Max-Age", "600")
 			w.Header().Add("Vary", "Origin")
@@ -256,6 +275,16 @@ func (s *Server) problem(w http.ResponseWriter, status int, code, message string
 
 func (s *Server) writeError(w http.ResponseWriter, err error) {
 	if err == nil {
+		return
+	}
+	var aiLimitErr *store.AILimitError
+	if errors.As(err, &aiLimitErr) {
+		retryAfter := retryAfterSeconds(aiLimitErr.RetryAfter)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+		s.problem(w, http.StatusTooManyRequests, "ai_rate_limited", "AI request limit reached; retry later", map[string]any{
+			"reason": aiLimitErr.Reason, "retry_after_seconds": retryAfter,
+		})
 		return
 	}
 	switch {

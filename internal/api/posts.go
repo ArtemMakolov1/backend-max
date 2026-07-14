@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +46,11 @@ type scheduleRequest struct {
 }
 
 func (s *Server) listPosts(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	status := strings.TrimSpace(r.URL.Query().Get("status"))
 	if status != "" && !validPostStatus(status) {
 		s.problem(w, http.StatusBadRequest, "validation_error", "Unknown post status", nil)
@@ -58,7 +65,13 @@ func (s *Server) listPosts(w http.ResponseWriter, r *http.Request) {
 		}
 		channelID = &parsed
 	}
-	posts, err := s.app.Store().ListPosts(r.Context(), status, channelID)
+	if channelID != nil {
+		if _, err := s.app.Store().GetChannelForUser(r.Context(), userID, *channelID); err != nil {
+			s.writeError(w, err)
+			return
+		}
+	}
+	posts, err := s.app.Store().ListPostsForUser(r.Context(), userID, status, channelID)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -67,6 +80,11 @@ func (s *Server) listPosts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	var request createPostRequest
 	if !s.decodeJSON(w, r, &request) {
 		return
@@ -83,12 +101,12 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 			s.problem(w, http.StatusBadRequest, "validation_error", "channel_id must be positive", nil)
 			return
 		}
-		if _, err := s.app.Store().GetChannel(r.Context(), *request.ChannelID); err != nil {
+		if _, err := s.app.Store().GetChannelForUser(r.Context(), userID, *request.ChannelID); err != nil {
 			s.writeError(w, err)
 			return
 		}
 	}
-	imagePath, err := s.resolveImageURL(request.ImageURL)
+	imagePath, err := s.resolveImageURL(r.Context(), userID, request.ImageURL)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -98,7 +116,8 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		notify = *request.Notify
 	}
 	post := store.Post{
-		Title: strings.TrimSpace(request.Title), Content: request.Content, Format: request.Format,
+		UserID: userID,
+		Title:  strings.TrimSpace(request.Title), Content: request.Content, Format: request.Format,
 		Status: store.PostStatusDraft, ChannelID: request.ChannelID, ImageURL: request.ImageURL,
 		ImagePath: imagePath, ImagePrompt: request.ImagePrompt, Notify: notify,
 		DisableLinkPreview: request.DisableLinkPreview,
@@ -131,12 +150,17 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getPost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	post, err := s.app.Store().GetPost(r.Context(), id)
+	post, err := s.app.Store().GetPostForUser(r.Context(), userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -145,12 +169,17 @@ func (s *Server) getPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	current, err := s.app.Store().GetPost(r.Context(), id)
+	current, err := s.app.Store().GetPostForUser(r.Context(), userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -204,7 +233,7 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 				s.problem(w, http.StatusBadRequest, "validation_error", "channel_id must be positive", nil)
 				return
 			}
-			if _, err := s.app.Store().GetChannel(r.Context(), *channelID); err != nil {
+			if _, err := s.app.Store().GetChannelForUser(r.Context(), userID, *channelID); err != nil {
 				s.writeError(w, err)
 				return
 			}
@@ -220,7 +249,7 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		resolved, err := s.resolveImageURL(imageURL)
+		resolved, err := s.resolveImageURL(r.Context(), userID, imageURL)
 		if err != nil {
 			s.writeError(w, err)
 			return
@@ -268,12 +297,17 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deletePost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	post, err := s.app.Store().GetPost(r.Context(), id)
+	post, err := s.app.Store().GetPostForUser(r.Context(), userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -290,12 +324,17 @@ func (s *Server) deletePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) duplicatePost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
-	post, err := s.app.Store().DuplicatePost(r.Context(), id)
+	post, err := s.app.Store().DuplicatePostForUser(r.Context(), userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -304,6 +343,11 @@ func (s *Server) duplicatePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) schedulePost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
 		s.writeError(w, err)
@@ -318,7 +362,7 @@ func (s *Server) schedulePost(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	post, err := s.app.Store().GetPost(r.Context(), id)
+	post, err := s.app.Store().GetPostForUser(r.Context(), userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -336,8 +380,17 @@ func (s *Server) schedulePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cancelSchedule(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if _, err := s.app.Store().GetPostForUser(r.Context(), userID, id); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -350,8 +403,17 @@ func (s *Server) cancelSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) publishPost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if _, err := s.app.Store().GetPostForUser(r.Context(), userID, id); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -366,8 +428,17 @@ func (s *Server) publishPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updatePublishedPost(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if _, err := s.app.Store().GetPostForUser(r.Context(), userID, id); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -382,8 +453,17 @@ func (s *Server) updatePublishedPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deletePublication(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
 	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if _, err := s.app.Store().GetPostForUser(r.Context(), userID, id); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -398,14 +478,33 @@ func (s *Server) deletePublication(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) generateImage(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	var request openaiimg.GenerateRequest
 	if !s.decodeJSON(w, r, &request) {
 		return
 	}
-	ctx, cancel := contextWithTimeout(r, 3*time.Minute)
+	if err := s.app.ValidateImageRequest(request); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationImage, s.now().UTC())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	defer release()
+	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
 	file, err := s.app.GenerateImage(ctx, request)
 	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if err := s.app.Store().RegisterMedia(r.Context(), userID, file.Filename, s.now().UTC()); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -413,7 +512,17 @@ func (s *Server) generateImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) generatePostImage(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
 	id, err := parseID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	ownedPost, err := s.app.Store().GetPostForUser(r.Context(), userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -422,19 +531,50 @@ func (s *Server) generatePostImage(w http.ResponseWriter, r *http.Request) {
 	if !s.decodeJSON(w, r, &request) {
 		return
 	}
-	ctx, cancel := contextWithTimeout(r, 3*time.Minute)
+	if strings.TrimSpace(request.Prompt) == "" {
+		request.Prompt = ownedPost.ImagePrompt
+	}
+	if err := s.app.ValidateImageRequest(request); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationImage, s.now().UTC())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	defer release()
+	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
 	post, err := s.app.GeneratePostImage(ctx, id, request)
 	if err != nil {
 		s.writeError(w, err)
 		return
 	}
+	if post.ImageURL != "" {
+		filename := path.Base(post.ImageURL)
+		if err := s.app.Store().RegisterMedia(r.Context(), userID, filename, s.now().UTC()); err != nil {
+			s.writeError(w, err)
+			return
+		}
+	}
 	s.writeJSON(w, http.StatusOK, post)
 }
 
-func (s *Server) resolveImageURL(imageURL string) (string, error) {
+func (s *Server) resolveImageURL(ctx context.Context, userID, imageURL string) (string, error) {
 	if strings.TrimSpace(imageURL) == "" {
 		return "", nil
+	}
+	filename, err := s.app.Media().FilenameFromURL(imageURL)
+	if err != nil {
+		return "", err
+	}
+	owned, err := s.app.Store().UserOwnsMedia(ctx, userID, filename)
+	if err != nil {
+		return "", err
+	}
+	if !owned {
+		return "", store.ErrNotFound
 	}
 	return s.app.Media().ResolveURL(imageURL)
 }

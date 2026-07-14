@@ -1,4 +1,97 @@
 services:
+  postgres:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-maxstudio}
+      POSTGRES_USER: ${POSTGRES_OWNER_USER:-maxstudio_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?Set POSTGRES_OWNER_PASSWORD in .env}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-maxstudio_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=100
+      - -c
+      - idle_in_transaction_session_timeout=60s
+    expose:
+      - "5432"
+    volumes:
+      # PostgreSQL 18 expects the persistent mount at /var/lib/postgresql.
+      - max-studio-postgres:/var/lib/postgresql
+      - ./docker/postgres/init-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
+    shm_size: 128mb
+    stop_grace_period: 30s
+    networks:
+      - database
+
+  pgbouncer:
+    image: percona/percona-pgbouncer:1.25.2@sha256:0da7c2501ebe8523f58f1e892bce0722b242300a769894c92b948d1bd48ca406
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/maxstudio-pgbouncer-entrypoint"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-maxstudio}
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-maxstudio_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
+      PGBOUNCER_DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-20}
+      PGBOUNCER_MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE:-2}
+      PGBOUNCER_RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-5}
+      PGBOUNCER_MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-200}
+    expose:
+      - "6432"
+    volumes:
+      - ./docker/pgbouncer/entrypoint.sh:/usr/local/bin/maxstudio-pgbouncer-entrypoint:ro
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U $${POSTGRES_APP_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - pool
+      - database
+
+  migrate:
+    build:
+      context: .
+    restart: "no"
+    entrypoint: ["/app/migrate"]
+    environment:
+      DIRECT_DATABASE_URL: "postgresql://${POSTGRES_OWNER_USER:-maxstudio_owner}:${POSTGRES_OWNER_PASSWORD:?Set POSTGRES_OWNER_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-maxstudio}?sslmode=disable"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - database
+
   backend:
     build:
       context: .
@@ -6,19 +99,17 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8080
-      DATABASE_PATH: /app/data/maxpilot.db
+      # Runtime traffic always goes through PgBouncer. The owner URL is never
+      # exposed to this container; only the one-shot migrate service receives it.
+      DATABASE_URL: "postgresql://${POSTGRES_APP_USER:-maxstudio_app}:${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}@pgbouncer:6432/${POSTGRES_DB:-maxstudio}?sslmode=disable"
       MEDIA_DIR: /app/media
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:4321}
-      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
-      ALLOW_INSECURE_NO_AUTH: ${ALLOW_INSECURE_NO_AUTH:-false}
-      # Keep false unless a trusted reverse proxy overwrites X-Real-IP and the
-      # published backend port is blocked from direct external access.
       OAUTH_TRUST_X_REAL_IP: ${OAUTH_TRUST_X_REAL_IP:-false}
       OAUTH_RATE_LIMIT_AT_EDGE: ${OAUTH_RATE_LIMIT_AT_EDGE:-false}
-      YANDEX_CLIENT_ID: ${YANDEX_CLIENT_ID:-}
-      YANDEX_CLIENT_SECRET: ${YANDEX_CLIENT_SECRET:-}
-      YANDEX_REDIRECT_URI: ${YANDEX_REDIRECT_URI:-}
+      YANDEX_CLIENT_ID: ${YANDEX_CLIENT_ID:?Set YANDEX_CLIENT_ID in .env}
+      YANDEX_CLIENT_SECRET: ${YANDEX_CLIENT_SECRET:?Set YANDEX_CLIENT_SECRET in .env}
+      YANDEX_REDIRECT_URI: ${YANDEX_REDIRECT_URI:?Set YANDEX_REDIRECT_URI in .env}
       YANDEX_ALLOWED_USERS: ${YANDEX_ALLOWED_USERS:-}
       AUTH_SESSION_TTL: ${AUTH_SESSION_TTL:-12h}
       MAX_API_BASE_URL: ${MAX_API_BASE_URL:-https://platform-api2.max.ru}
@@ -29,20 +120,70 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_RESEARCH_MODEL: ${OPENAI_RESEARCH_MODEL:-gpt-5.4-mini}
       OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      AI_GLOBAL_MAX_CONCURRENT: ${AI_GLOBAL_MAX_CONCURRENT:-4}
+      AI_USER_MAX_CONCURRENT: ${AI_USER_MAX_CONCURRENT:-1}
+      AI_IMAGE_PER_MINUTE: ${AI_IMAGE_PER_MINUTE:-2}
+      AI_IMAGE_PER_DAY: ${AI_IMAGE_PER_DAY:-20}
+      AI_RESEARCH_PER_MINUTE: ${AI_RESEARCH_PER_MINUTE:-2}
+      AI_RESEARCH_PER_DAY: ${AI_RESEARCH_PER_DAY:-20}
+      AI_LEASE_TTL: ${AI_LEASE_TTL:-4m}
       SCHEDULER_INTERVAL: ${SCHEDULER_INTERVAL:-15s}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     volumes:
-      - max-studio-data:/app/data
       - max-studio-media:/app/media
       - ./certs:/app/certs:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/api/v1/health"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 5s
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - app
+      - pool
+
+  setup-max-webhook:
+    build:
+      context: .
+    profiles: ["ops"]
+    restart: "no"
+    entrypoint: ["/app/setup-max-webhook"]
+    environment:
+      MAX_API_BASE_URL: ${MAX_API_BASE_URL:-https://platform-api2.max.ru}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      MAX_WEBHOOK_URL: ${MAX_WEBHOOK_URL:-}
+      MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET:-}
+      MAX_CA_CERT_FILE: ${MAX_CA_CERT_FILE:-}
+    volumes:
+      - ./certs:/app/certs:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - app
 
 volumes:
-  max-studio-data:
+  max-studio-postgres:
   max-studio-media:
+
+networks:
+  app:
+  pool:
+    internal: true
+  database:
+    internal: true

@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -65,47 +64,6 @@ func TestChannelVisualMetadataPersistsAcrossOperations(t *testing.T) {
 	}
 	if len(channels) != 1 || channels[0].IconURL != channel.IconURL || channels[0].ParticipantsCount != channel.ParticipantsCount {
 		t.Fatalf("listed channels = %#v", channels)
-	}
-}
-
-func TestChannelVisualMetadataMigrationPreservesLegacyRows(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "legacy.db")
-	legacy, err := sql.Open("sqlite", databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = legacy.ExecContext(ctx, `
-CREATE TABLE channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    max_chat_id TEXT NOT NULL UNIQUE,
-    title TEXT NOT NULL,
-    is_channel INTEGER NOT NULL DEFAULT 1,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-INSERT INTO channels(max_chat_id, title, is_channel, active, created_at, updated_at)
-VALUES ('legacy-1', 'Legacy', 1, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');`)
-	if closeErr := legacy.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	storage, err := Open(ctx, databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = storage.Close() })
-	channel, err := storage.GetChannelByMAXChatID(ctx, "legacy-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if channel.Title != "Legacy" || channel.IconURL != "" || channel.ParticipantsCount != 0 {
-		t.Fatalf("migrated channel = %#v", channel)
 	}
 }
 
@@ -349,7 +307,7 @@ func TestChannelDeletionProtectsPublicationDependencies(t *testing.T) {
 	}
 }
 
-func TestWebhookChannelUpsertIsIdempotent(t *testing.T) {
+func TestObservedBotChatUpsertIsIdempotentAndOrdered(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	storage, err := Open(ctx, filepath.Join(t.TempDir(), "test.db"))
@@ -358,16 +316,22 @@ func TestWebhookChannelUpsertIsIdempotent(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = storage.Close() })
 
-	first, err := storage.UpsertDiscoveredChannel(ctx, "777", "First", true, true)
-	if err != nil {
+	now := time.Now().UTC()
+	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
+		MAXChatID: "777", PublicLink: "https://max.ru/first", Title: "First", Active: true, LastSeenAt: now,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	second, err := storage.UpsertDiscoveredChannel(ctx, "777", "Renamed", true, false)
-	if err != nil {
+	if err := storage.MarkObservedBotChatRemoved(ctx, "777", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if first.ID != second.ID || second.Title != "Renamed" || second.Active {
-		t.Fatalf("unexpected upsert result: first=%#v second=%#v", first, second)
+	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
+		MAXChatID: "777", PublicLink: "https://max.ru/first", Title: "Equal-time replay", Active: true, LastSeenAt: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.GetActiveObservedBotChat(ctx, "", "777"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale bot_added reactivated removed chat: %v", err)
 	}
 }
 
@@ -663,53 +627,5 @@ func TestCreatePostRejectsInconsistentScheduleState(t *testing.T) {
 	at := time.Now().UTC().Add(time.Hour)
 	if _, err := storage.CreatePost(ctx, Post{Title: "Invalid", Format: FormatMarkdown, Status: PostStatusDraft, ScheduledAt: &at}); err == nil {
 		t.Fatal("CreatePost accepted scheduled_at with draft status")
-	}
-}
-
-func TestMigrationRepairsLegacyScheduleStatusDrift(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "legacy-calendar.db")
-	storage, err := Open(ctx, databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	orphan, err := storage.CreatePost(ctx, Post{Title: "Orphan", Content: "body", Format: FormatMarkdown})
-	if err != nil {
-		t.Fatal(err)
-	}
-	broken, err := storage.CreatePost(ctx, Post{Title: "Broken", Content: "body", Format: FormatMarkdown})
-	if err != nil {
-		t.Fatal(err)
-	}
-	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
-	if _, err := storage.db.ExecContext(ctx, `UPDATE posts SET scheduled_at = ? WHERE id = ?`, future, orphan.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := storage.db.ExecContext(ctx, `UPDATE posts SET status = ?, scheduled_at = NULL WHERE id = ?`, PostStatusScheduled, broken.ID); err != nil {
-		t.Fatal(err)
-	}
-	if err := storage.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	storage, err = Open(ctx, databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = storage.Close() })
-	orphan, err = storage.GetPost(ctx, orphan.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	broken, err = storage.GetPost(ctx, broken.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if orphan.Status != PostStatusDraft || orphan.ScheduledAt != nil {
-		t.Fatalf("orphan schedule repair = %#v", orphan)
-	}
-	if broken.Status != PostStatusDraft || broken.ScheduledAt != nil {
-		t.Fatalf("broken schedule repair = %#v", broken)
 	}
 }

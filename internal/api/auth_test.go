@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -20,13 +21,15 @@ import (
 )
 
 type fakeYandexOAuth struct {
-	profile           yandexauth.Profile
-	exchangedCode     string
-	exchangedVerifier string
-	userInfoToken     string
+	profile            yandexauth.Profile
+	authorizationCalls int
+	exchangedCode      string
+	exchangedVerifier  string
+	userInfoToken      string
 }
 
 func (f *fakeYandexOAuth) AuthorizationURL(redirectURI, state, challenge string) string {
+	f.authorizationCalls++
 	values := url.Values{
 		"redirect_uri": {redirectURI}, "state": {state}, "code_challenge": {challenge},
 		"code_challenge_method": {"S256"},
@@ -95,6 +98,7 @@ func TestYandexOAuthCreatesServerSessionAndLogoutInvalidatesIt(t *testing.T) {
 		t.Fatalf("health auth state = %#v", healthBody)
 	}
 
+	server.yandexAllowed["someone-else"] = struct{}{}
 	delete(server.yandexAllowed, "42")
 	revoked := httptest.NewRequest(http.MethodGet, "/api/v1/posts", nil)
 	revoked.AddCookie(sessionCookie)
@@ -171,14 +175,14 @@ func TestYandexOAuthStartIsRateLimitedBeforeStateCreation(t *testing.T) {
 	server.now = func() time.Time { return fixedNow }
 
 	for attempt := 0; attempt < 12; attempt++ {
-		request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/yandex/start", nil)
+		request := newYandexStartRequest(t, "", true, true)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
-		if response.Code != http.StatusFound {
-			t.Fatalf("attempt %d status = %d, want 302", attempt+1, response.Code)
+		if response.Code != http.StatusOK {
+			t.Fatalf("attempt %d status = %d, want 200", attempt+1, response.Code)
 		}
 	}
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/yandex/start", nil)
+	request := newYandexStartRequest(t, "", true, true)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "60" {
@@ -188,34 +192,93 @@ func TestYandexOAuthStartIsRateLimitedBeforeStateCreation(t *testing.T) {
 		t.Fatalf("rate-limited Cache-Control = %q", response.Header().Get("Cache-Control"))
 	}
 
-	otherClient := httptest.NewRequest(http.MethodGet, "/api/v1/auth/yandex/start", nil)
+	otherClient := newYandexStartRequest(t, "", true, true)
 	otherClient.RemoteAddr = "198.51.100.10:4321"
 	otherResponse := httptest.NewRecorder()
 	handler.ServeHTTP(otherResponse, otherClient)
-	if otherResponse.Code != http.StatusFound {
-		t.Fatalf("independent client status = %d, want 302", otherResponse.Code)
+	if otherResponse.Code != http.StatusOK {
+		t.Fatalf("independent client status = %d, want 200", otherResponse.Code)
 	}
 
 	server.trustXRealIP = true
-	proxiedClient := httptest.NewRequest(http.MethodGet, "/api/v1/auth/yandex/start", nil)
+	proxiedClient := newYandexStartRequest(t, "", true, true)
 	proxiedClient.Header.Set("X-Real-IP", "203.0.113.25")
 	proxiedResponse := httptest.NewRecorder()
 	handler.ServeHTTP(proxiedResponse, proxiedClient)
-	if proxiedResponse.Code != http.StatusFound {
-		t.Fatalf("trusted proxied client status = %d, want 302", proxiedResponse.Code)
+	if proxiedResponse.Code != http.StatusOK {
+		t.Fatalf("trusted proxied client status = %d, want 200", proxiedResponse.Code)
+	}
+}
+
+func TestYandexOAuthStartRequiresPOSTExactOriginAndBothConsents(t *testing.T) {
+	handler, provider, _ := newYandexAuthTestHandler(t, []string{"42"}, yandexauth.Profile{
+		ID: "42", ClientID: "client-id", Login: "editor",
+	})
+
+	oldGET := httptest.NewRequest(http.MethodGet, "/api/v1/auth/yandex/start?terms_accepted=true&personal_data_accepted=true", nil)
+	oldGET.Header.Set("Origin", "http://localhost:4321")
+	oldGETResponse := httptest.NewRecorder()
+	handler.ServeHTTP(oldGETResponse, oldGET)
+	if oldGETResponse.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("legacy GET status = %d, want 405", oldGETResponse.Code)
+	}
+
+	tests := []struct {
+		name          string
+		origin        string
+		termsAccepted bool
+		personalData  bool
+		wantStatus    int
+	}{
+		{name: "missing origin", termsAccepted: true, personalData: true, wantStatus: http.StatusForbidden},
+		{name: "foreign origin", origin: "https://evil.example", termsAccepted: true, personalData: true, wantStatus: http.StatusForbidden},
+		{name: "origin with trailing slash", origin: "http://localhost:4321/", termsAccepted: true, personalData: true, wantStatus: http.StatusForbidden},
+		{name: "terms missing", origin: "http://localhost:4321", personalData: true, wantStatus: http.StatusBadRequest},
+		{name: "personal data missing", origin: "http://localhost:4321", termsAccepted: true, wantStatus: http.StatusBadRequest},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := newYandexStartRequest(t, "/app/#/posts", test.termsAccepted, test.personalData)
+			if test.origin == "" {
+				request.Header.Del("Origin")
+			} else {
+				request.Header.Set("Origin", test.origin)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", response.Code, test.wantStatus, response.Body.String())
+			}
+			for _, cookie := range response.Result().Cookies() {
+				if cookie.Name == stateCookieName && cookie.Value != "" {
+					t.Fatalf("rejected request created OAuth state cookie: %#v", cookie)
+				}
+			}
+		})
+	}
+	if provider.authorizationCalls != 0 {
+		t.Fatalf("rejected OAuth starts called provider %d times", provider.authorizationCalls)
 	}
 }
 
 func beginYandexAuth(t *testing.T, handler http.Handler, returnTo string) (string, *http.Cookie) {
 	t.Helper()
-	request := httptest.NewRequest(http.MethodGet,
-		"/api/v1/auth/yandex/start?return_to="+url.QueryEscape(returnTo), nil)
+	request := newYandexStartRequest(t, returnTo, true, true)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusFound {
+	if response.Code != http.StatusOK {
 		t.Fatalf("start status = %d, body = %s", response.Code, response.Body.String())
 	}
-	location, err := url.Parse(response.Header().Get("Location"))
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("start Cache-Control = %q", response.Header().Get("Cache-Control"))
+	}
+	var payload struct {
+		AuthorizationURL string `json:"authorization_url"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	location, err := url.Parse(payload.AuthorizationURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,6 +287,22 @@ func beginYandexAuth(t *testing.T, handler http.Handler, returnTo string) (strin
 		t.Fatalf("authorization URL = %s", location)
 	}
 	return state, responseCookie(t, response, stateCookieName)
+}
+
+func newYandexStartRequest(t *testing.T, returnTo string, termsAccepted, personalDataAccepted bool) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"return_to":              returnTo,
+		"terms_accepted":         termsAccepted,
+		"personal_data_accepted": personalDataAccepted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/auth/yandex/start", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Origin", "http://localhost:4321")
+	return request
 }
 
 func responseCookie(t *testing.T, response *httptest.ResponseRecorder, name string) *http.Cookie {
@@ -252,7 +331,7 @@ func newYandexAuthTestHandler(t *testing.T, allowed []string, profile yandexauth
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application := app.New(storage, mediaStore, nil, nil, nil, logger)
 	provider := &fakeYandexOAuth{profile: profile}
-	server := New(application, logger, "http://localhost:4321", "webhook-secret", "", AuthOptions{
+	server := New(application, logger, "http://localhost:4321", "webhook-secret", AuthOptions{
 		YandexClient: provider, RedirectURI: "http://localhost:8080/api/v1/auth/yandex/callback",
 		AllowedUsers: allowed, SessionTTL: time.Hour,
 	})

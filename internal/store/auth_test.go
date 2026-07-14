@@ -21,7 +21,7 @@ func TestAuthSessionLifecycleAndExpiry(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = storage.Close() })
 
-	createdAt := time.Date(2026, time.July, 14, 8, 30, 0, 123, time.FixedZone("test", 3*60*60))
+	createdAt := time.Date(2026, time.July, 14, 8, 30, 0, 123000, time.FixedZone("test", 3*60*60))
 	expiresAt := createdAt.Add(24 * time.Hour)
 	tokenHash := strings.Repeat("a", 64)
 	want := AuthSession{
@@ -168,11 +168,6 @@ func TestAuthStoreRejectsOpaqueValuesInsteadOfHashes(t *testing.T) {
 	t.Cleanup(func() { _ = storage.Close() })
 
 	now := time.Now().UTC()
-	if err := storage.CreateAuthSession(ctx, AuthSession{
-		TokenHash: strings.Repeat("0", 64), YandexUserID: "1", CreatedAt: now, ExpiresAt: now.Add(time.Hour),
-	}); err == nil {
-		t.Fatal("CreateAuthSession(without allowlist identity) error = nil, want validation error")
-	}
 	invalidTokenHash := "not-a-sha256-digest-" + t.Name()
 	if err := storage.CreateAuthSession(ctx, AuthSession{
 		TokenHash: invalidTokenHash, YandexUserID: "1", CreatedAt: now, ExpiresAt: now.Add(time.Hour),
@@ -207,6 +202,9 @@ func TestCreateAuthRecordsPrunesExpiredRowsAndBoundsOAuthStates(t *testing.T) {
 
 	now := time.Date(2026, time.July, 14, 9, 0, 0, 0, time.UTC)
 	expiredSessionHash := strings.Repeat("e", 64)
+	if err := storage.UpsertUser(ctx, User{ID: "expired-user", DisplayName: "Expired"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := storage.db.ExecContext(ctx, `
 INSERT INTO auth_sessions(token_hash, yandex_user_id, created_at, expires_at)
 VALUES (?, 'expired-user', ?, ?)`, expiredSessionHash, timeText(now.Add(-2*time.Hour)), timeText(now.Add(-time.Hour))); err != nil {
@@ -214,8 +212,8 @@ VALUES (?, 'expired-user', ?, ?)`, expiredSessionHash, timeText(now.Add(-2*time.
 	}
 	expiredStateHash := strings.Repeat("f", 64)
 	if _, err := storage.db.ExecContext(ctx, `
-INSERT INTO oauth_states(state_hash, pkce_verifier, created_at, expires_at)
-VALUES (?, 'expired-verifier', ?, ?)`, expiredStateHash, timeText(now.Add(-2*time.Hour)), timeText(now.Add(-time.Hour))); err != nil {
+INSERT INTO oauth_states(state_hash, pkce_verifier, terms_version, personal_data_version, consent_at, created_at, expires_at)
+VALUES (?, 'expired-verifier', 'test', 'test', ?, ?, ?)`, expiredStateHash, now.Add(-2*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 

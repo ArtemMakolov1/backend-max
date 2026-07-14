@@ -5,15 +5,17 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
+var maxWebhookSecretPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{5,256}$`)
+
 const (
 	defaultHost                = "127.0.0.1"
 	defaultPort                = "8080"
-	defaultDatabasePath        = "./data/maxpilot.db"
 	defaultMediaDir            = "./media"
 	defaultPublicBaseURL       = "http://localhost:8080"
 	defaultFrontendOrigin      = "http://localhost:4321"
@@ -23,12 +25,24 @@ const (
 	defaultOpenAIResearchModel = "gpt-5.4-mini"
 	defaultSchedulerInterval   = 15 * time.Second
 	defaultAuthSessionTTL      = 12 * time.Hour
+	defaultAIGlobalConcurrent  = 4
+	defaultAIUserConcurrent    = 1
+	defaultAIImagePerMinute    = 2
+	defaultAIImagePerDay       = 20
+	defaultAIResearchPerMinute = 2
+	defaultAIResearchPerDay    = 20
+	defaultAILeaseTTL          = 4 * time.Minute
+	maxAIConfiguredConcurrent  = 100
+	maxAIConfiguredPerMinute   = 10_000
+	maxAIConfiguredPerDay      = 1_000_000
+	maxAIConfiguredLeaseTTL    = 24 * time.Hour
+	aiHandlerTimeout           = 3 * time.Minute
 )
 
 type Config struct {
 	Host                 string
 	Port                 string
-	DatabasePath         string
+	DatabaseURL          string
 	MediaDir             string
 	PublicBaseURL        string
 	FrontendOrigin       string
@@ -36,10 +50,9 @@ type Config struct {
 	MAXBotToken          string
 	MAXWebhookSecret     string
 	MAXCACertFile        string
-	AdminAPIKey          string
-	AllowInsecureNoAuth  bool
 	OAuthTrustXRealIP    bool
 	OAuthRateLimitAtEdge bool
+	AuthBootstrapMode    bool
 	YandexClientID       string
 	YandexClientSecret   string
 	YandexRedirectURI    string
@@ -49,6 +62,13 @@ type Config struct {
 	OpenAIAPIBaseURL     string
 	OpenAIImageModel     string
 	OpenAIResearchModel  string
+	AIGlobalConcurrent   int
+	AIUserConcurrent     int
+	AIImagePerMinute     int
+	AIImagePerDay        int
+	AIResearchPerMinute  int
+	AIResearchPerDay     int
+	AILeaseTTL           time.Duration
 	SchedulerInterval    time.Duration
 }
 
@@ -63,11 +83,6 @@ func Load() (Config, error) {
 	if err != nil || sessionTTL < 15*time.Minute || sessionTTL > 30*24*time.Hour {
 		return Config{}, fmt.Errorf("AUTH_SESSION_TTL must be between 15m and 720h: %q", sessionTTLText)
 	}
-	allowInsecureText := env("ALLOW_INSECURE_NO_AUTH", "false")
-	allowInsecureNoAuth, err := strconv.ParseBool(allowInsecureText)
-	if err != nil {
-		return Config{}, fmt.Errorf("ALLOW_INSECURE_NO_AUTH must be true or false: %q", allowInsecureText)
-	}
 	trustXRealIPText := env("OAUTH_TRUST_X_REAL_IP", "false")
 	trustXRealIP, err := strconv.ParseBool(trustXRealIPText)
 	if err != nil {
@@ -78,43 +93,91 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("OAUTH_RATE_LIMIT_AT_EDGE must be true or false: %q", rateLimitAtEdgeText)
 	}
+	authBootstrapText := env("AUTH_BOOTSTRAP_MODE", "false")
+	authBootstrapMode, err := strconv.ParseBool(authBootstrapText)
+	if err != nil {
+		return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE must be true or false: %q", authBootstrapText)
+	}
+	aiGlobalConcurrent, err := boundedPositiveIntEnv("AI_GLOBAL_MAX_CONCURRENT", defaultAIGlobalConcurrent, maxAIConfiguredConcurrent)
+	if err != nil {
+		return Config{}, err
+	}
+	aiUserConcurrent, err := boundedPositiveIntEnv("AI_USER_MAX_CONCURRENT", defaultAIUserConcurrent, maxAIConfiguredConcurrent)
+	if err != nil {
+		return Config{}, err
+	}
+	aiImagePerMinute, err := boundedPositiveIntEnv("AI_IMAGE_PER_MINUTE", defaultAIImagePerMinute, maxAIConfiguredPerMinute)
+	if err != nil {
+		return Config{}, err
+	}
+	aiImagePerDay, err := boundedPositiveIntEnv("AI_IMAGE_PER_DAY", defaultAIImagePerDay, maxAIConfiguredPerDay)
+	if err != nil {
+		return Config{}, err
+	}
+	aiResearchPerMinute, err := boundedPositiveIntEnv("AI_RESEARCH_PER_MINUTE", defaultAIResearchPerMinute, maxAIConfiguredPerMinute)
+	if err != nil {
+		return Config{}, err
+	}
+	aiResearchPerDay, err := boundedPositiveIntEnv("AI_RESEARCH_PER_DAY", defaultAIResearchPerDay, maxAIConfiguredPerDay)
+	if err != nil {
+		return Config{}, err
+	}
+	aiLeaseTTLText := env("AI_LEASE_TTL", defaultAILeaseTTL.String())
+	aiLeaseTTL, err := time.ParseDuration(aiLeaseTTLText)
+	if err != nil || aiLeaseTTL <= aiHandlerTimeout || aiLeaseTTL > maxAIConfiguredLeaseTTL {
+		return Config{}, fmt.Errorf("AI_LEASE_TTL must be greater than 3m and at most 24h: %q", aiLeaseTTLText)
+	}
 
 	cfg := Config{
 		Host:                 env("HOST", defaultHost),
 		Port:                 env("PORT", defaultPort),
-		DatabasePath:         env("DATABASE_PATH", defaultDatabasePath),
+		DatabaseURL:          strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		MediaDir:             env("MEDIA_DIR", defaultMediaDir),
 		PublicBaseURL:        strings.TrimRight(env("PUBLIC_BASE_URL", defaultPublicBaseURL), "/"),
 		FrontendOrigin:       strings.TrimRight(env("FRONTEND_ORIGIN", defaultFrontendOrigin), "/"),
-		MAXAPIBaseURL:        strings.TrimRight(env("MAX_API_BASE_URL", defaultMAXAPIBaseURL), "/"),
+		MAXAPIBaseURL:        env("MAX_API_BASE_URL", defaultMAXAPIBaseURL),
 		MAXBotToken:          strings.TrimSpace(os.Getenv("MAX_BOT_TOKEN")),
 		MAXWebhookSecret:     strings.TrimSpace(os.Getenv("MAX_WEBHOOK_SECRET")),
 		MAXCACertFile:        strings.TrimSpace(os.Getenv("MAX_CA_CERT_FILE")),
-		AdminAPIKey:          strings.TrimSpace(os.Getenv("ADMIN_API_KEY")),
-		AllowInsecureNoAuth:  allowInsecureNoAuth,
 		OAuthTrustXRealIP:    trustXRealIP,
 		OAuthRateLimitAtEdge: rateLimitAtEdge,
+		AuthBootstrapMode:    authBootstrapMode,
 		YandexClientID:       strings.TrimSpace(os.Getenv("YANDEX_CLIENT_ID")),
 		YandexClientSecret:   strings.TrimSpace(os.Getenv("YANDEX_CLIENT_SECRET")),
 		YandexRedirectURI:    strings.TrimSpace(os.Getenv("YANDEX_REDIRECT_URI")),
 		YandexAllowedUsers:   splitNormalizedCSV(os.Getenv("YANDEX_ALLOWED_USERS")),
 		AuthSessionTTL:       sessionTTL,
 		OpenAIAPIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		OpenAIAPIBaseURL:     strings.TrimRight(env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL), "/"),
+		OpenAIAPIBaseURL:     env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL),
 		OpenAIImageModel:     env("OPENAI_IMAGE_MODEL", defaultOpenAIImageModel),
 		OpenAIResearchModel:  env("OPENAI_RESEARCH_MODEL", defaultOpenAIResearchModel),
+		AIGlobalConcurrent:   aiGlobalConcurrent,
+		AIUserConcurrent:     aiUserConcurrent,
+		AIImagePerMinute:     aiImagePerMinute,
+		AIImagePerDay:        aiImagePerDay,
+		AIResearchPerMinute:  aiResearchPerMinute,
+		AIResearchPerDay:     aiResearchPerDay,
+		AILeaseTTL:           aiLeaseTTL,
 		SchedulerInterval:    interval,
 	}
 
-	if cfg.Host == "" || cfg.Port == "" || cfg.DatabasePath == "" || cfg.MediaDir == "" || cfg.PublicBaseURL == "" {
-		return Config{}, fmt.Errorf("HOST, PORT, DATABASE_PATH, MEDIA_DIR and PUBLIC_BASE_URL must not be empty")
+	if cfg.Host == "" || cfg.Port == "" || cfg.DatabaseURL == "" || cfg.MediaDir == "" || cfg.PublicBaseURL == "" {
+		return Config{}, fmt.Errorf("HOST, PORT, DATABASE_URL, MEDIA_DIR and PUBLIC_BASE_URL must not be empty")
+	}
+	if err := validateMAXAPIBaseURL(cfg.MAXAPIBaseURL); err != nil {
+		return Config{}, err
+	}
+	cfg.MAXAPIBaseURL = strings.TrimSuffix(cfg.MAXAPIBaseURL, "/")
+	if err := validateOpenAIAPIBaseURL(cfg.OpenAIAPIBaseURL); err != nil {
+		return Config{}, err
+	}
+	cfg.OpenAIAPIBaseURL = strings.TrimSuffix(cfg.OpenAIAPIBaseURL, "/")
+	if cfg.MAXBotToken != "" && !maxWebhookSecretPattern.MatchString(cfg.MAXWebhookSecret) {
+		return Config{}, fmt.Errorf("MAX_WEBHOOK_SECRET is required with MAX_BOT_TOKEN and must contain 5-256 letters, digits, underscores or hyphens")
 	}
 	frontendURL, err := validateFrontendOrigin(cfg.FrontendOrigin)
 	if err != nil {
 		return Config{}, err
-	}
-	if cfg.AdminAPIKey != "" && len(cfg.AdminAPIKey) < 24 {
-		return Config{}, fmt.Errorf("ADMIN_API_KEY must contain at least 24 characters")
 	}
 	oauthValues := []string{cfg.YandexClientID, cfg.YandexClientSecret, cfg.YandexRedirectURI}
 	oauthParts := 0
@@ -123,13 +186,22 @@ func Load() (Config, error) {
 			oauthParts++
 		}
 	}
+	if cfg.AuthBootstrapMode {
+		if oauthParts != 0 || len(cfg.YandexAllowedUsers) != 0 {
+			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
+		}
+		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" {
+			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX and OpenAI integrations to be disabled")
+		}
+		if err := validateBootstrapOrigins(cfg.PublicBaseURL, frontendURL); err != nil {
+			return Config{}, err
+		}
+		return cfg, nil
+	}
 	if oauthParts != 0 && oauthParts != len(oauthValues) {
 		return Config{}, fmt.Errorf("YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET and YANDEX_REDIRECT_URI must be configured together")
 	}
 	if cfg.YandexAuthEnabled() {
-		if len(cfg.YandexAllowedUsers) == 0 {
-			return Config{}, fmt.Errorf("YANDEX_ALLOWED_USERS must contain at least one Yandex ID, login or email")
-		}
 		if err := validateYandexRedirectURI(cfg.YandexRedirectURI); err != nil {
 			return Config{}, err
 		}
@@ -139,11 +211,8 @@ func Load() (Config, error) {
 	} else if len(cfg.YandexAllowedUsers) != 0 {
 		return Config{}, fmt.Errorf("YANDEX_ALLOWED_USERS requires Yandex OAuth credentials")
 	}
-	if cfg.AllowInsecureNoAuth && !isLoopbackHost(cfg.Host) {
-		return Config{}, fmt.Errorf("ALLOW_INSECURE_NO_AUTH may only be enabled on a loopback HOST")
-	}
-	if cfg.AdminAPIKey == "" && !cfg.YandexAuthEnabled() && !cfg.AllowInsecureNoAuth {
-		return Config{}, fmt.Errorf("ADMIN_API_KEY or Yandex OAuth is required; set ALLOW_INSECURE_NO_AUTH=true only for explicit loopback development")
+	if !cfg.YandexAuthEnabled() {
+		return Config{}, fmt.Errorf("yandex OAuth is required: configure YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET and YANDEX_REDIRECT_URI")
 	}
 	return cfg, nil
 }
@@ -166,6 +235,24 @@ func validateYandexRedirectURI(raw string) error {
 	return nil
 }
 
+func validateMAXAPIBaseURL(raw string) error {
+	const official = "https://platform-api2.max.ru"
+	normalized := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if normalized != official {
+		return fmt.Errorf("MAX_API_BASE_URL must be exactly %s (one trailing slash is allowed)", official)
+	}
+	return nil
+}
+
+func validateOpenAIAPIBaseURL(raw string) error {
+	const official = "https://api.openai.com"
+	normalized := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if normalized != official {
+		return fmt.Errorf("OPENAI_API_BASE_URL must be exactly %s (one trailing slash is allowed)", official)
+	}
+	return nil
+}
+
 func validateFrontendOrigin(raw string) (*url.URL, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
@@ -174,6 +261,19 @@ func validateFrontendOrigin(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("FRONTEND_ORIGIN must be an exact HTTP(S) origin without path, query or fragment")
 	}
 	return parsed, nil
+}
+
+func validateBootstrapOrigins(publicBaseURL string, frontendURL *url.URL) error {
+	publicURL, err := url.Parse(publicBaseURL)
+	if err != nil || publicURL.Scheme == "" || publicURL.Host == "" || publicURL.User != nil ||
+		(publicURL.Path != "" && publicURL.Path != "/") || publicURL.RawQuery != "" || publicURL.Fragment != "" {
+		return fmt.Errorf("PUBLIC_BASE_URL must be an exact HTTP origin in AUTH_BOOTSTRAP_MODE")
+	}
+	if frontendURL == nil || publicURL.Scheme != "http" || frontendURL.Scheme != "http" ||
+		publicURL.Host != frontendURL.Host || net.ParseIP(publicURL.Hostname()) == nil {
+		return fmt.Errorf("AUTH_BOOTSTRAP_MODE requires PUBLIC_BASE_URL and FRONTEND_ORIGIN to be the same plain-HTTP IP origin")
+	}
+	return nil
 }
 
 func isLoopbackHost(host string) bool {
@@ -207,4 +307,13 @@ func splitNormalizedCSV(value string) []string {
 		items = append(items, item)
 	}
 	return items
+}
+
+func boundedPositiveIntEnv(name string, fallback, maximum int) (int, error) {
+	raw := env(name, strconv.Itoa(fallback))
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d: %q", name, maximum, raw)
+	}
+	return value, nil
 }

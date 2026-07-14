@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -137,6 +138,38 @@ func TestGenerateUsesWebSearchCitationsThenStructuredOutput(t *testing.T) {
 	inputJSON, _ := json.Marshal(second["input"])
 	if !strings.Contains(string(inputJSON), "include_sources") || !strings.Contains(string(inputJSON), "example.com/report") {
 		t.Fatalf("draft input is missing research context: %s", inputJSON)
+	}
+}
+
+func TestResearchAPIKeyNeverFollowsRedirect(t *testing.T) {
+	t.Parallel()
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalls.Add(1)
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("redirect target received Authorization %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/stolen")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client, err := New(origin.URL, "shared-openai-key", "gpt-5.4-mini", origin.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Generate(context.Background(), Request{
+		Topic: "Безопасность редакционных процессов", Tone: "деловой", Format: "markdown",
+	})
+	if err == nil {
+		t.Fatal("Generate followed or accepted redirect")
+	}
+	if targetCalls.Load() != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", targetCalls.Load())
 	}
 }
 

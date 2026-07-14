@@ -99,7 +99,7 @@ func (c *Client) ExchangeCode(ctx context.Context, code, codeVerifier string) (s
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.SetBasicAuth(c.clientID, c.clientSecret)
-	response, err := c.httpClient.Do(req)
+	response, err := c.doWithoutRedirects(req)
 	if err != nil {
 		return "", fmt.Errorf("request Yandex token: %w", err)
 	}
@@ -108,6 +108,7 @@ func (c *Client) ExchangeCode(ctx context.Context, code, codeVerifier string) (s
 	}()
 
 	var payload struct {
+		// #nosec G117 -- access_token is the mandatory Yandex OAuth response field; it stays in memory and is never logged or serialized by this service.
 		AccessToken      string `json:"access_token"`
 		Error            string `json:"error"`
 		ErrorDescription string `json:"error_description"`
@@ -135,7 +136,7 @@ func (c *Client) UserInfo(ctx context.Context, accessToken string) (Profile, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "OAuth "+accessToken)
-	response, err := c.httpClient.Do(req)
+	response, err := c.doWithoutRedirects(req)
 	if err != nil {
 		return Profile{}, fmt.Errorf("request Yandex user info: %w", err)
 	}
@@ -151,6 +152,15 @@ func (c *Client) UserInfo(ctx context.Context, accessToken string) (Profile, err
 		return Profile{}, &Error{Operation: "user info", StatusCode: response.StatusCode, Code: "invalid_profile"}
 	}
 	return profile, nil
+}
+
+func (c *Client) doWithoutRedirects(req *http.Request) (*http.Response, error) {
+	client := *c.httpClient
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	// #nosec G704 -- callers construct requests only from the fixed official Yandex endpoints stored by New; redirects are disabled above.
+	return client.Do(req)
 }
 
 func decodeLimitedJSON(reader io.Reader, target any) error {

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -45,6 +46,35 @@ func TestGenerateUsesImagesEndpointAndDecodesBase64(t *testing.T) {
 	}
 	if string(result.Bytes) != string(want) || result.RequestID != "req_123" {
 		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestImageAPIKeyNeverFollowsRedirect(t *testing.T) {
+	t.Parallel()
+	var targetCalls atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetCalls.Add(1)
+		if got := r.Header.Get("Authorization"); got != "" {
+			t.Errorf("redirect target received Authorization %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", target.URL+"/stolen")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+
+	client, err := New(origin.URL, "shared-openai-key", "gpt-image-2", origin.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Generate(context.Background(), GenerateRequest{Prompt: "A safe illustration"}); err == nil {
+		t.Fatal("Generate followed or accepted redirect")
+	}
+	if targetCalls.Load() != 0 {
+		t.Fatalf("redirect target calls = %d, want 0", targetCalls.Load())
 	}
 }
 

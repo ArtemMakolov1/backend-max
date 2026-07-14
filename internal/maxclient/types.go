@@ -44,6 +44,7 @@ type ChatIcon struct {
 // channel without creating a visible test message.
 type ChatInfo struct {
 	ChatID            string   `json:"chat_id"`
+	OwnerID           string   `json:"owner_id"`
 	Type              string   `json:"type"`
 	Status            string   `json:"status"`
 	Title             string   `json:"title"`
@@ -85,11 +86,11 @@ func (m Membership) HasPermission(required Permission) bool {
 				return true
 			}
 		case PermissionEdit:
-			if permission == "edit_message" {
+			if permission == PermissionWrite || permission == "post_edit_delete_message" || permission == "edit_message" {
 				return true
 			}
 		case PermissionDelete:
-			if permission == "delete_message" {
+			if permission == PermissionWrite || permission == "post_edit_delete_message" || permission == "delete_message" {
 				return true
 			}
 		}

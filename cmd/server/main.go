@@ -35,14 +35,11 @@ func main() {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
-	if cfg.AllowInsecureNoAuth && cfg.AdminAPIKey == "" && !cfg.YandexAuthEnabled() {
-		logger.Warn("management API is running without authentication in loopback development mode")
-	}
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	storage, err := store.Open(rootCtx, cfg.DatabasePath)
+	storage, err := store.OpenRuntime(rootCtx, cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("could not open database", "error", err)
 		os.Exit(1)
@@ -101,11 +98,20 @@ func main() {
 		}
 		yandexOAuth = client
 	}
-	apiServer := api.New(application, logger, cfg.FrontendOrigin, cfg.MAXWebhookSecret, cfg.AdminAPIKey, api.AuthOptions{
+	apiServer := api.New(application, logger, cfg.FrontendOrigin, cfg.MAXWebhookSecret, api.AuthOptions{
 		YandexClient: yandexOAuth, RedirectURI: cfg.YandexRedirectURI,
 		AllowedUsers: cfg.YandexAllowedUsers, SessionTTL: cfg.AuthSessionTTL,
 		SecureCookies: strings.HasPrefix(strings.ToLower(cfg.YandexRedirectURI), "https://"),
 		TrustXRealIP:  cfg.OAuthTrustXRealIP, RateLimitAtEdge: cfg.OAuthRateLimitAtEdge,
+		AILimits: &api.AILimitOptions{
+			GlobalMaxConcurrent: cfg.AIGlobalConcurrent,
+			UserMaxConcurrent:   cfg.AIUserConcurrent,
+			ImagePerMinute:      cfg.AIImagePerMinute,
+			ImagePerDay:         cfg.AIImagePerDay,
+			ResearchPerMinute:   cfg.AIResearchPerMinute,
+			ResearchPerDay:      cfg.AIResearchPerDay,
+			LeaseTTL:            cfg.AILeaseTTL,
+		},
 	})
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, cfg.Port),
@@ -124,7 +130,7 @@ func main() {
 	serverErr := make(chan error, 1)
 	go func() {
 		logger.Info("server started", "address", httpServer.Addr, "frontend_origin", cfg.FrontendOrigin,
-			"admin_auth", cfg.AdminAPIKey != "", "yandex_auth", cfg.YandexAuthEnabled())
+			"yandex_auth", cfg.YandexAuthEnabled())
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
