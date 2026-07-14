@@ -49,6 +49,7 @@ jobs:
       - name: Verify release and deployment rollback policies
         run: |
           ./deploy/tests/release-gate-policy.sh
+          ./deploy/tests/pgbouncer-healthcheck-policy.sh
           ./deploy/tests/rollback-policy.sh
       - name: Run all tests with the race detector
         run: go test -race ./...
