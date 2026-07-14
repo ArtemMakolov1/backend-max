@@ -34,7 +34,7 @@ type MAXClient interface {
 	GetChatByLink(context.Context, string) (maxclient.ChatInfo, error)
 	GetMembership(context.Context, string) (maxclient.Membership, error)
 	SendClaimConfirmation(context.Context, string, string, string, string, string, string, string) error
-	AnswerCallback(context.Context, string, string) error
+	AnswerCallback(context.Context, string, string, string) error
 	UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error)
 	Publish(context.Context, maxclient.PublishRequest) (maxclient.Message, error)
 	Edit(context.Context, maxclient.EditRequest) error
@@ -397,11 +397,11 @@ func (a *App) ConnectDiscoverableChannelForUser(ctx context.Context, userID, max
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
 
-func (a *App) AnswerMAXCallback(ctx context.Context, callbackID, notification string) error {
+func (a *App) AnswerMAXCallback(ctx context.Context, callbackID, notification, messageText string) error {
 	if a.max == nil {
 		return ErrMAXNotConfigured
 	}
-	return a.max.AnswerCallback(ctx, callbackID, notification)
+	return a.max.AnswerCallback(ctx, callbackID, notification, messageText)
 }
 
 func (a *App) TestChannel(ctx context.Context, channelID int64) (ChannelCheck, error) {

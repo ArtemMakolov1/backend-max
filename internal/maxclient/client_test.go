@@ -206,6 +206,65 @@ func TestSendIdentityLinkConfirmationUsesPrivateCallbackButtons(t *testing.T) {
 	}
 }
 
+func TestAnswerCallbackReplacesSourceMessageAndClearsKeyboard(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/answers" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.URL.Query().Get("callback_id"); got != "callback-42" {
+			t.Errorf("callback_id = %q", got)
+		}
+		var body struct {
+			Notification string `json:"notification"`
+			Message      struct {
+				Text        string `json:"text"`
+				Attachments []any  `json:"attachments"`
+			} `json:"message"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Notification != "Профиль связан" || body.Message.Text != "✅ Готово! Профиль связан." {
+			t.Errorf("callback answer = %#v", body)
+		}
+		if body.Message.Attachments == nil || len(body.Message.Attachments) != 0 {
+			t.Errorf("inline keyboard was not removed: %#v", body.Message.Attachments)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "shared-token", server.Client())
+	if err := client.AnswerCallback(context.Background(), "callback-42", "Профиль связан", "✅ Готово! Профиль связан."); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AnswerCallback(context.Background(), "", "Профиль связан", ""); err == nil {
+		t.Fatal("empty callback ID was accepted")
+	}
+	if err := client.AnswerCallback(context.Background(), "callback-42", "", ""); err == nil {
+		t.Fatal("empty callback answer was accepted")
+	}
+}
+
+func TestAnswerCallbackReportsUnsuccessfulTwoHundredResponse(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":false,"message":"cannot replace callback message"}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "shared-token", server.Client())
+	err := client.AnswerCallback(context.Background(), "callback-42", "Профиль связан", "✅ Готово!")
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "operation_failed" || apiErr.Message != "cannot replace callback message" {
+		t.Fatalf("AnswerCallback() error = %#v", err)
+	}
+}
+
 func TestGetChatRejectsInvalidAndMalformedChatID(t *testing.T) {
 	t.Parallel()
 	client := mustClient(t, "https://platform-api2.max.ru", "token", http.DefaultClient)

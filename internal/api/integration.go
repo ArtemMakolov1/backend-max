@@ -302,7 +302,14 @@ func (s *Server) handleMessageCallback(w http.ResponseWriter, r *http.Request, u
 	}
 	if update.Callback.CallbackID != "" {
 		ctx, cancel := contextWithTimeout(r, 5*time.Second)
-		if answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID, notification); answerErr != nil {
+		messageText := notification
+		switch claim.Status {
+		case store.ChannelClaimConnected:
+			messageText = "✅ Готово! Канал подключён к MaxPosty.\n\nВернитесь в MaxPosty — теперь в него можно публиковать посты."
+		case store.ChannelClaimFailed:
+			messageText = notification + "\n\nВернитесь в MaxPosty, чтобы проверить настройки или начать заново."
+		}
+		if answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID, notification, messageText); answerErr != nil {
 			s.logger.Warn("could not answer MAX callback", "error", answerErr)
 		}
 		cancel()
@@ -385,7 +392,11 @@ func (s *Server) handleMAXIdentityCallback(w http.ResponseWriter, r *http.Reques
 	}
 	if update.Callback.CallbackID != "" {
 		ctx, cancel := contextWithTimeout(r, 5*time.Second)
-		if answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID, notification); answerErr != nil {
+		messageText := "✅ Готово! Профиль MAX связан с MaxPosty.\n\nВернитесь в MaxPosty — теперь можно подключить канал."
+		if attempt.Status == store.MAXIdentityAttemptFailed {
+			messageText = notification + "\n\nВернитесь в MaxPosty, чтобы проверить данные или начать заново."
+		}
+		if answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID, notification, messageText); answerErr != nil {
 			s.logger.Warn("could not answer MAX identity callback", "error", answerErr)
 		}
 		cancel()
