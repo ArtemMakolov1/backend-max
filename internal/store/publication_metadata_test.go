@@ -102,22 +102,39 @@ func TestMarkAndClearPublicationMetadata(t *testing.T) {
 	if post.MAXMessageID != "mid.lifecycle" || post.MAXMessageURL != "https://max.ru/channel/lifecycle" || post.MAXIsPinned || post.MAXViews != nil {
 		t.Fatalf("marked post = %#v", post)
 	}
+	if post.PublishedAt == nil {
+		t.Fatal("marked post has no published_at")
+	}
+	publishedAt := *post.PublishedAt
 	views := int64(3)
+	firstSyncAt := publishedAt.Add(time.Minute)
 	post, err = storage.SyncPublicationMetadataForUser(ctx, "test-owner", post.ID, channel.ID, post.MAXMessageID,
-		post.MAXMessageURL, &views, time.Now().UTC(), true)
+		post.MAXMessageURL, &views, firstSyncAt, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if post.MAXViews == nil || !post.MAXIsPinned || post.MAXStatsSyncedAt == nil {
 		t.Fatalf("sync did not set lifecycle metadata: %#v", post)
 	}
-	post, err = storage.ClearPublication(ctx, post.ID)
+	if _, err := storage.ClearPublicationForUser(ctx, "foreign-owner", post.ID, channel.ID, post.MAXMessageID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign clear error = %v, want ErrNotFound", err)
+	}
+	if _, err := storage.ClearPublicationForUser(ctx, "test-owner", post.ID, channel.ID, "mid.stale"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale clear error = %v, want ErrConflict", err)
+	}
+	post, err = storage.ClearPublicationForUser(ctx, "test-owner", post.ID, channel.ID, post.MAXMessageID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if post.Status != PostStatusDraft || post.MAXMessageID != "" || post.MAXMessageURL != "" ||
-		post.MAXViews != nil || post.MAXStatsSyncedAt != nil || post.MAXIsPinned {
+		post.MAXViews == nil || *post.MAXViews != views || post.MAXStatsSyncedAt == nil ||
+		!post.MAXStatsSyncedAt.Equal(firstSyncAt) || post.MAXStatsAttemptedAt != nil || post.MAXIsPinned ||
+		post.PublishedAt == nil || !post.PublishedAt.Equal(publishedAt) || post.LastError != "" {
 		t.Fatalf("cleared post = %#v", post)
+	}
+	history, err := storage.ListPostViewSnapshotsForUser(ctx, "test-owner", post.ID, nil, 500)
+	if err != nil || len(history) != 1 || history[0].MAXMessageID != "mid.lifecycle" || history[0].Views != views {
+		t.Fatalf("preserved explicit-delete history = %#v, %v", history, err)
 	}
 	post, err = storage.ClaimForPublishing(ctx, post.ID)
 	if err != nil {
@@ -132,7 +149,7 @@ func TestMarkAndClearPublicationMetadata(t *testing.T) {
 		post.MAXMessageURL, &secondViews, time.Now().UTC().Add(time.Minute), false); err != nil {
 		t.Fatal(err)
 	}
-	history, err := storage.ListPostViewSnapshotsForUser(ctx, "test-owner", post.ID, nil, 500)
+	history, err = storage.ListPostViewSnapshotsForUser(ctx, "test-owner", post.ID, nil, 500)
 	if err != nil || len(history) != 2 || history[0].MAXMessageID != "mid.lifecycle.second" || history[1].MAXMessageID != "mid.lifecycle" {
 		t.Fatalf("publication-segmented history = %#v, %v", history, err)
 	}

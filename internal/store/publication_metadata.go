@@ -186,6 +186,38 @@ WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND stat
 	return Post{}, fmt.Errorf("%w: MAX publication changed while its deletion was being reconciled", ErrConflict)
 }
 
+// ClearPublicationForUser records a successful, explicit deletion from MAX.
+// Live publication identifiers and mutable state are cleared so the post can
+// be published again, while published_at, the latest observed view count and
+// its immutable view snapshots remain available as historical facts.
+// The tenant, channel and expected MAX message are all part of the update so a
+// delayed delete cannot clear a concurrent re-publication or another user's
+// post.
+func (s *Store) ClearPublicationForUser(ctx context.Context, userID string, postID, channelID int64,
+	expectedMessageID string,
+) (Post, error) {
+	if err := validatePublicationMutation(userID, postID, channelID, expectedMessageID); err != nil {
+		return Post{}, err
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE posts
+SET status = ?, max_message_id = '', max_message_url = '',
+    max_stats_attempted_at = NULL, max_is_pinned = FALSE,
+    scheduled_at = NULL, last_error = '', updated_at = ?
+WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND status = ?`,
+		PostStatusDraft, nowText(), userID, postID, channelID, expectedMessageID, PostStatusPublished)
+	if err != nil {
+		return Post{}, fmt.Errorf("clear MAX publication: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 1 {
+		return s.GetPostForUser(ctx, userID, postID)
+	}
+	if _, err := s.GetPostForUser(ctx, userID, postID); err != nil {
+		return Post{}, err
+	}
+	return Post{}, fmt.Errorf("%w: MAX publication changed while it was being deleted", ErrConflict)
+}
+
 // SetPublicationPinnedForUser reconciles the local pin flags after a
 // successful MAX mutation. MAX permits one pin per chat, so setting true also
 // clears any older flag for this tenant and channel in the same transaction.

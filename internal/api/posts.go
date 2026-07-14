@@ -476,13 +476,9 @@ func (s *Server) deletePublication(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	if _, err := s.app.Store().GetPostForUser(r.Context(), userID, id); err != nil {
-		s.writeError(w, err)
-		return
-	}
 	ctx, cancel := contextWithTimeout(r, time.Minute)
 	defer cancel()
-	post, err := s.app.DeletePublication(ctx, id)
+	post, err := s.app.DeletePublication(ctx, userID, id)
 	if err != nil {
 		s.writeError(w, err)
 		return

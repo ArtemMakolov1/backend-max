@@ -182,6 +182,64 @@ func TestSyncMAXPublicationReconcilesMessageDeletedInMAX(t *testing.T) {
 	}
 }
 
+func TestDeletePublicationPreservesHistoryAndIsTenantScoped(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "-208", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionDelete,
+		}},
+	}
+	application, storage := newTestApp(t, fake)
+	ctx := context.Background()
+	channel, err := storage.CreateChannel(ctx, store.Channel{MAXChatID: "-208", Title: "Channel", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedAt := time.Date(2038, time.April, 6, 10, 0, 0, 0, time.UTC)
+	post, err := storage.CreatePost(ctx, store.Post{
+		Title: "Explicit delete", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.explicit", MAXMessageURL: "https://max.ru/channel/explicit",
+		PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	views := int64(23)
+	syncedAt := publishedAt.Add(time.Hour)
+	post, err = storage.SyncPublicationMetadataForUser(ctx, "test-owner", post.ID, channel.ID, post.MAXMessageID,
+		post.MAXMessageURL, &views, syncedAt, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := application.DeletePublication(ctx, "foreign-owner", post.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("foreign delete error = %v, want ErrNotFound", err)
+	}
+	if fake.deleteCalls != 0 {
+		t.Fatal("foreign delete reached MAX")
+	}
+	post, err = application.DeletePublication(ctx, "test-owner", post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.deleteCalls != 1 || post.Status != store.PostStatusDraft || post.MAXMessageID != "" ||
+		post.MAXMessageURL != "" || post.MAXViews == nil || *post.MAXViews != views ||
+		post.MAXStatsSyncedAt == nil || !post.MAXStatsSyncedAt.Equal(syncedAt) ||
+		post.MAXStatsAttemptedAt != nil || post.MAXIsPinned || post.PublishedAt == nil ||
+		!post.PublishedAt.Equal(publishedAt) {
+		t.Fatalf("deleted publication = %#v, MAX calls=%d", post, fake.deleteCalls)
+	}
+	history, err := storage.ListPostViewSnapshotsForUser(ctx, "test-owner", post.ID, nil, 500)
+	if err != nil || len(history) != 1 || history[0].MAXMessageID != "mid.explicit" || history[0].Views != views {
+		t.Fatalf("preserved view history = %#v, %v", history, err)
+	}
+	post, err = storage.ClaimForPublishing(ctx, post.ID)
+	if err != nil || post.Status != store.PostStatusPublishing {
+		t.Fatalf("republish claim = %#v, %v", post, err)
+	}
+}
+
 func TestPinAndUnpinRequireOptionalPinPermission(t *testing.T) {
 	t.Parallel()
 	fake := &fakeMAX{

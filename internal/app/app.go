@@ -707,13 +707,13 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post
 	return a.store.GetPost(ctx, postID)
 }
 
-func (a *App) DeletePublication(ctx context.Context, postID int64) (store.Post, error) {
-	if a.max == nil {
-		return store.Post{}, ErrMAXNotConfigured
-	}
-	post, err := a.store.GetPost(ctx, postID)
+func (a *App) DeletePublication(ctx context.Context, userID string, postID int64) (store.Post, error) {
+	post, err := a.store.GetPostForUser(ctx, userID, postID)
 	if err != nil {
 		return store.Post{}, err
+	}
+	if a.max == nil {
+		return store.Post{}, ErrMAXNotConfigured
 	}
 	if post.MAXMessageID == "" {
 		return store.Post{}, fmt.Errorf("%w: post has no MAX publication", ErrConflict)
@@ -724,7 +724,7 @@ func (a *App) DeletePublication(ctx context.Context, postID int64) (store.Post, 
 	if post.ChannelID == nil {
 		return store.Post{}, errors.New("published post has no channel_id")
 	}
-	channel, err := a.store.GetChannel(ctx, *post.ChannelID)
+	channel, err := a.store.GetChannelForUser(ctx, userID, *post.ChannelID)
 	if err != nil {
 		return store.Post{}, err
 	}
@@ -739,7 +739,7 @@ func (a *App) DeletePublication(ctx context.Context, postID int64) (store.Post, 
 	if err := a.max.Delete(ctx, post.MAXMessageID); err != nil {
 		return store.Post{}, err
 	}
-	return a.store.ClearPublication(ctx, postID)
+	return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)
 }
 
 // SyncMAXPublication refreshes the canonical MAX URL, latest view count and

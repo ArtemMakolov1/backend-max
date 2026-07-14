@@ -1205,21 +1205,6 @@ UPDATE posts SET status = ?, last_error = ?, scheduled_at = NULL, updated_at = ?
 	return s.GetPost(ctx, id)
 }
 
-func (s *Store) ClearPublication(ctx context.Context, id int64) (Post, error) {
-	result, err := s.db.ExecContext(ctx, `
-UPDATE posts SET status = ?, max_message_id = '', max_message_url = '', max_views = NULL,
-                 max_stats_synced_at = NULL, max_stats_attempted_at = NULL, max_is_pinned = FALSE,
-                 published_at = NULL, last_error = '', updated_at = ?
-WHERE id = ? AND status != ?`, PostStatusDraft, nowText(), id, PostStatusPublishing)
-	if err != nil {
-		return Post{}, fmt.Errorf("clear publication: %w", err)
-	}
-	if n, _ := result.RowsAffected(); n == 0 {
-		return Post{}, s.postWriteMiss(ctx, id, "post is currently publishing")
-	}
-	return s.GetPost(ctx, id)
-}
-
 const postColumns = `id, owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views, max_stats_synced_at,
 max_stats_attempted_at, max_is_pinned, last_error, created_at, updated_at, published_at`

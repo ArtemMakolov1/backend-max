@@ -513,7 +513,7 @@ func TestPublishedMutationsRecheckEditAndDeletePermissions(t *testing.T) {
 	if _, err := application.UpdatePublishedPost(context.Background(), post.ID); err == nil {
 		t.Fatal("UpdatePublishedPost accepted missing edit permission")
 	}
-	if _, err := application.DeletePublication(context.Background(), post.ID); err == nil {
+	if _, err := application.DeletePublication(context.Background(), "test-owner", post.ID); err == nil {
 		t.Fatal("DeletePublication accepted missing delete permission")
 	}
 	if fake.editCalls != 0 || fake.deleteCalls != 0 {

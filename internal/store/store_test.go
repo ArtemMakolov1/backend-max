@@ -332,7 +332,7 @@ func TestChannelDeletionProtectsPublicationDependencies(t *testing.T) {
 	if _, err := storage.MarkPublishFailed(ctx, publishing.ID, "stopped"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.ClearPublication(ctx, published.ID); err != nil {
+	if _, err := storage.ClearPublicationForUser(ctx, published.UserID, published.ID, channel.ID, published.MAXMessageID); err != nil {
 		t.Fatal(err)
 	}
 	count, err = storage.CountChannelBlockingPosts(ctx, channel.ID)
