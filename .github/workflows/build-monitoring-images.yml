@@ -1,0 +1,112 @@
+name: Build patched monitoring images
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: maxposty-monitoring-images
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build immutable exporter images
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      postgres_exporter: ${{ steps.build.outputs.postgres_exporter }}
+      pgbouncer_exporter: ${{ steps.build.outputs.pgbouncer_exporter }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push both architectures with provenance and SBOM
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          docker buildx create --name maxposty-monitoring-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+          build_image() {
+            local component=$1
+            local version=$2
+            local dockerfile=$3
+            local repository="ghcr.io/${owner}/maxposty-${component}"
+            local metadata="$RUNNER_TEMP/${component}.json"
+            docker buildx build \
+              --platform linux/amd64,linux/arm64 \
+              --file "$dockerfile" \
+              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --tag "${repository}:${version}" \
+              --provenance=mode=max \
+              --sbom=true \
+              --metadata-file "$metadata" \
+              --push \
+              .
+            local digest
+            digest=$(jq -er '."containerimage.digest"' "$metadata")
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            printf '%s=%s@%s\n' "${component//-/_}" "$repository" "$digest" >>"$GITHUB_OUTPUT"
+          }
+
+          build_image postgres-exporter v0.20.1-go1.26.5.1 docker/monitoring/postgres-exporter.Dockerfile
+          build_image pgbouncer-exporter v0.12.1-go1.26.5.1 docker/monitoring/pgbouncer-exporter.Dockerfile
+      - name: Remove registry credentials
+        if: ${{ always() }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
+
+  scan:
+    name: Scan ${{ matrix.component }} (${{ matrix.platform }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [postgres-exporter, pgbouncer-exporter]
+        platform: [linux/amd64, linux/arm64]
+    env:
+      TRIVY_PLATFORM: ${{ matrix.platform }}
+      IMAGE_REF: >-
+        ${{ matrix.component == 'postgres-exporter' &&
+            needs.build.outputs.postgres_exporter ||
+            needs.build.outputs.pgbouncer_exporter }}
+    steps:
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Block fixed high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          version: v0.72.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: "true"
+          exit-code: "1"
+          format: table
+          timeout: 10m
+      - name: Remove registry credentials
+        if: ${{ always() }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
