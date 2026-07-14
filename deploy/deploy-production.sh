@@ -286,13 +286,22 @@ chmod 600 "$manifest_final"
 
 backup_hook="$installation_dir/hooks/after-backup"
 bootstrap_mode=$(env_value "$next_env" AUTH_BOOTSTRAP_MODE)
-if [[ -x "$backup_hook" ]]; then
-  "$backup_hook" "$backup_final" "$media_final" "$manifest_final" "$image"
-elif [[ "$bootstrap_mode" == "false" ]]; then
-  echo "Production requires executable offsite backup hook: $backup_hook" >&2
-  exit 1
+if [[ "$bootstrap_mode" == "false" ]]; then
+  if [[ ! -x "$backup_hook" ]]; then
+    echo "Production requires executable offsite backup hook: $backup_hook" >&2
+    exit 1
+  fi
+  snapshot_image=$image
+  snapshot_source_sha=$release_id
+  if [[ -n "$current_dir" ]]; then
+    snapshot_image=$(env_value "$current_release" BACKEND_IMAGE)
+    snapshot_source_sha=$(basename -- "$current_dir")
+  fi
+  MAXPOSTY_BACKUP_SNAPSHOT_IMAGE="$snapshot_image" \
+    MAXPOSTY_BACKUP_SNAPSHOT_SOURCE_SHA="$snapshot_source_sha" \
+    "$backup_hook" "$backup_final" "$media_final" "$manifest_final" "$image"
 else
-  echo "Bootstrap warning: offsite backup hook is not installed; local snapshots only" >&2
+  echo "Bootstrap warning: encrypted offsite publication is disabled; local snapshots only" >&2
 fi
 
 retention_days=$(env_value "$next_env" BACKUP_RETENTION_DAYS)

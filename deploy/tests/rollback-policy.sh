@@ -36,6 +36,38 @@ render_bootstrap_env() {
     "$repo_root/deploy/render-production-env.sh" "$output"
 }
 
+run_bootstrap_skips_installed_offsite_hook() {
+  local sandbox installation_dir release_dir fake_bin output
+  if ! mv --help 2>&1 | grep -q -- '-T'; then
+    return 0
+  fi
+  sandbox=$(mktemp -d)
+  sandbox=$(CDPATH='' cd -- "$sandbox" && pwd -P)
+  installation_dir="$sandbox/backend"
+  release_dir="$installation_dir/releases/$new_sha"
+  fake_bin="$sandbox/bin"
+  output="$sandbox/output.log"
+  install -d "$fake_bin" "$sandbox/empty" "$installation_dir/hooks"
+  prepare_release "$release_dir"
+  render_bootstrap_env "$release_dir/.env.production.next"
+  ln -s "$repo_root/deploy/tests/fake-docker.sh" "$fake_bin/docker"
+  ln -s "$(type -P true)" "$fake_bin/flock"
+  printf '#!/usr/bin/env sh\ntouch "$TEST_HOOK_CALLED"\nexit 99\n' >"$installation_dir/hooks/after-backup"
+  chmod 755 "$installation_dir/hooks/after-backup"
+
+  PATH="$fake_bin:$PATH" \
+    TEST_LOG="$sandbox/docker.log" \
+    TEST_SCENARIO=bootstrap-hook-skip \
+    TEST_EMPTY_DIR="$sandbox/empty" \
+    TEST_OLD_SHA="$old_sha" \
+    TEST_HOOK_CALLED="$sandbox/hook-called" \
+    "$release_dir/deploy/deploy-production.sh" "$image" >"$output" 2>&1
+
+  [[ ! -e "$sandbox/hook-called" ]]
+  [[ "$(readlink -f "$installation_dir/current")" == "$release_dir" ]]
+  rm -rf "$sandbox"
+}
+
 run_initial_failure_policy() {
   local sandbox installation_dir release_dir fake_bin output
   sandbox=$(mktemp -d)
@@ -131,6 +163,7 @@ run_previous_release_recovery_policy() {
   rm -rf "$sandbox"
 }
 
+run_bootstrap_skips_installed_offsite_hook
 run_initial_failure_policy
 run_previous_release_recovery_policy
 echo "Deployment rollback policy tests passed."

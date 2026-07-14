@@ -172,9 +172,11 @@ jobs:
     needs: [image, scan]
     if: ${{ vars.DEPLOY_ENABLED == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
-      contents: read
+      # Production publishes a verified encrypted pre-migration snapshot as an
+      # immutable Release before it is allowed to apply additive migrations.
+      contents: write
       packages: read
     environment:
       name: ${{ vars.DEPLOY_STAGE == 'production' && 'production' || 'bootstrap' }}
@@ -285,7 +287,7 @@ jobs:
             "set -eu; trap \"rm -f '$remote_artifact'\" 0; tar -xzf '$remote_artifact' --no-same-owner -C '$release_dir'; if [ -e '$release_dir/certs' ] && [ ! -L '$release_dir/certs' ]; then rmdir '$release_dir/certs'; fi; ln -sfn '$install_dir/certs' '$release_dir/certs'"
           scp "${scp_options[@]}" "$PRODUCTION_ENV_PATH" "$target:$release_dir/.env.production.next"
           printf '%s\n' "$GHCR_TOKEN" | ssh "${ssh_options[@]}" "$target" \
-            "set -eu; trap \"rm -f '$release_dir/.env.production.next' '$release_dir/.release.next'\" 0; chmod 600 '$release_dir/.env.production.next'; '$release_dir/deploy/run-from-ci.sh' '$IMAGE' '$GITHUB_ACTOR' '$CONFIGURE_MAX_WEBHOOK'"
+            "set -eu; trap \"rm -f '$release_dir/.env.production.next' '$release_dir/.release.next'\" 0; chmod 600 '$release_dir/.env.production.next'; '$release_dir/deploy/run-from-ci.sh' '$IMAGE' '$GITHUB_ACTOR' '$CONFIGURE_MAX_WEBHOOK' '$GITHUB_REPOSITORY' '$SOURCE_SHA'"
           rm -f "$PRODUCTION_ENV_PATH" "$artifact"
       - name: Remove runner deployment credentials
         if: ${{ always() }}
