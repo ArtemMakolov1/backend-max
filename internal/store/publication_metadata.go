@@ -150,8 +150,9 @@ INSERT INTO post_view_snapshots(owner_id, post_id, max_message_id, views, captur
 
 // MarkMAXPublicationMissingForUser reconciles a post that was published by
 // MaxPosty but has since been deleted directly in MAX. The original
-// published_at and view snapshots remain historical facts; live MAX metadata
-// is cleared and the failed lifecycle state permits publishing the post again.
+// published_at, the last observed view count, and view snapshots remain
+// historical facts; live MAX identifiers are cleared and the failed lifecycle
+// state permits publishing the post again.
 // expectedMessageID makes a delayed 404 harmless if the post was concurrently
 // republished with a different MAX message.
 func (s *Store) MarkMAXPublicationMissingForUser(ctx context.Context, userID string, postID, channelID int64,
@@ -162,8 +163,8 @@ func (s *Store) MarkMAXPublicationMissingForUser(ctx context.Context, userID str
 	}
 	result, err := s.db.ExecContext(ctx, `
 UPDATE posts
-SET status = ?, max_message_id = '', max_message_url = '', max_views = NULL,
-    max_stats_synced_at = NULL, max_stats_attempted_at = NULL, max_is_pinned = FALSE,
+SET status = ?, max_message_id = '', max_message_url = '',
+    max_stats_attempted_at = NULL, max_is_pinned = FALSE,
     scheduled_at = NULL, last_error = ?, updated_at = ?
 WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND status = ?`,
 		PostStatusFailed, MAXPublicationMissingLastError, nowText(), userID, postID, channelID,

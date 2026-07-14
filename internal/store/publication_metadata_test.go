@@ -176,7 +176,8 @@ func TestMarkMAXPublicationMissingPreservesHistoryAndAllowsRepublish(t *testing.
 		t.Fatal(err)
 	}
 	if post.Status != PostStatusFailed || post.LastError != MAXPublicationMissingLastError ||
-		post.MAXMessageID != "" || post.MAXMessageURL != "" || post.MAXViews != nil || post.MAXStatsSyncedAt != nil ||
+		post.MAXMessageID != "" || post.MAXMessageURL != "" || post.MAXViews == nil || *post.MAXViews != views ||
+		post.MAXStatsSyncedAt == nil || !post.MAXStatsSyncedAt.Equal(publishedAt.Add(time.Hour)) ||
 		post.MAXStatsAttemptedAt != nil || post.MAXIsPinned || post.PublishedAt == nil || !post.PublishedAt.Equal(publishedAt) {
 		t.Fatalf("reconciled post = %#v", post)
 	}

@@ -157,12 +157,19 @@ func TestSyncMAXPublicationReconcilesMessageDeletedInMAX(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	views := int64(12)
+	post, err = storage.SyncPublicationMetadataForUser(context.Background(), "test-owner", post.ID, channel.ID,
+		post.MAXMessageID, post.MAXMessageURL, &views, now.Add(-time.Minute), false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	post, err = application.SyncMAXPublication(context.Background(), "test-owner", post.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if post.Status != store.PostStatusFailed || post.LastError != store.MAXPublicationMissingLastError ||
-		post.MAXMessageID != "" || post.MAXMessageURL != "" || post.MAXStatsAttemptedAt != nil ||
+		post.MAXMessageID != "" || post.MAXMessageURL != "" || post.MAXViews == nil || *post.MAXViews != views ||
+		post.MAXStatsSyncedAt == nil || post.MAXStatsAttemptedAt != nil ||
 		post.PublishedAt == nil || !post.PublishedAt.Equal(publishedAt) {
 		t.Fatalf("reconciled post = %#v", post)
 	}
