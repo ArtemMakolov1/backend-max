@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -14,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/media"
@@ -27,17 +25,12 @@ type fakeResearchClient struct {
 	requests []openairesearch.Request
 	result   openairesearch.Result
 	err      error
-	wait     bool
 }
 
 func (f *fakeResearchClient) Generate(ctx context.Context, request openairesearch.Request) (openairesearch.Result, error) {
 	f.mu.Lock()
 	f.requests = append(f.requests, request)
 	f.mu.Unlock()
-	if f.wait {
-		<-ctx.Done()
-		return openairesearch.Result{}, ctx.Err()
-	}
 	return f.result, f.err
 }
 
@@ -140,15 +133,13 @@ func TestResearchGenerateReportsUnavailableConfigurationAndUpstreamFailure(t *te
 	})
 }
 
-func TestResearchGenerateMapsParentDeadlineToGatewayTimeout(t *testing.T) {
+func TestResearchGenerateMapsDeadlineExceededToGatewayTimeout(t *testing.T) {
 	t.Parallel()
-	fake := &fakeResearchClient{wait: true}
+	fake := &fakeResearchClient{err: context.DeadlineExceeded}
 	handler := newResearchTestHandler(t, fake, "")
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/research/generate", bytes.NewBufferString(
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/research/generate", strings.NewReader(
 		`{"topic":"Тема поста","tone":"Деловой","format":"markdown","include_sources":false}`,
-	)).WithContext(ctx)
+	))
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	assertProblemCode(t, response, http.StatusGatewayTimeout, "upstream_timeout")

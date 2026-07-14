@@ -149,6 +149,63 @@ func TestGetChatAndMembershipAreReadOnly(t *testing.T) {
 	}
 }
 
+func TestSendIdentityLinkConfirmationUsesPrivateCallbackButtons(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/messages" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.URL.Query().Get("user_id"); got != "777" {
+			t.Errorf("user_id = %q, want 777", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "shared-token" {
+			t.Errorf("Authorization = %q, want shared-token", got)
+		}
+		var body struct {
+			Text        string `json:"text"`
+			Attachments []struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Buttons [][]struct {
+						Type    string `json:"type"`
+						Text    string `json:"text"`
+						Payload string `json:"payload"`
+					} `json:"buttons"`
+				} `json:"payload"`
+			} `json:"attachments"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(body.Text, "Аккаунт Анны") || !strings.Contains(body.Text, "390214") {
+			t.Errorf("confirmation text = %q", body.Text)
+		}
+		if len(body.Attachments) != 1 || body.Attachments[0].Type != "inline_keyboard" ||
+			len(body.Attachments[0].Payload.Buttons) != 1 || len(body.Attachments[0].Payload.Buttons[0]) != 2 {
+			t.Fatalf("unexpected attachments: %#v", body.Attachments)
+		}
+		buttons := body.Attachments[0].Payload.Buttons[0]
+		if buttons[0].Type != "callback" || buttons[0].Payload != "link_confirm_token" ||
+			buttons[1].Type != "callback" || buttons[1].Payload != "link_cancel_token" {
+			t.Errorf("unexpected callback buttons: %#v", buttons)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "shared-token", server.Client())
+	if err := client.SendIdentityLinkConfirmation(context.Background(), "777", "Аккаунт Анны", "390214",
+		"link_confirm_token", "link_cancel_token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendIdentityLinkConfirmation(context.Background(), "not-a-user", "Аккаунт Анны", "390214",
+		"link_confirm_token", "link_cancel_token"); err == nil {
+		t.Fatal("invalid MAX user id was accepted")
+	}
+}
+
 func TestGetChatRejectsInvalidAndMalformedChatID(t *testing.T) {
 	t.Parallel()
 	client := mustClient(t, "https://platform-api2.max.ru", "token", http.DefaultClient)

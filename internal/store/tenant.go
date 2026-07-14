@@ -28,13 +28,13 @@ func (s *Store) UpsertObservedBotChat(ctx context.Context, chat ObservedBotChat)
 		removedAt = chat.RemovedAt.UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO observed_bot_chats(
-max_chat_id, public_link, title, max_owner_id, active, last_seen_at, removed_at)
-VALUES (?,?,?,?,?,?,?)
+max_chat_id, public_link, title, max_owner_id, icon_url, participants_count, active, last_seen_at, removed_at)
+VALUES (?,?,?,?,?,?,?,?,?)
 ON CONFLICT(max_chat_id) DO UPDATE SET public_link=excluded.public_link, title=excluded.title,
-max_owner_id=excluded.max_owner_id, active=excluded.active, last_seen_at=excluded.last_seen_at,
-removed_at=excluded.removed_at
+max_owner_id=excluded.max_owner_id, icon_url=excluded.icon_url, participants_count=excluded.participants_count,
+active=excluded.active, last_seen_at=excluded.last_seen_at, removed_at=excluded.removed_at
 WHERE excluded.last_seen_at > observed_bot_chats.last_seen_at`, chat.MAXChatID, chat.PublicLink, chat.Title, chat.MAXOwnerID,
-		chat.Active, chat.LastSeenAt.UTC(), removedAt)
+		chat.IconURL, chat.ParticipantsCount, chat.Active, chat.LastSeenAt.UTC(), removedAt)
 	if err != nil {
 		return fmt.Errorf("upsert observed MAX chat: %w", err)
 	}
@@ -66,16 +66,16 @@ RETURNING 1`, maxChatID, now.UTC()).Scan(&applied)
 }
 
 func (s *Store) GetActiveObservedBotChat(ctx context.Context, publicLink, maxChatID string) (ObservedBotChat, error) {
-	query, value := `SELECT max_chat_id, public_link, title, max_owner_id, active, last_seen_at, removed_at
+	query, value := `SELECT max_chat_id, public_link, title, max_owner_id, COALESCE(icon_url,''), COALESCE(participants_count,0), active, last_seen_at, removed_at
 FROM observed_bot_chats WHERE active AND max_chat_id = ?`, maxChatID
 	if strings.TrimSpace(publicLink) != "" {
-		query, value = `SELECT max_chat_id, public_link, title, max_owner_id, active, last_seen_at, removed_at
+		query, value = `SELECT max_chat_id, public_link, title, max_owner_id, COALESCE(icon_url,''), COALESCE(participants_count,0), active, last_seen_at, removed_at
 FROM observed_bot_chats WHERE active AND lower(public_link) = lower(?)`, strings.TrimRight(strings.TrimSpace(publicLink), "/")
 	}
 	var chat ObservedBotChat
 	var removed sql.NullTime
 	if err := s.db.QueryRowContext(ctx, query, value).Scan(&chat.MAXChatID, &chat.PublicLink, &chat.Title,
-		&chat.MAXOwnerID, &chat.Active, &chat.LastSeenAt, &removed); err != nil {
+		&chat.MAXOwnerID, &chat.IconURL, &chat.ParticipantsCount, &chat.Active, &chat.LastSeenAt, &removed); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ObservedBotChat{}, ErrNotFound
 		}

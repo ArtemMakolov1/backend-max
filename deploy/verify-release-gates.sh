@@ -3,7 +3,7 @@ set -euo pipefail
 
 repository=${1:-}
 source_sha=${2:-}
-max_attempts=${3:-60}
+max_attempts=${3:-180}
 retry_delay_seconds=${4:-10}
 
 if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -14,8 +14,8 @@ if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Release gate requires a full lowercase commit SHA" >&2
   exit 2
 fi
-if [[ ! "$max_attempts" =~ ^[1-9][0-9]*$ ]] || ((max_attempts > 120)); then
-  echo "Release gate attempts must be between 1 and 120" >&2
+if [[ ! "$max_attempts" =~ ^[1-9][0-9]*$ ]] || ((max_attempts > 360)); then
+  echo "Release gate attempts must be between 1 and 360" >&2
   exit 2
 fi
 if [[ ! "$retry_delay_seconds" =~ ^[0-9]+$ ]] || ((retry_delay_seconds > 60)); then

@@ -175,6 +175,39 @@ func (c *Client) SendClaimConfirmation(ctx context.Context, userID, channelTitle
 	return c.doJSON(ctx, http.MethodPost, "/messages", url.Values{"user_id": {userID}}, body, nil)
 }
 
+// SendIdentityLinkConfirmation asks a MAX user to explicitly bind that MAX
+// identity to the named, authenticated MaxPosty account.
+func (c *Client) SendIdentityLinkConfirmation(ctx context.Context, userID, requesterLabel, comparisonCode, confirmPayload, cancelPayload string) error {
+	if !numericID(userID) {
+		return errors.New("send identity confirmation: MAX user ID must be numeric")
+	}
+	for _, payload := range []string{confirmPayload, cancelPayload} {
+		if payload == "" || len(payload) > 128 {
+			return errors.New("send identity confirmation: callback payload must contain 1 to 128 bytes")
+		}
+	}
+	requesterLabel = strings.TrimSpace(requesterLabel)
+	if requesterLabel == "" || len(comparisonCode) != 6 {
+		return errors.New("send identity confirmation: requester label and six-digit comparison code are required")
+	}
+	text := "Связать этот профиль MAX с аккаунтом MaxPosty «" + requesterLabel + "»?\n\n" +
+		"Код проверки: " + comparisonCode + "\nПодтвердите только если такой же код показан в MaxPosty."
+	body := struct {
+		Text        string `json:"text"`
+		Attachments []any  `json:"attachments"`
+	}{
+		Text: text,
+		Attachments: []any{map[string]any{
+			"type": "inline_keyboard",
+			"payload": map[string]any{"buttons": [][]map[string]string{{
+				{"type": "callback", "text": "Связать", "payload": confirmPayload},
+				{"type": "callback", "text": "Отмена", "payload": cancelPayload},
+			}}},
+		}},
+	}
+	return c.doJSON(ctx, http.MethodPost, "/messages", url.Values{"user_id": {userID}}, body, nil)
+}
+
 func (c *Client) AnswerCallback(ctx context.Context, callbackID, notification string) error {
 	if strings.TrimSpace(callbackID) == "" {
 		return errors.New("answer callback: callback ID is required")

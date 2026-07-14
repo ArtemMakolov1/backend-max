@@ -114,6 +114,8 @@ func (s *Server) Handler() http.Handler {
 			r.Use(s.requireSession)
 
 			r.Get("/channels", s.listChannels)
+			r.Get("/channels/discoverable", s.listDiscoverableChannels)
+			r.Post("/channels/connect/observed", s.connectObservedChannel)
 			r.Post("/channels/connect/start", s.startChannelConnect)
 			r.Get("/channels/connect/{claim_id}", s.getChannelConnect)
 			r.Get("/channels/{id}", s.getChannel)
@@ -146,6 +148,8 @@ func (s *Server) Handler() http.Handler {
 			r.Post("/media", s.uploadMedia)
 
 			r.Get("/integration/max", s.maxIntegrationStatus)
+			r.Get("/integration/max/identity", s.getMAXIdentity)
+			r.Post("/integration/max/identity", s.startMAXIdentity)
 			r.Get("/integrations/max", s.maxIntegrationStatus)
 			r.Post("/integration/max/test", s.testMAXIntegration)
 			r.Post("/integrations/max/test", s.testMAXIntegration)

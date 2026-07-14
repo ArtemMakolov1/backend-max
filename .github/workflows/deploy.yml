@@ -1,12 +1,8 @@
 name: Backend production deploy
 
 on:
-  workflow_run:
-    # Trigger from one workflow only: GitHub treats a multi-workflow list as
-    # OR, not AND. The release-gate job verifies both exact-SHA workflows.
-    workflows: ["Backend Security"]
+  push:
     branches: [main]
-    types: [completed]
   workflow_dispatch:
     inputs:
       configure_max_webhook:
@@ -23,20 +19,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+  SOURCE_SHA: ${{ github.sha }}
 
 jobs:
   release-gate:
     name: Require exact-commit CI and security workflows
     if: >-
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       github.event.workflow_run.head_branch == 'main' &&
-       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     permissions:
       actions: read
       contents: read

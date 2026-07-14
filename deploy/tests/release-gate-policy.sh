@@ -11,6 +11,16 @@ ln -s "$(type -P sleep)" "$fixture/sleep"
 
 sha=0123456789abcdef0123456789abcdef01234567
 wrong_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+workflow="$repo_root/.github/workflows/deploy.yml"
+
+grep -Fq '  push:' "$workflow"
+grep -Fq '    branches: [main]' "$workflow"
+grep -Fq 'SOURCE_SHA: ${{ github.sha }}' "$workflow"
+grep -Fq "./deploy/verify-release-gates.sh \"\$GITHUB_REPOSITORY\" \"\$SOURCE_SHA\"" "$workflow"
+if grep -Fq 'workflow_run:' "$workflow"; then
+  echo "Production deploy must start directly for every main push" >&2
+  exit 1
+fi
 
 PATH="$fixture:/usr/bin:/bin" MOCK_GATE_SHA="$sha" \
   "$repo_root/deploy/verify-release-gates.sh" owner/repository "$sha" 1 0 >/dev/null
@@ -24,6 +34,12 @@ fi
 if PATH="$fixture:/usr/bin:/bin" MOCK_GATE_SHA="$wrong_sha" \
   "$repo_root/deploy/verify-release-gates.sh" owner/repository "$sha" 1 0 >/dev/null 2>&1; then
   echo "Release gate accepted successful workflows from a different commit" >&2
+  exit 1
+fi
+
+if PATH="$fixture:/usr/bin:/bin" MOCK_GATE_SHA="$sha" \
+  "$repo_root/deploy/verify-release-gates.sh" owner/repository "$sha" 361 0 >/dev/null 2>&1; then
+  echo "Release gate accepted an unbounded attempt count" >&2
   exit 1
 fi
 

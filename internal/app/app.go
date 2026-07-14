@@ -147,7 +147,8 @@ func (a *App) ObserveMAXChat(ctx context.Context, maxChatID string, active bool,
 	}
 	return a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
 		MAXChatID: info.ChatID, PublicLink: strings.TrimRight(strings.TrimSpace(info.Link), "/"),
-		Title: info.Title, MAXOwnerID: info.OwnerID, Active: true, LastSeenAt: now,
+		Title: info.Title, MAXOwnerID: info.OwnerID, IconURL: info.Icon.URL,
+		ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: now,
 	})
 }
 
@@ -276,7 +277,7 @@ func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID str
 		info.Link = canonicalLink
 		if err := a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
 			MAXChatID: info.ChatID, PublicLink: canonicalLink, Title: info.Title, MAXOwnerID: info.OwnerID,
-			Active: true, LastSeenAt: a.now().UTC(),
+			IconURL: info.Icon.URL, ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: a.now().UTC(),
 		}); err != nil {
 			return ChannelClaimCandidate{}, err
 		}
@@ -329,6 +330,71 @@ func (a *App) SendChannelClaimConfirmation(ctx context.Context, maxUserID, title
 		return ErrMAXNotConfigured
 	}
 	return a.max.SendClaimConfirmation(ctx, maxUserID, title, link, requesterLabel, comparisonCode, confirmPayload, cancelPayload)
+}
+
+type maxIdentityConfirmationSender interface {
+	SendIdentityLinkConfirmation(context.Context, string, string, string, string, string) error
+}
+
+func (a *App) SendMAXIdentityLinkConfirmation(ctx context.Context, maxUserID, requesterLabel, comparisonCode, confirmPayload, cancelPayload string) error {
+	if a.max == nil {
+		return ErrMAXNotConfigured
+	}
+	if sender, ok := a.max.(maxIdentityConfirmationSender); ok {
+		return sender.SendIdentityLinkConfirmation(ctx, maxUserID, requesterLabel, comparisonCode, confirmPayload, cancelPayload)
+	}
+	// Compatibility for alternative clients implementing the older interface.
+	return a.max.SendClaimConfirmation(ctx, maxUserID, "профиль MAX", "", requesterLabel, comparisonCode, confirmPayload, cancelPayload)
+}
+
+func (a *App) ConnectDiscoverableChannelForUser(ctx context.Context, userID, maxChatID string) (ChannelCheck, error) {
+	if a.max == nil {
+		return ChannelCheck{}, ErrMAXNotConfigured
+	}
+	link, err := a.store.GetMAXIdentityLinkForUser(ctx, userID)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	// Authorize against the webhook inventory before contacting MAX. Besides
+	// reducing upstream load, this prevents a tenant from probing arbitrary
+	// chat IDs and learning whether the shared bot can access another tenant's
+	// channel through response differences.
+	observed, err := a.store.GetActiveObservedBotChat(ctx, "", maxChatID)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	if observed.MAXOwnerID == "" || observed.MAXOwnerID != link.MAXUserID {
+		return ChannelCheck{}, store.ErrNotFound
+	}
+	info, err := a.max.GetChat(ctx, maxChatID)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	membership, err := a.max.GetMembership(ctx, maxChatID)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	diagnostics := channelDiagnostics(info, membership)
+	if info.ChatID != maxChatID || info.OwnerID == "" || info.OwnerID != link.MAXUserID {
+		return ChannelCheck{}, &ChannelAccessError{Diagnostics: diagnostics, Message: "MAX channel owner does not match the linked MAX profile"}
+	}
+	if !diagnostics.CanPublish || !diagnostics.CanEdit || !diagnostics.CanDelete {
+		return ChannelCheck{}, &ChannelAccessError{Diagnostics: diagnostics,
+			Message: "The shared bot needs read, publish, edit, and delete permissions"}
+	}
+	title := strings.TrimSpace(info.Title)
+	if title == "" {
+		title = "MAX " + info.ChatID
+	}
+	channel, err := a.store.ConnectDiscoverableChannelForUser(ctx, userID, maxChatID, store.Channel{
+		UserID: userID, VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title,
+		PublicLink: strings.TrimSpace(info.Link), IconURL: info.Icon.URL, ParticipantsCount: info.ParticipantsCount,
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
 
 func (a *App) AnswerMAXCallback(ctx context.Context, callbackID, notification string) error {

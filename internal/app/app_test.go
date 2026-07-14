@@ -199,6 +199,54 @@ func TestPrepareChannelClaimKeepsNumericIDRegistryOnly(t *testing.T) {
 	}
 }
 
+func TestConnectDiscoverableChannelRejectsForeignInventoryBeforeMAX(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "200", OwnerID: "777", Type: "channel", Status: "active"},
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+			maxclient.PermissionEdit, maxclient.PermissionDelete,
+		}},
+	}
+	application, storage := newTestApp(t, fake)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	attempt := store.MAXIdentityLinkAttempt{
+		ID: "discoverable-owner-link", TokenHash: strings.Repeat("a", 64), UserID: "test-owner",
+		RequesterLabel: "Test Owner", ComparisonCode: "123456", CreatedAt: now,
+		ExpiresAt: now.Add(10 * time.Minute),
+	}
+	if err := storage.CreateMAXIdentityLinkAttempt(ctx, attempt); err != nil {
+		t.Fatal(err)
+	}
+	confirmHash := strings.Repeat("b", 64)
+	if _, _, err := storage.StartMAXIdentityLinkConfirmation(ctx, attempt.TokenHash, "777",
+		confirmHash, strings.Repeat("c", 64), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.ConfirmMAXIdentityLink(ctx, confirmHash, "777", true, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.UpsertObservedBotChat(ctx, store.ObservedBotChat{
+		MAXChatID: "200", MAXOwnerID: "999", Title: "Foreign", Active: true, LastSeenAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := application.ConnectDiscoverableChannelForUser(ctx, "test-owner", "200"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("foreign discoverable channel error = %v, want ErrNotFound", err)
+	}
+	if fake.getChatCalls != 0 || fake.memberCalls != 0 {
+		t.Fatalf("foreign inventory reached MAX API: %#v", fake)
+	}
+	if _, err := application.ConnectDiscoverableChannelForUser(ctx, "test-owner", "201"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown discoverable channel error = %v, want ErrNotFound", err)
+	}
+	if fake.getChatCalls != 0 || fake.memberCalls != 0 {
+		t.Fatalf("unknown inventory reached MAX API: %#v", fake)
+	}
+}
+
 func TestPrepareChannelClaimRejectsNonChannelBeforeCaching(t *testing.T) {
 	t.Parallel()
 	fake := &fakeMAX{}

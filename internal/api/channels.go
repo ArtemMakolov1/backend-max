@@ -33,6 +33,55 @@ type updateChannelRequest struct {
 	Active    *bool   `json:"active,omitempty"`
 }
 
+type connectObservedChannelRequest struct {
+	MAXChatID string `json:"max_chat_id"`
+}
+
+func (s *Server) listDiscoverableChannels(w http.ResponseWriter, r *http.Request) {
+	userID, err := authenticatedUserID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	channels, err := s.app.Store().ListDiscoverableChannelsForUser(r.Context(), userID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"channels": channels})
+}
+
+func (s *Server) connectObservedChannel(w http.ResponseWriter, r *http.Request) {
+	userID, err := authenticatedUserID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	var request connectObservedChannelRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	request.MAXChatID = strings.TrimSpace(request.MAXChatID)
+	if !validMAXChatID(request.MAXChatID) {
+		s.problem(w, http.StatusBadRequest, "validation_error", "max_chat_id must be a numeric string", nil)
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	check, err := s.app.ConnectDiscoverableChannelForUser(ctx, userID, request.MAXChatID)
+	cancel()
+	if err != nil {
+		if errors.Is(err, store.ErrChannelOwned) {
+			s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к другому аккаунту", nil)
+			return
+		}
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"channel": check.Channel, "diagnostics": check.Diagnostics})
+}
+
 func (s *Server) listChannels(w http.ResponseWriter, r *http.Request) {
 	userID, err := authenticatedUserID(r)
 	if err != nil {
