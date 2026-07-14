@@ -53,6 +53,23 @@ func TestPublicationMetadataPinAndBoundedHistoryAPI(t *testing.T) {
 	application := app.New(storage, mediaStore, fake, nil, nil, logger)
 	handler := withTestSession(t, storage,
 		New(application, logger, "http://localhost:4321", "", AuthOptions{YandexClient: &fakeYandexOAuth{}}).Handler(), "test-owner")
+	deletePublished := performJSONRequest(handler, http.MethodDelete, "/api/v1/posts/"+postID(post.ID), "")
+	if deletePublished.Code != http.StatusConflict {
+		t.Fatalf("published delete status = %d, body=%s", deletePublished.Code, deletePublished.Body.String())
+	}
+	var deleteProblem struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(deletePublished.Body.Bytes(), &deleteProblem); err != nil {
+		t.Fatal(err)
+	}
+	if deleteProblem.Error.Code != "publication_exists" ||
+		deleteProblem.Error.Message != "Пост всё ещё опубликован в MAX. Сначала удалите публикацию из MAX." {
+		t.Fatalf("published delete response = %#v", deleteProblem)
+	}
 
 	post = performPostRequest(t, handler, http.MethodPost, "/api/v1/posts/"+postID(post.ID)+"/sync-max", "", http.StatusOK)
 	if post.MAXMessageURL != fake.message.URL || post.MAXViews == nil || *post.MAXViews != views || post.MAXIsPinned || post.MAXStatsSyncedAt == nil {

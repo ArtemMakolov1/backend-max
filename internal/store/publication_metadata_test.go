@@ -155,6 +155,72 @@ func TestMarkAndClearPublicationMetadata(t *testing.T) {
 	}
 }
 
+func TestClearPublicationSupportsLegacyStatesButNeverPublishing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "legacy-publication-clear.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	channel, err := storage.CreateChannel(ctx, Channel{
+		MAXChatID: "-legacy-clear", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedAt := time.Date(2038, time.April, 7, 8, 0, 0, 0, time.UTC)
+	failed, err := storage.CreatePost(ctx, Post{
+		Title: "Legacy failed", Content: "body", Format: FormatMarkdown, Status: PostStatusFailed,
+		ChannelID: &channel.ID, MAXMessageID: "mid.legacy-failed", MAXMessageURL: "https://max.ru/channel/legacy-failed",
+		LastError: "legacy failure", PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err = storage.ClearPublicationForUser(ctx, "test-owner", failed.ID, channel.ID, failed.MAXMessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != PostStatusDraft || failed.MAXMessageID != "" || failed.MAXMessageURL != "" ||
+		failed.LastError != "" || failed.PublishedAt == nil || !failed.PublishedAt.Equal(publishedAt) {
+		t.Fatalf("cleared legacy failed publication = %#v", failed)
+	}
+	if err := storage.DeletePostForUser(ctx, "test-owner", failed.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.GetPostForUser(ctx, "test-owner", failed.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted legacy post lookup = %v, want ErrNotFound", err)
+	}
+	draft, err := storage.CreatePost(ctx, Post{
+		Title: "Legacy draft", Content: "body", Format: FormatMarkdown, Status: PostStatusDraft,
+		ChannelID: &channel.ID, MAXMessageID: "mid.legacy-draft", MAXMessageURL: "https://max.ru/channel/legacy-draft",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft, err = storage.ClearPublicationForUser(ctx, "test-owner", draft.ID, channel.ID, draft.MAXMessageID)
+	if err != nil || draft.Status != PostStatusDraft || draft.MAXMessageID != "" || draft.MAXMessageURL != "" {
+		t.Fatalf("cleared legacy draft publication = %#v, %v", draft, err)
+	}
+
+	publishing, err := storage.CreatePost(ctx, Post{
+		Title: "Publishing", Content: "body", Format: FormatMarkdown, Status: PostStatusPublishing,
+		ChannelID: &channel.ID, MAXMessageID: "mid.still-publishing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.ClearPublicationForUser(ctx, "test-owner", publishing.ID, channel.ID,
+		publishing.MAXMessageID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("publishing clear error = %v, want ErrConflict", err)
+	}
+	publishing, err = storage.GetPostForUser(ctx, "test-owner", publishing.ID)
+	if err != nil || publishing.Status != PostStatusPublishing || publishing.MAXMessageID != "mid.still-publishing" {
+		t.Fatalf("publishing post changed = %#v, %v", publishing, err)
+	}
+}
+
 func TestMarkMAXPublicationMissingPreservesHistoryAndAllowsRepublish(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

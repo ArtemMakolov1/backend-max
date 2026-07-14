@@ -240,6 +240,123 @@ func TestDeletePublicationPreservesHistoryAndIsTenantScoped(t *testing.T) {
 	}
 }
 
+func TestDeletePublicationTreatsMAXNotFoundAsAlreadyDeleted(t *testing.T) {
+	t.Parallel()
+	notFound := &maxclient.Error{StatusCode: http.StatusNotFound, Code: "message.not.found", Message: "Message not found"}
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "-209", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionDelete,
+		}},
+		deleteErr: notFound,
+	}
+	application, storage := newTestApp(t, fake)
+	ctx := context.Background()
+	channel, err := storage.CreateChannel(ctx, store.Channel{
+		MAXChatID: "-209", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedAt := time.Date(2038, time.April, 6, 11, 0, 0, 0, time.UTC)
+	post, err := storage.CreatePost(ctx, store.Post{
+		Title: "Already gone", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.already-gone", MAXMessageURL: "https://max.ru/channel/already-gone",
+		PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	post, err = application.DeletePublication(ctx, "test-owner", post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.deleteCalls != 1 || post.Status != store.PostStatusDraft || post.MAXMessageID != "" ||
+		post.MAXMessageURL != "" || post.LastError != "" || post.PublishedAt == nil ||
+		!post.PublishedAt.Equal(publishedAt) {
+		t.Fatalf("idempotent deleted publication = %#v, MAX calls=%d", post, fake.deleteCalls)
+	}
+}
+
+func TestDeletePublicationReconcilesAmbiguousFailureWhenMessageIsGone(t *testing.T) {
+	t.Parallel()
+	operationFailed := &maxclient.Error{
+		StatusCode: http.StatusOK, Code: "operation_failed", Message: "Error on message delete",
+	}
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "-210", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionDelete,
+		}},
+		deleteErr:     operationFailed,
+		getMessageErr: &maxclient.Error{StatusCode: http.StatusNotFound, Code: "message.not.found", Message: "Message not found"},
+	}
+	application, storage := newTestApp(t, fake)
+	ctx := context.Background()
+	channel, err := storage.CreateChannel(ctx, store.Channel{
+		MAXChatID: "-210", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(ctx, store.Post{
+		Title: "Ambiguous delete", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.ambiguous-delete", MAXMessageURL: "https://max.ru/channel/ambiguous-delete",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	post, err = application.DeletePublication(ctx, "test-owner", post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.deleteCalls != 1 || fake.getMessageCalls != 1 || post.Status != store.PostStatusDraft ||
+		post.MAXMessageID != "" || post.MAXMessageURL != "" {
+		t.Fatalf("reconciled ambiguous delete = %#v, MAX=%#v", post, fake)
+	}
+}
+
+func TestDeletePublicationPreservesAmbiguousFailureWhenMessageStillExists(t *testing.T) {
+	t.Parallel()
+	operationFailed := &maxclient.Error{
+		StatusCode: http.StatusOK, Code: "operation_failed", Message: "Error on message delete",
+	}
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "-211", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionDelete,
+		}},
+		deleteErr: operationFailed,
+		message:   maxclient.Message{MessageID: "mid.delete-still-exists", ChatID: "-211"},
+	}
+	application, storage := newTestApp(t, fake)
+	ctx := context.Background()
+	channel, err := storage.CreateChannel(ctx, store.Channel{
+		MAXChatID: "-211", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(ctx, store.Post{
+		Title: "Still exists", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: fake.message.MessageID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := application.DeletePublication(ctx, "test-owner", post.ID); !errors.Is(err, operationFailed) {
+		t.Fatalf("delete error = %v, want original operation failure", err)
+	}
+	stored, err := storage.GetPostForUser(ctx, "test-owner", post.ID)
+	if err != nil || stored.Status != store.PostStatusPublished || stored.MAXMessageID != post.MAXMessageID ||
+		fake.deleteCalls != 1 || fake.getMessageCalls != 1 {
+		t.Fatalf("ambiguous failure changed post = %#v, err=%v, MAX=%#v", stored, err, fake)
+	}
+}
+
 func TestPinAndUnpinRequireOptionalPinPermission(t *testing.T) {
 	t.Parallel()
 	fake := &fakeMAX{

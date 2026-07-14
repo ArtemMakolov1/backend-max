@@ -21,6 +21,7 @@ import (
 var (
 	ErrNotFound           = errors.New("not found")
 	ErrConflict           = errors.New("state conflict")
+	ErrPublicationExists  = errors.New("MAX publication exists")
 	ErrChannelOwned       = errors.New("channel is already connected to another account")
 	ErrScheduleNotDue     = errors.New("scheduled post is not due")
 	ErrMigrationIntegrity = errors.New("migration integrity check failed")
@@ -1004,14 +1005,46 @@ func (s *Store) updatePostSnapshot(ctx context.Context, post Post, changes PostC
 }
 
 func (s *Store) DeletePost(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM posts WHERE id = ? AND status != ?`, id, PostStatusPublishing)
+	result, err := s.db.ExecContext(ctx,
+		`DELETE FROM posts WHERE id = ? AND status != ? AND max_message_id = ''`, id, PostStatusPublishing)
 	if err != nil {
 		return fmt.Errorf("delete post: %w", err)
 	}
 	if n, _ := result.RowsAffected(); n == 0 {
-		return s.postWriteMiss(ctx, id, "post is currently publishing")
+		post, getErr := s.GetPost(ctx, id)
+		if getErr != nil {
+			return getErr
+		}
+		if post.MAXMessageID != "" {
+			return ErrPublicationExists
+		}
+		return fmt.Errorf("%w: post is currently publishing", ErrConflict)
 	}
 	return nil
+}
+
+// DeletePostForUser atomically keeps tenant ownership and MAX publication
+// lifecycle checks in the delete predicate. A caller must explicitly remove
+// the live MAX publication before deleting the local post.
+func (s *Store) DeletePostForUser(ctx context.Context, userID string, id int64) error {
+	result, err := s.db.ExecContext(ctx, `
+DELETE FROM posts
+WHERE owner_id = ? AND id = ? AND status != ? AND max_message_id = ''`,
+		userID, id, PostStatusPublishing)
+	if err != nil {
+		return fmt.Errorf("delete user post: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 1 {
+		return nil
+	}
+	post, err := s.GetPostForUser(ctx, userID, id)
+	if err != nil {
+		return err
+	}
+	if post.MAXMessageID != "" {
+		return ErrPublicationExists
+	}
+	return fmt.Errorf("%w: post is currently publishing", ErrConflict)
 }
 
 func (s *Store) DuplicatePost(ctx context.Context, id int64) (Post, error) {

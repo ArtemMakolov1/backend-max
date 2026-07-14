@@ -320,16 +320,11 @@ func (s *Server) deletePost(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	post, err := s.app.Store().GetPostForUser(r.Context(), userID, id)
-	if err != nil {
-		s.writeError(w, err)
+	if err := s.app.Store().DeletePostForUser(r.Context(), userID, id); errors.Is(err, store.ErrPublicationExists) {
+		s.problem(w, http.StatusConflict, "publication_exists",
+			"Пост всё ещё опубликован в MAX. Сначала удалите публикацию из MAX.", nil)
 		return
-	}
-	if post.MAXMessageID != "" {
-		s.problem(w, http.StatusConflict, "publication_exists", "Delete the MAX publication before deleting this post", nil)
-		return
-	}
-	if err := s.app.Store().DeletePost(r.Context(), id); err != nil {
+	} else if err != nil {
 		s.writeError(w, err)
 		return
 	}

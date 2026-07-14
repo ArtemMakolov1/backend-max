@@ -204,8 +204,8 @@ UPDATE posts
 SET status = ?, max_message_id = '', max_message_url = '',
     max_stats_attempted_at = NULL, max_is_pinned = FALSE,
     scheduled_at = NULL, last_error = '', updated_at = ?
-WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND status = ?`,
-		PostStatusDraft, nowText(), userID, postID, channelID, expectedMessageID, PostStatusPublished)
+WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND status != ?`,
+		PostStatusDraft, nowText(), userID, postID, channelID, expectedMessageID, PostStatusPublishing)
 	if err != nil {
 		return Post{}, fmt.Errorf("clear MAX publication: %w", err)
 	}

@@ -268,6 +268,49 @@ func TestPublishingStateCASAndRecovery(t *testing.T) {
 	}
 }
 
+func TestDeletePostForUserIsTenantScopedAndBlocksActivePublication(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "delete-user-post.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	channel, err := storage.CreateChannel(ctx, Channel{
+		MAXChatID: "delete-user-post", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(ctx, Post{
+		Title: "Published", Content: "body", Format: FormatMarkdown, Status: PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.delete-user-post",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := storage.DeletePostForUser(ctx, "foreign-owner", post.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign delete error = %v, want ErrNotFound", err)
+	}
+	if err := storage.DeletePostForUser(ctx, "test-owner", post.ID); !errors.Is(err, ErrPublicationExists) {
+		t.Fatalf("published delete error = %v, want ErrPublicationExists", err)
+	}
+	if _, err := storage.GetPostForUser(ctx, "test-owner", post.ID); err != nil {
+		t.Fatalf("blocked delete removed post: %v", err)
+	}
+	post, err = storage.ClearPublicationForUser(ctx, "test-owner", post.ID, channel.ID, post.MAXMessageID)
+	if err != nil || post.MAXMessageID != "" || post.Status != PostStatusDraft {
+		t.Fatalf("cleared publication = %#v, %v", post, err)
+	}
+	if err := storage.DeletePostForUser(ctx, "test-owner", post.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.GetPostForUser(ctx, "test-owner", post.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted post lookup error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestChannelDeletionProtectsPublicationDependencies(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

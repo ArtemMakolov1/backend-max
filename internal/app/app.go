@@ -775,6 +775,20 @@ func (a *App) DeletePublication(ctx context.Context, userID string, postID int64
 		return store.Post{}, &ChannelAccessError{Diagnostics: diagnostics, Message: "MAX delete permission is required"}
 	}
 	if err := a.max.Delete(ctx, post.MAXMessageID); err != nil {
+		// Deletion is idempotent from the user's perspective. If MAX reports
+		// that the message is already gone, clear the matching live metadata
+		// with the same CAS used after a successful explicit deletion.
+		if isMAXMessageNotFound(err) {
+			return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)
+		}
+		// MAX delete operations can return HTTP 200 with success=false and no
+		// machine-readable reason. Re-read the message to distinguish an
+		// already completed deletion from a genuine delete failure.
+		if isMAXOperationFailed(err) {
+			if _, getErr := a.max.GetMessage(ctx, post.MAXMessageID); isMAXMessageNotFound(getErr) {
+				return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)
+			}
+		}
 		return store.Post{}, err
 	}
 	return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)

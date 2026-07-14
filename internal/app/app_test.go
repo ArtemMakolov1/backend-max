@@ -41,6 +41,7 @@ type fakeMAX struct {
 	getMessageErrs     []error
 	getPinnedErr       error
 	editErr            error
+	deleteErr          error
 	getMessageCalls    int
 	getPinnedCalls     int
 	pinCalls           int
@@ -161,7 +162,7 @@ func (f *fakeMAX) Edit(_ context.Context, request maxclient.EditRequest) error {
 }
 func (f *fakeMAX) Delete(context.Context, string) error {
 	f.deleteCalls++
-	return nil
+	return f.deleteErr
 }
 
 func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
