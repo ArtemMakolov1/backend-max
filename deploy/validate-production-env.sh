@@ -144,7 +144,7 @@ case "$bootstrap_mode" in
     expect_exact PUBLIC_BASE_URL "https://maxposty.ru"
     expect_exact FRONTEND_ORIGIN "https://maxposty.ru"
     expect_exact YANDEX_REDIRECT_URI "https://maxposty.ru/api/v1/auth/yandex/callback"
-    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET OPENAI_API_KEY; do
+    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET; do
       if [[ -z "$(env_value "$key")" ]]; then
         echo "$key must not be empty in production mode" >&2
         exit 1

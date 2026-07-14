@@ -15,7 +15,7 @@ fi
 
 required_secret_names=(POSTGRES_OWNER_PASSWORD POSTGRES_APP_PASSWORD)
 if [[ "$deploy_stage" == "production" ]]; then
-  required_secret_names+=(YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET OPENAI_API_KEY)
+  required_secret_names+=(YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET)
 fi
 for name in "${required_secret_names[@]}"; do
   if [[ -z "${!name:-}" ]]; then
@@ -51,7 +51,7 @@ else
   rendered_allowed_users=${YANDEX_ALLOWED_USERS:-}
   rendered_bot_token=$MAX_BOT_TOKEN
   rendered_webhook_secret=$MAX_WEBHOOK_SECRET
-  rendered_openai_key=$OPENAI_API_KEY
+  rendered_openai_key=${OPENAI_API_KEY:-}
 fi
 
 {

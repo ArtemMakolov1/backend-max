@@ -91,6 +91,21 @@ func TestLoadAcceptsOAuthWithoutAllowlistForPublicSignup(t *testing.T) {
 	}
 }
 
+func TestLoadAllowsOAuthAndMAXWithoutOpenAI(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("MAX_BOT_TOKEN", "server-only-token")
+	t.Setenv("MAX_WEBHOOK_SECRET", "valid_webhook-secret_123")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.YandexAuthEnabled() || cfg.MAXBotToken == "" || cfg.OpenAIAPIKey != "" {
+		t.Fatalf("OAuth/MAX-only production config was not preserved: %#v", cfg)
+	}
+}
+
 func TestLoadUsesSafeAIQuotaDefaultsAndAcceptsBoundedOverrides(t *testing.T) {
 	clearAuthEnv(t)
 	setValidLocalYandexAuth(t)
@@ -265,7 +280,7 @@ func clearAuthEnv(t *testing.T) {
 		"OAUTH_RATE_LIMIT_AT_EDGE", "AI_GLOBAL_MAX_CONCURRENT", "AI_USER_MAX_CONCURRENT",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
-		"OPENAI_API_BASE_URL",
+		"OPENAI_API_KEY", "OPENAI_API_BASE_URL",
 	} {
 		t.Setenv(name, "")
 	}

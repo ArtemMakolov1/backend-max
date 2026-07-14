@@ -109,6 +109,20 @@ func TestAIResearchQuotaRejectsBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestAIEndpointsReportUnavailableWithoutOpenAIClient(t *testing.T) {
+	t.Parallel()
+	options := testAILimitOptions()
+	_, storage, rawHandler := newAIQuotaTestServer(t, nil, nil, options, "no-openai-user")
+	handler := withTestSession(t, storage, rawHandler, "no-openai-user")
+
+	image := performJSONRequest(handler, http.MethodPost, "/api/v1/images/generate", `{"prompt":"Картинка для поста"}`)
+	assertProblemCode(t, image, http.StatusServiceUnavailable, "openai_not_configured")
+
+	research := performJSONRequest(handler, http.MethodPost, "/api/v1/research/generate",
+		`{"topic":"Тема поста","tone":"Деловой","format":"markdown","include_sources":false}`)
+	assertProblemCode(t, research, http.StatusServiceUnavailable, "openai_research_not_configured")
+}
+
 func TestAIGlobalSemaphoreRejectsAcrossUsersAndOperationsWithoutWaiting(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
