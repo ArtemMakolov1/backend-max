@@ -14,7 +14,7 @@ import (
 
 const (
 	defaultAuthorizeURL = "https://oauth.yandex.ru/authorize"
-	defaultTokenURL     = "https://oauth.yandex.ru/token"
+	defaultExchangeURL  = "https://oauth.yandex.ru/token"
 	defaultUserInfoURL  = "https://login.yandex.ru/info"
 )
 
@@ -68,7 +68,7 @@ func New(clientID, clientSecret string, httpClient *http.Client) (*Client, error
 	}
 	return &Client{
 		clientID: clientID, clientSecret: clientSecret, httpClient: httpClient,
-		authorizeURL: defaultAuthorizeURL, tokenURL: defaultTokenURL, userInfoURL: defaultUserInfoURL,
+		authorizeURL: defaultAuthorizeURL, tokenURL: defaultExchangeURL, userInfoURL: defaultUserInfoURL,
 	}, nil
 }
 

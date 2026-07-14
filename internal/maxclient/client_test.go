@@ -2,7 +2,6 @@ package maxclient
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -407,7 +406,7 @@ func TestUploadImageUsesMultipartWithoutAuthorization(t *testing.T) {
 	}))
 	defer apiServer.Close()
 
-	httpClient := insecureTestHTTPClient()
+	httpClient := uploadServer.Client()
 	defer httpClient.CloseIdleConnections()
 	client := mustClient(t, apiServer.URL, "bot-token", httpClient)
 	result, err := client.UploadImage(context.Background(), "generated.png", strings.NewReader("PNG image bytes"))
@@ -442,7 +441,7 @@ func TestUploadImageRejectsHTTPRedirect(t *testing.T) {
 	}))
 	defer apiServer.Close()
 
-	httpClient := insecureTestHTTPClient()
+	httpClient := uploadServer.Client()
 	defer httpClient.CloseIdleConnections()
 	client := mustClient(t, apiServer.URL, "bot-token", httpClient)
 	_, err := client.UploadImage(context.Background(), "image.png", strings.NewReader("bytes"))
@@ -494,13 +493,4 @@ func mustClient(t *testing.T, baseURL, token string, httpClient *http.Client) *C
 		t.Fatalf("New() error = %v", err)
 	}
 	return client
-}
-
-func insecureTestHTTPClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // test servers use ephemeral self-signed certificates
-		},
-		Timeout: 2 * time.Second,
-	}
 }

@@ -261,6 +261,7 @@ func (s *Server) redirectAuthError(w http.ResponseWriter, r *http.Request, code 
 }
 
 func (s *Server) setStateCookie(w http.ResponseWriter, value string, maxAge int) {
+	//nolint:gosec // G124: Secure is runtime-derived; config requires HTTPS outside explicit loopback development.
 	http.SetCookie(w, &http.Cookie{
 		Name: stateCookieName, Value: value, Path: "/api/v1/auth/yandex/callback",
 		MaxAge: maxAge, HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,
@@ -268,6 +269,7 @@ func (s *Server) setStateCookie(w http.ResponseWriter, value string, maxAge int)
 }
 
 func (s *Server) clearStateCookie(w http.ResponseWriter) {
+	//nolint:gosec // G124: Secure mirrors the validated state cookie policy, including the localhost-only HTTP exception.
 	http.SetCookie(w, &http.Cookie{
 		Name: stateCookieName, Path: "/api/v1/auth/yandex/callback", MaxAge: -1,
 		Expires: time.Unix(1, 0), HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,
@@ -275,6 +277,7 @@ func (s *Server) clearStateCookie(w http.ResponseWriter) {
 }
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, value string, maxAge int) {
+	//nolint:gosec // G124: Secure is runtime-derived; config requires HTTPS outside explicit loopback development.
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookieName, Value: value, Path: "/", MaxAge: maxAge,
 		HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,
@@ -282,6 +285,7 @@ func (s *Server) setSessionCookie(w http.ResponseWriter, value string, maxAge in
 }
 
 func (s *Server) clearSessionCookie(w http.ResponseWriter) {
+	//nolint:gosec // G124: Secure mirrors the validated session cookie policy, including the localhost-only HTTP exception.
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookieName, Path: "/", MaxAge: -1, Expires: time.Unix(1, 0),
 		HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode,

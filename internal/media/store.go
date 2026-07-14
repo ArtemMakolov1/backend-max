@@ -140,7 +140,7 @@ func (s *Store) Save(originalName string, reader io.Reader) (File, error) {
 	filename := hex.EncodeToString(hash.Sum(nil)) + ext
 	destination := filepath.Join(s.dir, filename)
 	if _, err := os.Stat(destination); errors.Is(err, os.ErrNotExist) {
-		if err := os.Chmod(tmpName, 0o640); err != nil {
+		if err := os.Chmod(tmpName, 0o600); err != nil {
 			return File{}, fmt.Errorf("set media permissions: %w", err)
 		}
 		if err := os.Rename(tmpName, destination); err != nil {

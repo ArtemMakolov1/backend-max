@@ -173,8 +173,9 @@ func TestAuthStoreRejectsOpaqueValuesInsteadOfHashes(t *testing.T) {
 	}); err == nil {
 		t.Fatal("CreateAuthSession(without allowlist identity) error = nil, want validation error")
 	}
+	invalidTokenHash := "not-a-sha256-digest-" + t.Name()
 	if err := storage.CreateAuthSession(ctx, AuthSession{
-		TokenHash: "raw-browser-token", YandexUserID: "1", CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		TokenHash: invalidTokenHash, YandexUserID: "1", CreatedAt: now, ExpiresAt: now.Add(time.Hour),
 	}); err == nil {
 		t.Fatal("CreateAuthSession(raw token) error = nil, want validation error")
 	}

@@ -53,6 +53,7 @@ func (s *Server) uploadMedia(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, postID *int64) (store.Post, media.File, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, media.MaxImageBytes+(1<<20))
+	//nolint:gosec // G120: MaxBytesReader caps the entire request body before multipart parsing.
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		return store.Post{}, media.File{}, errors.New("invalid multipart upload or image is too large")
 	}

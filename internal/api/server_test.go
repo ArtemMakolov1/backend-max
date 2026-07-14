@@ -103,7 +103,10 @@ func TestCORSRejectsForeignOriginAndSessionMutationWithoutOrigin(t *testing.T) {
 	}
 
 	missingOrigin := httptest.NewRequest(http.MethodPost, "/api/v1/posts", nil)
-	missingOrigin.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "opaque-session"})
+	missingOrigin.AddCookie(&http.Cookie{
+		Name: sessionCookieName, Value: "opaque-session",
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
+	})
 	missingOriginResponse := httptest.NewRecorder()
 	server.cors(next).ServeHTTP(missingOriginResponse, missingOrigin)
 	if missingOriginResponse.Code != http.StatusForbidden {

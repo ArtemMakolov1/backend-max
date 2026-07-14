@@ -13,6 +13,7 @@ linters:
     - bodyclose
     - errcheck
     - errorlint
+    - gosec
     - govet
     - ineffassign
     - nilerr
