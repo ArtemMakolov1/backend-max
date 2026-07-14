@@ -183,7 +183,15 @@ func maxEventTime(timestamp int64, now time.Time) (time.Time, bool) {
 
 func (s *Server) handleBotStarted(w http.ResponseWriter, r *http.Request, update maxUpdate) {
 	maxUserID, err := webhookUserID(update.User)
-	if err != nil || !strings.HasPrefix(update.Payload, "claim_") {
+	if err != nil {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	if strings.HasPrefix(update.Payload, "link_") {
+		s.handleMAXIdentityBotStarted(w, r, maxUserID, strings.TrimPrefix(update.Payload, "link_"))
+		return
+	}
+	if !strings.HasPrefix(update.Payload, "claim_") {
 		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
 		return
 	}
@@ -239,6 +247,10 @@ func (s *Server) handleMessageCallback(w http.ResponseWriter, r *http.Request, u
 		return
 	}
 	payload := update.Callback.Payload
+	if strings.HasPrefix(payload, "link_confirm_") || strings.HasPrefix(payload, "link_cancel_") {
+		s.handleMAXIdentityCallback(w, r, update, maxUserID)
+		return
+	}
 	confirm := strings.HasPrefix(payload, "claim_confirm_")
 	cancelled := strings.HasPrefix(payload, "claim_cancel_")
 	if !confirm && !cancelled {
@@ -292,6 +304,89 @@ func (s *Server) handleMessageCallback(w http.ResponseWriter, r *http.Request, u
 		ctx, cancel := contextWithTimeout(r, 5*time.Second)
 		if answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID, notification); answerErr != nil {
 			s.logger.Warn("could not answer MAX callback", "error", answerErr)
+		}
+		cancel()
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleMAXIdentityBotStarted(w http.ResponseWriter, r *http.Request, maxUserID, deepToken string) {
+	if len(deepToken) < 32 || len(deepToken) > 96 {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	confirmToken, err := randomURLToken(32)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	cancelToken, err := randomURLToken(32)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	now := s.now().UTC()
+	attempt, first, err := s.app.Store().StartMAXIdentityLinkConfirmation(r.Context(), sha256Hex(deepToken), maxUserID,
+		sha256Hex(confirmToken), sha256Hex(cancelToken), now)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		s.writeError(w, err)
+		return
+	}
+	if first {
+		ctx, cancel := contextWithTimeout(r, 8*time.Second)
+		err = s.app.SendMAXIdentityLinkConfirmation(ctx, maxUserID, attempt.RequesterLabel, attempt.ComparisonCode,
+			"link_confirm_"+confirmToken, "link_cancel_"+cancelToken)
+		cancel()
+		if err != nil {
+			_ = s.app.Store().FailMAXIdentityLinkAttempt(r.Context(), attempt.UserID, attempt.ID, "confirmation_send_failed", now)
+			s.writeError(w, err)
+			return
+		}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleMAXIdentityCallback(w http.ResponseWriter, r *http.Request, update maxUpdate, maxUserID string) {
+	payload := update.Callback.Payload
+	confirm := strings.HasPrefix(payload, "link_confirm_")
+	token := strings.TrimPrefix(payload, "link_confirm_")
+	if !confirm {
+		token = strings.TrimPrefix(payload, "link_cancel_")
+	}
+	if len(token) < 32 || len(token) > 96 {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	attempt, err := s.app.Store().ConfirmMAXIdentityLink(r.Context(), sha256Hex(token), maxUserID, confirm, s.now().UTC())
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		s.writeError(w, err)
+		return
+	}
+	notification := "Профиль MAX связан с MaxPosty. Вернитесь в личный кабинет."
+	if attempt.Status == store.MAXIdentityAttemptFailed {
+		switch attempt.ErrorCode {
+		case "canceled":
+			notification = "Связывание профиля отменено."
+		case "max_identity_already_linked":
+			notification = "Этот профиль MAX уже связан с другим аккаунтом MaxPosty."
+		case "owner_identity_already_linked":
+			notification = "К этому аккаунту MaxPosty уже привязан другой профиль MAX."
+		default:
+			notification = "Не удалось связать профиль MAX."
+		}
+	}
+	if update.Callback.CallbackID != "" {
+		ctx, cancel := contextWithTimeout(r, 5*time.Second)
+		if answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID, notification); answerErr != nil {
+			s.logger.Warn("could not answer MAX identity callback", "error", answerErr)
 		}
 		cancel()
 	}

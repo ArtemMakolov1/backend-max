@@ -49,7 +49,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "002_ai_limits.sql"
+const RequiredSchemaVersion = "003_max_identity_links.sql"
 
 type schemaMigration struct {
 	version        string

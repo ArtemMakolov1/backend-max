@@ -31,13 +31,63 @@ type Channel struct {
 // ObservedBotChat is inventory learned from authenticated MAX bot_added and
 // bot_removed webhooks. It never grants a tenant ownership by itself.
 type ObservedBotChat struct {
-	MAXChatID  string
-	PublicLink string
-	Title      string
-	MAXOwnerID string
-	Active     bool
-	LastSeenAt time.Time
-	RemovedAt  *time.Time
+	MAXChatID         string
+	PublicLink        string
+	Title             string
+	MAXOwnerID        string
+	IconURL           string
+	ParticipantsCount int
+	Active            bool
+	LastSeenAt        time.Time
+	RemovedAt         *time.Time
+}
+
+const (
+	MAXIdentityAttemptPending              = "pending"
+	MAXIdentityAttemptAwaitingConfirmation = "awaiting_confirmation"
+	MAXIdentityAttemptLinked               = "linked"
+	MAXIdentityAttemptFailed               = "failed"
+	MAXIdentityAttemptExpired              = "expired"
+)
+
+// MAXIdentityLink is the durable, one-to-one association established after a
+// signed-in Yandex user explicitly confirms a one-time proof in MAX.
+type MAXIdentityLink struct {
+	UserID    string    `json:"-"`
+	MAXUserID string    `json:"max_user_id"`
+	LinkedAt  time.Time `json:"linked_at"`
+	UpdatedAt time.Time `json:"-"`
+}
+
+// MAXIdentityLinkAttempt contains only hashes of the deep-link and callback
+// bearer tokens. Raw tokens are returned once to the initiating browser or
+// sent to MAX and must never be persisted.
+type MAXIdentityLinkAttempt struct {
+	ID               string     `json:"request_id"`
+	TokenHash        string     `json:"-"`
+	ConfirmTokenHash string     `json:"-"`
+	CancelTokenHash  string     `json:"-"`
+	UserID           string     `json:"-"`
+	RequesterLabel   string     `json:"requester_label"`
+	ComparisonCode   string     `json:"comparison_code"`
+	Status           string     `json:"status"`
+	MAXUserID        string     `json:"max_user_id,omitempty"`
+	ErrorCode        string     `json:"error_code,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	ExpiresAt        time.Time  `json:"expires_at"`
+	ConsumedAt       *time.Time `json:"-"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+type DiscoverableChannel struct {
+	MAXChatID          string `json:"max_chat_id"`
+	Title              string `json:"title"`
+	PublicLink         string `json:"public_link,omitempty"`
+	IconURL            string `json:"icon_url,omitempty"`
+	ParticipantsCount  int    `json:"participants_count"`
+	OwnerVerified      bool   `json:"owner_verified"`
+	Connected          bool   `json:"connected"`
+	ConnectedChannelID *int64 `json:"connected_channel_id,omitempty"`
 }
 
 type Post struct {
