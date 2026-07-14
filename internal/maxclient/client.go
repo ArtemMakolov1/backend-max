@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,9 +20,12 @@ import (
 
 const (
 	maxJSONResponseBytes = 2 << 20
+	maxPublicPageBytes   = 2 << 20
 	maxImageBytes        = 50 << 20
 	maxUploadRedirects   = 5
 )
+
+var publicChannelIDPattern = regexp.MustCompile(`\bchannelId\b(?:\\?["'])?\s*:\s*(?:\\?["'])?([0-9]{1,19})\b`)
 
 // Client is safe for concurrent use as long as its supplied http.Client is not
 // mutated concurrently.
@@ -95,7 +100,98 @@ func (c *Client) GetChatByLink(ctx context.Context, publicLink string) (ChatInfo
 	if err != nil {
 		return ChatInfo{}, err
 	}
-	return c.getChat(ctx, slug)
+	chat, err := c.getChat(ctx, slug)
+	if err == nil || !isChatNotFound(err) {
+		return chat, err
+	}
+	chat, fallbackErr := c.getChatFromPublicPage(ctx, slug)
+	if fallbackErr != nil {
+		// Preserve the structured upstream error for the API layer while keeping
+		// the fallback reason available to operators and tests.
+		return ChatInfo{}, fmt.Errorf("resolve MAX public channel page: %w", errors.Join(fallbackErr, err))
+	}
+	return chat, nil
+}
+
+func (c *Client) getChatFromPublicPage(ctx context.Context, slug string) (ChatInfo, error) {
+	publicSlug := strings.TrimPrefix(slug, "@")
+	if !validChatSlug(publicSlug) {
+		return ChatInfo{}, errors.New("MAX public channel slug is invalid")
+	}
+	publicURL := (&url.URL{Scheme: "https", Host: "max.ru", Path: "/" + publicSlug}).String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicURL, nil)
+	if err != nil {
+		return ChatInfo{}, fmt.Errorf("create MAX public channel request: %w", err)
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; MaxPosty/1.0; +https://maxposty.ru)")
+	req.Header.Del("Authorization")
+	req.Header.Del("Cookie")
+
+	publicClient := *c.httpClient
+	publicClient.Jar = nil
+	publicClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	// #nosec G704 -- publicURL is constructed locally from the fixed HTTPS max.ru origin and a slug restricted to ASCII letters, digits, underscores and hyphens; redirects are disabled and no credentials are attached.
+	resp, err := publicClient.Do(req)
+	if err != nil {
+		return ChatInfo{}, fmt.Errorf("fetch MAX public channel page: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return ChatInfo{}, fmt.Errorf("MAX public channel page returned status %d", resp.StatusCode)
+	}
+	mediaType, _, mediaErr := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mediaErr != nil || (mediaType != "text/html" && mediaType != "application/xhtml+xml") {
+		return ChatInfo{}, errors.New("MAX public channel page did not return HTML")
+	}
+	body, err := readBoundedBody(resp.Body, maxPublicPageBytes, "MAX public channel page")
+	if err != nil {
+		return ChatInfo{}, err
+	}
+	chatID, err := parsePublicChannelID(body)
+	if err != nil {
+		return ChatInfo{}, err
+	}
+	chat, err := c.getChat(ctx, chatID)
+	if err != nil {
+		return ChatInfo{}, fmt.Errorf("get MAX chat discovered from public page: %w", err)
+	}
+	canonicalSlug, err := NormalizeChatLink(chat.Link)
+	if err != nil || !strings.EqualFold(strings.TrimPrefix(canonicalSlug, "@"), publicSlug) {
+		return ChatInfo{}, errors.New("MAX public channel page did not match the canonical API link")
+	}
+	return chat, nil
+}
+
+func parsePublicChannelID(body []byte) (string, error) {
+	var discovered int64
+	remaining := body
+	for len(remaining) != 0 {
+		match := publicChannelIDPattern.FindSubmatchIndex(remaining)
+		if match == nil {
+			break
+		}
+		value, err := strconv.ParseInt(string(remaining[match[2]:match[3]]), 10, 64)
+		if err != nil || value <= 0 {
+			return "", errors.New("MAX public channel page contains an invalid channelId")
+		}
+		if discovered != 0 && discovered != value {
+			return "", errors.New("MAX public channel page contains ambiguous channelId values")
+		}
+		discovered = value
+		remaining = remaining[match[1]:]
+	}
+	if discovered == 0 {
+		return "", errors.New("MAX public channel page does not contain channelId")
+	}
+	return strconv.FormatInt(-discovered, 10), nil
+}
+
+func isChatNotFound(err error) bool {
+	var apiErr *Error
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound && apiErr.Code == "chat.not.found"
 }
 
 func (c *Client) getChat(ctx context.Context, identifier string) (ChatInfo, error) {
@@ -535,13 +631,17 @@ func validateUploadURL(raw string) (*url.URL, error) {
 }
 
 func readJSONBody(reader io.Reader) ([]byte, error) {
-	limited := io.LimitReader(reader, maxJSONResponseBytes+1)
+	return readBoundedBody(reader, maxJSONResponseBytes, "JSON response")
+}
+
+func readBoundedBody(reader io.Reader, limit int64, label string) ([]byte, error) {
+	limited := io.LimitReader(reader, limit+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		return body, err
 	}
-	if len(body) > maxJSONResponseBytes {
-		return body[:maxJSONResponseBytes], fmt.Errorf("JSON response exceeds %d bytes", maxJSONResponseBytes)
+	if int64(len(body)) > limit {
+		return body[:limit], fmt.Errorf("%s exceeds %d bytes", label, limit)
 	}
 	return body, nil
 }
@@ -656,7 +756,7 @@ func NormalizeChatLink(value string) (string, error) {
 
 func validChatSlug(value string) bool {
 	value = strings.TrimPrefix(value, "@")
-	if value == "" || !asciiLetter(value[0]) {
+	if value == "" || len(value) > 128 || !asciiLetter(value[0]) {
 		return false
 	}
 	for i := 1; i < len(value); i++ {

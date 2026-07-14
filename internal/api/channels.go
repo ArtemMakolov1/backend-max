@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/store"
 )
 
@@ -117,12 +118,42 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	candidate, err := s.app.PrepareChannelClaim(ctx, request.PublicLink, request.MAXChatID)
 	if err != nil {
+		if errors.Is(err, app.ErrMAXChannelEventRequired) {
+			s.problem(w, http.StatusUnprocessableEntity, "max_channel_event_required",
+				"MAX не передал ID этого уже подключённого канала. Опубликуйте в канале любой новый пост, затем нажмите „Обновить список“.",
+				map[string]any{"action": "publish_post_and_refresh"})
+			return
+		}
 		if errors.Is(err, store.ErrNotFound) || strings.Contains(err.Error(), "first add") {
 			s.problem(w, http.StatusUnprocessableEntity, "bot_not_observed",
 				"Сначала добавьте помощника MaxPosty администратором канала и повторите подключение", nil)
 			return
 		}
 		s.writeError(w, err)
+		return
+	}
+	// A previously linked MAX identity is already an explicit ownership proof.
+	// The application method rechecks that identity, the observed channel owner,
+	// current API metadata and bot permissions before the transactional connect.
+	connected, connectErr := s.app.ConnectDiscoverableChannelForUser(ctx, userID, candidate.Info.ChatID)
+	switch {
+	case connectErr == nil:
+		claimID, tokenErr := randomURLToken(32)
+		if tokenErr != nil {
+			s.writeError(w, tokenErr)
+			return
+		}
+		s.writeJSON(w, http.StatusCreated, map[string]any{
+			"claim_id": claimID, "status": store.ChannelClaimConnected,
+			"channel": connected.Channel, "diagnostics": connected.Diagnostics,
+			"message": "Канал подтверждён связанным профилем MAX и подключён",
+		})
+		return
+	case errors.Is(connectErr, store.ErrChannelOwned):
+		s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к другому аккаунту", nil)
+		return
+	case !errors.Is(connectErr, store.ErrNotFound):
+		s.writeError(w, connectErr)
 		return
 	}
 	if existing, getErr := s.app.Store().GetChannelByMAXChatID(r.Context(), candidate.Info.ChatID); getErr == nil {

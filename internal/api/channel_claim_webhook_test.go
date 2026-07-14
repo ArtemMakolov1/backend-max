@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,17 +34,23 @@ type claimWebhookMAX struct {
 	callbackAnswers   []string
 	callbackMessages  []string
 	publishRuns       int
+	getChatIDs        []string
+	getLinkErr        error
 }
 
 func (f *claimWebhookMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 	return maxclient.BotInfo{UserID: 42, Username: "maxstudio_helper_bot", IsBot: true}, nil
 }
 
-func (f *claimWebhookMAX) GetChat(context.Context, string) (maxclient.ChatInfo, error) {
+func (f *claimWebhookMAX) GetChat(_ context.Context, chatID string) (maxclient.ChatInfo, error) {
+	f.getChatIDs = append(f.getChatIDs, chatID)
 	return f.chat, nil
 }
 
 func (f *claimWebhookMAX) GetChatByLink(context.Context, string) (maxclient.ChatInfo, error) {
+	if f.getLinkErr != nil {
+		return maxclient.ChatInfo{}, f.getLinkErr
+	}
 	return f.chat, nil
 }
 
@@ -185,6 +193,221 @@ func TestMAXCallbackCompletesChannelClaimWithoutBrowserPoll(t *testing.T) {
 	channels, err := storage.ListChannelsForUser(ctx, "tenant-a")
 	if err != nil || len(channels) != 1 {
 		t.Fatalf("callback replay created duplicate channels: %#v, %v", channels, err)
+	}
+}
+
+func TestMAXMessageCreatedObservesChannelFromNestedRecipient(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := store.Open(ctx, filepath.Join(t.TempDir(), "message-created.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	fake := &claimWebhookMAX{chat: maxclient.ChatInfo{
+		ChatID: "-70801090403050", OwnerID: "123456789", Type: "channel", Status: "active",
+		Title: "Канал из события", Link: "https://max.ru/official_channel",
+		Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/channel.png"}, ParticipantsCount: 15,
+	}}
+	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(app.New(storage, mediaStore, fake, nil, nil, logger), logger,
+		"http://localhost:4321", "webhook-secret")
+	server.now = func() time.Time { return time.UnixMilli(1775025604499).UTC() }
+
+	// This is the message_created fixture shape from the official MAX Go SDK.
+	// A channel delivery differs from its group-chat sample only by chat_type.
+	body := `{
+		"message": {
+			"recipient": {"chat_id": -70801090403050, "chat_type": "channel"},
+			"timestamp": 1775053255737,
+			"body": {"mid": "mid.ffffbdb48e6c3775019d496b34394b84", "seq": 116327994376978687, "text": "..."},
+			"sender": {"user_id": 123456789, "first_name": "John", "last_name": "Doe", "is_bot": false, "last_activity_time": 1775053249000, "name": "John Doe"},
+			"link": {"type": "forward", "message": {"mid": "mid.sha-more", "seq": 116327994376978687, "text": "Лада седан - баклажан"}, "sender": {"user_id": 398398398, "first_name": "Tod", "last_name": "V", "is_bot": false, "last_activity_time": 1775755269000, "name": "Tod V"}, "chat_id": -695695695695}
+		},
+		"timestamp": 1775025604499,
+		"update_type": "message_created"
+	}`
+	response := performMAXWebhook(server.Handler(), body)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"ok":true`) {
+		t.Fatalf("message_created = %d %s", response.Code, response.Body.String())
+	}
+	if len(fake.getChatIDs) != 1 || fake.getChatIDs[0] != "-70801090403050" {
+		t.Fatalf("GetChat ids = %#v, want nested recipient id", fake.getChatIDs)
+	}
+	observed, err := storage.GetActiveObservedBotChat(ctx, "https://max.ru/official_channel", "")
+	if err != nil || observed.MAXChatID != "-70801090403050" || observed.Title != "Канал из события" || !observed.Active {
+		t.Fatalf("observed channel = %#v, %v", observed, err)
+	}
+}
+
+func TestMAXMessageCreatedIgnoresNonChannelAndInvalidNestedRecipient(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := store.Open(ctx, filepath.Join(t.TempDir(), "message-created-ignored.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	fake := &claimWebhookMAX{chat: maxclient.ChatInfo{ChatID: "-1", Type: "channel", Status: "active"}}
+	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(app.New(storage, mediaStore, fake, nil, nil, logger), logger,
+		"http://localhost:4321", "webhook-secret")
+	now := time.UnixMilli(1775025604499).UTC()
+	server.now = func() time.Time { return now }
+
+	for name, body := range map[string]string{
+		"spoofed top-level channel": `{"update_type":"message_created","timestamp":1775025604499,"chat_id":-1,"is_channel":true,"message":{"recipient":{"chat_id":-1,"chat_type":"chat"}}}`,
+		"invalid nested chat id":    `{"update_type":"message_created","timestamp":1775025604499,"message":{"recipient":{"chat_id":"not-a-number","chat_type":"channel"}}}`,
+		"missing message":           `{"update_type":"message_created","timestamp":1775025604499}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := performMAXWebhook(server.Handler(), body)
+			if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"ignored":true`) {
+				t.Fatalf("message_created = %d %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if len(fake.getChatIDs) != 0 {
+		t.Fatalf("ignored events called GetChat: %#v", fake.getChatIDs)
+	}
+	if _, err := storage.GetActiveObservedBotChat(ctx, "", "-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("ignored event entered inventory: %v", err)
+	}
+}
+
+func TestStartChannelConnectMapsMAXChatNotFoundToActionableEventError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := store.Open(ctx, filepath.Join(t.TempDir(), "channel-event-required.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	fake := &claimWebhookMAX{getLinkErr: &maxclient.Error{
+		StatusCode: http.StatusNotFound,
+		Code:       "chat.not.found",
+		Message:    "Chat not found by link: se13549123_biz",
+	}}
+	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(app.New(storage, mediaStore, fake, nil, nil, logger), logger,
+		"http://localhost:4321", "webhook-secret", AuthOptions{YandexClient: &fakeYandexOAuth{}})
+	handler := withTestSession(t, storage, server.Handler(), "tenant-a")
+
+	response := performJSONRequest(handler, http.MethodPost, "/api/v1/channels/connect/start",
+		`{"public_link":"https://max.ru/se13549123_biz"}`)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("connect start = %d %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Details struct {
+				Action string `json:"action"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	const wantMessage = "MAX не передал ID этого уже подключённого канала. Опубликуйте в канале любой новый пост, затем нажмите „Обновить список“."
+	if payload.Error.Code != "max_channel_event_required" || payload.Error.Message != wantMessage ||
+		payload.Error.Details.Action != "publish_post_and_refresh" {
+		t.Fatalf("problem contract = %#v", payload.Error)
+	}
+}
+
+func TestStartChannelConnectUsesLinkedMAXIdentityWithoutRepeatedBotConfirmation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := store.Open(ctx, filepath.Join(t.TempDir(), "linked-identity-connect.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.UpsertUser(ctx, store.User{ID: "tenant-a", Login: "alice", DisplayName: "Alice"}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	linkMAXIdentityForChannelTest(t, storage, "tenant-a", "32202189", now)
+
+	fake := &claimWebhookMAX{
+		chat: maxclient.ChatInfo{
+			ChatID: "-76868796016845", OwnerID: "32202189", Type: "channel", Status: "active",
+			Title: "Тестовый канал", Link: "https://max.ru/se13549123_biz",
+			Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/channel.png"}, ParticipantsCount: 42,
+		},
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+			maxclient.PermissionEdit, maxclient.PermissionDelete,
+		}},
+	}
+	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(app.New(storage, mediaStore, fake, nil, nil, logger), logger,
+		"http://localhost:4321", "webhook-secret", AuthOptions{YandexClient: &fakeYandexOAuth{}})
+	handler := withTestSession(t, storage, server.Handler(), "tenant-a")
+
+	response := performJSONRequest(handler, http.MethodPost, "/api/v1/channels/connect/start",
+		`{"public_link":"https://max.ru/se13549123_biz"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("connect start = %d %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		ClaimID     string                 `json:"claim_id"`
+		Status      string                 `json:"status"`
+		Channel     store.Channel          `json:"channel"`
+		Diagnostics app.ChannelDiagnostics `json:"diagnostics"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ClaimID == "" || payload.Status != store.ChannelClaimConnected ||
+		payload.Channel.MAXChatID != fake.chat.ChatID ||
+		!payload.Diagnostics.CanPublish {
+		t.Fatalf("immediate connection payload = %#v", payload)
+	}
+	if fake.confirmationRuns != 0 {
+		t.Fatalf("linked identity triggered %d repeated bot confirmation(s)", fake.confirmationRuns)
+	}
+	channels, err := storage.ListChannelsForUser(ctx, "tenant-a")
+	if err != nil || len(channels) != 1 || channels[0].VerifiedMAXOwnerID != "32202189" {
+		t.Fatalf("connected channels = %#v, %v", channels, err)
+	}
+}
+
+func linkMAXIdentityForChannelTest(t *testing.T, storage *store.Store, userID, maxUserID string, now time.Time) {
+	t.Helper()
+	attempt := store.MAXIdentityLinkAttempt{
+		ID: "identity-" + userID, TokenHash: strings.Repeat("a", 64), UserID: userID,
+		RequesterLabel: userID, ComparisonCode: "123456", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+	}
+	if err := storage.CreateMAXIdentityLinkAttempt(t.Context(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	confirmHash := strings.Repeat("b", 64)
+	if _, _, err := storage.StartMAXIdentityLinkConfirmation(t.Context(), attempt.TokenHash, maxUserID,
+		confirmHash, strings.Repeat("c", 64), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.ConfirmMAXIdentityLink(t.Context(), confirmHash, maxUserID, true, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
 	}
 }
 

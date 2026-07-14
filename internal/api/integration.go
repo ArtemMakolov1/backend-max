@@ -93,6 +93,12 @@ type maxUpdate struct {
 			UserID json.RawMessage `json:"user_id"`
 		} `json:"user,omitempty"`
 	} `json:"callback,omitempty"`
+	Message *struct {
+		Recipient struct {
+			ChatID   json.RawMessage `json:"chat_id"`
+			ChatType string          `json:"chat_type"`
+		} `json:"recipient"`
+	} `json:"message,omitempty"`
 }
 
 func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +129,10 @@ func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	if update.UpdateType == "message_callback" {
 		s.handleMessageCallback(w, r, update)
+		return
+	}
+	if update.UpdateType == "message_created" {
+		s.handleMessageCreated(w, r, update)
 		return
 	}
 	chatID, err := webhookChatID(update.ChatID)
@@ -160,6 +170,35 @@ func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, err)
 			return
 		}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleMessageCreated(w http.ResponseWriter, r *http.Request, update maxUpdate) {
+	// Unlike bot lifecycle updates, message_created carries the chat identity
+	// inside message.recipient. Trust the authenticated MAX recipient type, not
+	// optional top-level compatibility fields, so dialogs and group chats never
+	// enter the channel inventory.
+	if update.Message == nil || update.Message.Recipient.ChatType != "channel" {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	chatID, err := webhookChatID(update.Message.Recipient.ChatID)
+	if err != nil {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	eventAt, valid := maxEventTime(update.Timestamp, s.now().UTC())
+	if !valid {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 8*time.Second)
+	err = s.app.DiscoverMAXChatFromMessage(ctx, chatID, eventAt)
+	cancel()
+	if err != nil {
+		s.writeError(w, err)
+		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

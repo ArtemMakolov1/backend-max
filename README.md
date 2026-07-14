@@ -156,7 +156,7 @@ SHA-256 хэши, попытка действует 10 минут, а один M
 POST https://maxposty.ru/api/v1/webhooks/max
 ```
 
-Настройте подписку общего бота один раз от имени оператора:
+Настройте подписку общего бота от имени оператора:
 
 ```sh
 make setup-max-webhook
@@ -168,8 +168,15 @@ docker compose --profile ops run --rm --build setup-max-webhook
 значение `MAX_WEBHOOK_SECRET` в поле `secret` и подписывается на события:
 
 ```text
-bot_started, message_callback, bot_added, bot_removed
+bot_started, message_callback, message_created, bot_added, bot_removed
 ```
+
+Команда использует штатный `POST /subscriptions`: он обновляет существующую
+подписку на тот же URL без предварительного удаления и разрыва доставки. После
+обновления команда запрашивает `GET /subscriptions` и завершается успешно только
+если MAX вернул этот endpoint со всеми обязательными типами событий, включая
+`message_created`. Секрет API обратно не возвращает, поэтому проверяются URL и
+набор событий.
 
 MAX отправляет секрет в `X-Max-Bot-Api-Secret`. Webhook без правильного секрета
 отклоняется. Токен общего бота нельзя передавать браузеру или пользователям.
@@ -180,7 +187,7 @@ MAX отправляет секрет в `X-Max-Bot-Api-Secret`. Webhook без 
 выдан доверенным центром, его CN/SAN совпадает с доменом и сервер отдаёт полную
 цепочку. MAX ждёт ответ не дольше 30 секунд; если ни одна доставка не была
 успешной в течение 8 часов, подписка автоматически отключается. Поэтому в
-production проверяйте `GET /subscriptions` и настройте оповещение.
+production дополнительно следите за фактической доставкой и настройте оповещение.
 
 API MAX работает только через `https://platform-api2.max.ru`. До 19 июля 2026
 проверьте, что trust store окружения доверяет новой цепочке MAX. Если системных
@@ -240,7 +247,7 @@ TEST_DATABASE_URL=postgresql://maxstudio_test:...@localhost:5432/maxstudio_test?
 ```sh
 make migrate      # применить миграции через direct URL
 make dev          # запустить API через PgBouncer
-make setup-max-webhook # один раз настроить production webhook общего бота
+make setup-max-webhook # вручную сверить production webhook общего бота
 make test         # тесты на PostgreSQL
 make test-race    # тесты с race detector
 make vet
