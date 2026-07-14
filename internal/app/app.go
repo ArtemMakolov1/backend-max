@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"golang.org/x/sync/singleflight"
+
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/openaiimg"
@@ -22,10 +24,11 @@ import (
 )
 
 var (
-	ErrMAXNotConfigured      = errors.New("MAX integration is not configured")
-	ErrOpenAINotConfigured   = errors.New("OpenAI integration is not configured")
-	ErrResearchNotConfigured = errors.New("OpenAI research integration is not configured")
-	ErrConflict              = errors.New("resource state conflict")
+	ErrMAXNotConfigured        = errors.New("MAX integration is not configured")
+	ErrMAXChannelEventRequired = errors.New("MAX channel event is required to discover the channel id")
+	ErrOpenAINotConfigured     = errors.New("OpenAI integration is not configured")
+	ErrResearchNotConfigured   = errors.New("OpenAI research integration is not configured")
+	ErrConflict                = errors.New("resource state conflict")
 )
 
 type MAXClient interface {
@@ -90,6 +93,10 @@ type App struct {
 	research ResearchClient
 	logger   *slog.Logger
 	now      func() time.Time
+	// messageChatDiscovery collapses webhook retries for a channel that has not
+	// entered the authenticated inventory yet. Lifecycle events intentionally do
+	// not use it because bot_added must refresh the stored channel metadata.
+	messageChatDiscovery singleflight.Group
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {
@@ -150,6 +157,29 @@ func (a *App) ObserveMAXChat(ctx context.Context, maxChatID string, active bool,
 		Title: info.Title, MAXOwnerID: info.OwnerID, IconURL: info.Icon.URL,
 		ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: now,
 	})
+}
+
+// DiscoverMAXChatFromMessage learns a channel from message_created only when
+// it is absent from the active inventory. The second lookup inside singleflight
+// closes the race between concurrent webhook deliveries and later retries.
+func (a *App) DiscoverMAXChatFromMessage(ctx context.Context, maxChatID string, eventAt time.Time) error {
+	if a.max == nil {
+		return ErrMAXNotConfigured
+	}
+	if _, err := a.store.GetActiveObservedBotChat(ctx, "", maxChatID); err == nil {
+		return nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	_, err, _ := a.messageChatDiscovery.Do(maxChatID, func() (any, error) {
+		if _, lookupErr := a.store.GetActiveObservedBotChat(ctx, "", maxChatID); lookupErr == nil {
+			return nil, nil
+		} else if !errors.Is(lookupErr, store.ErrNotFound) {
+			return nil, lookupErr
+		}
+		return nil, a.ObserveMAXChat(ctx, maxChatID, true, eventAt)
+	})
+	return err
 }
 
 func (a *App) ConnectChannel(ctx context.Context, publicLink, maxChatID, requestedTitle string) (ChannelCheck, error) {
@@ -245,6 +275,19 @@ func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID str
 		var err error
 		info, err = a.max.GetChatByLink(ctx, slug)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if cause := context.Cause(ctx); cause != nil {
+					return ChannelClaimCandidate{}, cause
+				}
+				if errors.Is(err, context.DeadlineExceeded) {
+					return ChannelClaimCandidate{}, context.DeadlineExceeded
+				}
+				return ChannelClaimCandidate{}, context.Canceled
+			}
+			var maxErr *maxclient.Error
+			if errors.As(err, &maxErr) && maxErr.StatusCode == 404 && maxErr.Code == "chat.not.found" {
+				return ChannelClaimCandidate{}, ErrMAXChannelEventRequired
+			}
 			return ChannelClaimCandidate{}, err
 		}
 		if info.Type != "channel" || info.Status != "active" {

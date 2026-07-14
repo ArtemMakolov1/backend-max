@@ -28,8 +28,8 @@ type Channel struct {
 	UpdatedAt          time.Time `json:"updated_at"`
 }
 
-// ObservedBotChat is inventory learned from authenticated MAX bot_added and
-// bot_removed webhooks. It never grants a tenant ownership by itself.
+// ObservedBotChat is inventory learned from authenticated MAX bot lifecycle
+// and channel-message webhooks. It never grants a tenant ownership by itself.
 type ObservedBotChat struct {
 	MAXChatID         string
 	PublicLink        string

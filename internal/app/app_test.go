@@ -18,6 +18,8 @@ import (
 type fakeMAX struct {
 	chat         maxclient.ChatInfo
 	membership   maxclient.Membership
+	getChatErr   error
+	getLinkErr   error
 	getChatCalls int
 	getLinkCalls int
 	lastChatLink string
@@ -33,6 +35,9 @@ func (f *fakeMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 }
 func (f *fakeMAX) GetChat(context.Context, string) (maxclient.ChatInfo, error) {
 	f.getChatCalls++
+	if f.getChatErr != nil {
+		return maxclient.ChatInfo{}, f.getChatErr
+	}
 	chat := f.chat
 	if chat.OwnerID == "" {
 		chat.OwnerID = "test-max-owner"
@@ -42,6 +47,9 @@ func (f *fakeMAX) GetChat(context.Context, string) (maxclient.ChatInfo, error) {
 func (f *fakeMAX) GetChatByLink(_ context.Context, link string) (maxclient.ChatInfo, error) {
 	f.getLinkCalls++
 	f.lastChatLink = link
+	if f.getLinkErr != nil {
+		return maxclient.ChatInfo{}, f.getLinkErr
+	}
 	chat := f.chat
 	if chat.OwnerID == "" {
 		chat.OwnerID = "test-max-owner"
@@ -196,6 +204,77 @@ func TestPrepareChannelClaimKeepsNumericIDRegistryOnly(t *testing.T) {
 	}
 	if fake.getLinkCalls != 0 || fake.getChatCalls != 0 || fake.memberCalls != 0 {
 		t.Fatalf("numeric registry miss reached MAX API: %#v", fake)
+	}
+}
+
+func TestPrepareChannelClaimRequiresChannelEventWhenMAXCannotResolvePublicLink(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{getLinkErr: &maxclient.Error{
+		StatusCode: 404,
+		Code:       "chat.not.found",
+		Message:    "Chat not found by link: se13549123_biz",
+	}}
+	application, _ := newTestApp(t, fake)
+
+	_, err := application.PrepareChannelClaim(context.Background(), "https://max.ru/se13549123_biz", "")
+	if !errors.Is(err, ErrMAXChannelEventRequired) {
+		t.Fatalf("PrepareChannelClaim() error = %v, want ErrMAXChannelEventRequired", err)
+	}
+	if fake.getLinkCalls != 1 || fake.lastChatLink != "se13549123_biz" || fake.getChatCalls != 0 || fake.memberCalls != 0 {
+		t.Fatalf("unexpected MAX calls after chat.not.found: %#v", fake)
+	}
+}
+
+func TestPrepareChannelClaimPreservesOtherMAXErrors(t *testing.T) {
+	t.Parallel()
+	upstream := &maxclient.Error{StatusCode: 500, Code: "chat.not.found", Message: "temporary failure"}
+	fake := &fakeMAX{getLinkErr: upstream}
+	application, _ := newTestApp(t, fake)
+
+	_, err := application.PrepareChannelClaim(context.Background(), "https://max.ru/se13549123_biz", "")
+	if !errors.Is(err, upstream) || errors.Is(err, ErrMAXChannelEventRequired) {
+		t.Fatalf("PrepareChannelClaim() error = %v, want original upstream error", err)
+	}
+}
+
+func TestPrepareChannelClaimPreservesPublicFallbackDeadline(t *testing.T) {
+	t.Parallel()
+	upstream := &maxclient.Error{
+		StatusCode: 404,
+		Code:       "chat.not.found",
+		Message:    "Chat not found by link: se13549123_biz",
+	}
+	fake := &fakeMAX{getLinkErr: errors.Join(context.DeadlineExceeded, upstream)}
+	application, _ := newTestApp(t, fake)
+
+	_, err := application.PrepareChannelClaim(context.Background(), "https://max.ru/se13549123_biz", "")
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrMAXChannelEventRequired) {
+		t.Fatalf("PrepareChannelClaim() error = %v, want preserved deadline", err)
+	}
+}
+
+func TestDiscoverMAXChatFromMessageSkipsKnownChannelRetries(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{}
+	application, storage := newTestApp(t, fake)
+	fake.chat = maxclient.ChatInfo{
+		ChatID: "-70801090403050", OwnerID: "123456789", Type: "channel", Status: "active",
+		Title: "Канал из события", Link: "https://max.ru/official_channel",
+	}
+	eventAt := time.Now().UTC().Truncate(time.Microsecond)
+
+	if err := application.DiscoverMAXChatFromMessage(context.Background(), fake.chat.ChatID, eventAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.DiscoverMAXChatFromMessage(context.Background(), fake.chat.ChatID, eventAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if fake.getChatCalls != 1 {
+		t.Fatalf("GetChat calls = %d, want one discovery call for webhook retries", fake.getChatCalls)
+	}
+	observed, err := storage.GetActiveObservedBotChat(context.Background(), "", fake.chat.ChatID)
+	if err != nil || observed.MAXChatID != fake.chat.ChatID || !observed.Active {
+		t.Fatalf("observed channel = %#v, %v", observed, err)
 	}
 }
 

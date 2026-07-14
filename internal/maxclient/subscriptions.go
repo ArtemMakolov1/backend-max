@@ -3,6 +3,7 @@ package maxclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -11,9 +12,17 @@ import (
 
 var webhookSecretPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{5,256}$`)
 
+var studioWebhookUpdateTypes = []string{
+	"bot_added",
+	"bot_removed",
+	"bot_started",
+	"message_created",
+	"message_callback",
+}
+
 // ConfigureStudioWebhook creates or updates the product webhook for the shared
 // MAX bot. End users never call this method: the service operator configures it
-// once for the bot used by every tenant.
+// for the bot used by every tenant, and production deploys reconcile it.
 func (c *Client) ConfigureStudioWebhook(ctx context.Context, rawURL, secret string) error {
 	webhookURL, err := validateWebhookURL(rawURL)
 	if err != nil {
@@ -29,21 +38,63 @@ func (c *Client) ConfigureStudioWebhook(ctx context.Context, rawURL, secret stri
 		// #nosec G117 -- MAX requires the JSON key "secret" for webhook authentication; the value is sent only to the pinned API and is never logged.
 		Secret string `json:"secret"`
 	}{
-		URL: webhookURL.String(),
-		UpdateTypes: []string{
-			"bot_added",
-			"bot_removed",
-			"bot_started",
-			"message_callback",
-		},
-		Secret: secret,
+		URL:         webhookURL.String(),
+		UpdateTypes: append([]string(nil), studioWebhookUpdateTypes...),
+		Secret:      secret,
 	}
 
 	var response operationResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/subscriptions", nil, body, &response); err != nil {
 		return err
 	}
-	return response.asError(http.StatusOK)
+	if err := response.asError(http.StatusOK); err != nil {
+		return err
+	}
+	return c.verifyStudioWebhookSubscription(ctx, webhookURL.String())
+}
+
+func (c *Client) verifyStudioWebhookSubscription(ctx context.Context, webhookURL string) error {
+	var response struct {
+		Subscriptions []struct {
+			URL         string   `json:"url"`
+			UpdateTypes []string `json:"update_types"`
+		} `json:"subscriptions"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/subscriptions", nil, nil, &response); err != nil {
+		return fmt.Errorf("verify MAX webhook subscription: %w", err)
+	}
+
+	matchedEndpoint := false
+	firstMissingUpdateType := ""
+	for _, subscription := range response.Subscriptions {
+		if subscription.URL != webhookURL {
+			continue
+		}
+		matchedEndpoint = true
+		configured := make(map[string]struct{}, len(subscription.UpdateTypes))
+		for _, updateType := range subscription.UpdateTypes {
+			configured[updateType] = struct{}{}
+		}
+		missingUpdateType := ""
+		for _, required := range studioWebhookUpdateTypes {
+			if _, ok := configured[required]; !ok {
+				missingUpdateType = required
+				break
+			}
+		}
+		if missingUpdateType == "" {
+			return nil
+		}
+		if firstMissingUpdateType == "" {
+			firstMissingUpdateType = missingUpdateType
+		}
+	}
+
+	if matchedEndpoint {
+		return fmt.Errorf("verify MAX webhook subscription: required update type %q is missing", firstMissingUpdateType)
+	}
+
+	return errors.New("verify MAX webhook subscription: updated endpoint was not returned")
 }
 
 // ValidateStudioWebhookConfiguration performs every local check without

@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       configure_max_webhook:
-        description: Configure the shared MAX bot webhook after a healthy deploy
+        description: Reconcile and verify the shared MAX bot webhook after a healthy deploy
         required: true
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -178,6 +178,10 @@ jobs:
       VPS_PORT: ${{ vars.VPS_PORT || '22' }}
       VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
       DEPLOY_STAGE: ${{ vars.DEPLOY_STAGE || 'bootstrap' }}
+      CONFIGURE_MAX_WEBHOOK: >-
+        ${{ vars.DEPLOY_STAGE == 'production' &&
+            (github.event_name == 'push' ||
+             (github.event_name == 'workflow_dispatch' && inputs.configure_max_webhook)) }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -185,8 +189,6 @@ jobs:
           persist-credentials: false
       - name: Validate deployment target
         shell: bash
-        env:
-          CONFIGURE_MAX_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && inputs.configure_max_webhook || false }}
         run: |
           set -euo pipefail
           [[ "$DEPLOY_STAGE" == "bootstrap" || "$DEPLOY_STAGE" == "production" ]] || { echo "DEPLOY_STAGE must be bootstrap or production" >&2; exit 1; }
@@ -246,7 +248,6 @@ jobs:
           PRODUCTION_ENV_PATH: ${{ runner.temp }}/maxposty-backend.env
           GHCR_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.image.outputs.image }}
-          CONFIGURE_MAX_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && inputs.configure_max_webhook || false }}
         run: |
           set -euo pipefail
           install_dir=/opt/maxposty/backend
