@@ -256,7 +256,7 @@ func (a *App) PublishPost(ctx context.Context, postID int64) (store.Post, error)
 	}
 	post, err := a.store.ClaimForPublishing(ctx, postID)
 	if err != nil {
-		return store.Post{}, fmt.Errorf("%w: %v", ErrConflict, err)
+		return store.Post{}, fmt.Errorf("%w: %w", ErrConflict, err)
 	}
 	return a.publishClaimedPost(ctx, post)
 }
@@ -557,7 +557,9 @@ func (a *App) imageTokens(ctx context.Context, post store.Post) ([]string, error
 	if err != nil {
 		return nil, fmt.Errorf("open post image: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	upload, err := a.max.UploadImage(ctx, filepath.Base(imagePath), file)
 	if err != nil {
 		return nil, err

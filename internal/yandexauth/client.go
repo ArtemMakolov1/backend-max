@@ -61,7 +61,7 @@ func New(clientID, clientSecret string, httpClient *http.Client) (*Client, error
 	clientID = strings.TrimSpace(clientID)
 	clientSecret = strings.TrimSpace(clientSecret)
 	if clientID == "" || clientSecret == "" {
-		return nil, errors.New("Yandex OAuth client ID and secret are required")
+		return nil, errors.New("yandex OAuth client ID and secret are required")
 	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}
@@ -103,7 +103,9 @@ func (c *Client) ExchangeCode(ctx context.Context, code, codeVerifier string) (s
 	if err != nil {
 		return "", fmt.Errorf("request Yandex token: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 
 	var payload struct {
 		AccessToken      string `json:"access_token"`
@@ -137,7 +139,9 @@ func (c *Client) UserInfo(ctx context.Context, accessToken string) (Profile, err
 	if err != nil {
 		return Profile{}, fmt.Errorf("request Yandex user info: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 
 	var profile Profile
 	if err := decodeLimitedJSON(response.Body, &profile); err != nil {

@@ -380,7 +380,9 @@ func TestUploadImageUsesMultipartWithoutAuthorization(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read multipart data: %v", err)
 		}
-		defer file.Close()
+		defer func() {
+			_ = file.Close()
+		}()
 		contents, err := io.ReadAll(file)
 		if err != nil {
 			t.Fatalf("read uploaded file: %v", err)

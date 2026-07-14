@@ -24,7 +24,11 @@ func TestAdminKeyProtectsManagementAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer storage.Close()
+	t.Cleanup(func() {
+		if closeErr := storage.Close(); closeErr != nil {
+			t.Errorf("close store: %v", closeErr)
+		}
+	})
 	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
 	if err != nil {
 		t.Fatalf("open media store: %v", err)

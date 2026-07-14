@@ -8,17 +8,17 @@
 !.env.example
 
 # Runtime data
-data/
-media/
+/data/
+/media/
 *.db
 *.db-*
-bin/
-coverage.out
+/bin/
+/coverage.out
 /server
 
 # Local certificate bundles must never be committed.
-certs/*
-!certs/.gitkeep
+/certs/*
+!/certs/.gitkeep
 
 # Logs
 *.log

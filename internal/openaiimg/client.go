@@ -113,7 +113,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (Result,
 	if err != nil {
 		return Result{}, fmt.Errorf("call OpenAI image API: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return Result{}, fmt.Errorf("read OpenAI image response: %w", err)

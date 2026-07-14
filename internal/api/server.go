@@ -2,11 +2,8 @@ package api
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -317,14 +314,6 @@ func parseID(r *http.Request) (int64, error) {
 		return 0, errors.New("id must be a positive integer")
 	}
 	return id, nil
-}
-
-func requestID() string {
-	var data [12]byte
-	if _, err := rand.Read(data[:]); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(data[:])
 }
 
 func isValidationError(err error) bool {

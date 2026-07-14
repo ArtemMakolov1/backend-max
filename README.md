@@ -34,9 +34,22 @@ Useful repository-local commands:
 make test       # unit tests
 make test-race  # tests with the race detector
 make vet        # Go static checks
+make lint-install # install the pinned golangci-lint release into bin/
+make lint       # golangci-lint checks and formatting
+make lint-config # validate .golangci.yml against its v2 schema
+make ci         # local lint + race tests + vet gate
 make build      # bin/maxpilot
 make docker-build
 ```
+
+The linter version is pinned in `.golangci-lint-version`. Run
+`make lint-install` once to install that exact release into the ignored local
+`bin/` directory through the official golangci-lint installer. `make lint`
+prefers that binary and can also use an already installed compatible v2 binary;
+it parses the configuration and analyzes production and test code. The explicit
+`make lint-config` schema check requires access to `golangci-lint.run`. GitHub
+Actions always runs the exact pinned version on every push and pull request,
+together with race tests, `go vet`, and a production build.
 
 ## Docker Compose
 

@@ -47,7 +47,11 @@ func main() {
 		logger.Error("could not open database", "error", err)
 		os.Exit(1)
 	}
-	defer storage.Close()
+	defer func() {
+		if closeErr := storage.Close(); closeErr != nil {
+			logger.Error("could not close database", "error", closeErr)
+		}
+	}()
 
 	mediaStore, err := media.New(cfg.MediaDir, cfg.PublicBaseURL)
 	if err != nil {

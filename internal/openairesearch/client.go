@@ -329,7 +329,9 @@ func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnv
 	if err != nil {
 		return responseEnvelope{}, fmt.Errorf("call OpenAI Responses API: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return responseEnvelope{}, fmt.Errorf("read OpenAI Responses response: %w", err)

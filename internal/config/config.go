@@ -157,7 +157,7 @@ func validateYandexRedirectURI(raw string) error {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawQuery != "" {
 		return fmt.Errorf("YANDEX_REDIRECT_URI must be an absolute HTTP(S) URL without credentials, query or fragment")
 	}
-	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !isLoopbackHost(parsed.Hostname())) {
 		return fmt.Errorf("YANDEX_REDIRECT_URI must use HTTPS outside localhost")
 	}
 	if parsed.Path != "/api/v1/auth/yandex/callback" {

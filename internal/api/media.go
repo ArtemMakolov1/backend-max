@@ -57,7 +57,9 @@ func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, post
 		return store.Post{}, media.File{}, errors.New("invalid multipart upload or image is too large")
 	}
 	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
+		defer func() {
+			_ = r.MultipartForm.RemoveAll()
+		}()
 	}
 	if postID == nil {
 		if raw := strings.TrimSpace(r.FormValue("post_id")); raw != "" {
@@ -76,7 +78,9 @@ func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, post
 	if err != nil {
 		return store.Post{}, media.File{}, err
 	}
-	defer upload.Close()
+	defer func() {
+		_ = upload.Close()
+	}()
 	file, err := s.app.Media().Save(fileHeader.Filename, upload)
 	if err != nil {
 		return store.Post{}, media.File{}, err
@@ -113,7 +117,9 @@ func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusBadRequest, "invalid_media_path", err.Error(), nil)
 		return
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 	header := make([]byte, 512)
 	n, _ := io.ReadFull(file, header)
 	_, _ = file.Seek(0, io.SeekStart)

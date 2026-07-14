@@ -42,14 +42,19 @@ func Open(ctx context.Context, databasePath string) (*Store, error) {
 		"PRAGMA synchronous = NORMAL",
 	} {
 		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("configure sqlite (%s): %w", pragma, err)
+			resultErr := fmt.Errorf("configure sqlite (%s): %w", pragma, err)
+			if closeErr := db.Close(); closeErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("close sqlite: %w", closeErr))
+			}
+			return nil, resultErr
 		}
 	}
 
 	s := &Store{db: db}
 	if err := s.migrate(ctx); err != nil {
-		db.Close()
+		if closeErr := db.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("close sqlite: %w", closeErr))
+		}
 		return nil, err
 	}
 	return s, nil
@@ -229,7 +234,9 @@ FROM channels ORDER BY active DESC, title COLLATE NOCASE, id`)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	channels := make([]Channel, 0)
 	for rows.Next() {
@@ -381,7 +388,9 @@ func (s *Store) ListPosts(ctx context.Context, status string, channelID *int64) 
 	if err != nil {
 		return nil, fmt.Errorf("list posts: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	posts := make([]Post, 0)
 	for rows.Next() {
@@ -650,7 +659,9 @@ ORDER BY julianday(scheduled_at), id LIMIT ?`, PostStatusScheduled, now.UTC().Fo
 	if err != nil {
 		return nil, fmt.Errorf("list due posts: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 	var ids []int64
 	for rows.Next() {
 		var id int64

@@ -214,7 +214,9 @@ func (c *Client) UploadImage(ctx context.Context, filename string, image io.Read
 	if err != nil {
 		return UploadResult{}, fmt.Errorf("upload image to MAX storage: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	responseBody, readErr := readJSONBody(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -366,7 +368,9 @@ func (c *Client) doJSON(ctx context.Context, method, endpointPath string, query 
 	if err != nil {
 		return fmt.Errorf("MAX API %s %s: %w", method, endpointPath, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	responseBody, readErr := readJSONBody(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -528,9 +532,7 @@ func NormalizeChatLink(value string) (string, error) {
 }
 
 func validChatSlug(value string) bool {
-	if strings.HasPrefix(value, "@") {
-		value = strings.TrimPrefix(value, "@")
-	}
+	value = strings.TrimPrefix(value, "@")
 	if value == "" || !asciiLetter(value[0]) {
 		return false
 	}

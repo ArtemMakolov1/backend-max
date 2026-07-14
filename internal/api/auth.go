@@ -198,7 +198,6 @@ func (s *Server) finishYandexAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	profile, err := s.yandexClient.UserInfo(ctx, accessToken)
-	accessToken = ""
 	if err != nil {
 		s.logger.Warn("Yandex OAuth profile request failed", "error", err)
 		s.redirectAuthError(w, r, "oauth_unavailable")
