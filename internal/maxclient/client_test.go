@@ -1,0 +1,504 @@
+package maxclient
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestGetMeUsesRawAuthorizationToken(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method != http.MethodGet || r.URL.Path != "/api/me" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "raw-token" {
+			t.Errorf("Authorization = %q, want raw token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"user_id":42,"first_name":"Editor","username":"channel_bot","is_bot":true}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL+"/api/", "raw-token", server.Client())
+	bot, err := client.GetMe(context.Background())
+	if err != nil {
+		t.Fatalf("GetMe() error = %v", err)
+	}
+	if bot.UserID != 42 || bot.FirstName != "Editor" || !bot.IsBot {
+		t.Fatalf("GetMe() = %#v", bot)
+	}
+	if err := client.Test(context.Background()); err != nil {
+		t.Fatalf("Test() error = %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("request count = %d, want 2", got)
+	}
+}
+
+func TestGetChatIsReadOnlyAndPreservesLargeID(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/-9007199254740993" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"chat_id":-9007199254740993,"type":"channel","status":"active","title":"Новости","link":"https://max.ru/news","icon":{"url":"https://cdn.max.ru/news.png"},"participants_count":12450}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	chat, err := client.GetChat(context.Background(), "-9007199254740993")
+	if err != nil {
+		t.Fatalf("GetChat() error = %v", err)
+	}
+	if chat.ChatID != "-9007199254740993" || chat.Type != "channel" || chat.Status != "active" || chat.Title != "Новости" ||
+		chat.Icon.URL != "https://cdn.max.ru/news.png" || chat.ParticipantsCount != 12450 {
+		t.Fatalf("GetChat() = %#v", chat)
+	}
+}
+
+func TestResolveChatAndMembershipAreReadOnly(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/chats/news-room":
+			_, _ = io.WriteString(w, `{"chat_id":-9223372036854775807,"type":"channel","status":"active","title":"News","link":"https://max.ru/news-room"}`)
+		case "/chats/-9223372036854775807/members/me":
+			_, _ = io.WriteString(w, `{"user_id":42,"first_name":"Bot","is_bot":true,"is_admin":true,"permissions":["read_all_messages","post_edit_delete_message","edit_message","delete_message"]}`)
+		default:
+			t.Errorf("unexpected path %q", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	chat, err := client.ResolveChat(context.Background(), "https://max.ru/news-room?from=test")
+	if err != nil {
+		t.Fatalf("ResolveChat() error = %v", err)
+	}
+	if chat.ChatID != "-9223372036854775807" || chat.Type != "channel" || chat.Status != "active" {
+		t.Fatalf("ResolveChat() = %#v", chat)
+	}
+	membership, err := client.GetMembership(context.Background(), chat.ChatID)
+	if err != nil {
+		t.Fatalf("GetMembership() error = %v", err)
+	}
+	if !membership.IsAdmin || !membership.HasPermission(PermissionReadAllMessages) ||
+		!membership.HasPermission(PermissionWrite) || !membership.HasPermission(PermissionEdit) ||
+		!membership.HasPermission(PermissionDelete) {
+		t.Fatalf("unexpected membership: %#v", membership)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestResolveChatRejectsInvalidLinksAndMalformedChatID(t *testing.T) {
+	t.Parallel()
+	client := mustClient(t, "https://platform-api2.max.ru", "token", http.DefaultClient)
+	for _, input := range []string{"", "http://max.ru/news", "https://evil.example/news", "https://max.ru/a/b", "123"} {
+		if _, err := client.ResolveChat(context.Background(), input); err == nil {
+			t.Errorf("ResolveChat(%q) accepted invalid link", input)
+		}
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"chat_id":"not-a-number","type":"channel","status":"active"}`)
+	}))
+	defer server.Close()
+	client = mustClient(t, server.URL, "token", server.Client())
+	if _, err := client.ResolveChat(context.Background(), "news"); err == nil || !strings.Contains(err.Error(), "numeric chat_id") {
+		t.Fatalf("ResolveChat malformed response error = %v", err)
+	}
+}
+
+func TestNormalizeChatLink(t *testing.T) {
+	t.Parallel()
+	for input, want := range map[string]string{
+		"news":                          "news",
+		"@news_room":                    "@news_room",
+		"max.ru/news-room":              "news-room",
+		"https://max.ru/news?from=test": "news",
+		"https://MAX.RU/News":           "News",
+	} {
+		got, err := NormalizeChatLink(input)
+		if err != nil || got != want {
+			t.Errorf("NormalizeChatLink(%q) = %q, %v; want %q", input, got, err, want)
+		}
+	}
+}
+
+func TestNumericIDUsesSignedInt64Contract(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"0", "9223372036854775807", "-9223372036854775808"} {
+		if !numericID(value) {
+			t.Errorf("numericID(%q) = false, want true", value)
+		}
+	}
+	for _, value := range []string{"", "+1", "9223372036854775808", "-9223372036854775809", "1.0", "1e3"} {
+		if numericID(value) {
+			t.Errorf("numericID(%q) = true, want false", value)
+		}
+	}
+}
+
+func TestPublishBuildsMAXMessageContract(t *testing.T) {
+	t.Parallel()
+
+	notify := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/messages" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.URL.Query().Get("chat_id"); got != "-987654321" {
+			t.Errorf("chat_id = %q", got)
+		}
+		if got := r.URL.Query().Get("disable_link_preview"); got != "true" {
+			t.Errorf("disable_link_preview = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "token" {
+			t.Errorf("Authorization = %q", got)
+		}
+
+		var body struct {
+			Text        string `json:"text"`
+			Format      Format `json:"format"`
+			Notify      *bool  `json:"notify"`
+			Attachments []struct {
+				Type    string `json:"type"`
+				Payload struct {
+					Token string `json:"token"`
+				} `json:"payload"`
+			} `json:"attachments"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if body.Text != "**Новый пост**" || body.Format != FormatMarkdown {
+			t.Errorf("message body = %#v", body)
+		}
+		if body.Notify == nil || *body.Notify {
+			t.Errorf("notify = %#v, want false", body.Notify)
+		}
+		if len(body.Attachments) != 2 || body.Attachments[0].Type != "image" || body.Attachments[0].Payload.Token != "image-1" || body.Attachments[1].Payload.Token != "image-2" {
+			t.Errorf("attachments = %#v", body.Attachments)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"message":{"body":{"mid":"mid-123","text":"**Новый пост**"},"url":"https://max.ru/channel/post"}}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	message, err := client.Publish(context.Background(), PublishRequest{
+		ChatID:             "-987654321",
+		Text:               "**Новый пост**",
+		Format:             FormatMarkdown,
+		ImageTokens:        []string{"image-1", "image-2"},
+		DisableLinkPreview: true,
+		Notify:             &notify,
+	})
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if message.MessageID != "mid-123" || message.URL != "https://max.ru/channel/post" || message.Text != "**Новый пост**" {
+		t.Fatalf("Publish() = %#v", message)
+	}
+}
+
+func TestEditAndDeleteBuildMAXContract(t *testing.T) {
+	t.Parallel()
+
+	var edited atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/messages" || r.URL.Query().Get("message_id") != "mid-7" {
+			t.Errorf("unexpected URL: %s", r.URL.String())
+		}
+		if got := r.Header.Get("Authorization"); got != "token" {
+			t.Errorf("Authorization = %q", got)
+		}
+
+		switch r.Method {
+		case http.MethodPut:
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode edit request: %v", err)
+			}
+			if string(body["attachments"]) != "[]" {
+				t.Errorf("attachments = %s, want [] to clear images", body["attachments"])
+			}
+			if string(body["format"]) != `"html"` {
+				t.Errorf("format = %s", body["format"])
+			}
+			edited.Store(true)
+		case http.MethodDelete:
+			if !edited.Load() {
+				t.Error("delete arrived before edit")
+			}
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":true}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	if err := client.Edit(context.Background(), EditRequest{
+		MessageID:   "mid-7",
+		Text:        "<b>Исправлено</b>",
+		Format:      FormatHTML,
+		ImageTokens: []string{},
+	}); err != nil {
+		t.Fatalf("Edit() error = %v", err)
+	}
+	if err := client.Delete(context.Background(), "mid-7"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+}
+
+func TestStructuredErrorPreservesRateLimitAndServerStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		code       string
+		retryAfter string
+	}{
+		{name: "rate limit", status: http.StatusTooManyRequests, body: `{"code":"rate_limit","message":"slow down"}`, code: "rate_limit", retryAfter: "7"},
+		{name: "server", status: http.StatusServiceUnavailable, body: `{"code":50301,"message":"unavailable"}`, code: "50301"},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", test.retryAfter)
+				w.Header().Set("X-Request-Id", "request-123")
+				w.WriteHeader(test.status)
+				_, _ = io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+
+			client := mustClient(t, server.URL, "token", server.Client())
+			_, err := client.GetMe(context.Background())
+			var apiErr *Error
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("GetMe() error = %T %v, want *Error", err, err)
+			}
+			if apiErr.StatusCode != test.status || apiErr.Code != test.code || apiErr.RequestID != "request-123" || apiErr.Body != test.body {
+				t.Fatalf("API error = %#v", apiErr)
+			}
+			if !apiErr.Temporary() {
+				t.Error("Temporary() = false")
+			}
+			if test.retryAfter != "" && apiErr.RetryAfter != 7*time.Second {
+				t.Errorf("RetryAfter = %s", apiErr.RetryAfter)
+			}
+		})
+	}
+}
+
+func TestJSONResponseLimit(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, strings.Repeat("x", maxJSONResponseBytes+1))
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	_, err := client.GetMe(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("GetMe() error = %v, want response size error", err)
+	}
+}
+
+func TestOversizedServerErrorStillPreservesStatus(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, strings.Repeat("x", maxJSONResponseBytes+1))
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	_, err := client.GetMe(context.Background())
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("GetMe() error = %T %v, want *Error", err, err)
+	}
+	if apiErr.StatusCode != http.StatusBadGateway || !strings.Contains(apiErr.Message, "exceeds") || len(apiErr.Body) != maxJSONResponseBytes {
+		t.Fatalf("API error = %#v", apiErr)
+	}
+}
+
+func TestUploadImageUsesMultipartWithoutAuthorization(t *testing.T) {
+	t.Parallel()
+
+	uploadServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.TLS == nil {
+			t.Errorf("unexpected upload request: %s TLS=%v", r.Method, r.TLS != nil)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			t.Errorf("upload Authorization = %q, want empty", auth)
+		}
+		file, header, err := r.FormFile("data")
+		if err != nil {
+			t.Fatalf("read multipart data: %v", err)
+		}
+		defer file.Close()
+		contents, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatalf("read uploaded file: %v", err)
+		}
+		if header.Filename != "generated.png" || string(contents) != "PNG image bytes" {
+			t.Errorf("uploaded %q = %q", header.Filename, contents)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"token":"image-token"}`)
+	}))
+	defer uploadServer.Close()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/uploads" || r.URL.Query().Get("type") != "image" {
+			t.Errorf("unexpected reservation request: %s %s", r.Method, r.URL.String())
+		}
+		if auth := r.Header.Get("Authorization"); auth != "bot-token" {
+			t.Errorf("reservation Authorization = %q", auth)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"url": uploadServer.URL + "/signed-upload"})
+	}))
+	defer apiServer.Close()
+
+	httpClient := insecureTestHTTPClient()
+	defer httpClient.CloseIdleConnections()
+	client := mustClient(t, apiServer.URL, "bot-token", httpClient)
+	result, err := client.UploadImage(context.Background(), "generated.png", strings.NewReader("PNG image bytes"))
+	if err != nil {
+		t.Fatalf("UploadImage() error = %v", err)
+	}
+	if result.Token != "image-token" {
+		t.Fatalf("UploadImage() = %#v", result)
+	}
+}
+
+func TestUploadImageRejectsHTTPRedirect(t *testing.T) {
+	t.Parallel()
+
+	var targetCalled atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		targetCalled.Store(true)
+	}))
+	defer target.Close()
+
+	uploadServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			t.Errorf("upload Authorization = %q, want empty", auth)
+		}
+		http.Redirect(w, r, target.URL+"/downgrade", http.StatusTemporaryRedirect)
+	}))
+	defer uploadServer.Close()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"url": uploadServer.URL})
+	}))
+	defer apiServer.Close()
+
+	httpClient := insecureTestHTTPClient()
+	defer httpClient.CloseIdleConnections()
+	client := mustClient(t, apiServer.URL, "bot-token", httpClient)
+	_, err := client.UploadImage(context.Background(), "image.png", strings.NewReader("bytes"))
+	if err == nil || !strings.Contains(err.Error(), "unsafe image upload redirect") {
+		t.Fatalf("UploadImage() error = %v, want unsafe redirect error", err)
+	}
+	if targetCalled.Load() {
+		t.Error("insecure redirect target was contacted")
+	}
+}
+
+func TestUploadImageRejectsInsecureReservationURL(t *testing.T) {
+	t.Parallel()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"url": "http://uploads.example.test/file"})
+	}))
+	defer apiServer.Close()
+
+	client := mustClient(t, apiServer.URL, "bot-token", apiServer.Client())
+	_, err := client.UploadImage(context.Background(), "image.png", strings.NewReader("bytes"))
+	if err == nil || !strings.Contains(err.Error(), "absolute HTTPS") {
+		t.Fatalf("UploadImage() error = %v, want HTTPS validation error", err)
+	}
+}
+
+func TestEditReportsUnsuccessfulTwoHundredResponse(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"success":false,"message":"cannot edit"}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	err := client.Edit(context.Background(), EditRequest{MessageID: "mid", Text: "text"})
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Code != "operation_failed" || apiErr.Message != "cannot edit" {
+		t.Fatalf("Edit() error = %#v", err)
+	}
+}
+
+func mustClient(t *testing.T, baseURL, token string, httpClient *http.Client) *Client {
+	t.Helper()
+	client, err := New(baseURL, token, httpClient)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	return client
+}
+
+func insecureTestHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // test servers use ephemeral self-signed certificates
+		},
+		Timeout: 2 * time.Second,
+	}
+}

@@ -1,0 +1,173 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"maxpilot/backend/internal/api"
+	"maxpilot/backend/internal/app"
+	"maxpilot/backend/internal/config"
+	"maxpilot/backend/internal/maxclient"
+	"maxpilot/backend/internal/media"
+	"maxpilot/backend/internal/openaiimg"
+	"maxpilot/backend/internal/openairesearch"
+	"maxpilot/backend/internal/store"
+	"maxpilot/backend/internal/yandexauth"
+)
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("invalid configuration", "error", err)
+		os.Exit(1)
+	}
+	if cfg.AllowInsecureNoAuth && cfg.AdminAPIKey == "" && !cfg.YandexAuthEnabled() {
+		logger.Warn("management API is running without authentication in loopback development mode")
+	}
+
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	storage, err := store.Open(rootCtx, cfg.DatabasePath)
+	if err != nil {
+		logger.Error("could not open database", "error", err)
+		os.Exit(1)
+	}
+	defer storage.Close()
+
+	mediaStore, err := media.New(cfg.MediaDir, cfg.PublicBaseURL)
+	if err != nil {
+		logger.Error("could not initialize media store", "error", err)
+		os.Exit(1)
+	}
+
+	var maxAPI app.MAXClient
+	if cfg.MAXBotToken != "" {
+		maxHTTPClient, err := newMAXHTTPClient(cfg.MAXCACertFile)
+		if err != nil {
+			logger.Error("could not configure MAX TLS", "error", err)
+			os.Exit(1)
+		}
+		client, err := maxclient.New(cfg.MAXAPIBaseURL, cfg.MAXBotToken, maxHTTPClient)
+		if err != nil {
+			logger.Error("could not initialize MAX client", "error", err)
+			os.Exit(1)
+		}
+		maxAPI = client
+	}
+
+	var openAI app.ImageClient
+	var research app.ResearchClient
+	if cfg.OpenAIAPIKey != "" {
+		client, err := openaiimg.New(cfg.OpenAIAPIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIImageModel, &http.Client{Timeout: 3 * time.Minute})
+		if err != nil {
+			logger.Error("could not initialize OpenAI client", "error", err)
+			os.Exit(1)
+		}
+		openAI = client
+		researchClient, err := openairesearch.New(cfg.OpenAIAPIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIResearchModel, &http.Client{Timeout: 90 * time.Second})
+		if err != nil {
+			logger.Error("could not initialize OpenAI research client", "error", err)
+			os.Exit(1)
+		}
+		research = researchClient
+	}
+
+	application := app.New(storage, mediaStore, maxAPI, openAI, research, logger)
+	var yandexOAuth api.YandexOAuthClient
+	if cfg.YandexAuthEnabled() {
+		client, err := yandexauth.New(cfg.YandexClientID, cfg.YandexClientSecret, nil)
+		if err != nil {
+			logger.Error("could not initialize Yandex OAuth", "error", err)
+			os.Exit(1)
+		}
+		yandexOAuth = client
+	}
+	apiServer := api.New(application, logger, cfg.FrontendOrigin, cfg.MAXWebhookSecret, cfg.AdminAPIKey, api.AuthOptions{
+		YandexClient: yandexOAuth, RedirectURI: cfg.YandexRedirectURI,
+		AllowedUsers: cfg.YandexAllowedUsers, SessionTTL: cfg.AuthSessionTTL,
+		SecureCookies: strings.HasPrefix(strings.ToLower(cfg.YandexRedirectURI), "https://"),
+		TrustXRealIP:  cfg.OAuthTrustXRealIP, RateLimitAtEdge: cfg.OAuthRateLimitAtEdge,
+	})
+	httpServer := &http.Server{
+		Addr:              net.JoinHostPort(cfg.Host, cfg.Port),
+		Handler:           apiServer.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       time.Minute,
+		WriteTimeout:      4 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	if maxAPI != nil {
+		go application.RunScheduler(rootCtx, cfg.SchedulerInterval)
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		logger.Info("server started", "address", httpServer.Addr, "frontend_origin", cfg.FrontendOrigin,
+			"admin_auth", cfg.AdminAPIKey != "", "yandex_auth", cfg.YandexAuthEnabled())
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+		close(serverErr)
+	}()
+
+	select {
+	case <-rootCtx.Done():
+		logger.Info("shutdown requested")
+	case err := <-serverErr:
+		if err != nil {
+			logger.Error("HTTP server failed", "error", err)
+			stop()
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("graceful shutdown failed", "error", err)
+	}
+	logger.Info("server stopped")
+}
+
+func newMAXHTTPClient(caCertFile string) (*http.Client, error) {
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("default HTTP transport has an unexpected type")
+	}
+	clone := transport.Clone()
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if caCertFile != "" {
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("load system CA pool: %w", err)
+		}
+		pemBytes, err := os.ReadFile(caCertFile)
+		if err != nil {
+			return nil, fmt.Errorf("read MAX_CA_CERT_FILE: %w", err)
+		}
+		if ok := roots.AppendCertsFromPEM(pemBytes); !ok {
+			return nil, errors.New("MAX_CA_CERT_FILE does not contain a valid PEM certificate")
+		}
+		tlsConfig.RootCAs = roots
+	}
+	// TLS verification remains enabled. MAX_CA_CERT_FILE only extends the
+	// system trust store for the platform-api2.max.ru certificate chain.
+	clone.TLSClientConfig = tlsConfig
+	return &http.Client{Transport: clone, Timeout: 75 * time.Second}, nil
+}

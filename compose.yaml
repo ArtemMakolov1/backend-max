@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: .
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8080
+      DATABASE_PATH: /app/data/maxpilot.db
+      MEDIA_DIR: /app/media
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:4321}
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-}
+      ALLOW_INSECURE_NO_AUTH: ${ALLOW_INSECURE_NO_AUTH:-false}
+      # Keep false unless a trusted reverse proxy overwrites X-Real-IP and the
+      # published backend port is blocked from direct external access.
+      OAUTH_TRUST_X_REAL_IP: ${OAUTH_TRUST_X_REAL_IP:-false}
+      OAUTH_RATE_LIMIT_AT_EDGE: ${OAUTH_RATE_LIMIT_AT_EDGE:-false}
+      YANDEX_CLIENT_ID: ${YANDEX_CLIENT_ID:-}
+      YANDEX_CLIENT_SECRET: ${YANDEX_CLIENT_SECRET:-}
+      YANDEX_REDIRECT_URI: ${YANDEX_REDIRECT_URI:-}
+      YANDEX_ALLOWED_USERS: ${YANDEX_ALLOWED_USERS:-}
+      AUTH_SESSION_TTL: ${AUTH_SESSION_TTL:-12h}
+      MAX_API_BASE_URL: ${MAX_API_BASE_URL:-https://platform-api2.max.ru}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      MAX_WEBHOOK_SECRET: ${MAX_WEBHOOK_SECRET:-}
+      MAX_CA_CERT_FILE: ${MAX_CA_CERT_FILE:-}
+      OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL:-https://api.openai.com}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_RESEARCH_MODEL: ${OPENAI_RESEARCH_MODEL:-gpt-5.4-mini}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      SCHEDULER_INTERVAL: ${SCHEDULER_INTERVAL:-15s}
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    volumes:
+      - max-studio-data:/app/data
+      - max-studio-media:/app/media
+      - ./certs:/app/certs:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/api/v1/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  max-studio-data:
+  max-studio-media:

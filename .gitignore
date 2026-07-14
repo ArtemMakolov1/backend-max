@@ -1,0 +1,24 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+media/
+*.db
+*.db-*
+bin/
+coverage.out
+/server
+
+# Local certificate bundles must never be committed.
+certs/*
+!certs/.gitkeep
+
+# Logs
+*.log
