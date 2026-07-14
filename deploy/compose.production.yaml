@@ -215,7 +215,7 @@ services:
       - database
 
   postgres-exporter:
-    image: prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e
+    image: ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.5.1@sha256:526d3ff7f8276026715ca822d221bba0763dfea24fae7b8fa53ae1d9d3062934
     restart: unless-stopped
     command:
       - --collector.long_running_transactions
@@ -252,7 +252,7 @@ services:
       - monitoring
 
   pgbouncer-exporter:
-    image: prometheuscommunity/pgbouncer-exporter:v0.12.1@sha256:30f31b6c2efdad3647f8182cc7c1a3a19e42bae5d17387694989f969371c230d
+    image: ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.5.1@sha256:d03dc3a1b1d4c40c1a92edc00b8cd262e4c1e7aeabfda971aeb511583ab46ede
     restart: unless-stopped
     environment:
       PGBOUNCER_EXPORTER_CONNECTION_STRING: postgresql://${POSTGRES_MONITOR_USER}:${POSTGRES_MONITOR_PASSWORD}@pgbouncer:6432/pgbouncer?sslmode=disable
@@ -361,7 +361,10 @@ services:
       - monitoring
 
   grafana:
-    image: grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
+    # The stable 13.1.0 image was blocked by the release CVE gate. This clean
+    # official build is pinned by digest, so the mutable nightly tag can never
+    # change what production pulls.
+    image: grafana/grafana:nightly-slim@sha256:951d45bbdb8a2e909fa1315b12a7bc3f7be3835e076e40ecf304888f426b6179
     restart: unless-stopped
     environment:
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}

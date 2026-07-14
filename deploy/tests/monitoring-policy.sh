@@ -14,9 +14,9 @@ fi
 
 for image in \
   'prom/prometheus:v3.13.1@sha256:' \
-  'grafana/grafana:13.1.0@sha256:' \
-  'prometheuscommunity/postgres-exporter:v0.20.1@sha256:' \
-  'prometheuscommunity/pgbouncer-exporter:v0.12.1@sha256:' \
+  'grafana/grafana:nightly-slim@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.5.1@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.5.1@sha256:' \
   'prom/node-exporter:v1.12.1@sha256:'; do
   grep -F "$image" "$production_compose" >/dev/null || {
     echo "Monitoring image is not pinned by digest: $image" >&2

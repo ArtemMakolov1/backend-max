@@ -14,7 +14,14 @@
 - публичный адрес — `https://maxposty.ru/monitoring/`, перед ним Caddy обязан
   проверять обычную серверную сессию Яндекс ID, удалять входящие
   `X-WEBAUTH-*` и самостоятельно устанавливать `X-WEBAUTH-USER` и
-  `X-WEBAUTH-ROLE`.
+`X-WEBAUTH-ROLE`.
+
+Production exporter images are rebuilt from the exact upstream release
+commits with the patched Go toolchain and dependencies in
+`docker/monitoring/`. The resulting multi-architecture GHCR manifests are
+pinned by digest, carry SBOM/provenance attestations and pass the same Trivy
+gate as the application image. Grafana is also pinned to the exact clean
+official image digest selected by that gate.
 
 `OBSERVABILITY_ADMIN_USERS` — comma-separated allowlist идентификаторов
 операторов. Backend endpoint `/api/v1/observability/auth` разрешает доступ
