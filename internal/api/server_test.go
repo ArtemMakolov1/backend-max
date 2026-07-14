@@ -13,8 +13,49 @@ import (
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/media"
+	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/store"
 )
+
+func TestMetricsEndpointAllowsOnlyDirectPrivateScrapers(t *testing.T) {
+	t.Parallel()
+
+	metrics := observability.New()
+	handler := (&Server{logger: slog.Default(), frontendOrigin: "https://maxposty.ru", metrics: metrics}).Handler()
+
+	missing := httptest.NewRequest(http.MethodGet, "/not-a-real-route/private-id", nil)
+	missing.RemoteAddr = "172.20.0.4:54321"
+	handler.ServeHTTP(httptest.NewRecorder(), missing)
+
+	privateRequest := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	privateRequest.RemoteAddr = "172.20.0.5:53110"
+	privateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(privateResponse, privateRequest)
+	if privateResponse.Code != http.StatusOK {
+		t.Fatalf("private metrics status = %d, body = %s", privateResponse.Code, privateResponse.Body.String())
+	}
+	if body := privateResponse.Body.String(); !strings.Contains(body, `maxposty_http_requests_total{method="GET",route="unmatched",status_class="4xx"} 1`) ||
+		strings.Contains(body, "private-id") {
+		t.Fatalf("unexpected metrics body: %s", body)
+	}
+
+	publicRequest := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	publicRequest.RemoteAddr = "203.0.113.10:42000"
+	publicResponse := httptest.NewRecorder()
+	handler.ServeHTTP(publicResponse, publicRequest)
+	if publicResponse.Code != http.StatusNotFound {
+		t.Fatalf("public metrics status = %d, want 404", publicResponse.Code)
+	}
+
+	forwardedRequest := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	forwardedRequest.RemoteAddr = "172.20.0.2:42000"
+	forwardedRequest.Header.Set("X-Forwarded-For", "203.0.113.10")
+	forwardedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(forwardedResponse, forwardedRequest)
+	if forwardedResponse.Code != http.StatusNotFound {
+		t.Fatalf("forwarded metrics status = %d, want 404", forwardedResponse.Code)
+	}
+}
 
 func TestManagementAPIRequiresYandexSessionAndRejectsAdminKeyFallback(t *testing.T) {
 	t.Parallel()

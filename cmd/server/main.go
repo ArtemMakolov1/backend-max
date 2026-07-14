@@ -20,6 +20,7 @@ import (
 	"maxpilot/backend/internal/config"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
+	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/openaiimg"
 	"maxpilot/backend/internal/openairesearch"
 	"maxpilot/backend/internal/store"
@@ -39,7 +40,9 @@ func main() {
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	storage, err := store.OpenRuntime(rootCtx, cfg.DatabaseURL)
+	metrics := observability.New()
+	metrics.SetSchedulerInterval(cfg.SchedulerInterval)
+	storage, err := store.OpenRuntimeWithTracer(rootCtx, cfg.DatabaseURL, metrics)
 	if err != nil {
 		logger.Error("could not open database", "error", err)
 		os.Exit(1)
@@ -49,6 +52,14 @@ func main() {
 			logger.Error("could not close database", "error", closeErr)
 		}
 	}()
+	if err := metrics.RegisterDBPoolStats(storage.DBStats); err != nil {
+		logger.Error("could not register database pool metrics", "error", err)
+		os.Exit(1)
+	}
+	if err := metrics.RegisterProductAnalytics(storage.ProductAnalyticsSnapshot); err != nil {
+		logger.Error("could not register product analytics metrics", "error", err)
+		os.Exit(1)
+	}
 
 	mediaStore, err := media.New(cfg.MediaDir, cfg.PublicBaseURL)
 	if err != nil {
@@ -88,7 +99,7 @@ func main() {
 		research = researchClient
 	}
 
-	application := app.New(storage, mediaStore, maxAPI, openAI, research, logger)
+	application := app.NewWithMetrics(storage, mediaStore, maxAPI, openAI, research, logger, metrics)
 	var yandexOAuth api.YandexOAuthClient
 	if cfg.YandexAuthEnabled() {
 		client, err := yandexauth.New(cfg.YandexClientID, cfg.YandexClientSecret, nil)
@@ -101,8 +112,9 @@ func main() {
 	apiServer := api.New(application, logger, cfg.FrontendOrigin, cfg.MAXWebhookSecret, api.AuthOptions{
 		YandexClient: yandexOAuth, RedirectURI: cfg.YandexRedirectURI,
 		AllowedUsers: cfg.YandexAllowedUsers, SessionTTL: cfg.AuthSessionTTL,
-		SecureCookies: strings.HasPrefix(strings.ToLower(cfg.YandexRedirectURI), "https://"),
-		TrustXRealIP:  cfg.OAuthTrustXRealIP, RateLimitAtEdge: cfg.OAuthRateLimitAtEdge,
+		ObservabilityAdmins: cfg.ObservabilityAdmins,
+		SecureCookies:       strings.HasPrefix(strings.ToLower(cfg.YandexRedirectURI), "https://"),
+		TrustXRealIP:        cfg.OAuthTrustXRealIP, RateLimitAtEdge: cfg.OAuthRateLimitAtEdge,
 		AILimits: &api.AILimitOptions{
 			GlobalMaxConcurrent: cfg.AIGlobalConcurrent,
 			UserMaxConcurrent:   cfg.AIUserConcurrent,
@@ -112,6 +124,7 @@ func main() {
 			ResearchPerDay:      cfg.AIResearchPerDay,
 			LeaseTTL:            cfg.AILeaseTTL,
 		},
+		Metrics: metrics,
 	})
 	httpServer := &http.Server{
 		Addr:              net.JoinHostPort(cfg.Host, cfg.Port),

@@ -112,6 +112,24 @@ type ContentFormatter interface {
 	FormatContent(context.Context, openairesearch.FormatRequest) (openairesearch.FormatResult, error)
 }
 
+// Metrics receives only bounded operational dimensions. Implementations must
+// never attach post, channel or user identifiers as metric labels.
+type Metrics interface {
+	ObservePublicationOperation(operation, outcome string, elapsed time.Duration)
+	ObserveSchedulerJob(job, outcome string)
+	SetSchedulerDue(job string, count int)
+	ObserveSchedulerCycle(elapsed time.Duration, completedAt time.Time)
+	AddRecoveredPublications(count int64)
+}
+
+type noopMetrics struct{}
+
+func (noopMetrics) ObservePublicationOperation(string, string, time.Duration) {}
+func (noopMetrics) ObserveSchedulerJob(string, string)                        {}
+func (noopMetrics) SetSchedulerDue(string, int)                               {}
+func (noopMetrics) ObserveSchedulerCycle(time.Duration, time.Time)            {}
+func (noopMetrics) AddRecoveredPublications(int64)                            {}
+
 type App struct {
 	store    *store.Store
 	media    *media.Store
@@ -119,6 +137,7 @@ type App struct {
 	images   ImageClient
 	research ResearchClient
 	logger   *slog.Logger
+	metrics  Metrics
 	now      func() time.Time
 	// messageChatDiscovery collapses webhook retries for a channel that has not
 	// entered the authenticated inventory yet. Lifecycle events intentionally do
@@ -127,12 +146,19 @@ type App struct {
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {
+	return NewWithMetrics(storage, mediaStore, max, images, research, logger, noopMetrics{})
+}
+
+func NewWithMetrics(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger, metrics Metrics) *App {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if metrics == nil {
+		metrics = noopMetrics{}
+	}
 	return &App{
 		store: storage, media: mediaStore, max: max, images: images, research: research,
-		logger: logger, now: time.Now,
+		logger: logger, metrics: metrics, now: time.Now,
 	}
 }
 
@@ -607,7 +633,11 @@ func (a *App) PublishPost(ctx context.Context, postID int64) (store.Post, error)
 	return a.publishClaimedPost(ctx, post)
 }
 
-func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (store.Post, error) {
+func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (result store.Post, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		a.metrics.ObservePublicationOperation("publish", metricOutcome(resultErr), time.Since(startedAt))
+	}()
 	postID := post.ID
 	channel, err := a.validateForPublish(ctx, post)
 	if err != nil {
@@ -644,7 +674,11 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (store.Po
 	return a.store.MarkPublished(ctx, postID, message.MessageID, message.URL)
 }
 
-func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post, error) {
+func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result store.Post, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		a.metrics.ObservePublicationOperation("edit", metricOutcome(resultErr), time.Since(startedAt))
+	}()
 	if a.max == nil {
 		return store.Post{}, ErrMAXNotConfigured
 	}
@@ -707,7 +741,11 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post
 	return a.store.GetPost(ctx, postID)
 }
 
-func (a *App) DeletePublication(ctx context.Context, userID string, postID int64) (store.Post, error) {
+func (a *App) DeletePublication(ctx context.Context, userID string, postID int64) (result store.Post, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		a.metrics.ObservePublicationOperation("delete", metricOutcome(resultErr), time.Since(startedAt))
+	}()
 	post, err := a.store.GetPostForUser(ctx, userID, postID)
 	if err != nil {
 		return store.Post{}, err
@@ -793,7 +831,11 @@ func (a *App) syncClaimedMAXPublicationForUser(ctx context.Context, userID strin
 	return a.syncClaimedMAXPublication(ctx, userID, post, channel, syncedAt)
 }
 
-func (a *App) syncClaimedMAXPublication(ctx context.Context, userID string, post store.Post, channel store.Channel, syncedAt time.Time) (store.Post, error) {
+func (a *App) syncClaimedMAXPublication(ctx context.Context, userID string, post store.Post, channel store.Channel, syncedAt time.Time) (result store.Post, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		a.metrics.ObservePublicationOperation("sync", metricOutcome(resultErr), time.Since(startedAt))
+	}()
 	message, err := a.max.GetMessage(ctx, post.MAXMessageID)
 	if err != nil {
 		if isMAXMessageNotFound(err) {
@@ -821,7 +863,11 @@ func (a *App) syncClaimedMAXPublication(ctx context.Context, userID string, post
 		message.URL, message.Views, syncedAt.UTC(), pinned)
 }
 
-func (a *App) PinPost(ctx context.Context, userID string, postID int64) (store.Post, error) {
+func (a *App) PinPost(ctx context.Context, userID string, postID int64) (result store.Post, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		a.metrics.ObservePublicationOperation("pin", metricOutcome(resultErr), time.Since(startedAt))
+	}()
 	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
 	if err != nil {
 		return store.Post{}, err
@@ -838,7 +884,11 @@ func (a *App) PinPost(ctx context.Context, userID string, postID int64) (store.P
 	return a.store.SetPublicationPinnedForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, true)
 }
 
-func (a *App) UnpinPost(ctx context.Context, userID string, postID int64) (store.Post, error) {
+func (a *App) UnpinPost(ctx context.Context, userID string, postID int64) (result store.Post, resultErr error) {
+	startedAt := time.Now()
+	defer func() {
+		a.metrics.ObservePublicationOperation("unpin", metricOutcome(resultErr), time.Since(startedAt))
+	}()
 	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
 	if err != nil {
 		return store.Post{}, err
@@ -929,6 +979,13 @@ func isStoredMAXPublicationMissing(post store.Post) bool {
 		strings.TrimSpace(post.MAXMessageID) == ""
 }
 
+func metricOutcome(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "success"
+}
+
 func validateMAXMessageChannel(message maxclient.Message, chatID string) error {
 	if strings.TrimSpace(message.MessageID) == "" || message.ChatID == "" || message.ChatID != chatID {
 		return fmt.Errorf("%w: MAX message does not belong to the post channel", ErrConflict)
@@ -955,6 +1012,10 @@ func (a *App) RunScheduler(ctx context.Context, interval time.Duration) {
 }
 
 func (a *App) runSchedulerCycle(ctx context.Context, now time.Time) {
+	startedAt := time.Now()
+	defer func() {
+		a.metrics.ObserveSchedulerCycle(time.Since(startedAt), a.now().UTC())
+	}()
 	a.publishDueAt(ctx, now)
 	a.syncDueMAXStats(ctx, now)
 }
@@ -965,9 +1026,12 @@ func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {
 	}
 	posts, err := a.store.ListPostsDueForStats(ctx, now.UTC(), time.Hour, 10)
 	if err != nil {
+		a.metrics.ObserveSchedulerJob("stats_sync_scan", "error")
 		a.logger.Error("scheduler could not list posts due for MAX stats", "error", err)
 		return
 	}
+	a.metrics.ObserveSchedulerJob("stats_sync_scan", "success")
+	a.metrics.SetSchedulerDue("stats_sync", len(posts))
 	const parallelism = 2
 	workerCount := min(parallelism, len(posts))
 	jobs := make(chan store.Post)
@@ -978,25 +1042,31 @@ func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {
 			defer workers.Done()
 			for post := range jobs {
 				if post.ChannelID == nil {
+					a.metrics.ObserveSchedulerJob("stats_sync", "skipped")
 					continue
 				}
 				claimed, claimErr := a.store.ClaimPostStatsAttemptForUser(ctx, post.UserID, post.ID, *post.ChannelID,
 					post.MAXMessageID, now.UTC(), time.Hour)
 				if claimErr != nil {
+					a.metrics.ObserveSchedulerJob("stats_sync", "error")
 					a.logger.Warn("could not claim MAX post statistics synchronization", "post_id", post.ID, "error", claimErr)
 					continue
 				}
 				if !claimed {
+					a.metrics.ObserveSchedulerJob("stats_sync", "skipped")
 					continue
 				}
 				syncCtx, cancel := context.WithTimeout(ctx, time.Minute)
 				_, syncErr := a.syncClaimedMAXPublicationForUser(syncCtx, post.UserID, post.ID, now.UTC())
 				cancel()
 				if syncErr != nil {
+					a.metrics.ObserveSchedulerJob("stats_sync", "error")
 					// A confirmed GET-message 404 is reconciled inside the sync and
 					// returns success. Other upstream failures (including a failed
 					// pin lookup) leave the publication intact for a later retry.
 					a.logger.Warn("could not synchronize MAX post statistics", "post_id", post.ID, "error", syncErr)
+				} else {
+					a.metrics.ObserveSchedulerJob("stats_sync", "success")
 				}
 			}
 		}()
@@ -1022,17 +1092,23 @@ func (a *App) publishDueAt(ctx context.Context, now time.Time) {
 	now = now.UTC()
 	recovered, err := a.store.RecoverStalePublishing(ctx, now.Add(-10*time.Minute))
 	if err != nil {
+		a.metrics.ObserveSchedulerJob("publication_recovery", "error")
 		a.logger.Error("scheduler could not recover stale publishing posts", "error", err)
 		return
 	}
+	a.metrics.ObserveSchedulerJob("publication_recovery", "success")
+	a.metrics.AddRecoveredPublications(recovered)
 	if recovered > 0 {
 		a.logger.Warn("recovered interrupted publishing posts", "count", recovered)
 	}
 	ids, err := a.store.DuePostIDs(ctx, now, 25)
 	if err != nil {
+		a.metrics.ObserveSchedulerJob("publish_scan", "error")
 		a.logger.Error("scheduler could not list due posts", "error", err)
 		return
 	}
+	a.metrics.ObserveSchedulerJob("publish_scan", "success")
+	a.metrics.SetSchedulerDue("publish", len(ids))
 	const parallelism = 3
 	workerCount := min(parallelism, len(ids))
 	jobs := make(chan int64)
@@ -1046,9 +1122,13 @@ func (a *App) publishDueAt(ctx context.Context, now time.Time) {
 				published, publishErr := a.publishScheduledPost(publishCtx, id, now)
 				cancel()
 				if publishErr != nil {
+					a.metrics.ObserveSchedulerJob("publish", "error")
 					a.logger.Error("scheduled post failed", "post_id", id, "error", publishErr)
 				} else if published {
+					a.metrics.ObserveSchedulerJob("publish", "success")
 					a.logger.Info("scheduled post published", "post_id", id)
+				} else {
+					a.metrics.ObserveSchedulerJob("publish", "skipped")
 				}
 			}
 		}()

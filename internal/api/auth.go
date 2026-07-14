@@ -44,13 +44,14 @@ type authPrincipal struct {
 }
 
 type authStatusPayload struct {
-	Required         bool              `json:"auth_required"`
-	Authenticated    bool              `json:"authenticated"`
-	Methods          map[string]bool   `json:"auth_methods"`
-	Method           string            `json:"auth_method"`
-	User             *authUser         `json:"user"`
-	SessionExpiresAt *time.Time        `json:"session_expires_at,omitempty"`
-	DocumentVersions map[string]string `json:"document_versions"`
+	Required            bool              `json:"auth_required"`
+	Authenticated       bool              `json:"authenticated"`
+	Methods             map[string]bool   `json:"auth_methods"`
+	Method              string            `json:"auth_method"`
+	User                *authUser         `json:"user"`
+	SessionExpiresAt    *time.Time        `json:"session_expires_at,omitempty"`
+	DocumentVersions    map[string]string `json:"document_versions"`
+	ObservabilityAccess bool              `json:"observability_access"`
 }
 
 type yandexAuthStartRequest struct {
@@ -93,6 +94,10 @@ func (s *Server) authenticate(r *http.Request) (authPrincipal, bool) {
 
 func (s *Server) authenticationStatus(r *http.Request) authStatusPayload {
 	principal, authenticated := s.authenticate(r)
+	observabilityAccess := false
+	if authenticated {
+		_, observabilityAccess = s.observabilityIdentity(principal.User)
+	}
 	if !authenticated {
 		principal.Method = "none"
 	}
@@ -100,7 +105,8 @@ func (s *Server) authenticationStatus(r *http.Request) authStatusPayload {
 		Required: s.authRequired(), Authenticated: authenticated,
 		Methods: map[string]bool{"yandex": s.yandexClient != nil},
 		Method:  principal.Method, User: principal.User, SessionExpiresAt: principal.ExpiresAt,
-		DocumentVersions: map[string]string{"terms": termsVersion, "personal_data": personalDataVersion},
+		DocumentVersions:    map[string]string{"terms": termsVersion, "personal_data": personalDataVersion},
+		ObservabilityAccess: observabilityAccess,
 	}
 }
 

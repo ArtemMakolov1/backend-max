@@ -55,6 +55,39 @@ jobs:
           format: table
           timeout: 10m
 
+  monitoring-images:
+    name: Monitoring image scan (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: postgres-exporter
+            image: "prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e"
+          - component: pgbouncer-exporter
+            image: "prometheuscommunity/pgbouncer-exporter:v0.12.1@sha256:30f31b6c2efdad3647f8182cc7c1a3a19e42bae5d17387694989f969371c230d"
+          - component: node-exporter
+            image: "prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0"
+          - component: prometheus
+            image: "prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893"
+          - component: grafana
+            image: "grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63"
+    steps:
+      - name: Block fixed high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0, post-2026 incident immutable commit
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          version: v0.72.0
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: "true"
+          exit-code: "1"
+          format: table
+          timeout: 10m
+
   dependency-review:
     name: Dependency review
     if: github.event_name == 'pull_request'
@@ -103,7 +136,7 @@ jobs:
   release-security-gate:
     name: Release security gate
     if: ${{ always() }}
-    needs: [vulnerabilities, repository-scan, codeql]
+    needs: [vulnerabilities, repository-scan, monitoring-images, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -112,9 +145,11 @@ jobs:
         env:
           VULNERABILITIES_RESULT: ${{ needs.vulnerabilities.result }}
           REPOSITORY_SCAN_RESULT: ${{ needs.repository-scan.result }}
+          MONITORING_IMAGES_RESULT: ${{ needs.monitoring-images.result }}
           CODEQL_RESULT: ${{ needs.codeql.result }}
         run: |
           set -euo pipefail
           [[ "$VULNERABILITIES_RESULT" == "success" ]]
           [[ "$REPOSITORY_SCAN_RESULT" == "success" ]]
+          [[ "$MONITORING_IMAGES_RESULT" == "success" ]]
           [[ "$CODEQL_RESULT" == "success" ]]

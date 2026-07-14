@@ -49,7 +49,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "007_channel_icon_backfill.sql"
+const RequiredSchemaVersion = "008_user_activity_daily.sql"
 
 type schemaMigration struct {
 	version        string
@@ -98,6 +98,13 @@ func Migrate(ctx context.Context, directDatabaseURL string) error {
 }
 
 func OpenRuntime(ctx context.Context, databaseURL string) (*Store, error) {
+	return OpenRuntimeWithTracer(ctx, databaseURL, nil)
+}
+
+// OpenRuntimeWithTracer opens the PgBouncer-compatible runtime pool and wires
+// a pgx tracer into every physical connection. The tracer must not retain SQL
+// text or arguments because they can contain tenant data.
+func OpenRuntimeWithTracer(ctx context.Context, databaseURL string, tracer pgx.QueryTracer) (*Store, error) {
 	if strings.TrimSpace(databaseURL) == "" {
 		return nil, errors.New("DATABASE_URL is required")
 	}
@@ -105,7 +112,7 @@ func OpenRuntime(ctx context.Context, databaseURL string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := openPostgres(databaseURL)
+	db, err := openPostgresWithTracer(databaseURL, tracer)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +128,10 @@ func OpenRuntime(ctx context.Context, databaseURL string) (*Store, error) {
 }
 
 func openPostgres(databaseURL string) (*sql.DB, error) {
+	return openPostgresWithTracer(databaseURL, nil)
+}
+
+func openPostgresWithTracer(databaseURL string, tracer pgx.QueryTracer) (*sql.DB, error) {
 	config, err := pgx.ParseConfig(strings.TrimSpace(databaseURL))
 	if err != nil {
 		return nil, fmt.Errorf("parse PostgreSQL URL: %w", err)
@@ -129,6 +140,7 @@ func openPostgres(databaseURL string) (*sql.DB, error) {
 	// statements between transactions. Exec uses the extended protocol without
 	// preparing or caching statements on a server connection.
 	config.DefaultQueryExecMode = pgx.QueryExecModeExec
+	config.Tracer = tracer
 	db := stdlib.OpenDB(*config)
 	db.SetMaxOpenConns(20)
 	db.SetMaxIdleConns(10)
@@ -206,6 +218,9 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+// DBStats returns a point-in-time snapshot of the runtime pool for Prometheus.
+func (s *Store) DBStats() sql.DBStats { return s.db.Stats() }
 
 func runMigrations(ctx context.Context, directDatabaseURL string) error {
 	migrations, err := loadEmbeddedMigrations()

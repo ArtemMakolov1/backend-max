@@ -6,9 +6,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -16,6 +18,7 @@ import (
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/maxclient"
+	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/openaiimg"
 	"maxpilot/backend/internal/openairesearch"
 	"maxpilot/backend/internal/store"
@@ -29,30 +32,37 @@ type YandexOAuthClient interface {
 }
 
 type AuthOptions struct {
-	YandexClient    YandexOAuthClient
-	RedirectURI     string
-	AllowedUsers    []string
-	SessionTTL      time.Duration
-	SecureCookies   bool
-	TrustXRealIP    bool
-	RateLimitAtEdge bool
-	AILimits        *AILimitOptions
+	YandexClient        YandexOAuthClient
+	RedirectURI         string
+	AllowedUsers        []string
+	ObservabilityAdmins []string
+	SessionTTL          time.Duration
+	SecureCookies       bool
+	TrustXRealIP        bool
+	RateLimitAtEdge     bool
+	AILimits            *AILimitOptions
+	Metrics             *observability.Metrics
 }
 
 type Server struct {
-	app               *app.App
-	logger            *slog.Logger
-	frontendOrigin    string
-	webhookSecret     string
-	yandexClient      YandexOAuthClient
-	yandexRedirect    string
-	yandexAllowed     map[string]struct{}
-	sessionTTL        time.Duration
-	secureCookies     bool
-	oauthStartLimiter *keyedWindowLimiter
-	aiLimiter         *aiRequestLimiter
-	trustXRealIP      bool
-	now               func() time.Time
+	app                 *app.App
+	logger              *slog.Logger
+	frontendOrigin      string
+	webhookSecret       string
+	yandexClient        YandexOAuthClient
+	yandexRedirect      string
+	yandexAllowed       map[string]struct{}
+	observabilityAdmins map[string]struct{}
+	sessionTTL          time.Duration
+	secureCookies       bool
+	oauthStartLimiter   *keyedWindowLimiter
+	aiLimiter           *aiRequestLimiter
+	trustXRealIP        bool
+	now                 func() time.Time
+	metrics             *observability.Metrics
+	activityMu          sync.Mutex
+	activityDay         string
+	activityUsers       map[string]struct{}
 }
 
 type principalContextKey struct{}
@@ -62,11 +72,13 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		logger = slog.Default()
 	}
 	aiLimits := DefaultAILimitOptions()
+	metrics := observability.New()
 	server := &Server{
 		app: application, logger: logger,
 		frontendOrigin: strings.TrimRight(frontendOrigin, "/"), webhookSecret: webhookSecret,
 		sessionTTL:        12 * time.Hour,
 		oauthStartLimiter: newKeyedWindowLimiter(12, 600, time.Minute, 4096), now: time.Now,
+		observabilityAdmins: make(map[string]struct{}), activityUsers: make(map[string]struct{}),
 	}
 	if len(authOptions) != 0 {
 		options := authOptions[0]
@@ -76,6 +88,11 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		for _, user := range options.AllowedUsers {
 			if normalized := strings.ToLower(strings.TrimSpace(user)); normalized != "" {
 				server.yandexAllowed[normalized] = struct{}{}
+			}
+		}
+		for _, user := range options.ObservabilityAdmins {
+			if normalized := strings.ToLower(strings.TrimSpace(user)); normalized != "" {
+				server.observabilityAdmins[normalized] = struct{}{}
 			}
 		}
 		if options.SessionTTL > 0 {
@@ -89,7 +106,11 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		if options.AILimits != nil {
 			aiLimits = *options.AILimits
 		}
+		if options.Metrics != nil {
+			metrics = options.Metrics
+		}
 	}
+	server.metrics = metrics
 	server.aiLimiter = newAIRequestLimiter(application.Store(), logger, aiLimits)
 	return server
 }
@@ -97,9 +118,11 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 func (s *Server) Handler() http.Handler {
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
+	router.Use(s.observeHTTP)
 	router.Use(middleware.Recoverer)
 	router.Use(s.cors)
 	router.Use(s.requestLogger)
+	router.Get("/metrics", s.serveMetrics)
 
 	router.With(s.requireSession).Get("/media/{filename}", s.serveMedia)
 	router.Route("/api/v1", func(r chi.Router) {
@@ -109,6 +132,7 @@ func (s *Server) Handler() http.Handler {
 		r.Post("/auth/yandex/start", s.startYandexAuth)
 		r.Get("/auth/yandex/callback", s.finishYandexAuth)
 		r.Post("/auth/logout", s.logout)
+		r.Get("/observability/auth", s.observabilityAuth)
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireSession)
@@ -163,6 +187,33 @@ func (s *Server) Handler() http.Handler {
 	return router
 }
 
+func (s *Server) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if !isDirectPrivateRequest(r) {
+		http.NotFound(w, r)
+		return
+	}
+	s.metrics.Handler().ServeHTTP(w, r)
+}
+
+// isDirectPrivateRequest keeps metrics available to a Prometheus container on
+// the private Docker network while preventing the public reverse proxy from
+// turning /metrics into an unauthenticated internet endpoint. A direct scraper
+// does not attach proxy identity headers.
+func isDirectPrivateRequest(r *http.Request) bool {
+	for _, header := range []string{"Forwarded", "X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"} {
+		if strings.TrimSpace(r.Header.Get(header)) != "" {
+			return false
+		}
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
+}
+
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
@@ -177,7 +228,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"research_configured": s.app.ResearchConfigured(), "content_formatting_configured": s.app.ContentFormattingConfigured(),
 		"auth_required": status.Required, "authenticated": status.Authenticated,
 		"auth_methods": status.Methods, "auth_method": status.Method, "user": status.User,
-		"session_expires_at": status.SessionExpiresAt,
+		"session_expires_at": status.SessionExpiresAt, "observability_access": status.ObservabilityAccess,
 	})
 }
 
@@ -190,8 +241,40 @@ func (s *Server) requireSession(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), principalContextKey{}, principal)
+		s.touchUserActivity(ctx, principal.User.ID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (s *Server) touchUserActivity(ctx context.Context, userID string) {
+	now := s.now().UTC()
+	day := now.Format(time.DateOnly)
+	s.activityMu.Lock()
+	if s.activityDay != day {
+		s.activityDay = day
+		s.activityUsers = make(map[string]struct{})
+	}
+	_, alreadyReserved := s.activityUsers[userID]
+	if !alreadyReserved {
+		// Reserve before I/O so concurrent first requests cannot stampede the
+		// same daily UPSERT. A failed write releases the reservation for retry.
+		s.activityUsers[userID] = struct{}{}
+	}
+	s.activityMu.Unlock()
+	if alreadyReserved {
+		return
+	}
+	touchCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := s.app.Store().TouchUserActivity(touchCtx, userID, now); err != nil {
+		s.logger.Warn("user activity aggregation failed", "error", err)
+		s.activityMu.Lock()
+		if s.activityDay == day {
+			delete(s.activityUsers, userID)
+		}
+		s.activityMu.Unlock()
+		return
+	}
 }
 
 func authenticatedUserID(r *http.Request) (string, error) {
@@ -231,23 +314,62 @@ func (s *Server) cors(next http.Handler) http.Handler {
 
 func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		wrapped := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(wrapped, r)
+		route := chi.RouteContext(r.Context()).RoutePattern()
+		if route == "" {
+			route = "unmatched"
+		}
 		s.logger.Info("http request",
 			"request_id", middleware.GetReqID(r.Context()), "method", r.Method,
-			"path", r.URL.Path, "status", wrapped.status, "duration_ms", time.Since(start).Milliseconds())
+			"route", route, "status", wrapped.status, "duration_ms", time.Since(start).Milliseconds())
+	})
+}
+
+func (s *Server) observeHTTP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		s.metrics.IncHTTPInFlight()
+		defer s.metrics.DecHTTPInFlight()
+		wrapped := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(wrapped, r)
+		route := chi.RouteContext(r.Context()).RoutePattern()
+		if route == "" {
+			route = "unmatched"
+		}
+		s.metrics.ObserveHTTPRequest(r.Method, route, wrapped.status, time.Since(start))
 	})
 }
 
 type statusWriter struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
 func (w *statusWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.wroteHeader = true
 	w.status = status
 	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *statusWriter) Write(body []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
 }
 
 func (s *Server) decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {

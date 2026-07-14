@@ -6,6 +6,8 @@ set -eu
 : "${POSTGRES_DB:?POSTGRES_DB is required}"
 : "${POSTGRES_APP_USER:?POSTGRES_APP_USER is required}"
 : "${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}"
+: "${POSTGRES_MONITOR_USER:?POSTGRES_MONITOR_USER is required}"
+: "${POSTGRES_MONITOR_PASSWORD:?POSTGRES_MONITOR_PASSWORD is required}"
 
 validate_identifier() {
   value_name=$1
@@ -31,6 +33,7 @@ validate_numeric() {
 
 validate_identifier POSTGRES_DB "$POSTGRES_DB"
 validate_identifier POSTGRES_APP_USER "$POSTGRES_APP_USER"
+validate_identifier POSTGRES_MONITOR_USER "$POSTGRES_MONITOR_USER"
 
 case "$POSTGRES_HOST" in
   *[!a-zA-Z0-9_.-]*|'')
@@ -55,6 +58,18 @@ esac
 
 if [ "${#POSTGRES_APP_PASSWORD}" -lt 32 ]; then
   echo "POSTGRES_APP_PASSWORD must contain at least 32 characters" >&2
+  exit 1
+fi
+
+case "$POSTGRES_MONITOR_PASSWORD" in
+  *[!a-zA-Z0-9_-]*|'')
+    echo "POSTGRES_MONITOR_PASSWORD must be URL-safe (letters, digits, underscore or hyphen)" >&2
+    exit 1
+    ;;
+esac
+
+if [ "${#POSTGRES_MONITOR_PASSWORD}" -lt 32 ]; then
+  echo "POSTGRES_MONITOR_PASSWORD must contain at least 32 characters" >&2
   exit 1
 fi
 
@@ -96,11 +111,14 @@ application_name_add_host = 1
 log_connections = 0
 log_disconnections = 0
 log_pooler_errors = 1
+ignore_startup_parameters = extra_float_digits
+stats_users = $POSTGRES_MONITOR_USER
 EOF
 
 # PgBouncer performs SCRAM-SHA-256 client authentication. The URL-safe plain
 # password is kept only in this container's tmpfs so PgBouncer can also use it
 # for SCRAM authentication to PostgreSQL; it is never baked into an image.
 printf '"%s" "%s"\n' "$POSTGRES_APP_USER" "$POSTGRES_APP_PASSWORD" >"$config_dir/userlist.txt"
+printf '"%s" "%s"\n' "$POSTGRES_MONITOR_USER" "$POSTGRES_MONITOR_PASSWORD" >>"$config_dir/userlist.txt"
 
 exec pgbouncer "$config_dir/pgbouncer.ini"

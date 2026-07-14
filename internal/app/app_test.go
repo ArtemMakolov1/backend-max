@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +46,44 @@ type fakeMAX struct {
 	pinCalls           int
 	unpinCalls         int
 }
+
+type recordingMetrics struct {
+	mu          sync.Mutex
+	publication map[string]int
+	jobs        map[string]int
+	due         map[string]int
+	cycles      int
+}
+
+func newRecordingMetrics() *recordingMetrics {
+	return &recordingMetrics{publication: map[string]int{}, jobs: map[string]int{}, due: map[string]int{}}
+}
+
+func (m *recordingMetrics) ObservePublicationOperation(operation, outcome string, _ time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publication[operation+":"+outcome]++
+}
+
+func (m *recordingMetrics) ObserveSchedulerJob(job, outcome string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobs[job+":"+outcome]++
+}
+
+func (m *recordingMetrics) SetSchedulerDue(job string, count int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.due[job] = count
+}
+
+func (m *recordingMetrics) ObserveSchedulerCycle(time.Duration, time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cycles++
+}
+
+func (m *recordingMetrics) AddRecoveredPublications(int64) {}
 
 func (f *fakeMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 	return maxclient.BotInfo{UserID: 1, Username: "studio_bot", IsBot: true}, nil
@@ -642,6 +681,8 @@ func TestSchedulerPublishesOnlyPostsStillDueAtAtomicClaim(t *testing.T) {
 		},
 	}
 	application, storage := newTestApp(t, fake)
+	metrics := newRecordingMetrics()
+	application.metrics = metrics
 	now := time.Date(2033, time.June, 2, 12, 0, 0, 0, time.UTC)
 	application.now = func() time.Time { return now }
 	channel, err := storage.CreateChannel(context.Background(), store.Channel{
@@ -690,6 +731,9 @@ func TestSchedulerPublishesOnlyPostsStillDueAtAtomicClaim(t *testing.T) {
 	}
 	if fake.publishCalls != 1 {
 		t.Fatalf("MAX publish calls = %d, want 1", fake.publishCalls)
+	}
+	if metrics.due["publish"] != 1 || metrics.jobs["publish:success"] != 1 || metrics.publication["publish:success"] != 1 {
+		t.Fatalf("unexpected scheduler metrics: due=%#v jobs=%#v publications=%#v", metrics.due, metrics.jobs, metrics.publication)
 	}
 }
 

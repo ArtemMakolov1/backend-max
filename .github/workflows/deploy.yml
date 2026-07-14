@@ -206,6 +206,9 @@ jobs:
         env:
           POSTGRES_OWNER_PASSWORD: ${{ secrets.POSTGRES_OWNER_PASSWORD }}
           POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          POSTGRES_MONITOR_PASSWORD: ${{ secrets.POSTGRES_MONITOR_PASSWORD }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          GRAFANA_SECRET_KEY: ${{ secrets.GRAFANA_SECRET_KEY }}
           BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '14' }}
         run: |
           set -euo pipefail
@@ -217,9 +220,13 @@ jobs:
         env:
           POSTGRES_OWNER_PASSWORD: ${{ secrets.POSTGRES_OWNER_PASSWORD }}
           POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          POSTGRES_MONITOR_PASSWORD: ${{ secrets.POSTGRES_MONITOR_PASSWORD }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          GRAFANA_SECRET_KEY: ${{ secrets.GRAFANA_SECRET_KEY }}
           YANDEX_CLIENT_ID: ${{ secrets.YANDEX_CLIENT_ID }}
           YANDEX_CLIENT_SECRET: ${{ secrets.YANDEX_CLIENT_SECRET }}
           YANDEX_ALLOWED_USERS: ${{ vars.YANDEX_ALLOWED_USERS }}
+          OBSERVABILITY_ADMIN_USERS: ${{ vars.OBSERVABILITY_ADMIN_USERS }}
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
           MAX_WEBHOOK_SECRET: ${{ secrets.MAX_WEBHOOK_SECRET }}
           MAX_CA_CERT_FILE: ${{ vars.MAX_CA_CERT_FILE }}
@@ -272,7 +279,7 @@ jobs:
             -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
           )
 
-          tar -czf "$artifact" deploy docker
+          tar -czf "$artifact" deploy docker monitoring
           ssh "${ssh_options[@]}" "$target" \
             "install -d -m 750 '$install_dir' '$install_dir/releases' '$release_dir' '$install_dir/backups'; install -d -m 755 '$install_dir/certs' '$install_dir/hooks'"
           scp "${scp_options[@]}" "$artifact" "$target:$remote_artifact"

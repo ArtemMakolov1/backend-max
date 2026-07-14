@@ -13,7 +13,13 @@ if [[ "$deploy_stage" != "bootstrap" && "$deploy_stage" != "production" ]]; then
   exit 1
 fi
 
-required_secret_names=(POSTGRES_OWNER_PASSWORD POSTGRES_APP_PASSWORD)
+required_secret_names=(
+  POSTGRES_OWNER_PASSWORD
+  POSTGRES_APP_PASSWORD
+  POSTGRES_MONITOR_PASSWORD
+  GRAFANA_ADMIN_PASSWORD
+  GRAFANA_SECRET_KEY
+)
 if [[ "$deploy_stage" == "production" ]]; then
   required_secret_names+=(YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET)
 fi
@@ -38,6 +44,7 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_oauth_client_secret=''
   rendered_oauth_redirect_uri=''
   rendered_allowed_users=''
+  rendered_observability_admins=''
   rendered_bot_token=''
   rendered_webhook_secret=''
   rendered_openai_key=''
@@ -49,6 +56,11 @@ else
   rendered_oauth_client_secret=$YANDEX_CLIENT_SECRET
   rendered_oauth_redirect_uri=https://maxposty.ru/api/v1/auth/yandex/callback
   rendered_allowed_users=${YANDEX_ALLOWED_USERS:-}
+  rendered_observability_admins=${OBSERVABILITY_ADMIN_USERS:-}
+  if [[ -z "$rendered_observability_admins" ]]; then
+    echo "Missing required production deployment variable: OBSERVABILITY_ADMIN_USERS" >&2
+    exit 1
+  fi
   rendered_bot_token=$MAX_BOT_TOKEN
   rendered_webhook_secret=$MAX_WEBHOOK_SECRET
   rendered_openai_key=${OPENAI_API_KEY:-}
@@ -60,17 +72,23 @@ fi
   printf 'POSTGRES_OWNER_PASSWORD=%s\n' "$POSTGRES_OWNER_PASSWORD"
   printf 'POSTGRES_APP_USER=maxstudio_app\n'
   printf 'POSTGRES_APP_PASSWORD=%s\n' "$POSTGRES_APP_PASSWORD"
+  printf 'POSTGRES_MONITOR_USER=maxstudio_monitor\n'
+  printf 'POSTGRES_MONITOR_PASSWORD=%s\n' "$POSTGRES_MONITOR_PASSWORD"
   printf 'PGBOUNCER_DEFAULT_POOL_SIZE=%s\n' "${PGBOUNCER_DEFAULT_POOL_SIZE:-20}"
   printf 'PGBOUNCER_MIN_POOL_SIZE=%s\n' "${PGBOUNCER_MIN_POOL_SIZE:-2}"
   printf 'PGBOUNCER_RESERVE_POOL_SIZE=%s\n' "${PGBOUNCER_RESERVE_POOL_SIZE:-5}"
   printf 'PGBOUNCER_MAX_CLIENT_CONN=%s\n' "${PGBOUNCER_MAX_CLIENT_CONN:-200}"
   printf 'PUBLIC_BASE_URL=%s\n' "$public_base_url"
   printf 'FRONTEND_ORIGIN=%s\n' "$frontend_origin"
+  printf 'GRAFANA_ROOT_URL=%s/monitoring/\n' "$public_base_url"
+  printf 'GRAFANA_ADMIN_PASSWORD=%s\n' "$GRAFANA_ADMIN_PASSWORD"
+  printf 'GRAFANA_SECRET_KEY=%s\n' "$GRAFANA_SECRET_KEY"
   printf 'AUTH_BOOTSTRAP_MODE=%s\n' "$auth_bootstrap_mode"
   printf 'YANDEX_CLIENT_ID=%s\n' "$rendered_oauth_client_id"
   printf 'YANDEX_CLIENT_SECRET=%s\n' "$rendered_oauth_client_secret"
   printf 'YANDEX_REDIRECT_URI=%s\n' "$rendered_oauth_redirect_uri"
   printf 'YANDEX_ALLOWED_USERS=%s\n' "$rendered_allowed_users"
+  printf 'OBSERVABILITY_ADMIN_USERS=%s\n' "$rendered_observability_admins"
   printf 'AUTH_SESSION_TTL=%s\n' "${AUTH_SESSION_TTL:-12h}"
   printf 'OAUTH_TRUST_X_REAL_IP=true\n'
   printf 'OAUTH_RATE_LIMIT_AT_EDGE=false\n'

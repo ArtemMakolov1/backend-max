@@ -12,8 +12,12 @@ render_production() {
     DEPLOY_STAGE=production \
     POSTGRES_OWNER_PASSWORD=owner_password_0123456789abcdef0123456789abcdef \
     POSTGRES_APP_PASSWORD=app_password_0123456789abcdef0123456789abcdef \
+    POSTGRES_MONITOR_PASSWORD=monitor_password_0123456789abcdef0123456789abcdef \
+    GRAFANA_ADMIN_PASSWORD=grafana_admin_0123456789abcdef0123456789abcdef \
+    GRAFANA_SECRET_KEY=grafana_secret_0123456789abcdef0123456789abcdef \
     YANDEX_CLIENT_ID=yandex-client-id \
     YANDEX_CLIENT_SECRET=yandex-client-secret \
+    OBSERVABILITY_ADMIN_USERS=makolov99 \
     MAX_BOT_TOKEN=max-bot-token \
     MAX_WEBHOOK_SECRET=0123456789abcdef0123456789abcdef \
     OPENAI_API_KEY= \
@@ -25,26 +29,59 @@ production_env="$sandbox/production.env"
 render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
 grep -Fx 'OPENAI_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'GRAFANA_ROOT_URL=https://maxposty.ru/monitoring/' "$production_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$production_env"
 
-for required_secret in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET; do
+for required_secret in \
+  POSTGRES_MONITOR_PASSWORD GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY \
+  YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET; do
   if render_production "$sandbox/missing-$required_secret.env" "$required_secret=" >/dev/null 2>&1; then
     echo "Production render accepted an empty $required_secret" >&2
     exit 1
   fi
 done
 
+if render_production "$sandbox/missing-observability-admins.env" OBSERVABILITY_ADMIN_USERS= >/dev/null 2>&1; then
+  echo "Production render accepted empty OBSERVABILITY_ADMIN_USERS" >&2
+  exit 1
+fi
+
+awk -F= '$1 == "OBSERVABILITY_ADMIN_USERS" { print "OBSERVABILITY_ADMIN_USERS=valid,not valid"; next } { print }' \
+  "$production_env" >"$sandbox/invalid-observability-admins.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-observability-admins.env" >/dev/null 2>&1; then
+  echo "Production validation accepted invalid OBSERVABILITY_ADMIN_USERS" >&2
+  exit 1
+fi
+
+awk -F= '$1 == "OBSERVABILITY_ADMIN_USERS" { print "OBSERVABILITY_ADMIN_USERS=user@example.com"; next } { print }' \
+  "$sandbox/production.env" >"$sandbox/email-observability-admin.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/email-observability-admin.env" >/dev/null 2>&1; then
+  echo "Production validation accepted an email although auth checks only Yandex login/PSUID" >&2
+  exit 1
+fi
+
+awk -F= '$1 == "POSTGRES_MONITOR_USER" { print "POSTGRES_MONITOR_USER=maxstudio_owner"; next } { print }' \
+  "$production_env" >"$sandbox/duplicate-db-role.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/duplicate-db-role.env" >/dev/null 2>&1; then
+  echo "Production validation accepted duplicate PostgreSQL roles" >&2
+  exit 1
+fi
+
 bootstrap_env="$sandbox/bootstrap.env"
 env \
   DEPLOY_STAGE=bootstrap \
   POSTGRES_OWNER_PASSWORD=owner_password_0123456789abcdef0123456789abcdef \
   POSTGRES_APP_PASSWORD=app_password_0123456789abcdef0123456789abcdef \
+  POSTGRES_MONITOR_PASSWORD=monitor_password_0123456789abcdef0123456789abcdef \
+  GRAFANA_ADMIN_PASSWORD=grafana_admin_0123456789abcdef0123456789abcdef \
+  GRAFANA_SECRET_KEY=grafana_secret_0123456789abcdef0123456789abcdef \
   YANDEX_CLIENT_ID=must-not-leak \
+  OBSERVABILITY_ADMIN_USERS=must-not-leak \
   MAX_BOT_TOKEN=must-not-leak \
   OPENAI_API_KEY=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in YANDEX_CLIENT_ID MAX_BOT_TOKEN OPENAI_API_KEY; do
+for integration_key in YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN OPENAI_API_KEY; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

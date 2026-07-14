@@ -26,6 +26,7 @@ prepare_release() {
   install -d -m 750 "$release_dir"
   cp -R "$repo_root/deploy" "$release_dir/deploy"
   cp -R "$repo_root/docker" "$release_dir/docker"
+  cp -R "$repo_root/monitoring" "$release_dir/monitoring"
 }
 
 render_bootstrap_env() {
@@ -33,6 +34,9 @@ render_bootstrap_env() {
   DEPLOY_STAGE=bootstrap \
     POSTGRES_OWNER_PASSWORD=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     POSTGRES_APP_PASSWORD=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    POSTGRES_MONITOR_PASSWORD=cccccccccccccccccccccccccccccccc \
+    GRAFANA_ADMIN_PASSWORD=dddddddddddddddddddddddddddddddd \
+    GRAFANA_SECRET_KEY=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
     "$repo_root/deploy/render-production-env.sh" "$output"
 }
 
@@ -163,7 +167,63 @@ run_previous_release_recovery_policy() {
   rm -rf "$sandbox"
 }
 
+run_post_migration_recovery_policy() {
+  local scenario=$1
+  local sandbox installation_dir release_dir current_dir fake_bin output restore_line
+  sandbox=$(mktemp -d)
+  sandbox=$(CDPATH='' cd -- "$sandbox" && pwd -P)
+  installation_dir="$sandbox/backend"
+  release_dir="$installation_dir/releases/$new_sha"
+  current_dir="$installation_dir/releases/$old_sha"
+  fake_bin="$sandbox/bin"
+  output="$sandbox/output.log"
+  install -d "$fake_bin" "$sandbox/empty"
+  prepare_release "$release_dir"
+  prepare_release "$current_dir"
+  render_bootstrap_env "$release_dir/.env.production.next"
+  render_bootstrap_env "$current_dir/.env.production"
+  printf 'BACKEND_IMAGE=%s\n' "$image" >"$current_dir/.release"
+  ln -s "$current_dir" "$installation_dir/current"
+  ln -s "$repo_root/deploy/tests/fake-docker.sh" "$fake_bin/docker"
+  ln -s "$(type -P true)" "$fake_bin/flock"
+
+  if PATH="$fake_bin:$PATH" \
+    TEST_LOG="$sandbox/docker.log" \
+    TEST_SCENARIO="$scenario" \
+    TEST_EMPTY_DIR="$sandbox/empty" \
+    TEST_OLD_SHA="$old_sha" \
+    "$release_dir/deploy/deploy-production.sh" "$image" >"$output" 2>&1; then
+    echo "Post-migration recovery fixture unexpectedly succeeded: $scenario" >&2
+    rm -rf "$sandbox"
+    exit 1
+  fi
+
+  grep -F "$release_dir/deploy/compose.production.yaml run --rm --no-deps migrate" "$sandbox/docker.log" >/dev/null
+  grep -F "$release_dir/deploy/compose.production.yaml up -d --no-deps --force-recreate backend" "$sandbox/docker.log" >/dev/null
+  restore_line=$(grep -nF "$current_dir/deploy/compose.production.yaml up -d --no-deps --force-recreate backend" "$sandbox/docker.log" | tail -1 | cut -d: -f1)
+  if [[ -z "$restore_line" ]]; then
+    echo "Post-migration failure did not restore the accepted backend: $scenario" >&2
+    rm -rf "$sandbox"
+    exit 1
+  fi
+  if [[ "$scenario" == "monitoring-fail" ]]; then
+    grep -F "$release_dir/deploy/compose.production.yaml stop grafana prometheus postgres-exporter pgbouncer-exporter node-exporter" "$sandbox/docker.log" >/dev/null
+    grep -F "$current_dir/deploy/compose.production.yaml up -d --no-deps --force-recreate grafana" "$sandbox/docker.log" >/dev/null
+  fi
+  if grep -F 'missing-env:' "$sandbox/docker.log" >/dev/null; then
+    echo "Post-migration rollback lost required env metadata: $scenario" >&2
+    rm -rf "$sandbox"
+    exit 1
+  fi
+  assert_file_absent "$release_dir/.env.production.next"
+  assert_file_absent "$release_dir/.release.next"
+  [[ "$(readlink -f "$installation_dir/current")" == "$current_dir" ]]
+  rm -rf "$sandbox"
+}
+
 run_bootstrap_skips_installed_offsite_hook
 run_initial_failure_policy
 run_previous_release_recovery_policy
+run_post_migration_recovery_policy new-backend-health-fail
+run_post_migration_recovery_policy monitoring-fail
 echo "Deployment rollback policy tests passed."

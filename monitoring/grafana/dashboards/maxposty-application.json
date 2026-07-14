@@ -1,0 +1,148 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "sum(maxposty_http_requests_in_flight) or vector(0)", "refId": "A"}],
+      "title": "Запросов сейчас",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 2}]}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (rate(maxposty_http_request_duration_seconds_bucket[5m])))", "refId": "A"}],
+      "title": "API p95",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.25}, {"color": "red", "value": 0.5}]}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (rate(maxposty_db_query_duration_seconds_bucket[5m])))", "refId": "A"}],
+      "title": "SQL p95",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "max": 1, "min": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.7}, {"color": "red", "value": 0.85}]}, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "max(maxposty_db_pool_in_use_connections / clamp_min(maxposty_db_pool_max_open_connections, 1)) or vector(0)", "refId": "A"}],
+      "title": "Заполнение SQL-пула",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "id": 5,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (method, route) (rate(maxposty_http_requests_total[$__rate_interval]))", "legendFormat": "{{method}} {{route}}", "refId": "A"}],
+      "title": "Запросы по маршрутам",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 8, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "id": 6,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, method, route) (rate(maxposty_http_request_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "{{method}} {{route}}", "refId": "A"}],
+      "title": "p95 по маршрутам",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "bars", "fillOpacity": 55, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}}, "unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 12},
+      "id": 7,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (status_class) (rate(maxposty_http_requests_total[$__rate_interval]))", "legendFormat": "{{status_class}}", "refId": "A"}],
+      "title": "Ответы по статусам",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 12},
+      "id": 8,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, operation, result) (rate(maxposty_db_query_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "{{operation}} · {{result}}", "refId": "A"}],
+      "title": "SQL p95 по операции",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 12},
+      "id": 9,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (operation) (rate(maxposty_db_query_errors_total[$__rate_interval]))", "legendFormat": "ошибки · {{operation}}", "refId": "A"},
+        {"expr": "sum by (operation) (rate(maxposty_db_slow_queries_total[$__rate_interval]))", "legendFormat": "медленные · {{operation}}", "refId": "B"}
+      ],
+      "title": "Ошибки и медленные SQL-запросы",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 20},
+      "id": 10,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "max(maxposty_db_pool_open_connections) or vector(0)", "legendFormat": "открыто", "refId": "A"},
+        {"expr": "max(maxposty_db_pool_in_use_connections) or vector(0)", "legendFormat": "занято", "refId": "B"},
+        {"expr": "max(maxposty_db_pool_idle_connections) or vector(0)", "legendFormat": "свободно", "refId": "C"},
+        {"expr": "max(maxposty_db_pool_max_open_connections) or vector(0)", "legendFormat": "лимит", "refId": "D"}
+      ],
+      "title": "Пул database/sql",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 10, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 20},
+      "id": 11,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, operation, outcome) (rate(maxposty_publication_operation_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "{{operation}} · {{outcome}}", "refId": "A"}],
+      "title": "Публикация MAX p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "bars", "fillOpacity": 45, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 20},
+      "id": 12,
+      "options": {"legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "max by (job) (maxposty_scheduler_due_items)", "legendFormat": "{{job}}", "refId": "A"}],
+      "title": "Задачи, ожидающие планировщик",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["maxposty", "application", "api"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "MaxPosty — API и приложение",
+  "uid": "maxposty-application",
+  "version": 1,
+  "weekStart": "monday"
+}

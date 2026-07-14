@@ -11,7 +11,10 @@ import (
 	"time"
 )
 
-var maxWebhookSecretPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{5,256}$`)
+var (
+	maxWebhookSecretPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{5,256}$`)
+	observabilityAdminPattern = regexp.MustCompile(`^[a-z0-9._+-]{1,128}$`)
+)
 
 const (
 	defaultHost                = "127.0.0.1"
@@ -57,6 +60,7 @@ type Config struct {
 	YandexClientSecret   string
 	YandexRedirectURI    string
 	YandexAllowedUsers   []string
+	ObservabilityAdmins  []string
 	AuthSessionTTL       time.Duration
 	OpenAIAPIKey         string
 	OpenAIAPIBaseURL     string
@@ -146,6 +150,7 @@ func Load() (Config, error) {
 		YandexClientSecret:   strings.TrimSpace(os.Getenv("YANDEX_CLIENT_SECRET")),
 		YandexRedirectURI:    strings.TrimSpace(os.Getenv("YANDEX_REDIRECT_URI")),
 		YandexAllowedUsers:   splitNormalizedCSV(os.Getenv("YANDEX_ALLOWED_USERS")),
+		ObservabilityAdmins:  splitNormalizedCSV(os.Getenv("OBSERVABILITY_ADMIN_USERS")),
 		AuthSessionTTL:       sessionTTL,
 		OpenAIAPIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		OpenAIAPIBaseURL:     env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL),
@@ -187,7 +192,7 @@ func Load() (Config, error) {
 		}
 	}
 	if cfg.AuthBootstrapMode {
-		if oauthParts != 0 || len(cfg.YandexAllowedUsers) != 0 {
+		if oauthParts != 0 || len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
 		}
 		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" {
@@ -210,6 +215,11 @@ func Load() (Config, error) {
 		}
 	} else if len(cfg.YandexAllowedUsers) != 0 {
 		return Config{}, fmt.Errorf("YANDEX_ALLOWED_USERS requires Yandex OAuth credentials")
+	}
+	for _, identity := range cfg.ObservabilityAdmins {
+		if !observabilityAdminPattern.MatchString(identity) {
+			return Config{}, fmt.Errorf("OBSERVABILITY_ADMIN_USERS contains an invalid Yandex identity %q", identity)
+		}
 	}
 	if !cfg.YandexAuthEnabled() {
 		return Config{}, fmt.Errorf("yandex OAuth is required: configure YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET and YANDEX_REDIRECT_URI")

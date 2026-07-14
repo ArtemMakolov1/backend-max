@@ -1,0 +1,220 @@
+groups:
+  - name: maxposty-targets
+    rules:
+      - alert: MaxPostyTargetDown
+        expr: up{job=~"maxposty-backend|postgres|pgbouncer|node"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Недоступен компонент MaxPosty: {{ $labels.job }}"
+          description: "Prometheus не может опросить {{ $labels.instance }} дольше двух минут."
+
+      - alert: MaxPostyPostgreSQLExporterCannotConnect
+        expr: pg_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Exporter не может подключиться к PostgreSQL"
+          description: "HTTP endpoint exporter'а работает, но соединение с PostgreSQL недоступно."
+
+      - alert: MaxPostyPgBouncerExporterCannotConnect
+        expr: pgbouncer_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Exporter не может подключиться к PgBouncer"
+          description: "HTTP endpoint exporter'а работает, но служебная БД PgBouncer недоступна."
+
+  - name: maxposty-application
+    rules:
+      - alert: MaxPostyHighHTTP5xxRate
+        expr: |
+          (
+            sum(rate(maxposty_http_request_errors_total{status_class="5xx"}[5m]))
+            /
+            clamp_min(sum(rate(maxposty_http_requests_total[5m])), 0.01)
+          ) > 0.05
+          and sum(rate(maxposty_http_requests_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Высокая доля ошибок 5xx"
+          description: "Больше 5% запросов завершаются ошибкой 5xx в течение 10 минут."
+
+      - alert: MaxPostyHighHTTPP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(maxposty_http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая задержка API"
+          description: "p95 времени ответа API превышает 2 секунды в течение 10 минут."
+
+      - alert: MaxPostyDatabaseQueryErrors
+        expr: sum(rate(maxposty_db_query_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ошибки запросов к PostgreSQL"
+          description: "Приложение фиксирует ошибки SQL-запросов в течение пяти минут."
+
+      - alert: MaxPostySlowDatabaseQueries
+        expr: sum(rate(maxposty_db_slow_queries_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Много медленных SQL-запросов"
+          description: "Более 0.1 запроса/с превышают порог 500 мс в течение 10 минут."
+
+      - alert: MaxPostyDatabasePoolSaturation
+        expr: |
+          (
+            maxposty_db_pool_in_use_connections
+            /
+            clamp_min(maxposty_db_pool_max_open_connections, 1)
+          ) > 0.85
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Пул соединений приложения заполнен"
+          description: "Более 85% доступных соединений database/sql заняты."
+
+      - alert: MaxPostyPublicationFailures
+        expr: sum(rate(maxposty_publication_operations_total{outcome!="success"}[10m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ошибки публикации в MAX"
+          description: "Операции публикации или синхронизации MAX регулярно завершаются ошибкой."
+
+      - alert: MaxPostyProductAnalyticsStale
+        expr: |
+          (maxposty_product_analytics_last_success_timestamp_seconds == 0)
+          or (time() - maxposty_product_analytics_last_success_timestamp_seconds > 600)
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Продуктовые показатели не обновляются"
+          description: "Последний успешный расчёт DAU/WAU/MAU и воронки был более 10 минут назад."
+
+      - alert: MaxPostySchedulerStale
+        expr: |
+          (maxposty_scheduler_last_cycle_timestamp_seconds == 0)
+          or (
+            time() - maxposty_scheduler_last_cycle_timestamp_seconds
+            > clamp_min(4 * maxposty_scheduler_interval_seconds, 180)
+          )
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Планировщик публикаций не выполняется"
+          description: "Последний цикл не завершился за четыре настроенных интервала (минимум три минуты)."
+
+      - alert: MaxPostySchedulerJobErrors
+        expr: sum(increase(maxposty_scheduler_jobs_total{outcome="error"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Планировщик завершает задачи с ошибками"
+          description: "За последние 10 минут планировщик не смог выполнить одну или несколько задач."
+
+  - name: maxposty-postgresql
+    rules:
+      - alert: MaxPostyPostgreSQLConnectionsHigh
+        expr: |
+          (
+            sum(pg_stat_database_numbackends)
+            /
+            clamp_min(max(pg_settings_max_connections), 1)
+          ) > 0.80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL близок к лимиту соединений"
+          description: "Используется более 80% max_connections."
+
+      - alert: MaxPostyPostgreSQLDeadlocks
+        expr: sum(increase(pg_stat_database_deadlocks[10m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Обнаружены deadlock в PostgreSQL"
+          description: "PostgreSQL зарегистрировал взаимную блокировку за последние 10 минут."
+
+      - alert: MaxPostyPostgreSQLLongRunningTransaction
+        expr: pg_long_running_transactions_oldest_timestamp_seconds > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "В PostgreSQL выполняется долгая транзакция"
+          description: "Самая старая активная транзакция длится больше 60 секунд в течение пяти минут."
+
+      - alert: MaxPostyPgBouncerClientsWaiting
+        expr: sum(pgbouncer_pools_client_waiting_connections) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Клиенты ждут соединение PgBouncer"
+          description: "В очереди PgBouncer есть клиенты дольше пяти минут."
+
+      - alert: MaxPostyPgBouncerClientSaturation
+        expr: |
+          (
+            (
+              sum(pgbouncer_pools_client_active_connections)
+              + sum(pgbouncer_pools_client_waiting_connections)
+            )
+            /
+            clamp_min(max(pgbouncer_config_max_client_connections), 1)
+          ) > 0.80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PgBouncer близок к лимиту клиентов"
+          description: "Используется более 80% max_client_conn."
+
+  - name: maxposty-host
+    rules:
+      - alert: MaxPostyDiskSpaceLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs"}
+            /
+            node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs"}
+          ) < 0.15
+          and node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|nsfs"} > 1073741824
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "На диске осталось меньше 15%"
+          description: "Свободное место на {{ $labels.mountpoint }}: {{ $value | humanizePercentage }}."
+
+      - alert: MaxPostyMemoryPressure
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "На VPS мало доступной памяти"
+          description: "Доступно меньше 10% оперативной памяти в течение 10 минут."

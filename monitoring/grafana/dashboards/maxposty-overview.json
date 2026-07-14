@@ -1,0 +1,133 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "max(maxposty_product_active_users{period=\"day\"}) or vector(0)", "refId": "A"}],
+      "title": "DAU — активны сегодня",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "max(maxposty_product_active_users{period=\"week\"}) or vector(0)", "refId": "A"}],
+      "title": "WAU — активны за 7 дней",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "purple", "value": null}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "max(maxposty_product_active_users{period=\"month\"}) or vector(0)", "refId": "A"}],
+      "title": "MAU — активны за 30 дней",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 4, "x": 12, "y": 0},
+      "id": 4,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "count(ALERTS{alertstate=\"firing\"}) or vector(0)", "refId": "A"}],
+      "title": "Активные алерты",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "continuous-GrYlRd"}, "min": 0, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 8, "x": 16, "y": 0},
+      "id": 5,
+      "options": {"displayMode": "gradient", "maxVizHeight": 300, "minVizHeight": 16, "minVizWidth": 8, "namePlacement": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true, "sizing": "auto", "valueMode": "color"},
+      "targets": [
+        {"expr": "max(maxposty_product_funnel_users{stage=\"registered\"}) or vector(0)", "legendFormat": "1. Зарегистрировались", "refId": "A"},
+        {"expr": "max(maxposty_product_funnel_users{stage=\"max_linked\"}) or vector(0)", "legendFormat": "2. Связали MAX", "refId": "B"},
+        {"expr": "max(maxposty_product_funnel_users{stage=\"channel_connected\"}) or vector(0)", "legendFormat": "3. Подключили канал", "refId": "C"},
+        {"expr": "max(maxposty_product_funnel_users{stage=\"post_created\"}) or vector(0)", "legendFormat": "4. Создали пост", "refId": "D"},
+        {"expr": "max(maxposty_product_funnel_users{stage=\"scheduled_or_published\"}) or vector(0)", "legendFormat": "5. Запланировали/опубликовали", "refId": "E"},
+        {"expr": "max(maxposty_product_funnel_users{stage=\"published\"}) or vector(0)", "legendFormat": "6. Опубликовали", "refId": "F"}
+      ],
+      "title": "Воронка: регистрация → опубликованный пост",
+      "description": "Снимок текущего состояния: уникальные пользователи на каждом последовательном этапе. Этапы не содержат идентификаторы пользователей и могут уменьшиться после удаления данных.",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 15, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 5},
+      "id": 6,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum(rate(maxposty_http_requests_total[$__rate_interval])) or vector(0)", "legendFormat": "Все запросы", "refId": "A"},
+        {"expr": "sum(rate(maxposty_http_request_errors_total{status_class=\"5xx\"}[$__rate_interval])) or vector(0)", "legendFormat": "Ошибки 5xx", "refId": "B"}
+      ],
+      "title": "API: запросы и ошибки",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 5},
+      "id": 7,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (operation, outcome) (rate(maxposty_publication_operations_total[$__rate_interval]))", "legendFormat": "{{operation}} · {{outcome}}", "refId": "A"}],
+      "title": "Операции публикации MAX",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}}, "unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 13},
+      "id": 8,
+      "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (job, outcome) (rate(maxposty_scheduler_jobs_total[$__rate_interval]))", "legendFormat": "{{job}} · {{outcome}}", "refId": "A"}],
+      "title": "Планировщик",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "drawStyle": "line", "fillOpacity": 12, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}}, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 13},
+      "id": 9,
+      "options": {"legend": {"calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "((sum(rate(maxposty_http_request_errors_total{status_class=\"5xx\"}[$__rate_interval])) / clamp_min(sum(rate(maxposty_http_requests_total[$__rate_interval])), 0.001))) or vector(0)", "legendFormat": "5xx", "refId": "A"}],
+      "title": "Доля серверных ошибок",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "maxposty-prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "thresholds"}, "mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 11, "w": 8, "x": 16, "y": 10},
+      "id": 10,
+      "options": {"cellHeight": "sm", "showHeader": true},
+      "targets": [{"expr": "ALERTS{alertstate=\"firing\"}", "format": "table", "instant": true, "refId": "A"}],
+      "title": "Срабатывающие правила",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "tags": ["maxposty", "product", "overview"],
+  "templating": {"list": []},
+  "time": {"from": "now-24h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "MaxPosty — продукт и надёжность",
+  "uid": "maxposty-overview",
+  "version": 1,
+  "weekStart": "monday"
+}

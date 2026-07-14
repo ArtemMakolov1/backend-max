@@ -25,6 +25,16 @@ services:
       - max_connections=100
       - -c
       - idle_in_transaction_session_timeout=60s
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.max=1000
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - compute_query_id=on
+      - -c
+      - track_io_timing=on
     expose:
       - "5432"
     volumes:
@@ -54,6 +64,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_APP_USER: ${POSTGRES_APP_USER}
       POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD}
+      POSTGRES_MONITOR_USER: ${POSTGRES_MONITOR_USER}
+      POSTGRES_MONITOR_PASSWORD: ${POSTGRES_MONITOR_PASSWORD}
       PGBOUNCER_DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE}
       PGBOUNCER_MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE}
       PGBOUNCER_RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE}
@@ -72,6 +84,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      monitoring-role:
+        condition: service_completed_successfully
     healthcheck:
       # The pinned Percona image has Bash but does not ship PostgreSQL client
       # tools. Opening PgBouncer's listening socket avoids a false unhealthy
@@ -122,6 +136,7 @@ services:
       YANDEX_CLIENT_SECRET: ${YANDEX_CLIENT_SECRET}
       YANDEX_REDIRECT_URI: ${YANDEX_REDIRECT_URI}
       YANDEX_ALLOWED_USERS: ${YANDEX_ALLOWED_USERS}
+      OBSERVABILITY_ADMIN_USERS: ${OBSERVABILITY_ADMIN_USERS}
       AUTH_SESSION_TTL: ${AUTH_SESSION_TTL}
       MAX_API_BASE_URL: ${MAX_API_BASE_URL}
       MAX_BOT_TOKEN: ${MAX_BOT_TOKEN}
@@ -171,6 +186,238 @@ services:
           - backend
           - maxposty-backend
       pool:
+      monitoring:
+
+  monitoring-role:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: "no"
+    entrypoint: ["/usr/local/bin/configure-monitoring-role"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_OWNER_USER: ${POSTGRES_OWNER_USER}
+      POSTGRES_OWNER_PASSWORD: ${POSTGRES_OWNER_PASSWORD}
+      POSTGRES_MONITOR_USER: ${POSTGRES_MONITOR_USER}
+      POSTGRES_MONITOR_PASSWORD: ${POSTGRES_MONITOR_PASSWORD}
+    volumes:
+      - ../docker/postgres/configure-monitoring-role.sh:/usr/local/bin/configure-monitoring-role:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+    networks:
+      - database
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e
+    restart: unless-stopped
+    command:
+      - --collector.long_running_transactions
+      - --collector.stat_statements
+      - --collector.stat_statements.limit=25
+      - --no-collector.stat_statements.include_query
+      - --log.level=warn
+    environment:
+      DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB}?sslmode=disable
+      DATA_SOURCE_USER: ${POSTGRES_MONITOR_USER}
+      DATA_SOURCE_PASS: ${POSTGRES_MONITOR_PASSWORD}
+    expose:
+      - "9187"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      monitoring-role:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9187/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - database
+      - monitoring
+
+  pgbouncer-exporter:
+    image: prometheuscommunity/pgbouncer-exporter:v0.12.1@sha256:30f31b6c2efdad3647f8182cc7c1a3a19e42bae5d17387694989f969371c230d
+    restart: unless-stopped
+    environment:
+      PGBOUNCER_EXPORTER_CONNECTION_STRING: postgresql://${POSTGRES_MONITOR_USER}:${POSTGRES_MONITOR_PASSWORD}@pgbouncer:6432/pgbouncer?sslmode=disable
+    expose:
+      - "9127"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9127/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - pool
+      - monitoring
+
+  node-exporter:
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    restart: unless-stopped
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/rootfs
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)
+      - --collector.netdev.device-exclude=^(veth.*|docker.*|br-.*)$
+    expose:
+      - "9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro,rslave
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9100/metrics"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 5s
+    logging: *default-logging
+    networks:
+      - monitoring
+
+  prometheus:
+    image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --storage.tsdb.retention.size=5GB
+      - --web.enable-admin-api=false
+      - --log.level=warn
+    expose:
+      - "9090"
+    # SSH-only break-glass access remains available when the application auth
+    # path or database is down; it is never bound to a public interface.
+    ports:
+      - "127.0.0.1:19090:9090"
+    volumes:
+      - ../monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      backend:
+        condition: service_healthy
+      postgres-exporter:
+        condition: service_healthy
+      pgbouncer-exporter:
+        condition: service_healthy
+      node-exporter:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
+    restart: unless-stopped
+    environment:
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_SECURITY_SECRET_KEY: ${GRAFANA_SECRET_KEY}
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST: prometheus:9090
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_HEADERS: Role:X-WEBAUTH-ROLE
+      # Caddy is the only network peer allowed to assert a user identity.
+      # Loopback is included solely for the authenticated deployment smoke
+      # check that verifies provisioned dashboards and the datasource.
+      GF_AUTH_PROXY_WHITELIST: 172.29.42.10,127.0.0.1
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_PROXY_ENABLE_LOGIN_TOKEN: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Viewer
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+    expose:
+      - "3000"
+    volumes:
+      - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    pids_limit: 256
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/monitoring/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    logging: *default-logging
+    networks:
+      monitoring_edge:
+        ipv4_address: 172.29.42.20
+        aliases:
+          - grafana
+          - maxposty-grafana
+      monitoring:
 
   setup-max-webhook:
     image: ${BACKEND_IMAGE}
@@ -212,12 +459,19 @@ services:
 volumes:
   postgres-data:
   media-data:
+  prometheus-data:
+  grafana-data:
 
 networks:
   edge:
     name: maxposty-edge
     external: true
+  monitoring_edge:
+    name: maxposty-monitoring-edge
+    external: true
   pool:
     internal: true
   database:
+    internal: true
+  monitoring:
     internal: true

@@ -16,6 +16,8 @@ if [[ ${1:-} == "network" && ${2:-} == "inspect" ]]; then
   case "$*" in
     *'.Driver'*) printf 'bridge\n' ;;
     *'.Scope'*) printf 'local\n' ;;
+    *'.Labels'*'maxposty-monitoring-edge'*) printf 'monitoring-edge\n' ;;
+    *'.IPAM.Config'*'maxposty-monitoring-edge'*) printf '172.29.42.0/24\n' ;;
     *'.Labels'*) printf 'maxposty\n' ;;
   esac
   exit 0
@@ -23,7 +25,10 @@ fi
 
 if [[ ${1:-} == "inspect" ]]; then
   container_id=${!#}
-  if [[ "$container_id" == "new-backend-id" && "$TEST_SCENARIO" == "initial-health-fail" ]]; then
+  if [[ "$container_id" == "new-backend-id" && \
+    ("$TEST_SCENARIO" == "initial-health-fail" || "$TEST_SCENARIO" == "new-backend-health-fail") ]]; then
+    printf 'unhealthy\n'
+  elif [[ "$container_id" == "new-grafana-id" && "$TEST_SCENARIO" == "monitoring-fail" ]]; then
     printf 'unhealthy\n'
   else
     printf 'healthy\n'
@@ -63,6 +68,41 @@ fi
 if [[ "$*" == *" ps -q "* ]]; then
   service=${!#}
   printf '%s-%s-id\n' "$bundle_kind" "$service"
+  exit 0
+fi
+
+if [[ "$*" == *" exec -T postgres-exporter "*"/metrics"* ]]; then
+  printf 'pg_up 1\n'
+  exit 0
+fi
+
+if [[ "$*" == *" exec -T pgbouncer-exporter "*"/metrics"* ]]; then
+  printf 'pgbouncer_up 1\n'
+  exit 0
+fi
+
+if [[ "$*" == *" exec -T prometheus "*"/api/v1/query"* ]]; then
+  printf '{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1,"1"]}]}}\n'
+  exit 0
+fi
+
+if [[ "$*" == *" exec -T grafana "*"/monitoring/api/datasources/uid/maxposty-prometheus"* ]]; then
+  printf '{"uid":"maxposty-prometheus"}\n'
+  exit 0
+fi
+
+if [[ "$*" == *" exec -T grafana "*"/monitoring/api/dashboards/uid/maxposty-overview"* ]]; then
+  printf '{"dashboard":{"uid":"maxposty-overview"}}\n'
+  exit 0
+fi
+
+if [[ "$*" == *" exec -T grafana "*"/monitoring/api/dashboards/uid/maxposty-application"* ]]; then
+  printf '{"dashboard":{"uid":"maxposty-application"}}\n'
+  exit 0
+fi
+
+if [[ "$*" == *" exec -T grafana "*"/monitoring/api/dashboards/uid/maxposty-infrastructure"* ]]; then
+  printf '{"dashboard":{"uid":"maxposty-infrastructure"}}\n'
   exit 0
 fi
 

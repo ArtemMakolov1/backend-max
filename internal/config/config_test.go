@@ -27,6 +27,33 @@ func TestLoadAcceptsYandexOAuthAsPublicHostProtection(t *testing.T) {
 	}
 }
 
+func TestLoadNormalizesObservabilityAdmins(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("OBSERVABILITY_ADMIN_USERS", " Makolov99, 12345,makolov99 ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.ObservabilityAdmins, ","); got != "makolov99,12345" {
+		t.Fatalf("observability admins = %q", got)
+	}
+}
+
+func TestLoadRejectsInvalidObservabilityAdmin(t *testing.T) {
+	for _, value := range []string{"valid-user,not valid", "user@example.com"} {
+		t.Run(value, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv("OBSERVABILITY_ADMIN_USERS", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "OBSERVABILITY_ADMIN_USERS") {
+				t.Fatalf("Load() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRequiresYandexOAuthEvenWhenLegacyAdminVariablesAreSet(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("HOST", "0.0.0.0")
@@ -276,7 +303,7 @@ func clearAuthEnv(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://app:secret@localhost:6432/maxstudio?sslmode=disable")
 	for _, name := range []string{
 		"ADMIN_API_KEY", "YANDEX_CLIENT_ID", "YANDEX_CLIENT_SECRET", "YANDEX_REDIRECT_URI",
-		"YANDEX_ALLOWED_USERS", "AUTH_SESSION_TTL", "ALLOW_INSECURE_NO_AUTH", "AUTH_BOOTSTRAP_MODE", "OAUTH_TRUST_X_REAL_IP",
+		"YANDEX_ALLOWED_USERS", "OBSERVABILITY_ADMIN_USERS", "AUTH_SESSION_TTL", "ALLOW_INSECURE_NO_AUTH", "AUTH_BOOTSTRAP_MODE", "OAUTH_TRUST_X_REAL_IP",
 		"OAUTH_RATE_LIMIT_AT_EDGE", "AI_GLOBAL_MAX_CONCURRENT", "AI_USER_MAX_CONCURRENT",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",

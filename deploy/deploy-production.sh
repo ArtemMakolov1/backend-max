@@ -77,6 +77,12 @@ if [[ -L "$current_link" ]]; then
       exit 1
     fi
   done
+  for key in POSTGRES_MONITOR_PASSWORD GRAFANA_SECRET_KEY; do
+    if grep -q "^${key}=" "$current_env" && [[ "$(env_value "$current_env" "$key")" != "$(env_value "$next_env" "$key")" ]]; then
+      echo "$key cannot be rotated by an application deployment; use the documented monitoring credential rotation procedure" >&2
+      exit 1
+    fi
+  done
 elif [[ -e "$current_link" ]]; then
   echo "$current_link must be a symlink to a versioned release" >&2
   exit 1
@@ -116,6 +122,45 @@ ensure_edge_network() {
 }
 
 ensure_edge_network
+
+ensure_monitoring_edge_network() {
+  local network_name=maxposty-monitoring-edge
+  local infrastructure_dir network_driver network_scope network_label network_subnet
+  infrastructure_dir=$(dirname "$installation_dir")
+
+  exec 7>"$infrastructure_dir/.maxposty-monitoring-edge-network.lock"
+  if ! flock -w 30 7; then
+    echo "Timed out waiting to configure the shared $network_name Docker network" >&2
+    return 1
+  fi
+  if ! docker network inspect "$network_name" >/dev/null 2>&1; then
+    docker network create \
+      --driver bridge \
+      --attachable \
+      --subnet 172.29.42.0/24 \
+      --label com.maxposty.stack=maxposty \
+      --label com.maxposty.purpose=monitoring-edge \
+      "$network_name" >/dev/null 2>&1 || true
+  fi
+
+  if ! docker network inspect "$network_name" >/dev/null 2>&1; then
+    echo "Could not create the shared $network_name Docker network" >&2
+    return 1
+  fi
+  network_driver=$(docker network inspect --format '{{.Driver}}' "$network_name")
+  network_scope=$(docker network inspect --format '{{.Scope}}' "$network_name")
+  network_label=$(docker network inspect --format '{{index .Labels "com.maxposty.purpose"}}' "$network_name")
+  network_subnet=$(docker network inspect --format '{{(index .IPAM.Config 0).Subnet}}' "$network_name")
+  if [[ "$network_driver" != "bridge" || "$network_scope" != "local" || \
+    "$network_label" != "monitoring-edge" || "$network_subnet" != "172.29.42.0/24" ]]; then
+    echo "Existing $network_name network does not match the isolated monitoring contract" >&2
+    return 1
+  fi
+  flock -u 7
+  exec 7>&-
+}
+
+ensure_monitoring_edge_network
 
 printf 'BACKEND_IMAGE=%s\n' "$image" >"$next_release"
 chmod 600 "$next_release"
@@ -158,6 +203,140 @@ wait_for_health() {
   return 1
 }
 
+wait_for_prometheus_target() {
+  local bundle_dir=$1
+  local environment_file=$2
+  local release_file=$3
+  local job=$4
+  local encoded_job response
+  # Job names are fixed by monitoring/prometheus/prometheus.yml. Keep the URL
+  # encoding explicit so no deployment input is interpolated into PromQL.
+  case "$job" in
+    maxposty-backend) encoded_job=maxposty-backend ;;
+    postgres) encoded_job=postgres ;;
+    pgbouncer) encoded_job=pgbouncer ;;
+    node) encoded_job=node ;;
+    *) return 2 ;;
+  esac
+  for ((attempt = 1; attempt <= 20; attempt++)); do
+    response=$(compose "$bundle_dir" "$environment_file" "$release_file" exec -T prometheus \
+      wget -q -O - "http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22${encoded_job}%22%7D" 2>/dev/null || true)
+    if grep -Eq '"value":\[[^]]*,"1"\]' <<<"$response"; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+wait_for_grafana_provisioning() {
+  local bundle_dir=$1
+  local environment_file=$2
+  local release_file=$3
+  local resource response
+  local resources=(
+    'datasources/uid/maxposty-prometheus|maxposty-prometheus'
+    'dashboards/uid/maxposty-overview|maxposty-overview'
+    'dashboards/uid/maxposty-application|maxposty-application'
+    'dashboards/uid/maxposty-infrastructure|maxposty-infrastructure'
+  )
+
+  for ((attempt = 1; attempt <= 20; attempt++)); do
+    local all_ready=true
+    for resource in "${resources[@]}"; do
+      local api_path=${resource%%|*}
+      local expected_uid=${resource##*|}
+      response=$(compose "$bundle_dir" "$environment_file" "$release_file" exec -T grafana \
+        wget -q -O - \
+        --header='X-WEBAUTH-USER: maxposty-deploy-check' \
+        --header='X-WEBAUTH-ROLE: Viewer' \
+        "http://127.0.0.1:3000/monitoring/api/${api_path}" 2>/dev/null || true)
+      if ! grep -Fq "\"uid\":\"${expected_uid}\"" <<<"$response"; then
+        all_ready=false
+        break
+      fi
+    done
+    if [[ "$all_ready" == "true" ]]; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+has_monitoring_stack() {
+  local bundle_dir=$1
+  grep -q '^  prometheus:$' "$bundle_dir/deploy/compose.production.yaml"
+}
+
+start_monitoring() {
+  local bundle_dir=$1
+  local environment_file=$2
+  local release_file=$3
+  local service
+
+  if ! compose "$bundle_dir" "$environment_file" "$release_file" up -d --no-deps --force-recreate \
+    postgres-exporter pgbouncer-exporter node-exporter; then
+    echo "Monitoring exporters could not be recreated" >&2
+    return 1
+  fi
+  for service in postgres-exporter pgbouncer-exporter node-exporter; do
+    if ! wait_for_health "$bundle_dir" "$environment_file" "$release_file" "$service" 30; then
+      compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color "$service" >&2 || true
+      echo "$service did not become healthy" >&2
+      return 1
+    fi
+  done
+
+  # An exporter HTTP endpoint can be healthy while its database connection is
+  # broken. Gate the release on the exporters' own connection metrics instead
+  # of accepting a stale or disconnected monitoring stack.
+  if ! compose "$bundle_dir" "$environment_file" "$release_file" exec -T postgres-exporter \
+    wget -q -O - http://127.0.0.1:9187/metrics | grep -Eq '^pg_up 1(\.0)?$'; then
+    compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color postgres-exporter >&2 || true
+    echo "PostgreSQL exporter is healthy but cannot query PostgreSQL" >&2
+    return 1
+  fi
+  if ! compose "$bundle_dir" "$environment_file" "$release_file" exec -T pgbouncer-exporter \
+    wget -q -O - http://127.0.0.1:9127/metrics | grep -Eq '^pgbouncer_up 1(\.0)?$'; then
+    compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color pgbouncer-exporter >&2 || true
+    echo "PgBouncer exporter is healthy but cannot query PgBouncer" >&2
+    return 1
+  fi
+
+  if ! compose "$bundle_dir" "$environment_file" "$release_file" up -d --no-deps --force-recreate prometheus; then
+    echo "Prometheus could not be recreated" >&2
+    return 1
+  fi
+  if ! wait_for_health "$bundle_dir" "$environment_file" "$release_file" prometheus 30; then
+    compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color prometheus >&2 || true
+    echo "Prometheus did not become healthy" >&2
+    return 1
+  fi
+  for service in maxposty-backend postgres pgbouncer node; do
+    if ! wait_for_prometheus_target "$bundle_dir" "$environment_file" "$release_file" "$service"; then
+      compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color prometheus >&2 || true
+      echo "Prometheus target is missing or down: $service" >&2
+      return 1
+    fi
+  done
+
+  if ! compose "$bundle_dir" "$environment_file" "$release_file" up -d --no-deps --force-recreate grafana; then
+    echo "Grafana could not be recreated" >&2
+    return 1
+  fi
+  if ! wait_for_health "$bundle_dir" "$environment_file" "$release_file" grafana 30; then
+    compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color grafana >&2 || true
+    echo "Grafana did not become healthy" >&2
+    return 1
+  fi
+  if ! wait_for_grafana_provisioning "$bundle_dir" "$environment_file" "$release_file"; then
+    compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=200 --no-color grafana >&2 || true
+    echo "Grafana is healthy but required dashboards or the Prometheus datasource were not provisioned" >&2
+    return 1
+  fi
+}
+
 backup_temporary=''
 media_temporary=''
 stack_mutated=false
@@ -174,6 +353,9 @@ restore_previous_release() {
   set +e
   if [[ -n "$current_dir" && ("$stack_mutated" == "true" || "$writes_frozen" == "true") ]]; then
     echo "Deployment failed; restoring the previous versioned backend bundle" >&2
+    if has_monitoring_stack "$release_dir"; then
+      compose "$release_dir" "$next_env" "$next_release" stop grafana prometheus postgres-exporter pgbouncer-exporter node-exporter >/dev/null 2>&1 || true
+    fi
     if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate postgres; then
       restore_failed=true
     elif ! wait_for_health "$current_dir" "$current_env" "$current_release" postgres 40; then
@@ -192,6 +374,11 @@ restore_previous_release() {
     fi
     if ! wait_for_health "$current_dir" "$current_env" "$current_release" backend 40; then
       restore_failed=true
+    fi
+    if has_monitoring_stack "$current_dir"; then
+      if ! start_monitoring "$current_dir" "$current_env" "$current_release"; then
+        restore_failed=true
+      fi
     fi
     if [[ "$restore_failed" == "true" ]]; then
       echo "Previous bundle did not recover fully; manual recovery is required" >&2
@@ -212,9 +399,19 @@ restore_previous_release() {
 trap restore_previous_release EXIT
 
 compose "$release_dir" "$next_env" "$next_release" config >/dev/null
-compose "$release_dir" "$next_env" "$next_release" pull backend migrate
+compose "$release_dir" "$next_env" "$next_release" pull \
+  backend migrate postgres pgbouncer postgres-exporter pgbouncer-exporter node-exporter prometheus grafana
 
 stack_mutated=true
+
+# Freeze the old backend before Compose is allowed to recreate PostgreSQL or
+# PgBouncer. This avoids serving requests through a database restart during an
+# observability/configuration rollout.
+if [[ -n "$current_dir" ]]; then
+  writes_frozen=true
+  compose "$current_dir" "$current_env" "$current_release" stop backend
+fi
+
 compose "$release_dir" "$next_env" "$next_release" up -d postgres
 if ! wait_for_health "$release_dir" "$next_env" "$next_release" postgres 40; then
   compose "$release_dir" "$next_env" "$next_release" logs --tail=120 --no-color postgres >&2 || true
@@ -228,13 +425,8 @@ if ! wait_for_health "$release_dir" "$next_env" "$next_release" pgbouncer 30; th
   exit 1
 fi
 
-# Freeze application writes while the database and media volume are captured,
-# copied off-host (in production), and the additive migration is applied. This
-# intentionally trades a bounded maintenance window for a coherent restore point.
-if [[ -n "$current_dir" ]]; then
-  writes_frozen=true
-  compose "$current_dir" "$current_env" "$current_release" stop backend
-fi
+# Application writes stay frozen while the database and media volume are
+# captured, copied off-host (in production), and the additive migration runs.
 
 backup_dir="$installation_dir/backups"
 mkdir -p "$backup_dir"
@@ -314,6 +506,11 @@ compose "$release_dir" "$next_env" "$next_release" up -d --no-deps --force-recre
 if ! wait_for_health "$release_dir" "$next_env" "$next_release" backend 40; then
   compose "$release_dir" "$next_env" "$next_release" logs --tail=120 --no-color backend >&2 || true
   echo "New backend did not become healthy; database remains on the additive schema and the previous bundle will be restored" >&2
+  exit 1
+fi
+
+if ! start_monitoring "$release_dir" "$next_env" "$next_release"; then
+  echo "The monitoring stack did not become healthy; the previous release will be restored" >&2
   exit 1
 fi
 
