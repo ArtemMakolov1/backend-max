@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,8 @@ var (
 	ErrResearchNotConfigured   = errors.New("OpenAI research integration is not configured")
 	ErrConflict                = errors.New("resource state conflict")
 )
+
+const manualMAXStatsCooldown = 15 * time.Second
 
 type MAXClient interface {
 	GetMe(context.Context) (maxclient.BotInfo, error)
@@ -69,6 +72,21 @@ type ChannelCheck struct {
 type ChannelAccessError struct {
 	Diagnostics ChannelDiagnostics
 	Message     string
+}
+
+// MAXStatsCooldownError tells API clients exactly when another manual MAX
+// metadata refresh is allowed. It still unwraps to ErrConflict for callers
+// that only need the broader state-conflict classification.
+type MAXStatsCooldownError struct {
+	RetryAfter time.Duration
+}
+
+func (e *MAXStatsCooldownError) Error() string {
+	return "MAX statistics were refreshed recently"
+}
+
+func (e *MAXStatsCooldownError) Unwrap() error {
+	return ErrConflict
 }
 
 func (e *ChannelAccessError) Error() string {
@@ -634,6 +652,9 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post
 	if err != nil {
 		return store.Post{}, err
 	}
+	if isStoredMAXPublicationMissing(post) {
+		return post, nil
+	}
 	if post.Status != store.PostStatusPublished || post.MAXMessageID == "" {
 		return store.Post{}, fmt.Errorf("%w: post has no active MAX publication", ErrConflict)
 	}
@@ -649,6 +670,16 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post
 	if !diagnostics.CanEdit {
 		return store.Post{}, &ChannelAccessError{Diagnostics: diagnostics, Message: "MAX edit permission is required"}
 	}
+	message, err := a.max.GetMessage(ctx, post.MAXMessageID)
+	if err != nil {
+		if isMAXMessageNotFound(err) {
+			return a.markMAXPublicationMissing(ctx, post)
+		}
+		return store.Post{}, err
+	}
+	if err := validateMAXMessageOwnership(message, post.MAXMessageID, channel.MAXChatID); err != nil {
+		return store.Post{}, err
+	}
 	tokens := make([]string, 0)
 	if post.ImageURL != "" {
 		tokens, err = a.imageTokens(ctx, post)
@@ -662,6 +693,15 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post
 		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons), Notify: &notify,
 	})
 	if err != nil {
+		// MAX edit operations can return HTTP 200 with success=false and no
+		// machine-readable reason. Re-read the message to distinguish an
+		// external deletion (including the small race after our preflight)
+		// from a genuine edit failure.
+		if isMAXOperationFailed(err) {
+			if _, getErr := a.max.GetMessage(ctx, post.MAXMessageID); isMAXMessageNotFound(getErr) {
+				return a.markMAXPublicationMissing(ctx, post)
+			}
+		}
 		return store.Post{}, err
 	}
 	return a.store.GetPost(ctx, postID)
@@ -706,6 +746,13 @@ func (a *App) DeletePublication(ctx context.Context, postID int64) (store.Post, 
 // actual pin state for one tenant-owned published post. View observations are
 // appended transactionally by the store for future reports.
 func (a *App) SyncMAXPublication(ctx context.Context, userID string, postID int64) (store.Post, error) {
+	current, err := a.store.GetPostForUser(ctx, userID, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if isStoredMAXPublicationMissing(current) {
+		return current, nil
+	}
 	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
 	if err != nil {
 		return store.Post{}, err
@@ -714,12 +761,26 @@ func (a *App) SyncMAXPublication(ctx context.Context, userID string, postID int6
 		return store.Post{}, ErrMAXNotConfigured
 	}
 	now := a.now().UTC()
-	claimed, err := a.store.ClaimPostStatsAttemptForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, now, 15*time.Second)
+	claimed, err := a.store.ClaimPostStatsAttemptForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, now, manualMAXStatsCooldown)
 	if err != nil {
 		return store.Post{}, err
 	}
 	if !claimed {
-		return store.Post{}, fmt.Errorf("%w: MAX statistics were requested recently; retry in a few seconds", ErrConflict)
+		current, getErr := a.store.GetPostForUser(ctx, userID, post.ID)
+		if getErr != nil {
+			return store.Post{}, getErr
+		}
+		if isStoredMAXPublicationMissing(current) {
+			return current, nil
+		}
+		retryAfter := manualMAXStatsCooldown
+		if current.MAXStatsAttemptedAt != nil {
+			remaining := current.MAXStatsAttemptedAt.UTC().Add(manualMAXStatsCooldown).Sub(now)
+			if remaining > 0 && remaining < retryAfter {
+				retryAfter = remaining
+			}
+		}
+		return store.Post{}, &MAXStatsCooldownError{RetryAfter: retryAfter}
 	}
 	return a.syncClaimedMAXPublication(ctx, userID, post, channel, now)
 }
@@ -735,6 +796,9 @@ func (a *App) syncClaimedMAXPublicationForUser(ctx context.Context, userID strin
 func (a *App) syncClaimedMAXPublication(ctx context.Context, userID string, post store.Post, channel store.Channel, syncedAt time.Time) (store.Post, error) {
 	message, err := a.max.GetMessage(ctx, post.MAXMessageID)
 	if err != nil {
+		if isMAXMessageNotFound(err) {
+			return a.store.MarkMAXPublicationMissingForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID)
+		}
 		return store.Post{}, err
 	}
 	if err := validateMAXMessageOwnership(message, post.MAXMessageID, channel.MAXChatID); err != nil {
@@ -842,6 +906,29 @@ func validateMAXMessageOwnership(message maxclient.Message, messageID, chatID st
 	return validateMAXMessageChannel(message, chatID)
 }
 
+func (a *App) markMAXPublicationMissing(ctx context.Context, post store.Post) (store.Post, error) {
+	if post.ChannelID == nil {
+		return store.Post{}, errors.New("published post has no channel_id")
+	}
+	return a.store.MarkMAXPublicationMissingForUser(ctx, post.UserID, post.ID, *post.ChannelID, post.MAXMessageID)
+}
+
+func isMAXMessageNotFound(err error) bool {
+	var apiErr *maxclient.Error
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound
+}
+
+func isMAXOperationFailed(err error) bool {
+	var apiErr *maxclient.Error
+	return errors.As(err, &apiErr) && apiErr.Code == "operation_failed"
+}
+
+func isStoredMAXPublicationMissing(post store.Post) bool {
+	return post.Status == store.PostStatusFailed &&
+		post.LastError == store.MAXPublicationMissingLastError &&
+		strings.TrimSpace(post.MAXMessageID) == ""
+}
+
 func validateMAXMessageChannel(message maxclient.Message, chatID string) error {
 	if strings.TrimSpace(message.MessageID) == "" || message.ChatID == "" || message.ChatID != chatID {
 		return fmt.Errorf("%w: MAX message does not belong to the post channel", ErrConflict)
@@ -906,8 +993,9 @@ func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {
 				_, syncErr := a.syncClaimedMAXPublicationForUser(syncCtx, post.UserID, post.ID, now.UTC())
 				cancel()
 				if syncErr != nil {
-					// Keep the publication intact. In particular, an upstream 404
-					// is not proof that a local post should be deleted or unpinned.
+					// A confirmed GET-message 404 is reconciled inside the sync and
+					// returns success. Other upstream failures (including a failed
+					// pin lookup) leave the publication intact for a later retry.
 					a.logger.Warn("could not synchronize MAX post statistics", "post_id", post.ID, "error", syncErr)
 				}
 			}

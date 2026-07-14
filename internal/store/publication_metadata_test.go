@@ -138,6 +138,62 @@ func TestMarkAndClearPublicationMetadata(t *testing.T) {
 	}
 }
 
+func TestMarkMAXPublicationMissingPreservesHistoryAndAllowsRepublish(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "missing-publication.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	channel, err := storage.CreateChannel(ctx, Channel{MAXChatID: "-120", Title: "Channel", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedAt := time.Date(2036, time.January, 2, 3, 4, 5, 0, time.UTC)
+	post, err := storage.CreatePost(ctx, Post{
+		Title: "Deleted remotely", Content: "body", Format: FormatMarkdown, Status: PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.deleted", MAXMessageURL: "https://max.ru/channel/deleted",
+		PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	views := int64(17)
+	post, err = storage.SyncPublicationMetadataForUser(ctx, "test-owner", post.ID, channel.ID, post.MAXMessageID,
+		post.MAXMessageURL, &views, publishedAt.Add(time.Hour), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.MarkMAXPublicationMissingForUser(ctx, "foreign-owner", post.ID, channel.ID, post.MAXMessageID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign reconciliation error = %v, want ErrNotFound", err)
+	}
+	if _, err := storage.MarkMAXPublicationMissingForUser(ctx, "test-owner", post.ID, channel.ID, "mid.other"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale reconciliation error = %v, want ErrConflict", err)
+	}
+	post, err = storage.MarkMAXPublicationMissingForUser(ctx, "test-owner", post.ID, channel.ID, post.MAXMessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.Status != PostStatusFailed || post.LastError != MAXPublicationMissingLastError ||
+		post.MAXMessageID != "" || post.MAXMessageURL != "" || post.MAXViews != nil || post.MAXStatsSyncedAt != nil ||
+		post.MAXStatsAttemptedAt != nil || post.MAXIsPinned || post.PublishedAt == nil || !post.PublishedAt.Equal(publishedAt) {
+		t.Fatalf("reconciled post = %#v", post)
+	}
+	history, err := storage.ListPostViewSnapshotsForUser(ctx, "test-owner", post.ID, nil, 500)
+	if err != nil || len(history) != 1 || history[0].MAXMessageID != "mid.deleted" || history[0].Views != views {
+		t.Fatalf("preserved history = %#v, %v", history, err)
+	}
+	// Reconciliation is idempotent, and a failed post remains publishable.
+	if _, err := storage.MarkMAXPublicationMissingForUser(ctx, "test-owner", post.ID, channel.ID, "mid.deleted"); err != nil {
+		t.Fatal(err)
+	}
+	post, err = storage.ClaimForPublishing(ctx, post.ID)
+	if err != nil || post.Status != PostStatusPublishing || post.LastError != "" {
+		t.Fatalf("republish claim = %#v, %v", post, err)
+	}
+}
+
 func TestListPostsDueForStatsUsesLatestSuccessfulSync(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

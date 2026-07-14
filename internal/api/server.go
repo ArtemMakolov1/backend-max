@@ -296,6 +296,16 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		})
 		return
 	}
+	var statsCooldownErr *app.MAXStatsCooldownError
+	if errors.As(err, &statsCooldownErr) {
+		retryAfter := retryAfterSeconds(statsCooldownErr.RetryAfter)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+		s.problem(w, http.StatusTooManyRequests, "stats_refresh_cooldown",
+			"Статистика только что обновлялась. Повторите через несколько секунд.",
+			map[string]any{"retry_after_seconds": retryAfter})
+		return
+	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		s.problem(w, http.StatusNotFound, "not_found", "Resource was not found", nil)

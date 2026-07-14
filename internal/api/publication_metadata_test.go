@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/maxclient"
@@ -58,8 +59,24 @@ func TestPublicationMetadataPinAndBoundedHistoryAPI(t *testing.T) {
 		t.Fatalf("sync response = %#v", post)
 	}
 	repeated := performJSONRequest(handler, http.MethodPost, "/api/v1/posts/"+postID(post.ID)+"/sync-max", "")
-	if repeated.Code != http.StatusConflict {
+	if repeated.Code != http.StatusTooManyRequests || repeated.Header().Get("Retry-After") != "15" {
 		t.Fatalf("repeated sync status = %d, body=%s", repeated.Code, repeated.Body.String())
+	}
+	var cooldownPayload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Details struct {
+				RetryAfterSeconds int64 `json:"retry_after_seconds"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(repeated.Body.Bytes(), &cooldownPayload); err != nil {
+		t.Fatal(err)
+	}
+	if cooldownPayload.Error.Code != "stats_refresh_cooldown" ||
+		cooldownPayload.Error.Details.RetryAfterSeconds != 15 || cooldownPayload.Error.Message == "" {
+		t.Fatalf("cooldown response = %#v", cooldownPayload)
 	}
 
 	post = performPostRequest(t, handler, http.MethodPost, "/api/v1/posts/"+postID(post.ID)+"/pin", "", http.StatusOK)
@@ -88,5 +105,21 @@ func TestPublicationMetadataPinAndBoundedHistoryAPI(t *testing.T) {
 		"/api/v1/posts/"+postID(post.ID)+"/view-history?limit=1001", "")
 	if invalidLimit.Code != http.StatusBadRequest {
 		t.Fatalf("invalid history limit status = %d, body=%s", invalidLimit.Code, invalidLimit.Body.String())
+	}
+
+	publishedAt := time.Now().UTC().Add(-time.Hour)
+	missing, err := storage.CreatePost(ctx, store.Post{
+		Title: "Deleted in MAX", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.api.deleted", MAXMessageURL: "https://max.ru/channel/deleted",
+		PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.getMessageErr = &maxclient.Error{StatusCode: http.StatusNotFound, Code: "message.not.found", Message: "Message not found"}
+	missing = performPostRequest(t, handler, http.MethodPost, "/api/v1/posts/"+postID(missing.ID)+"/sync-max", "", http.StatusOK)
+	if missing.Status != store.PostStatusFailed || missing.LastError != store.MAXPublicationMissingLastError ||
+		missing.MAXMessageID != "" || missing.MAXMessageURL != "" || missing.PublishedAt == nil {
+		t.Fatalf("missing publication response = %#v", missing)
 	}
 }

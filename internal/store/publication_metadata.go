@@ -148,6 +148,43 @@ INSERT INTO post_view_snapshots(owner_id, post_id, max_message_id, views, captur
 	return s.GetPostForUser(ctx, userID, postID)
 }
 
+// MarkMAXPublicationMissingForUser reconciles a post that was published by
+// MaxPosty but has since been deleted directly in MAX. The original
+// published_at and view snapshots remain historical facts; live MAX metadata
+// is cleared and the failed lifecycle state permits publishing the post again.
+// expectedMessageID makes a delayed 404 harmless if the post was concurrently
+// republished with a different MAX message.
+func (s *Store) MarkMAXPublicationMissingForUser(ctx context.Context, userID string, postID, channelID int64,
+	expectedMessageID string,
+) (Post, error) {
+	if err := validatePublicationMutation(userID, postID, channelID, expectedMessageID); err != nil {
+		return Post{}, err
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE posts
+SET status = ?, max_message_id = '', max_message_url = '', max_views = NULL,
+    max_stats_synced_at = NULL, max_stats_attempted_at = NULL, max_is_pinned = FALSE,
+    scheduled_at = NULL, last_error = ?, updated_at = ?
+WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND status = ?`,
+		PostStatusFailed, MAXPublicationMissingLastError, nowText(), userID, postID, channelID,
+		expectedMessageID, PostStatusPublished)
+	if err != nil {
+		return Post{}, fmt.Errorf("mark missing MAX publication: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected == 1 {
+		return s.GetPostForUser(ctx, userID, postID)
+	}
+	current, getErr := s.GetPostForUser(ctx, userID, postID)
+	if getErr != nil {
+		return Post{}, getErr
+	}
+	if current.Status == PostStatusFailed && current.LastError == MAXPublicationMissingLastError &&
+		current.MAXMessageID == "" {
+		return current, nil
+	}
+	return Post{}, fmt.Errorf("%w: MAX publication changed while its deletion was being reconciled", ErrConflict)
+}
+
 // SetPublicationPinnedForUser reconciles the local pin flags after a
 // successful MAX mutation. MAX permits one pin per chat, so setting true also
 // clears any older flag for this tenant and channel in the same transaction.

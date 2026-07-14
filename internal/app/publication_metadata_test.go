@@ -22,6 +22,7 @@ func TestSyncMAXPublicationPersistsURLViewsPinAndHistory(t *testing.T) {
 	}
 	application, storage := newTestApp(t, fake)
 	application.now = func() time.Time { return now }
+	firstSyncAt := now
 	channel, err := storage.CreateChannel(context.Background(), store.Channel{
 		MAXChatID: "-201", Title: "Channel", IsChannel: true, Active: true,
 	})
@@ -48,15 +49,29 @@ func TestSyncMAXPublicationPersistsURLViewsPinAndHistory(t *testing.T) {
 	}
 	if _, err := application.SyncMAXPublication(context.Background(), "test-owner", post.ID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("immediate repeated sync error = %v, want conflict", err)
+	} else {
+		var cooldownErr *MAXStatsCooldownError
+		if !errors.As(err, &cooldownErr) || cooldownErr.RetryAfter != manualMAXStatsCooldown {
+			t.Fatalf("immediate repeated sync error = %#v, want %s cooldown", err, manualMAXStatsCooldown)
+		}
 	}
 	if fake.getMessageCalls != 1 {
 		t.Fatal("throttled manual sync reached MAX")
 	}
+	now = now.Add(5 * time.Second)
+	if _, err := application.SyncMAXPublication(context.Background(), "test-owner", post.ID); err == nil {
+		t.Fatal("sync inside cooldown unexpectedly succeeded")
+	} else {
+		var cooldownErr *MAXStatsCooldownError
+		if !errors.As(err, &cooldownErr) || cooldownErr.RetryAfter != 10*time.Second {
+			t.Fatalf("partial cooldown error = %#v, want 10s", err)
+		}
+	}
 	history, err := storage.ListPostViewSnapshotsForUser(context.Background(), "test-owner", post.ID, nil, 500)
-	if err != nil || len(history) != 1 || history[0].Views != views || !history[0].CapturedAt.Equal(now) {
+	if err != nil || len(history) != 1 || history[0].Views != views || !history[0].CapturedAt.Equal(firstSyncAt) {
 		t.Fatalf("view history = %#v, %v", history, err)
 	}
-	now = now.Add(16 * time.Second)
+	now = now.Add(11 * time.Second)
 	views = 82
 	fake.pinnedMessage = nil
 	post, err = application.SyncMAXPublication(context.Background(), "test-owner", post.ID)
@@ -116,6 +131,47 @@ func TestSyncMAXPublicationRejectsForeignTenantChannelMismatchAndUpstream404(t *
 	stored, err := storage.GetPost(context.Background(), post.ID)
 	if err != nil || stored.MAXViews != nil || stored.MAXStatsSyncedAt != nil || stored.MAXIsPinned {
 		t.Fatalf("failed sync changed post = %#v, %v", stored, err)
+	}
+}
+
+func TestSyncMAXPublicationReconcilesMessageDeletedInMAX(t *testing.T) {
+	t.Parallel()
+	upstream := &maxclient.Error{StatusCode: http.StatusNotFound, Code: "message.not.found", Message: "Message not found"}
+	fake := &fakeMAX{
+		chat:          maxclient.ChatInfo{ChatID: "-207", Type: "channel", Status: "active", Title: "Channel"},
+		getMessageErr: upstream,
+	}
+	application, storage := newTestApp(t, fake)
+	now := time.Date(2038, time.April, 6, 9, 0, 0, 0, time.UTC)
+	application.now = func() time.Time { return now }
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{MAXChatID: "-207", Title: "Channel", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedAt := now.Add(-time.Hour)
+	post, err := storage.CreatePost(context.Background(), store.Post{
+		Title: "Gone", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.gone.manual", MAXMessageURL: "https://max.ru/channel/gone",
+		PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err = application.SyncMAXPublication(context.Background(), "test-owner", post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.Status != store.PostStatusFailed || post.LastError != store.MAXPublicationMissingLastError ||
+		post.MAXMessageID != "" || post.MAXMessageURL != "" || post.MAXStatsAttemptedAt != nil ||
+		post.PublishedAt == nil || !post.PublishedAt.Equal(publishedAt) {
+		t.Fatalf("reconciled post = %#v", post)
+	}
+	if fake.getMessageCalls != 1 || fake.getPinnedCalls != 0 {
+		t.Fatalf("unexpected MAX calls = %#v", fake)
+	}
+	post, err = application.SyncMAXPublication(context.Background(), "test-owner", post.ID)
+	if err != nil || !isStoredMAXPublicationMissing(post) || fake.getMessageCalls != 1 {
+		t.Fatalf("idempotent sync = %#v, err=%v, MAX calls=%d", post, err, fake.getMessageCalls)
 	}
 }
 
@@ -212,7 +268,7 @@ func TestStatsWorkerRefreshesDuePostsWithoutMembershipLookup(t *testing.T) {
 func TestStatsWorkerBacksOffAfterUpstreamFailure(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2038, time.April, 5, 9, 0, 0, 0, time.UTC)
-	upstream := &maxclient.Error{StatusCode: http.StatusNotFound, Code: "message.not.found", Message: "gone"}
+	upstream := &maxclient.Error{StatusCode: http.StatusServiceUnavailable, Code: "temporarily_unavailable", Message: "retry later"}
 	fake := &fakeMAX{
 		chat:          maxclient.ChatInfo{ChatID: "-205", Type: "channel", Status: "active", Title: "Channel"},
 		getMessageErr: upstream,

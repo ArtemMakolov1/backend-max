@@ -11,6 +11,13 @@ const (
 	PostStatusPublishing = "publishing"
 	PostStatusPublished  = "published"
 	PostStatusFailed     = "failed"
+
+	// MAXPublicationMissingLastError is persisted when a publication that was
+	// previously sent successfully no longer exists in MAX. Keeping a stable,
+	// user-facing marker lets API clients distinguish this recoverable state
+	// from an ordinary publication failure without adding another lifecycle
+	// status or discarding the original publication timestamp.
+	MAXPublicationMissingLastError = "Публикация удалена из MAX"
 )
 
 type Channel struct {

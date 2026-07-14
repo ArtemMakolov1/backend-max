@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,9 @@ type fakeMAX struct {
 	message            maxclient.Message
 	pinnedMessage      *maxclient.Message
 	getMessageErr      error
+	getMessageErrs     []error
 	getPinnedErr       error
+	editErr            error
 	getMessageCalls    int
 	getPinnedCalls     int
 	pinCalls           int
@@ -79,6 +82,9 @@ func (f *fakeMAX) GetMembership(context.Context, string) (maxclient.Membership, 
 }
 func (f *fakeMAX) GetMessage(context.Context, string) (maxclient.Message, error) {
 	f.getMessageCalls++
+	if f.getMessageCalls <= len(f.getMessageErrs) {
+		return f.message, f.getMessageErrs[f.getMessageCalls-1]
+	}
 	return f.message, f.getMessageErr
 }
 func (f *fakeMAX) GetPinnedMessage(context.Context, string) (*maxclient.Message, error) {
@@ -112,7 +118,7 @@ func (f *fakeMAX) Publish(_ context.Context, request maxclient.PublishRequest) (
 func (f *fakeMAX) Edit(_ context.Context, request maxclient.EditRequest) error {
 	f.editCalls++
 	f.lastEditRequest = request
-	return nil
+	return f.editErr
 }
 func (f *fakeMAX) Delete(context.Context, string) error {
 	f.deleteCalls++
@@ -515,6 +521,76 @@ func TestPublishedMutationsRecheckEditAndDeletePermissions(t *testing.T) {
 	}
 }
 
+func TestUpdatePublishedPostReconcilesMessageDeletedInMAX(t *testing.T) {
+	t.Parallel()
+	notFound := &maxclient.Error{StatusCode: http.StatusNotFound, Code: "message.not.found", Message: "Message not found"}
+	tests := []struct {
+		name               string
+		getMessageErrs     []error
+		getMessageErr      error
+		editErr            error
+		wantGetMessageCall int
+		wantEditCall       int
+	}{
+		{
+			name: "deleted before edit", getMessageErr: notFound,
+			wantGetMessageCall: 1, wantEditCall: 0,
+		},
+		{
+			name: "deleted during edit", getMessageErrs: []error{nil, notFound},
+			editErr:            &maxclient.Error{StatusCode: http.StatusOK, Code: "operation_failed", Message: "Error on message edit"},
+			wantGetMessageCall: 2, wantEditCall: 1,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			fake := &fakeMAX{
+				chat: maxclient.ChatInfo{ChatID: "31", Type: "channel", Status: "active", Title: "Channel"},
+				membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+					maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionEdit,
+				}},
+				message:       maxclient.Message{MessageID: "mid-31", ChatID: "31"},
+				getMessageErr: test.getMessageErr, getMessageErrs: test.getMessageErrs, editErr: test.editErr,
+			}
+			application, storage := newTestApp(t, fake)
+			channel, err := storage.CreateChannel(context.Background(), store.Channel{
+				MAXChatID: "31", Title: "Channel", IsChannel: true, Active: true,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			publishedAt := time.Date(2039, time.May, 6, 7, 8, 9, 0, time.UTC)
+			post, err := storage.CreatePost(context.Background(), store.Post{
+				Title: "Published", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+				ChannelID: &channel.ID, MAXMessageID: "mid-31", MAXMessageURL: "https://max.ru/channel/message",
+				PublishedAt: &publishedAt,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			post, err = application.UpdatePublishedPost(context.Background(), post.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if post.Status != store.PostStatusFailed || post.LastError != store.MAXPublicationMissingLastError ||
+				post.MAXMessageID != "" || post.MAXMessageURL != "" || post.PublishedAt == nil || !post.PublishedAt.Equal(publishedAt) {
+				t.Fatalf("reconciled post = %#v", post)
+			}
+			if fake.getMessageCalls != test.wantGetMessageCall || fake.editCalls != test.wantEditCall {
+				t.Fatalf("MAX calls = get %d edit %d, want get %d edit %d", fake.getMessageCalls, fake.editCalls,
+					test.wantGetMessageCall, test.wantEditCall)
+			}
+			post, err = application.UpdatePublishedPost(context.Background(), post.ID)
+			if err != nil || !isStoredMAXPublicationMissing(post) ||
+				fake.getMessageCalls != test.wantGetMessageCall || fake.editCalls != test.wantEditCall {
+				t.Fatalf("idempotent update = %#v, err=%v, MAX=%#v", post, err, fake)
+			}
+		})
+	}
+}
+
 func TestScheduleRejectsPastAndNormalizesOffsetWithoutCallingMAX(t *testing.T) {
 	t.Parallel()
 	fake := &fakeMAX{
@@ -679,7 +755,8 @@ func TestSelectedCalendarPostSkippedAfterPostponeOrCancel(t *testing.T) {
 func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	t.Parallel()
 	fake := &fakeMAX{
-		chat: maxclient.ChatInfo{ChatID: "70", Type: "channel", Status: "active", Title: "Channel"},
+		chat:    maxclient.ChatInfo{ChatID: "70", Type: "channel", Status: "active", Title: "Channel"},
+		message: maxclient.Message{MessageID: "mid.buttons", ChatID: "70"},
 		membership: maxclient.Membership{
 			IsAdmin: true,
 			Permissions: []maxclient.Permission{
