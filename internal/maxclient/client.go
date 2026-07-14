@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -523,20 +524,55 @@ func (c *Client) UploadImage(ctx context.Context, filename string, image io.Read
 		return UploadResult{}, fmt.Errorf("read MAX image upload response: %w", readErr)
 	}
 
-	var result struct {
-		Token string `json:"token"`
-	}
-	if err := decodeJSON(responseBody, &result); err != nil {
-		return UploadResult{}, fmt.Errorf("decode MAX image upload response: %w", err)
-	}
-	if result.Token == "" {
-		result.Token = reservation.Token
-	}
-	if result.Token == "" {
-		return UploadResult{}, errors.New("MAX image upload response does not contain a token")
+	token := imageUploadToken(responseBody, reservation.Token, uploadURL.Query().Get("token"))
+	if token == "" {
+		// A syntactically successful storage response without an attachment
+		// token is still an upstream protocol failure. Keep it typed so the API
+		// returns max_api_error instead of hiding the problem as internal_error.
+		return UploadResult{}, &Error{
+			StatusCode: resp.StatusCode,
+			Code:       "invalid_upload_response",
+			Message:    "MAX image upload response does not contain a token",
+			RequestID:  firstHeader(resp.Header, "X-Request-Id", "X-Request-ID", "X-Max-Request-Id"),
+		}
 	}
 
-	return UploadResult{Token: result.Token}, nil
+	return UploadResult{Token: token}, nil
+}
+
+// imageUploadToken accepts both upload response shapes currently used by MAX:
+// the documented top-level token and the photo-token map returned by the
+// official MAX Go client/storage endpoint. Reservation and signed-URL tokens
+// remain valid fallbacks for deployments where MAX returns the image token
+// before the multipart upload.
+func imageUploadToken(responseBody []byte, fallbacks ...string) string {
+	var response struct {
+		Token  string `json:"token"`
+		Photos map[string]struct {
+			Token string `json:"token"`
+		} `json:"photos"`
+	}
+	if json.Unmarshal(responseBody, &response) == nil {
+		if strings.TrimSpace(response.Token) != "" {
+			return response.Token
+		}
+		keys := make([]string, 0, len(response.Photos))
+		for key := range response.Photos {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if token := response.Photos[key].Token; strings.TrimSpace(token) != "" {
+				return token
+			}
+		}
+	}
+	for _, token := range fallbacks {
+		if strings.TrimSpace(token) != "" {
+			return token
+		}
+	}
+	return ""
 }
 
 // Publish creates a post in a MAX chat or channel.

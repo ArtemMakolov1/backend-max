@@ -617,7 +617,7 @@ func TestOversizedServerErrorStillPreservesStatus(t *testing.T) {
 	}
 }
 
-func TestUploadImageUsesMultipartWithoutAuthorization(t *testing.T) {
+func TestUploadImageUsesPhotoTokenMapAndCanEditMessage(t *testing.T) {
 	t.Parallel()
 
 	uploadServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -642,19 +642,42 @@ func TestUploadImageUsesMultipartWithoutAuthorization(t *testing.T) {
 			t.Errorf("uploaded %q = %q", header.Filename, contents)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"token":"image-token"}`)
+		_, _ = io.WriteString(w, `{"photos":{"8t/PabcNTw==":{"token":"image-token"}}}`)
 	}))
 	defer uploadServer.Close()
 
+	var editCalled atomic.Bool
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/uploads" || r.URL.Query().Get("type") != "image" {
-			t.Errorf("unexpected reservation request: %s %s", r.Method, r.URL.String())
-		}
 		if auth := r.Header.Get("Authorization"); auth != "bot-token" {
-			t.Errorf("reservation Authorization = %q", auth)
+			t.Errorf("MAX API Authorization = %q", auth)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"url": uploadServer.URL + "/signed-upload"})
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/uploads" && r.URL.Query().Get("type") == "image":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"url": uploadServer.URL + "/signed-upload"})
+		case r.Method == http.MethodPut && r.URL.Path == "/messages" && r.URL.Query().Get("message_id") == "mid-with-new-image":
+			var body struct {
+				Attachments []struct {
+					Type    string `json:"type"`
+					Payload struct {
+						Token string `json:"token"`
+					} `json:"payload"`
+				} `json:"attachments"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Attachments) != 1 || body.Attachments[0].Type != "image" ||
+				body.Attachments[0].Payload.Token != "image-token" {
+				t.Fatalf("edit attachments = %#v", body.Attachments)
+			}
+			editCalled.Store(true)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"success":true}`)
+		default:
+			t.Errorf("unexpected MAX API request: %s %s", r.Method, r.URL.String())
+			http.NotFound(w, r)
+		}
 	}))
 	defer apiServer.Close()
 
@@ -667,6 +690,61 @@ func TestUploadImageUsesMultipartWithoutAuthorization(t *testing.T) {
 	}
 	if result.Token != "image-token" {
 		t.Fatalf("UploadImage() = %#v", result)
+	}
+	if err := client.Edit(context.Background(), EditRequest{
+		MessageID: "mid-with-new-image", Text: "Пост с новой картинкой", Format: FormatMarkdown,
+		ImageTokens: []string{result.Token},
+	}); err != nil {
+		t.Fatalf("Edit() error = %v", err)
+	}
+	if !editCalled.Load() {
+		t.Fatal("uploaded image token was not attached by edit")
+	}
+}
+
+func TestImageUploadTokenSupportsMAXResponseVariants(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		body      string
+		fallbacks []string
+		want      string
+	}{
+		{name: "top level", body: `{"token":"direct-token"}`, want: "direct-token"},
+		{name: "photo map", body: `{"photos":{"second":{"token":"second-token"},"first":{"token":"first-token"}}}`, want: "first-token"},
+		{name: "reservation fallback", body: `{}`, fallbacks: []string{"reservation-token"}, want: "reservation-token"},
+		{name: "signed URL fallback", body: `not-json`, fallbacks: []string{"", "url-token"}, want: "url-token"},
+		{name: "missing", body: `{"photos":{"empty":{"token":""}}}`, want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := imageUploadToken([]byte(test.body), test.fallbacks...); got != test.want {
+				t.Fatalf("imageUploadToken() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestUploadImageReportsMissingTokenAsMAXAPIError(t *testing.T) {
+	t.Parallel()
+	uploadServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", "upload-request-42")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer uploadServer.Close()
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"url": uploadServer.URL})
+	}))
+	defer apiServer.Close()
+
+	client := mustClient(t, apiServer.URL, "bot-token", uploadServer.Client())
+	_, err := client.UploadImage(context.Background(), "image.png", strings.NewReader("bytes"))
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusOK || apiErr.Code != "invalid_upload_response" ||
+		apiErr.RequestID != "upload-request-42" {
+		t.Fatalf("UploadImage() error = %#v, want typed MAX protocol error", err)
 	}
 }
 

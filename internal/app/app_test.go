@@ -814,6 +814,58 @@ func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	}
 }
 
+func TestUpdatePublishedPostAddsImageWithoutReplacingPublication(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat:    maxclient.ChatInfo{ChatID: "72", Type: "channel", Status: "active", Title: "Channel"},
+		message: maxclient.Message{MessageID: "mid.add-image", ChatID: "72"},
+		membership: maxclient.Membership{
+			IsAdmin: true,
+			Permissions: []maxclient.Permission{
+				maxclient.PermissionReadAllMessages, maxclient.PermissionEdit,
+			},
+		},
+	}
+	application, storage := newTestApp(t, fake)
+	ctx := context.Background()
+	channel, err := storage.CreateChannel(ctx, store.Channel{
+		MAXChatID: "72", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedAt := time.Date(2039, time.May, 7, 8, 9, 10, 0, time.UTC)
+	post, err := storage.CreatePost(ctx, store.Post{
+		Title: "Add image", Content: "Body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: "mid.add-image", MAXMessageURL: "https://max.ru/channel/add-image",
+		PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(t.TempDir(), "added.png")
+	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	imageURL := "http://localhost:8080/media/added.png"
+	if post, err = storage.UpdatePost(ctx, post.ID, store.PostChanges{ImageURL: &imageURL, ImagePath: &imagePath}); err != nil {
+		t.Fatal(err)
+	}
+	post, err = application.UpdatePublishedPost(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.uploadCalls != 1 || fake.editCalls != 1 || len(fake.lastEditRequest.ImageTokens) != 1 ||
+		fake.lastEditRequest.ImageTokens[0] != "image-token" {
+		t.Fatalf("image update request = %#v, fake = %#v", fake.lastEditRequest, fake)
+	}
+	if post.Status != store.PostStatusPublished || post.MAXMessageID != "mid.add-image" ||
+		post.MAXMessageURL != "https://max.ru/channel/add-image" || post.PublishedAt == nil ||
+		!post.PublishedAt.Equal(publishedAt) {
+		t.Fatalf("image update replaced publication history: %#v", post)
+	}
+}
+
 func TestScheduleRejectsIncompleteLinkButtons(t *testing.T) {
 	t.Parallel()
 	application, storage := newTestApp(t, &fakeMAX{})
