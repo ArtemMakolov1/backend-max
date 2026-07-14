@@ -67,7 +67,10 @@ openssl x509 -in "$cert_source" -noout -checkend 2592000 >/dev/null 2>&1 || {
   exit 1
 }
 install -d -m 755 "$installation_dir/hooks"
-install -d -m 750 "$installation_dir/certs"
+# This directory is bind-mounted into the rootless application container.
+# It contains public certificates only; execute permission is required so the
+# container user can traverse it and read the explicitly world-readable PEMs.
+install -d -m 755 "$installation_dir/certs"
 hook_temporary="$installation_dir/hooks/.after-backup.$$.tmp"
 cert_temporary="$installation_dir/certs/.backup-recipient.$$.tmp"
 install -m 755 "$hook_source" "$hook_temporary"

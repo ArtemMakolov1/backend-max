@@ -17,6 +17,13 @@ grep -Fq '  push:' "$workflow"
 grep -Fq '    branches: [main]' "$workflow"
 grep -Fq 'SOURCE_SHA: ${{ github.sha }}' "$workflow"
 grep -Fq "./deploy/verify-release-gates.sh \"\$GITHUB_REPOSITORY\" \"\$SOURCE_SHA\"" "$workflow"
+grep -Fq "install -d -m 755 '\$install_dir/certs' '\$install_dir/hooks'" "$workflow"
+grep -Fq 'install -d -m 755 "$installation_dir/certs"' "$repo_root/deploy/run-from-ci.sh"
+if grep -Fq -- "-m 750 '\$install_dir/certs'" "$workflow" ||
+  grep -Fq 'install -d -m 750 "$installation_dir/certs"' "$repo_root/deploy/run-from-ci.sh"; then
+  echo "Public certificate directory must remain traversable by the container user" >&2
+  exit 1
+fi
 if grep -Fq 'workflow_run:' "$workflow"; then
   echo "Production deploy must start directly for every main push" >&2
   exit 1

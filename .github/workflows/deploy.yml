@@ -273,7 +273,7 @@ jobs:
 
           tar -czf "$artifact" deploy docker
           ssh "${ssh_options[@]}" "$target" \
-            "install -d -m 750 '$install_dir' '$install_dir/releases' '$release_dir' '$install_dir/certs' '$install_dir/backups'; install -d -m 755 '$install_dir/hooks'"
+            "install -d -m 750 '$install_dir' '$install_dir/releases' '$release_dir' '$install_dir/backups'; install -d -m 755 '$install_dir/certs' '$install_dir/hooks'"
           scp "${scp_options[@]}" "$artifact" "$target:$remote_artifact"
           ssh "${ssh_options[@]}" "$target" \
             "set -eu; trap \"rm -f '$remote_artifact'\" 0; tar -xzf '$remote_artifact' --no-same-owner -C '$release_dir'; if [ -e '$release_dir/certs' ] && [ ! -L '$release_dir/certs' ]; then rmdir '$release_dir/certs'; fi; ln -sfn '$install_dir/certs' '$release_dir/certs'"
