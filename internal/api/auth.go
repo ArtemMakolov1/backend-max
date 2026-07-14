@@ -34,6 +34,7 @@ type authUser struct {
 	Provider    string `json:"provider"`
 	Login       string `json:"login,omitempty"`
 	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url"`
 }
 
 type authPrincipal struct {
@@ -79,7 +80,7 @@ func (s *Server) authenticate(r *http.Request) (authPrincipal, bool) {
 				expiresAt := session.ExpiresAt
 				return authPrincipal{Method: "yandex", ExpiresAt: &expiresAt, User: &authUser{
 					ID: session.YandexUserID, Provider: "yandex", Login: session.Login,
-					DisplayName: firstNonEmpty(session.DisplayName, session.Login, "Пользователь Яндекса"),
+					DisplayName: firstNonEmpty(session.DisplayName, session.Login, "Пользователь Яндекса"), AvatarURL: session.AvatarURL,
 				}}, true
 			}
 			if !errors.Is(err, store.ErrNotFound) {
@@ -234,16 +235,16 @@ func (s *Server) finishYandexAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	now := s.now().UTC()
 	yandexUserID := firstNonEmpty(profile.PSUID, profile.ID)
-	displayName := firstNonEmpty(profile.DisplayName, profile.RealName,
-		strings.TrimSpace(profile.FirstName+" "+profile.LastName), profile.Login, "Пользователь Яндекса")
+	displayName := yandexDisplayName(profile)
+	avatarURL := yandexauth.AvatarURL(profile)
 	if err := s.app.Store().CreateAuthenticatedSession(r.Context(), store.User{
-		ID: yandexUserID, Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName,
+		ID: yandexUserID, Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName, AvatarURL: avatarURL,
 	}, []store.Consent{
 		{Document: "terms", Version: state.TermsVersion, AcceptedAt: state.ConsentAt, Source: "yandex_oauth"},
 		{Document: "personal_data", Version: state.PersonalDataVersion, AcceptedAt: state.ConsentAt, Source: "yandex_oauth"},
 	}, store.AuthSession{
 		TokenHash: sha256Hex(sessionToken), YandexUserID: yandexUserID,
-		Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName,
+		Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName, AvatarURL: avatarURL,
 		AllowlistIdentity: allowlistIdentity,
 		CreatedAt:         now, ExpiresAt: now.Add(s.sessionTTL),
 	}); err != nil {
@@ -364,6 +365,12 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func yandexDisplayName(profile yandexauth.Profile) string {
+	firstLast := strings.TrimSpace(strings.TrimSpace(profile.FirstName) + " " + strings.TrimSpace(profile.LastName))
+	return firstNonEmpty(firstLast,
+		profile.RealName, profile.DisplayName, profile.Login, "Пользователь Яндекса")
 }
 
 func hasSessionCookie(r *http.Request) bool {

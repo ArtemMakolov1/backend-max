@@ -80,7 +80,7 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "004_future_additive.sql"
+	const futureVersion = "008_future_additive.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {
@@ -260,6 +260,152 @@ SELECT EXISTS (
 	}
 	if checksumColumnExists {
 		t.Fatal("failed legacy upgrade left a partially-added checksum column")
+	}
+}
+
+func TestExpandMigrationsBackfillAndEnforceApplicationInvariants(t *testing.T) {
+	ctx := context.Background()
+	_, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) < 6 {
+		t.Fatalf("loaded %d migrations, want at least 6", len(migrations))
+	}
+	for _, migration := range migrations[:3] {
+		if _, err := db.ExecContext(ctx, string(migration.contents)); err != nil {
+			t.Fatalf("apply prerequisite migration %s: %v", migration.version, err)
+		}
+	}
+
+	now := time.Now().UTC()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO users(id, display_name, created_at, updated_at) VALUES ('owner', 'Owner', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO auth_sessions(token_hash, yandex_user_id, created_at, expires_at)
+VALUES ($1, 'owner', $2, $3)`, strings.Repeat("a", 64), now, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO posts(owner_id, title, content, created_at, updated_at)
+VALUES ('owner', 'Legacy post', 'Body', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, migration := range migrations[3:6] {
+		if _, err := db.ExecContext(ctx, string(migration.contents)); err != nil {
+			t.Fatalf("apply expand migration %s: %v", migration.version, err)
+		}
+	}
+
+	var linkButtons, messageURL, userAvatar, sessionAvatar string
+	var isPinned bool
+	if err := db.QueryRowContext(ctx, `
+SELECT link_buttons::text, max_message_url, max_is_pinned
+FROM posts WHERE owner_id = 'owner'`).Scan(&linkButtons, &messageURL, &isPinned); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT avatar_url FROM users WHERE id = 'owner'`).Scan(&userAvatar); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT avatar_url FROM auth_sessions WHERE yandex_user_id = 'owner'`).Scan(&sessionAvatar); err != nil {
+		t.Fatal(err)
+	}
+	if linkButtons != "[]" || messageURL != "" || isPinned || userAvatar != "" || sessionAvatar != "" {
+		t.Fatalf("legacy defaults: buttons=%q url=%q pinned=%v user_avatar=%q session_avatar=%q",
+			linkButtons, messageURL, isPinned, userAvatar, sessionAvatar)
+	}
+
+	invalidUpdates := []struct {
+		name string
+		sql  string
+	}{
+		{name: "null link buttons", sql: `UPDATE posts SET link_buttons = NULL WHERE owner_id = 'owner'`},
+		{name: "too many link buttons", sql: `UPDATE posts SET link_buttons = '[{}, {}, {}, {}]'::jsonb WHERE owner_id = 'owner'`},
+		{name: "null message URL", sql: `UPDATE posts SET max_message_url = NULL WHERE owner_id = 'owner'`},
+		{name: "null pinned flag", sql: `UPDATE posts SET max_is_pinned = NULL WHERE owner_id = 'owner'`},
+		{name: "negative views", sql: `UPDATE posts SET max_views = -1 WHERE owner_id = 'owner'`},
+		{name: "null user avatar", sql: `UPDATE users SET avatar_url = NULL WHERE id = 'owner'`},
+		{name: "null session avatar", sql: `UPDATE auth_sessions SET avatar_url = NULL WHERE yandex_user_id = 'owner'`},
+	}
+	for _, test := range invalidUpdates {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := db.ExecContext(ctx, test.sql); err == nil {
+				t.Fatal("invalid update unexpectedly succeeded")
+			}
+		})
+	}
+
+	constraintNames := []string{
+		"posts_link_buttons_shape",
+		"users_avatar_url_not_null",
+		"auth_sessions_avatar_url_not_null",
+		"posts_max_message_url_not_null",
+		"posts_max_is_pinned_not_null",
+		"posts_max_views_nonnegative",
+	}
+	var validated int
+	if err := db.QueryRowContext(ctx, `
+SELECT count(*)
+FROM pg_constraint
+WHERE conname = ANY($1)
+  AND convalidated`, constraintNames).Scan(&validated); err != nil {
+		t.Fatal(err)
+	}
+	if validated != len(constraintNames) {
+		t.Fatalf("validated expand constraints = %d, want %d", validated, len(constraintNames))
+	}
+}
+
+func TestChannelIconBackfillAcceptsOnlyOfficialMAXAssets(t *testing.T) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	if err := Migrate(ctx, testURL); err != nil {
+		t.Fatalf("initial migration: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO users(id, display_name, created_at, updated_at) VALUES ('owner', 'Owner', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title, created_at, updated_at)
+VALUES ('owner', 'max-owner', 'safe-chat', 'Safe', $1, $1),
+       ('owner', 'max-owner', 'unsafe-chat', 'Unsafe', $1, $1),
+	   ('owner', 'max-owner', 'fragment-chat', 'Fragment', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO observed_bot_chats(max_chat_id, icon_url, active, last_seen_at)
+VALUES ('safe-chat', 'https://cdn.max.ru/channel.png', TRUE, $1),
+       ('unsafe-chat', 'https://cdn.max.ru.evil.example/tracker.png', TRUE, $1),
+       ('fragment-chat', 'https://cdn.max.ru/channel.png#tracking', TRUE, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+
+	migrationSQL, err := migrationFiles.ReadFile("migrations/007_channel_icon_backfill.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, string(migrationSQL)); err != nil {
+		t.Fatalf("rerun channel icon backfill: %v", err)
+	}
+
+	var safeIcon, unsafeIcon, fragmentIcon string
+	if err := db.QueryRowContext(ctx, `SELECT icon_url FROM channels WHERE max_chat_id='safe-chat'`).Scan(&safeIcon); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT icon_url FROM channels WHERE max_chat_id='unsafe-chat'`).Scan(&unsafeIcon); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT icon_url FROM channels WHERE max_chat_id='fragment-chat'`).Scan(&fragmentIcon); err != nil {
+		t.Fatal(err)
+	}
+	if safeIcon != "https://cdn.max.ru/channel.png" || unsafeIcon != "" || fragmentIcon != "" {
+		t.Fatalf("backfilled icons: safe=%q unsafe=%q fragment=%q", safeIcon, unsafeIcon, fragmentIcon)
 	}
 }
 

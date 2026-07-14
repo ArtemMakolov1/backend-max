@@ -36,6 +36,10 @@ type MAXClient interface {
 	GetChat(context.Context, string) (maxclient.ChatInfo, error)
 	GetChatByLink(context.Context, string) (maxclient.ChatInfo, error)
 	GetMembership(context.Context, string) (maxclient.Membership, error)
+	GetMessage(context.Context, string) (maxclient.Message, error)
+	GetPinnedMessage(context.Context, string) (*maxclient.Message, error)
+	PinMessage(context.Context, string, string) error
+	UnpinMessage(context.Context, string) error
 	SendClaimConfirmation(context.Context, string, string, string, string, string, string, string) error
 	AnswerCallback(context.Context, string, string, string) error
 	UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error)
@@ -53,6 +57,7 @@ type ChannelDiagnostics struct {
 	CanPublish                 bool     `json:"can_publish"`
 	CanEdit                    bool     `json:"can_edit"`
 	CanDelete                  bool     `json:"can_delete"`
+	CanPin                     bool     `json:"can_pin"`
 	MissingRequiredPermissions []string `json:"missing_required_permissions"`
 }
 
@@ -83,6 +88,10 @@ type imageRequestValidator interface {
 
 type ResearchClient interface {
 	Generate(context.Context, openairesearch.Request) (openairesearch.Result, error)
+}
+
+type ContentFormatter interface {
+	FormatContent(context.Context, openairesearch.FormatRequest) (openairesearch.FormatResult, error)
 }
 
 type App struct {
@@ -119,6 +128,11 @@ func (a *App) OpenAIConfigured() bool { return a.images != nil || a.research != 
 
 func (a *App) ResearchConfigured() bool { return a.research != nil }
 
+func (a *App) ContentFormattingConfigured() bool {
+	_, ok := a.research.(ContentFormatter)
+	return a.research != nil && ok
+}
+
 // ValidateImageRequest performs every available local check before an API
 // handler reserves quota. The real OpenAI client validates its configured
 // model's size rules; test or alternative clients still receive the common
@@ -154,7 +168,7 @@ func (a *App) ObserveMAXChat(ctx context.Context, maxChatID string, active bool,
 	}
 	return a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
 		MAXChatID: info.ChatID, PublicLink: strings.TrimRight(strings.TrimSpace(info.Link), "/"),
-		Title: info.Title, MAXOwnerID: info.OwnerID, IconURL: info.Icon.URL,
+		Title: info.Title, MAXOwnerID: info.OwnerID, IconURL: maxclient.SafeAssetURL(info.Icon.URL),
 		ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: now,
 	})
 }
@@ -222,7 +236,7 @@ func (a *App) ConnectChannel(ctx context.Context, publicLink, maxChatID, request
 		}
 	}
 	channel, err := a.store.UpsertConnectedChannel(ctx, store.Channel{
-		VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title, PublicLink: canonicalLink, IconURL: info.Icon.URL,
+		VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title, PublicLink: canonicalLink, IconURL: maxclient.SafeAssetURL(info.Icon.URL),
 		ParticipantsCount: info.ParticipantsCount, IsChannel: true, Active: true,
 	})
 	if err != nil {
@@ -320,7 +334,7 @@ func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID str
 		info.Link = canonicalLink
 		if err := a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
 			MAXChatID: info.ChatID, PublicLink: canonicalLink, Title: info.Title, MAXOwnerID: info.OwnerID,
-			IconURL: info.Icon.URL, ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: a.now().UTC(),
+			IconURL: maxclient.SafeAssetURL(info.Icon.URL), ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: a.now().UTC(),
 		}); err != nil {
 			return ChannelClaimCandidate{}, err
 		}
@@ -362,7 +376,7 @@ func (a *App) CompleteChannelClaim(ctx context.Context, claim store.ChannelClaim
 	}
 	channel, err := a.store.CompleteChannelClaim(ctx, claim, store.Channel{
 		UserID: claim.UserID, VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title,
-		PublicLink: strings.TrimSpace(info.Link), IconURL: info.Icon.URL, ParticipantsCount: info.ParticipantsCount,
+		PublicLink: strings.TrimSpace(info.Link), IconURL: maxclient.SafeAssetURL(info.Icon.URL), ParticipantsCount: info.ParticipantsCount,
 		IsChannel: true, Active: true,
 	})
 	return channel, diagnostics, err
@@ -431,7 +445,7 @@ func (a *App) ConnectDiscoverableChannelForUser(ctx context.Context, userID, max
 	}
 	channel, err := a.store.ConnectDiscoverableChannelForUser(ctx, userID, maxChatID, store.Channel{
 		UserID: userID, VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title,
-		PublicLink: strings.TrimSpace(info.Link), IconURL: info.Icon.URL, ParticipantsCount: info.ParticipantsCount,
+		PublicLink: strings.TrimSpace(info.Link), IconURL: maxclient.SafeAssetURL(info.Icon.URL), ParticipantsCount: info.ParticipantsCount,
 		IsChannel: true, Active: true,
 	})
 	if err != nil {
@@ -464,6 +478,7 @@ func (a *App) TestChannel(ctx context.Context, channelID int64) (ChannelCheck, e
 		diagnostics.CanPublish = false
 		diagnostics.CanEdit = false
 		diagnostics.CanDelete = false
+		diagnostics.CanPin = false
 	}
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
@@ -480,9 +495,14 @@ func (a *App) TestChannelForUser(ctx context.Context, userID string, channelID i
 	if err != nil {
 		return ChannelCheck{}, err
 	}
+	channel, err = a.store.RefreshChannelVisualMetadataForUser(ctx, userID, channel.ID,
+		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
 	diagnostics := channelDiagnostics(info, membership)
 	if !channel.Active {
-		diagnostics.CanPublish, diagnostics.CanEdit, diagnostics.CanDelete = false, false, false
+		diagnostics.CanPublish, diagnostics.CanEdit, diagnostics.CanDelete, diagnostics.CanPin = false, false, false, false
 	}
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
@@ -506,6 +526,17 @@ func (a *App) GenerateResearch(ctx context.Context, request openairesearch.Reque
 		return openairesearch.Result{}, ErrResearchNotConfigured
 	}
 	return a.research.Generate(ctx, request)
+}
+
+func (a *App) FormatPostContent(ctx context.Context, request openairesearch.FormatRequest) (openairesearch.FormatResult, error) {
+	if err := openairesearch.ValidateFormatRequest(request); err != nil {
+		return openairesearch.FormatResult{}, err
+	}
+	formatter, ok := a.research.(ContentFormatter)
+	if a.research == nil || !ok {
+		return openairesearch.FormatResult{}, ErrResearchNotConfigured
+	}
+	return formatter.FormatContent(ctx, request)
 }
 
 func (a *App) GeneratePostImage(ctx context.Context, postID int64, request openaiimg.GenerateRequest) (store.Post, error) {
@@ -583,7 +614,8 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (store.Po
 	notify := post.Notify
 	message, err := a.publishWithAttachmentRetry(ctx, maxclient.PublishRequest{
 		ChatID: channel.MAXChatID, Text: post.Content, Format: maxclient.Format(post.Format),
-		ImageTokens: tokens, DisableLinkPreview: post.DisableLinkPreview, Notify: &notify,
+		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons),
+		DisableLinkPreview: post.DisableLinkPreview, Notify: &notify,
 	})
 	if err != nil {
 		return a.fail(postID, err)
@@ -591,7 +623,7 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (store.Po
 	if message.MessageID == "" {
 		return a.fail(postID, errors.New("MAX published the post but returned no message ID; check the channel before retrying"))
 	}
-	return a.store.MarkPublished(ctx, postID, message.MessageID)
+	return a.store.MarkPublished(ctx, postID, message.MessageID, message.URL)
 }
 
 func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post, error) {
@@ -627,7 +659,7 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (store.Post
 	notify := post.Notify
 	err = a.editWithAttachmentRetry(ctx, maxclient.EditRequest{
 		MessageID: post.MAXMessageID, Text: post.Content, Format: maxclient.Format(post.Format),
-		ImageTokens: tokens, Notify: &notify,
+		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons), Notify: &notify,
 	})
 	if err != nil {
 		return store.Post{}, err
@@ -670,6 +702,153 @@ func (a *App) DeletePublication(ctx context.Context, postID int64) (store.Post, 
 	return a.store.ClearPublication(ctx, postID)
 }
 
+// SyncMAXPublication refreshes the canonical MAX URL, latest view count and
+// actual pin state for one tenant-owned published post. View observations are
+// appended transactionally by the store for future reports.
+func (a *App) SyncMAXPublication(ctx context.Context, userID string, postID int64) (store.Post, error) {
+	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if a.max == nil {
+		return store.Post{}, ErrMAXNotConfigured
+	}
+	now := a.now().UTC()
+	claimed, err := a.store.ClaimPostStatsAttemptForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, now, 15*time.Second)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if !claimed {
+		return store.Post{}, fmt.Errorf("%w: MAX statistics were requested recently; retry in a few seconds", ErrConflict)
+	}
+	return a.syncClaimedMAXPublication(ctx, userID, post, channel, now)
+}
+
+func (a *App) syncClaimedMAXPublicationForUser(ctx context.Context, userID string, postID int64, syncedAt time.Time) (store.Post, error) {
+	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	return a.syncClaimedMAXPublication(ctx, userID, post, channel, syncedAt)
+}
+
+func (a *App) syncClaimedMAXPublication(ctx context.Context, userID string, post store.Post, channel store.Channel, syncedAt time.Time) (store.Post, error) {
+	message, err := a.max.GetMessage(ctx, post.MAXMessageID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if err := validateMAXMessageOwnership(message, post.MAXMessageID, channel.MAXChatID); err != nil {
+		return store.Post{}, err
+	}
+	pinnedMessage, err := a.max.GetPinnedMessage(ctx, channel.MAXChatID)
+	if err != nil {
+		// A MAX 404 is meaningful (missing/inaccessible chat or message) and
+		// must not be converted into a false local pin state.
+		return store.Post{}, err
+	}
+	pinned := false
+	if pinnedMessage != nil {
+		if err := validateMAXMessageChannel(*pinnedMessage, channel.MAXChatID); err != nil {
+			return store.Post{}, err
+		}
+		pinned = pinnedMessage.MessageID == post.MAXMessageID
+	}
+	return a.store.SyncPublicationMetadataForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID,
+		message.URL, message.Views, syncedAt.UTC(), pinned)
+}
+
+func (a *App) PinPost(ctx context.Context, userID string, postID int64) (store.Post, error) {
+	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if a.max == nil {
+		return store.Post{}, ErrMAXNotConfigured
+	}
+	if err := a.requirePinAccess(ctx, channel); err != nil {
+		return store.Post{}, err
+	}
+	if err := a.max.PinMessage(ctx, channel.MAXChatID, post.MAXMessageID); err != nil {
+		return store.Post{}, err
+	}
+	return a.store.SetPublicationPinnedForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, true)
+}
+
+func (a *App) UnpinPost(ctx context.Context, userID string, postID int64) (store.Post, error) {
+	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if a.max == nil {
+		return store.Post{}, ErrMAXNotConfigured
+	}
+	if err := a.requirePinAccess(ctx, channel); err != nil {
+		return store.Post{}, err
+	}
+	current, err := a.max.GetPinnedMessage(ctx, channel.MAXChatID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if current == nil {
+		return store.Post{}, fmt.Errorf("%w: this post is not currently pinned in MAX", ErrConflict)
+	}
+	if err := validateMAXMessageChannel(*current, channel.MAXChatID); err != nil {
+		return store.Post{}, err
+	}
+	if current.MessageID != post.MAXMessageID {
+		return store.Post{}, fmt.Errorf("%w: this post is not currently pinned in MAX", ErrConflict)
+	}
+	if err := a.max.UnpinMessage(ctx, channel.MAXChatID); err != nil {
+		return store.Post{}, err
+	}
+	return a.store.SetPublicationPinnedForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, false)
+}
+
+func (a *App) publishedPostForUser(ctx context.Context, userID string, postID int64) (store.Post, store.Channel, error) {
+	post, err := a.store.GetPostForUser(ctx, userID, postID)
+	if err != nil {
+		return store.Post{}, store.Channel{}, err
+	}
+	if post.Status != store.PostStatusPublished || strings.TrimSpace(post.MAXMessageID) == "" || post.ChannelID == nil {
+		return store.Post{}, store.Channel{}, fmt.Errorf("%w: post has no active MAX publication", ErrConflict)
+	}
+	channel, err := a.store.GetChannelForUser(ctx, userID, *post.ChannelID)
+	if err != nil {
+		return store.Post{}, store.Channel{}, err
+	}
+	if !channel.Active {
+		return store.Post{}, store.Channel{}, errors.New("selected MAX channel is inactive")
+	}
+	return post, channel, nil
+}
+
+func (a *App) requirePinAccess(ctx context.Context, channel store.Channel) error {
+	info, membership, err := a.inspectChannel(ctx, channel)
+	if err != nil {
+		return err
+	}
+	diagnostics := channelDiagnostics(info, membership)
+	if !diagnostics.CanPin {
+		return &ChannelAccessError{Diagnostics: diagnostics,
+			Message: "MAX pin_message permission is required to pin or unpin posts"}
+	}
+	return nil
+}
+
+func validateMAXMessageOwnership(message maxclient.Message, messageID, chatID string) error {
+	if message.MessageID != messageID {
+		return fmt.Errorf("%w: MAX returned a different publication", ErrConflict)
+	}
+	return validateMAXMessageChannel(message, chatID)
+}
+
+func validateMAXMessageChannel(message maxclient.Message, chatID string) error {
+	if strings.TrimSpace(message.MessageID) == "" || message.ChatID == "" || message.ChatID != chatID {
+		return fmt.Errorf("%w: MAX message does not belong to the post channel", ErrConflict)
+	}
+	return nil
+}
+
 func (a *App) RunScheduler(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		a.logger.Error("scheduler interval must be positive", "interval", interval)
@@ -677,15 +856,74 @@ func (a *App) RunScheduler(ctx context.Context, interval time.Duration) {
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	a.publishDueAt(ctx, a.now().UTC())
+	a.runSchedulerCycle(ctx, a.now().UTC())
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			a.publishDueAt(ctx, a.now().UTC())
+			a.runSchedulerCycle(ctx, a.now().UTC())
 		}
 	}
+}
+
+func (a *App) runSchedulerCycle(ctx context.Context, now time.Time) {
+	a.publishDueAt(ctx, now)
+	a.syncDueMAXStats(ctx, now)
+}
+
+func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {
+	if a.max == nil {
+		return
+	}
+	posts, err := a.store.ListPostsDueForStats(ctx, now.UTC(), time.Hour, 10)
+	if err != nil {
+		a.logger.Error("scheduler could not list posts due for MAX stats", "error", err)
+		return
+	}
+	const parallelism = 2
+	workerCount := min(parallelism, len(posts))
+	jobs := make(chan store.Post)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for post := range jobs {
+				if post.ChannelID == nil {
+					continue
+				}
+				claimed, claimErr := a.store.ClaimPostStatsAttemptForUser(ctx, post.UserID, post.ID, *post.ChannelID,
+					post.MAXMessageID, now.UTC(), time.Hour)
+				if claimErr != nil {
+					a.logger.Warn("could not claim MAX post statistics synchronization", "post_id", post.ID, "error", claimErr)
+					continue
+				}
+				if !claimed {
+					continue
+				}
+				syncCtx, cancel := context.WithTimeout(ctx, time.Minute)
+				_, syncErr := a.syncClaimedMAXPublicationForUser(syncCtx, post.UserID, post.ID, now.UTC())
+				cancel()
+				if syncErr != nil {
+					// Keep the publication intact. In particular, an upstream 404
+					// is not proof that a local post should be deleted or unpinned.
+					a.logger.Warn("could not synchronize MAX post statistics", "post_id", post.ID, "error", syncErr)
+				}
+			}
+		}()
+	}
+	for _, post := range posts {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return
+		case jobs <- post:
+		}
+	}
+	close(jobs)
+	workers.Wait()
 }
 
 func (a *App) publishDueAt(ctx context.Context, now time.Time) {
@@ -785,6 +1023,9 @@ func (a *App) validateForPublish(ctx context.Context, post store.Post) (store.Ch
 	if utf8.RuneCountInString(post.Content) > 4000 {
 		return store.Channel{}, errors.New("MAX post content must not exceed 4000 characters")
 	}
+	if err := store.ValidateLinkButtonsForPublish(post.LinkButtons); err != nil {
+		return store.Channel{}, err
+	}
 	if post.ChannelID == nil {
 		return store.Channel{}, errors.New("post channel_id is required")
 	}
@@ -799,6 +1040,17 @@ func (a *App) validateForPublish(ctx context.Context, post store.Post) (store.Ch
 		return store.Channel{}, errors.New("post and channel ownership do not match")
 	}
 	return channel, nil
+}
+
+func maxLinkButtons(buttons []store.LinkButton) []maxclient.LinkButton {
+	if buttons == nil {
+		return nil
+	}
+	result := make([]maxclient.LinkButton, len(buttons))
+	for i, button := range buttons {
+		result[i] = maxclient.LinkButton{Text: strings.TrimSpace(button.Text), URL: strings.TrimSpace(button.URL)}
+	}
+	return result
 }
 
 func (a *App) inspectChannel(ctx context.Context, channel store.Channel) (maxclient.ChatInfo, maxclient.Membership, error) {
@@ -838,6 +1090,7 @@ func channelDiagnostics(info maxclient.ChatInfo, membership maxclient.Membership
 	}
 	hasEdit := membership.HasPermission(maxclient.PermissionEdit)
 	hasDelete := membership.HasPermission(maxclient.PermissionDelete)
+	hasPin := membership.HasPermission(maxclient.PermissionPinMessage)
 	if !hasEdit {
 		missing = append(missing, string(maxclient.PermissionEdit))
 	}
@@ -851,6 +1104,7 @@ func channelDiagnostics(info maxclient.ChatInfo, membership maxclient.Membership
 		CanPublish:                 activeChannel && membership.IsAdmin && hasRead && hasWrite,
 		CanEdit:                    activeChannel && membership.IsAdmin && hasRead && hasEdit,
 		CanDelete:                  activeChannel && membership.IsAdmin && hasRead && hasDelete,
+		CanPin:                     activeChannel && membership.IsAdmin && hasPin,
 		MissingRequiredPermissions: missing,
 	}
 }

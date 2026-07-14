@@ -25,7 +25,10 @@ const (
 	maxUploadRedirects   = 5
 )
 
-var publicChannelIDPattern = regexp.MustCompile(`\bchannelId\b(?:\\?["'])?\s*:\s*(?:\\?["'])?([0-9]{1,19})\b`)
+var (
+	publicChannelIDPattern = regexp.MustCompile(`\bchannelId\b(?:\\?["'])?\s*:\s*(?:\\?["'])?([0-9]{1,19})\b`)
+	messageIDPattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$`)
+)
 
 // Client is safe for concurrent use as long as its supplied http.Client is not
 // mutated concurrently.
@@ -229,6 +232,87 @@ func (c *Client) GetMembership(ctx context.Context, chatID string) (Membership, 
 		return Membership{}, err
 	}
 	return membership, nil
+}
+
+// GetMessage returns the current message metadata exposed by MAX, including
+// the canonical public URL and view count. It is intentionally read-only.
+func (c *Client) GetMessage(ctx context.Context, messageID string) (Message, error) {
+	if !validMessageID(messageID) {
+		return Message{}, errors.New("get MAX message: message ID is invalid")
+	}
+	var response apiMessage
+	if err := c.doJSON(ctx, http.MethodGet, "/messages/"+url.PathEscape(messageID), nil, nil, &response); err != nil {
+		return Message{}, err
+	}
+	message := response.publicMessage()
+	if !validMessageID(message.MessageID) || message.MessageID != messageID {
+		return Message{}, errors.New("MAX message response does not match the requested message ID")
+	}
+	if message.ChatID != "" && !numericID(message.ChatID) {
+		return Message{}, errors.New("MAX message response contains an invalid chat ID")
+	}
+	if message.Views != nil && *message.Views < 0 {
+		return Message{}, errors.New("MAX message response contains a negative view count")
+	}
+	return message, nil
+}
+
+// GetPinnedMessage returns the message currently pinned in a chat. MAX 404
+// responses are deliberately preserved as structured upstream errors so a
+// caller never mistakes an inaccessible chat or message for "not pinned".
+func (c *Client) GetPinnedMessage(ctx context.Context, chatID string) (*Message, error) {
+	if !numericID(chatID) {
+		return nil, errors.New("get pinned MAX message: chat ID must be numeric")
+	}
+	var response *apiMessage
+	if err := c.doJSON(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/pin", nil, nil, &response); err != nil {
+		return nil, err
+	}
+	if response == nil {
+		return nil, nil
+	}
+	message := response.publicMessage()
+	if !validMessageID(message.MessageID) {
+		return nil, errors.New("MAX pinned message response does not contain a valid message ID")
+	}
+	if message.ChatID != "" && !numericID(message.ChatID) {
+		return nil, errors.New("MAX pinned message response contains an invalid chat ID")
+	}
+	if message.Views != nil && *message.Views < 0 {
+		return nil, errors.New("MAX pinned message response contains a negative view count")
+	}
+	return &message, nil
+}
+
+// PinMessage pins a message without notifying channel subscribers.
+func (c *Client) PinMessage(ctx context.Context, chatID, messageID string) error {
+	if !numericID(chatID) {
+		return errors.New("pin MAX message: chat ID must be numeric")
+	}
+	if !validMessageID(messageID) {
+		return errors.New("pin MAX message: message ID is invalid")
+	}
+	body := struct {
+		MessageID string `json:"message_id"`
+		Notify    bool   `json:"notify"`
+	}{MessageID: messageID, Notify: false}
+	var response operationResponse
+	if err := c.doJSON(ctx, http.MethodPut, "/chats/"+url.PathEscape(chatID)+"/pin", nil, body, &response); err != nil {
+		return err
+	}
+	return response.asError(http.StatusOK)
+}
+
+// UnpinMessage removes the current pin from a chat.
+func (c *Client) UnpinMessage(ctx context.Context, chatID string) error {
+	if !numericID(chatID) {
+		return errors.New("unpin MAX message: chat ID must be numeric")
+	}
+	var response operationResponse
+	if err := c.doJSON(ctx, http.MethodDelete, "/chats/"+url.PathEscape(chatID)+"/pin", nil, nil, &response); err != nil {
+		return err
+	}
+	return response.asError(http.StatusOK)
 }
 
 // SendClaimConfirmation asks the MAX account that opened the deep link to
@@ -464,12 +548,12 @@ func (c *Client) Publish(ctx context.Context, request PublishRequest) (Message, 
 		return Message{}, fmt.Errorf("publish MAX post: unsupported format %q", request.Format)
 	}
 
-	attachments, err := imageAttachments(request.ImageTokens)
+	attachments, err := messageAttachments(request.ImageTokens, request.LinkButtons)
 	if err != nil {
 		return Message{}, fmt.Errorf("publish MAX post: %w", err)
 	}
 	body := messageBody{
-		Text:        request.Text,
+		Text:        normalizeMessageText(request.Text, request.Format),
 		Attachments: attachments,
 		Notify:      request.Notify,
 		Format:      request.Format,
@@ -490,19 +574,19 @@ func (c *Client) Publish(ctx context.Context, request PublishRequest) (Message, 
 
 // Edit updates a post previously sent by the bot.
 func (c *Client) Edit(ctx context.Context, request EditRequest) error {
-	if request.MessageID == "" {
-		return errors.New("edit MAX post: message ID is required")
+	if !validMessageID(request.MessageID) {
+		return errors.New("edit MAX post: message ID is invalid")
 	}
 	if !validFormat(request.Format) {
 		return fmt.Errorf("edit MAX post: unsupported format %q", request.Format)
 	}
 
-	attachments, err := imageAttachments(request.ImageTokens)
+	attachments, err := messageAttachments(request.ImageTokens, request.LinkButtons)
 	if err != nil {
 		return fmt.Errorf("edit MAX post: %w", err)
 	}
 	body := messageBody{
-		Text:        request.Text,
+		Text:        normalizeMessageText(request.Text, request.Format),
 		Attachments: attachments,
 		Notify:      request.Notify,
 		Format:      request.Format,
@@ -518,8 +602,8 @@ func (c *Client) Edit(ctx context.Context, request EditRequest) error {
 
 // Delete removes a post previously sent by the bot.
 func (c *Client) Delete(ctx context.Context, messageID string) error {
-	if messageID == "" {
-		return errors.New("delete MAX post: message ID is required")
+	if !validMessageID(messageID) {
+		return errors.New("delete MAX post: message ID is invalid")
 	}
 
 	query := url.Values{"message_id": []string{messageID}}
@@ -719,6 +803,10 @@ func numericID(value string) bool {
 	}
 	_, err := strconv.ParseInt(value, 10, 64)
 	return err == nil
+}
+
+func validMessageID(value string) bool {
+	return messageIDPattern.MatchString(value)
 }
 
 // NormalizeChatLink converts https://max.ru/<slug>, max.ru/<slug>, @slug and

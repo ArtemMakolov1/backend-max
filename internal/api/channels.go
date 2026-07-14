@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"maxpilot/backend/internal/app"
+	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/store"
 )
 
@@ -206,7 +207,7 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		"claim_id": claim.ID, "status": claim.Status, "expires_at": claim.ExpiresAt, "bot_url": botURL,
 		"comparison_code": claim.ComparisonCode, "requester_label": claim.RequesterLabel,
 		"channel": map[string]any{"max_chat_id": candidate.Info.ChatID, "title": candidate.Info.Title,
-			"public_link": candidate.Info.Link, "icon_url": candidate.Info.Icon.URL},
+			"public_link": candidate.Info.Link, "icon_url": maxclient.SafeAssetURL(candidate.Info.Icon.URL)},
 		"message": "Откройте помощника в MAX и подтвердите подключение в личном сообщении",
 	})
 }

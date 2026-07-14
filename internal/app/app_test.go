@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,18 +17,30 @@ import (
 )
 
 type fakeMAX struct {
-	chat         maxclient.ChatInfo
-	membership   maxclient.Membership
-	getChatErr   error
-	getLinkErr   error
-	getChatCalls int
-	getLinkCalls int
-	lastChatLink string
-	memberCalls  int
-	resolveCalls int
-	publishCalls int
-	editCalls    int
-	deleteCalls  int
+	chat               maxclient.ChatInfo
+	membership         maxclient.Membership
+	getChatErr         error
+	getLinkErr         error
+	getChatCalls       int
+	getLinkCalls       int
+	lastChatLink       string
+	memberCalls        int
+	resolveCalls       int
+	publishCalls       int
+	editCalls          int
+	deleteCalls        int
+	uploadCalls        int
+	lastPublishRequest maxclient.PublishRequest
+	lastEditRequest    maxclient.EditRequest
+	publishMessage     maxclient.Message
+	message            maxclient.Message
+	pinnedMessage      *maxclient.Message
+	getMessageErr      error
+	getPinnedErr       error
+	getMessageCalls    int
+	getPinnedCalls     int
+	pinCalls           int
+	unpinCalls         int
 }
 
 func (f *fakeMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
@@ -64,19 +77,41 @@ func (f *fakeMAX) GetMembership(context.Context, string) (maxclient.Membership, 
 	f.memberCalls++
 	return f.membership, nil
 }
+func (f *fakeMAX) GetMessage(context.Context, string) (maxclient.Message, error) {
+	f.getMessageCalls++
+	return f.message, f.getMessageErr
+}
+func (f *fakeMAX) GetPinnedMessage(context.Context, string) (*maxclient.Message, error) {
+	f.getPinnedCalls++
+	return f.pinnedMessage, f.getPinnedErr
+}
+func (f *fakeMAX) PinMessage(context.Context, string, string) error {
+	f.pinCalls++
+	return nil
+}
+func (f *fakeMAX) UnpinMessage(context.Context, string) error {
+	f.unpinCalls++
+	return nil
+}
 func (f *fakeMAX) SendClaimConfirmation(context.Context, string, string, string, string, string, string, string) error {
 	return nil
 }
 func (f *fakeMAX) AnswerCallback(context.Context, string, string, string) error { return nil }
 func (f *fakeMAX) UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error) {
+	f.uploadCalls++
 	return maxclient.UploadResult{Token: "image-token"}, nil
 }
-func (f *fakeMAX) Publish(context.Context, maxclient.PublishRequest) (maxclient.Message, error) {
+func (f *fakeMAX) Publish(_ context.Context, request maxclient.PublishRequest) (maxclient.Message, error) {
 	f.publishCalls++
+	f.lastPublishRequest = request
+	if f.publishMessage.MessageID != "" {
+		return f.publishMessage, nil
+	}
 	return maxclient.Message{MessageID: "mid-1"}, nil
 }
-func (f *fakeMAX) Edit(context.Context, maxclient.EditRequest) error {
+func (f *fakeMAX) Edit(_ context.Context, request maxclient.EditRequest) error {
 	f.editCalls++
+	f.lastEditRequest = request
 	return nil
 }
 func (f *fakeMAX) Delete(context.Context, string) error {
@@ -125,6 +160,49 @@ func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
 	stored, err := storage.GetChannel(context.Background(), check.Channel.ID)
 	if err != nil || stored.PublicLink == "" || stored.IconURL != "https://cdn.max.ru/official.png" || stored.ParticipantsCount != 3210 {
 		t.Fatalf("stored channel = %#v, %v", stored, err)
+	}
+}
+
+func TestConnectedChannelIconIsSanitizedAndRefreshedForItsTenant(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{
+			ChatID: "-124", Type: "channel", Status: "active", Title: "Official",
+			Icon: maxclient.ChatIcon{URL: "https://tracker.example/channel.png"},
+		},
+		membership: maxclient.Membership{
+			IsAdmin: true,
+			Permissions: []maxclient.Permission{
+				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+				maxclient.PermissionEdit, maxclient.PermissionDelete,
+			},
+		},
+	}
+	application, storage := newTestApp(t, fake)
+
+	connected, err := application.ConnectChannel(context.Background(), "", "-124", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connected.Channel.IconURL != "" {
+		t.Fatalf("untrusted MAX icon was persisted: %q", connected.Channel.IconURL)
+	}
+
+	fake.chat.Icon.URL = "https://cdn.max.ru/channels/official.png?size=256"
+	fake.chat.ParticipantsCount = 73
+	checked, err := application.TestChannelForUser(context.Background(), connected.Channel.UserID, connected.Channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked.Channel.IconURL != fake.chat.Icon.URL || checked.Channel.ParticipantsCount != 73 {
+		t.Fatalf("checked channel visual metadata = %#v", checked.Channel)
+	}
+	stored, err := storage.GetChannelForUser(context.Background(), connected.Channel.UserID, connected.Channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.IconURL != fake.chat.Icon.URL || stored.ParticipantsCount != 73 {
+		t.Fatalf("stored channel visual metadata = %#v", stored)
 	}
 }
 
@@ -595,6 +673,95 @@ func TestSelectedCalendarPostSkippedAfterPostponeOrCancel(t *testing.T) {
 	}
 	if fake.publishCalls != 0 || fake.getChatCalls != 0 || fake.memberCalls != 0 {
 		t.Fatalf("postponed/canceled selection reached MAX: %#v", fake)
+	}
+}
+
+func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "70", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{
+			IsAdmin: true,
+			Permissions: []maxclient.Permission{
+				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionEdit,
+			},
+		},
+		publishMessage: maxclient.Message{MessageID: "mid.buttons", URL: "https://max.ru/channel/buttons"},
+	}
+	application, storage := newTestApp(t, fake)
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{
+		MAXChatID: "70", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imagePath := filepath.Join(t.TempDir(), "post.png")
+	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(context.Background(), store.Post{
+		Title: "Buttons", Content: "Body", Format: store.FormatMarkdown, ChannelID: &channel.ID,
+		ImageURL: "http://localhost:8080/media/post.png", ImagePath: imagePath, Notify: true,
+		LinkButtons: []store.LinkButton{
+			{Text: "  Сайт ", URL: " https://example.com "},
+			{Text: "Каталог", URL: "https://example.com/catalog"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err = application.PublishPost(context.Background(), post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.Status != store.PostStatusPublished || post.MAXMessageURL != fake.publishMessage.URL || fake.publishCalls != 1 || fake.uploadCalls != 1 {
+		t.Fatalf("publish state = %#v, fake = %#v", post, fake)
+	}
+	if len(fake.lastPublishRequest.ImageTokens) != 1 || len(fake.lastPublishRequest.LinkButtons) != 2 ||
+		fake.lastPublishRequest.LinkButtons[0].Text != "Сайт" || fake.lastPublishRequest.LinkButtons[0].URL != "https://example.com" {
+		t.Fatalf("publish request = %#v", fake.lastPublishRequest)
+	}
+
+	cleared := []store.LinkButton{}
+	if _, err := storage.UpdatePost(context.Background(), post.ID, store.PostChanges{LinkButtons: &cleared}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.UpdatePublishedPost(context.Background(), post.ID); err != nil {
+		t.Fatal(err)
+	}
+	if fake.editCalls != 1 || fake.uploadCalls != 2 || len(fake.lastEditRequest.ImageTokens) != 1 {
+		t.Fatalf("edit request = %#v, fake = %#v", fake.lastEditRequest, fake)
+	}
+	if fake.lastEditRequest.LinkButtons == nil || len(fake.lastEditRequest.LinkButtons) != 0 {
+		t.Fatalf("edit LinkButtons = %#v, want explicit empty slice", fake.lastEditRequest.LinkButtons)
+	}
+}
+
+func TestScheduleRejectsIncompleteLinkButtons(t *testing.T) {
+	t.Parallel()
+	application, storage := newTestApp(t, &fakeMAX{})
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{
+		MAXChatID: "71", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(context.Background(), store.Post{
+		Title: "Draft", Content: "Body", Format: store.FormatMarkdown, ChannelID: &channel.ID,
+		LinkButtons: []store.LinkButton{{Text: "Подробнее", URL: "https://"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.SchedulePost(context.Background(), post.ID, time.Now().UTC().Add(time.Hour)); err == nil {
+		t.Fatal("SchedulePost accepted an incomplete HTTPS URL")
+	}
+	stored, err := storage.GetPost(context.Background(), post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != store.PostStatusDraft {
+		t.Fatalf("invalid post status = %q, want draft", stored.Status)
 	}
 }
 

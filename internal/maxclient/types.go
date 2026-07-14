@@ -1,6 +1,7 @@
 package maxclient
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"time"
@@ -60,6 +61,7 @@ const (
 	PermissionWrite           Permission = "write"
 	PermissionEdit            Permission = "edit"
 	PermissionDelete          Permission = "delete"
+	PermissionPinMessage      Permission = "pin_message"
 )
 
 // Membership is the read-only result of GET /chats/{chatId}/members/me.
@@ -108,6 +110,8 @@ type Message struct {
 	MessageID string
 	URL       string
 	Text      string
+	ChatID    string
+	Views     *int64
 }
 
 // PublishRequest describes a new channel post. ImageTokens are tokens returned
@@ -117,18 +121,20 @@ type PublishRequest struct {
 	Text               string
 	Format             Format
 	ImageTokens        []string
+	LinkButtons        []LinkButton
 	DisableLinkPreview bool
 	Notify             *bool
 }
 
-// EditRequest replaces the editable fields of an existing post. A nil
-// ImageTokens slice leaves attachments unchanged; a non-nil empty slice removes
-// all attachments.
+// EditRequest replaces the editable fields of an existing post. When both
+// attachment slices are nil, MAX attachments are left unchanged. Otherwise the
+// two slices describe the complete desired image + keyboard state.
 type EditRequest struct {
 	MessageID   string
 	Text        string
 	Format      Format
 	ImageTokens []string
+	LinkButtons []LinkButton
 	Notify      *bool
 }
 
@@ -168,8 +174,8 @@ func (e *Error) Temporary() bool {
 }
 
 type attachment struct {
-	Type    string            `json:"type"`
-	Payload attachmentPayload `json:"payload"`
+	Type    string `json:"type"`
+	Payload any    `json:"payload"`
 }
 
 type attachmentPayload struct {
@@ -184,10 +190,17 @@ type messageBody struct {
 }
 
 type apiMessage struct {
-	MessageID string `json:"message_id,omitempty"`
-	Mid       string `json:"mid,omitempty"`
-	URL       string `json:"url,omitempty"`
-	Body      *struct {
+	MessageID string          `json:"message_id,omitempty"`
+	Mid       string          `json:"mid,omitempty"`
+	URL       string          `json:"url,omitempty"`
+	ChatID    json.RawMessage `json:"chat_id,omitempty"`
+	Recipient *struct {
+		ChatID json.RawMessage `json:"chat_id,omitempty"`
+	} `json:"recipient,omitempty"`
+	Stat *struct {
+		Views *int64 `json:"views,omitempty"`
+	} `json:"stat,omitempty"`
+	Body *struct {
 		Mid  string `json:"mid,omitempty"`
 		Text string `json:"text,omitempty"`
 	} `json:"body,omitempty"`
@@ -199,15 +212,25 @@ func (m apiMessage) publicMessage() Message {
 		id = m.Mid
 	}
 
-	var text string
+	var text, chatID string
 	if m.Body != nil {
 		if id == "" {
 			id = m.Body.Mid
 		}
 		text = m.Body.Text
 	}
+	if len(m.ChatID) != 0 {
+		chatID = jsonCode(m.ChatID)
+	}
+	if m.Recipient != nil && len(m.Recipient.ChatID) != 0 {
+		chatID = jsonCode(m.Recipient.ChatID)
+	}
+	var views *int64
+	if m.Stat != nil {
+		views = m.Stat.Views
+	}
 
-	return Message{MessageID: id, URL: m.URL, Text: text}
+	return Message{MessageID: id, URL: m.URL, Text: text, ChatID: chatID, Views: views}
 }
 
 func imageAttachments(tokens []string) (*[]attachment, error) {

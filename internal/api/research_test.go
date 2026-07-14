@@ -21,10 +21,13 @@ import (
 )
 
 type fakeResearchClient struct {
-	mu       sync.Mutex
-	requests []openairesearch.Request
-	result   openairesearch.Result
-	err      error
+	mu             sync.Mutex
+	requests       []openairesearch.Request
+	result         openairesearch.Result
+	err            error
+	formatRequests []openairesearch.FormatRequest
+	formatResult   openairesearch.FormatResult
+	formatErr      error
 }
 
 func (f *fakeResearchClient) Generate(ctx context.Context, request openairesearch.Request) (openairesearch.Result, error) {
@@ -32,6 +35,13 @@ func (f *fakeResearchClient) Generate(ctx context.Context, request openairesearc
 	f.requests = append(f.requests, request)
 	f.mu.Unlock()
 	return f.result, f.err
+}
+
+func (f *fakeResearchClient) FormatContent(_ context.Context, request openairesearch.FormatRequest) (openairesearch.FormatResult, error) {
+	f.mu.Lock()
+	f.formatRequests = append(f.formatRequests, request)
+	f.mu.Unlock()
+	return f.formatResult, f.formatErr
 }
 
 func TestResearchGenerateReturnsExactContractUnderYandexSession(t *testing.T) {

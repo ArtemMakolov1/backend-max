@@ -91,24 +91,30 @@ type DiscoverableChannel struct {
 }
 
 type Post struct {
-	ID                 int64      `json:"id"`
-	UserID             string     `json:"-"`
-	Title              string     `json:"title"`
-	Content            string     `json:"content"`
-	Format             string     `json:"format"`
-	Status             string     `json:"status"`
-	ChannelID          *int64     `json:"channel_id,omitempty"`
-	ImageURL           string     `json:"image_url,omitempty"`
-	ImagePath          string     `json:"-"`
-	ImagePrompt        string     `json:"image_prompt,omitempty"`
-	Notify             bool       `json:"notify"`
-	DisableLinkPreview bool       `json:"disable_link_preview"`
-	ScheduledAt        *time.Time `json:"scheduled_at,omitempty"`
-	MAXMessageID       string     `json:"max_message_id,omitempty"`
-	LastError          string     `json:"last_error,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
-	PublishedAt        *time.Time `json:"published_at,omitempty"`
+	ID                  int64        `json:"id"`
+	UserID              string       `json:"-"`
+	Title               string       `json:"title"`
+	Content             string       `json:"content"`
+	Format              string       `json:"format"`
+	Status              string       `json:"status"`
+	ChannelID           *int64       `json:"channel_id,omitempty"`
+	ImageURL            string       `json:"image_url,omitempty"`
+	ImagePath           string       `json:"-"`
+	ImagePrompt         string       `json:"image_prompt,omitempty"`
+	LinkButtons         []LinkButton `json:"link_buttons"`
+	Notify              bool         `json:"notify"`
+	DisableLinkPreview  bool         `json:"disable_link_preview"`
+	ScheduledAt         *time.Time   `json:"scheduled_at,omitempty"`
+	MAXMessageID        string       `json:"max_message_id,omitempty"`
+	MAXMessageURL       string       `json:"max_message_url"`
+	MAXViews            *int64       `json:"max_views"`
+	MAXStatsSyncedAt    *time.Time   `json:"max_stats_synced_at"`
+	MAXStatsAttemptedAt *time.Time   `json:"-"`
+	MAXIsPinned         bool         `json:"max_is_pinned"`
+	LastError           string       `json:"last_error,omitempty"`
+	CreatedAt           time.Time    `json:"created_at"`
+	UpdatedAt           time.Time    `json:"updated_at"`
+	PublishedAt         *time.Time   `json:"published_at,omitempty"`
 }
 
 type PostChanges struct {
@@ -119,6 +125,7 @@ type PostChanges struct {
 	ImageURL           *string
 	ImagePath          *string
 	ImagePrompt        *string
+	LinkButtons        *[]LinkButton
 	Notify             *bool
 	DisableLinkPreview *bool
 	ScheduledAt        **time.Time
@@ -133,6 +140,7 @@ type AuthSession struct {
 	Login             string
 	Email             string
 	DisplayName       string
+	AvatarURL         string
 	AllowlistIdentity string
 	CreatedAt         time.Time
 	ExpiresAt         time.Time
@@ -145,6 +153,7 @@ type User struct {
 	Login       string    `json:"login,omitempty"`
 	Email       string    `json:"email,omitempty"`
 	DisplayName string    `json:"display_name"`
+	AvatarURL   string    `json:"avatar_url,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
 }

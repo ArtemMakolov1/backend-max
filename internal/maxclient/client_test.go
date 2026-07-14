@@ -427,6 +427,56 @@ func TestPublishBuildsMAXMessageContract(t *testing.T) {
 	}
 }
 
+func TestPublishAndEditNormalizeLegacyMarkdownHeadingPayloads(t *testing.T) {
+	t.Parallel()
+	const publishInput = "## Привет\n++Меня зовут Фома++\n```markdown\n### Код не меняется\n```\n###### Итог"
+	const publishPayload = "# Привет\n++Меня зовут Фома++\n```markdown\n### Код не меняется\n```\n# Итог"
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body struct {
+			Text   string `json:"text"`
+			Format Format `json:"format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode message request: %v", err)
+		}
+		if body.Format != FormatMarkdown {
+			t.Errorf("format = %q, want markdown", body.Format)
+		}
+		switch r.Method {
+		case http.MethodPost:
+			if body.Text != publishPayload {
+				t.Errorf("publish text = %q, want %q", body.Text, publishPayload)
+			}
+			_, _ = io.WriteString(w, `{"message":{"body":{"mid":"mid-heading"}}}`)
+		case http.MethodPut:
+			if body.Text != "# Исправлено" {
+				t.Errorf("edit text = %q, want %q", body.Text, "# Исправлено")
+			}
+			_, _ = io.WriteString(w, `{"success":true}`)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	if _, err := client.Publish(context.Background(), PublishRequest{
+		ChatID: "-987654321", Text: publishInput, Format: FormatMarkdown,
+	}); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if err := client.Edit(context.Background(), EditRequest{
+		MessageID: "mid-heading", Text: "##### Исправлено", Format: FormatMarkdown,
+	}); err != nil {
+		t.Fatalf("Edit() error = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("message calls = %d, want 2", calls.Load())
+	}
+}
+
 func TestEditAndDeleteBuildMAXContract(t *testing.T) {
 	t.Parallel()
 
@@ -451,6 +501,13 @@ func TestEditAndDeleteBuildMAXContract(t *testing.T) {
 			if string(body["format"]) != `"html"` {
 				t.Errorf("format = %s", body["format"])
 			}
+			var text string
+			if err := json.Unmarshal(body["text"], &text); err != nil {
+				t.Fatalf("decode edit text: %v", err)
+			}
+			if text != "## Не Markdown\n<b>Исправлено</b>" {
+				t.Errorf("HTML text was normalized: %q", text)
+			}
 			edited.Store(true)
 		case http.MethodDelete:
 			if !edited.Load() {
@@ -467,7 +524,7 @@ func TestEditAndDeleteBuildMAXContract(t *testing.T) {
 	client := mustClient(t, server.URL, "token", server.Client())
 	if err := client.Edit(context.Background(), EditRequest{
 		MessageID:   "mid-7",
-		Text:        "<b>Исправлено</b>",
+		Text:        "## Не Markdown\n<b>Исправлено</b>",
 		Format:      FormatHTML,
 		ImageTokens: []string{},
 	}); err != nil {

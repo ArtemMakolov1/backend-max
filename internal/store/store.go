@@ -49,7 +49,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "003_max_identity_links.sql"
+const RequiredSchemaVersion = "007_channel_icon_backfill.sql"
 
 type schemaMigration struct {
 	version        string
@@ -678,6 +678,28 @@ WHERE owner_id = ? AND id = ?`, current.Title, current.Active, nowText(), userID
 	return s.GetChannelForUser(ctx, userID, id)
 }
 
+// RefreshChannelVisualMetadataForUser stores visual metadata obtained from an
+// authenticated MAX chat lookup without widening access to another tenant's
+// channel. URL trust is validated by the application before this boundary.
+func (s *Store) RefreshChannelVisualMetadataForUser(ctx context.Context, userID string, id int64, iconURL string, participantsCount int) (Channel, error) {
+	if strings.TrimSpace(userID) == "" || id <= 0 {
+		return Channel{}, errors.New("user id and channel id are required")
+	}
+	if participantsCount < 0 {
+		participantsCount = 0
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE channels
+SET icon_url = ?, participants_count = ?, updated_at = ?
+WHERE owner_id = ? AND id = ?`, iconURL, participantsCount, nowText(), userID, id)
+	if err != nil {
+		return Channel{}, fmt.Errorf("refresh user channel visual metadata: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return Channel{}, ErrNotFound
+	}
+	return s.GetChannelForUser(ctx, userID, id)
+}
+
 func (s *Store) DeleteChannel(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `
 DELETE FROM channels
@@ -763,16 +785,21 @@ func (s *Store) CreatePost(ctx context.Context, post Post) (Post, error) {
 	if post.Status != PostStatusScheduled && post.ScheduledAt != nil {
 		return Post{}, errors.New("scheduled_at requires scheduled status")
 	}
+	linkButtonsJSON, err := marshalLinkButtons(post.LinkButtons)
+	if err != nil {
+		return Post{}, err
+	}
 	now := nowText()
 	var id int64
-	err := s.db.QueryRowContext(ctx, `
-INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt,
-                  notify, disable_link_preview, scheduled_at, max_message_id, last_error, published_at,
-                  created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+	err = s.db.QueryRowContext(ctx, `
+INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
+                  notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views,
+                  max_stats_synced_at, max_is_pinned, last_error, published_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
 		post.UserID, post.Title, post.Content, post.Format, post.Status, nullableInt64(post.ChannelID), post.ImageURL,
-		post.ImagePath, post.ImagePrompt, post.Notify, post.DisableLinkPreview, nullableTime(post.ScheduledAt),
-		post.MAXMessageID, post.LastError, nullableTime(post.PublishedAt), now, now).Scan(&id)
+		post.ImagePath, post.ImagePrompt, linkButtonsJSON, post.Notify, post.DisableLinkPreview, nullableTime(post.ScheduledAt),
+		post.MAXMessageID, post.MAXMessageURL, nullableInt64(post.MAXViews), nullableTime(post.MAXStatsSyncedAt),
+		post.MAXIsPinned, post.LastError, nullableTime(post.PublishedAt), now, now).Scan(&id)
 	if err != nil {
 		return Post{}, fmt.Errorf("create post: %w", err)
 	}
@@ -911,6 +938,9 @@ func (s *Store) updatePostSnapshot(ctx context.Context, post Post, changes PostC
 	if changes.ImagePrompt != nil {
 		post.ImagePrompt = *changes.ImagePrompt
 	}
+	if changes.LinkButtons != nil {
+		post.LinkButtons = normalizeLinkButtons(append([]LinkButton(nil), (*changes.LinkButtons)...))
+	}
 	if changes.Notify != nil {
 		post.Notify = *changes.Notify
 	}
@@ -938,12 +968,16 @@ func (s *Store) updatePostSnapshot(ctx context.Context, post Post, changes PostC
 		post.ScheduledAt = *changes.ScheduledAt
 	}
 
+	linkButtonsJSON, err := marshalLinkButtons(post.LinkButtons)
+	if err != nil {
+		return Post{}, err
+	}
 	result, err := s.db.ExecContext(ctx, `
 	UPDATE posts SET title = ?, content = ?, format = ?, channel_id = ?, image_url = ?, image_path = ?,
-	             image_prompt = ?, notify = ?, disable_link_preview = ?, status = ?, scheduled_at = ?,
+	             image_prompt = ?, link_buttons = ?, notify = ?, disable_link_preview = ?, status = ?, scheduled_at = ?,
 	             last_error = ?, updated_at = ?
 	WHERE id = ? AND status = ? AND updated_at = ?`, post.Title, post.Content, post.Format, nullableInt64(post.ChannelID), post.ImageURL,
-		post.ImagePath, post.ImagePrompt, post.Notify, post.DisableLinkPreview, post.Status, nullableTime(post.ScheduledAt),
+		post.ImagePath, post.ImagePrompt, linkButtonsJSON, post.Notify, post.DisableLinkPreview, post.Status, nullableTime(post.ScheduledAt),
 		post.LastError, nowText(), post.ID, expectedStatus, expectedUpdatedAt)
 	if err != nil {
 		return Post{}, fmt.Errorf("update post: %w", err)
@@ -969,11 +1003,11 @@ func (s *Store) DuplicatePost(ctx context.Context, id int64) (Post, error) {
 	now := nowText()
 	var copyID int64
 	err := s.db.QueryRowContext(ctx, `
-INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt,
-	              notify, disable_link_preview, scheduled_at, max_message_id, last_error, published_at,
-	              created_at, updated_at)
-SELECT owner_id, trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt,
-	   notify, disable_link_preview, NULL, '', '', NULL, ?, ?
+INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
+	              notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views,
+	              max_stats_synced_at, max_is_pinned, last_error, published_at, created_at, updated_at)
+SELECT owner_id, trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt, link_buttons,
+	   notify, disable_link_preview, NULL, '', '', NULL, NULL, FALSE, '', NULL, ?, ?
 FROM posts WHERE id = ? AND status != ? RETURNING id`, PostStatusDraft, now, now, id, PostStatusPublishing).Scan(&copyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Post{}, s.postWriteMiss(ctx, id, "post is currently publishing")
@@ -1141,12 +1175,14 @@ WHERE owner_id <> '' AND status = ? AND updated_at < ?`, PostStatusFailed, warni
 	return count, nil
 }
 
-func (s *Store) MarkPublished(ctx context.Context, id int64, messageID string) (Post, error) {
+func (s *Store) MarkPublished(ctx context.Context, id int64, messageID, messageURL string) (Post, error) {
 	now := nowText()
 	result, err := s.db.ExecContext(ctx, `
-UPDATE posts SET status = ?, max_message_id = ?, last_error = '', scheduled_at = NULL,
+UPDATE posts SET status = ?, max_message_id = ?, max_message_url = ?, max_views = NULL,
+                 max_stats_synced_at = NULL, max_stats_attempted_at = NULL, max_is_pinned = FALSE,
+                 last_error = '', scheduled_at = NULL,
                  published_at = ?, updated_at = ? WHERE id = ? AND status = ?`,
-		PostStatusPublished, messageID, now, now, id, PostStatusPublishing)
+		PostStatusPublished, messageID, messageURL, now, now, id, PostStatusPublishing)
 	if err != nil {
 		return Post{}, fmt.Errorf("mark published: %w", err)
 	}
@@ -1171,7 +1207,9 @@ UPDATE posts SET status = ?, last_error = ?, scheduled_at = NULL, updated_at = ?
 
 func (s *Store) ClearPublication(ctx context.Context, id int64) (Post, error) {
 	result, err := s.db.ExecContext(ctx, `
-UPDATE posts SET status = ?, max_message_id = '', published_at = NULL, last_error = '', updated_at = ?
+UPDATE posts SET status = ?, max_message_id = '', max_message_url = '', max_views = NULL,
+                 max_stats_synced_at = NULL, max_stats_attempted_at = NULL, max_is_pinned = FALSE,
+                 published_at = NULL, last_error = '', updated_at = ?
 WHERE id = ? AND status != ?`, PostStatusDraft, nowText(), id, PostStatusPublishing)
 	if err != nil {
 		return Post{}, fmt.Errorf("clear publication: %w", err)
@@ -1182,8 +1220,9 @@ WHERE id = ? AND status != ?`, PostStatusDraft, nowText(), id, PostStatusPublish
 	return s.GetPost(ctx, id)
 }
 
-const postColumns = `id, owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt,
-notify, disable_link_preview, scheduled_at, max_message_id, last_error, created_at, updated_at, published_at`
+const postColumns = `id, owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
+notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views, max_stats_synced_at,
+max_stats_attempted_at, max_is_pinned, last_error, created_at, updated_at, published_at`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -1214,10 +1253,13 @@ func (s *Store) postWriteMiss(ctx context.Context, id int64, message string) err
 func scanPost(row scanner) (Post, error) {
 	var post Post
 	var channelID sql.NullInt64
-	var scheduledAt, publishedAt sql.NullTime
+	var scheduledAt, publishedAt, statsSyncedAt, statsAttemptedAt sql.NullTime
+	var maxViews sql.NullInt64
+	var linkButtonsJSON []byte
 	if err := row.Scan(&post.ID, &post.UserID, &post.Title, &post.Content, &post.Format, &post.Status, &channelID,
-		&post.ImageURL, &post.ImagePath, &post.ImagePrompt, &post.Notify, &post.DisableLinkPreview,
-		&scheduledAt, &post.MAXMessageID, &post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt); err != nil {
+		&post.ImageURL, &post.ImagePath, &post.ImagePrompt, &linkButtonsJSON, &post.Notify, &post.DisableLinkPreview,
+		&scheduledAt, &post.MAXMessageID, &post.MAXMessageURL, &maxViews, &statsSyncedAt, &statsAttemptedAt, &post.MAXIsPinned,
+		&post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Post{}, ErrNotFound
 		}
@@ -1226,7 +1268,17 @@ func scanPost(row scanner) (Post, error) {
 	if channelID.Valid {
 		post.ChannelID = &channelID.Int64
 	}
+	linkButtons, err := unmarshalLinkButtons(linkButtonsJSON)
+	if err != nil {
+		return Post{}, fmt.Errorf("scan post: %w", err)
+	}
+	post.LinkButtons = linkButtons
 	post.ScheduledAt = parseNullableTime(scheduledAt)
+	if maxViews.Valid {
+		post.MAXViews = &maxViews.Int64
+	}
+	post.MAXStatsSyncedAt = parseNullableTime(statsSyncedAt)
+	post.MAXStatsAttemptedAt = parseNullableTime(statsAttemptedAt)
 	post.PublishedAt = parseNullableTime(publishedAt)
 	post.CreatedAt = post.CreatedAt.UTC()
 	post.UpdatedAt = post.UpdatedAt.UTC()

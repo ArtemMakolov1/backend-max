@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	authSessionColumns   = `token_hash, yandex_user_id, login, email, display_name, allowlist_identity, created_at, expires_at`
+	authSessionColumns   = `token_hash, yandex_user_id, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at`
 	oauthStateColumns    = `state_hash, pkce_verifier, return_to, terms_version, personal_data_version, consent_at, created_at, expires_at`
 	maxActiveOAuthStates = 1024
 )
@@ -39,11 +39,11 @@ func (s *Store) CreateAuthenticatedSession(ctx context.Context, user User, conse
 	defer func() { _ = tx.Rollback() }()
 	now := session.CreatedAt.UTC()
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO users(id, login, email, display_name, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $5)
+INSERT INTO users(id, login, email, display_name, avatar_url, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $6)
 ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
-display_name = excluded.display_name, updated_at = excluded.updated_at`,
-		user.ID, user.Login, user.Email, user.DisplayName, now); err != nil {
+display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_at = excluded.updated_at`,
+		user.ID, user.Login, user.Email, user.DisplayName, user.AvatarURL, now); err != nil {
 		return fmt.Errorf("upsert authenticated user: %w", err)
 	}
 	for _, consent := range consents {
@@ -65,9 +65,9 @@ ON CONFLICT(owner_id, document, version) DO NOTHING`, user.ID, consent.Document,
 		return fmt.Errorf("delete expired auth sessions: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, allowlist_identity, created_at, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, session.TokenHash, session.YandexUserID,
-		session.Login, session.Email, session.DisplayName, session.AllowlistIdentity, now, session.ExpiresAt.UTC()); err != nil {
+INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, session.TokenHash, session.YandexUserID,
+		session.Login, session.Email, session.DisplayName, session.AvatarURL, session.AllowlistIdentity, now, session.ExpiresAt.UTC()); err != nil {
 		return fmt.Errorf("create auth session: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -85,11 +85,11 @@ func (s *Store) UpsertUser(ctx context.Context, user User) error {
 		now = user.CreatedAt.UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO users(id, login, email, display_name, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)
+INSERT INTO users(id, login, email, display_name, avatar_url, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
-display_name = excluded.display_name, updated_at = excluded.updated_at`, user.ID, user.Login,
-		user.Email, user.DisplayName, now, time.Now().UTC())
+display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_at = excluded.updated_at`, user.ID, user.Login,
+		user.Email, user.DisplayName, user.AvatarURL, now, time.Now().UTC())
 	if err != nil {
 		return fmt.Errorf("upsert user: %w", err)
 	}
@@ -98,9 +98,9 @@ display_name = excluded.display_name, updated_at = excluded.updated_at`, user.ID
 
 func (s *Store) GetUser(ctx context.Context, userID string) (User, error) {
 	var user User
-	if err := s.db.QueryRowContext(ctx, `SELECT id, login, email, display_name, created_at, updated_at
+	if err := s.db.QueryRowContext(ctx, `SELECT id, login, email, display_name, avatar_url, created_at, updated_at
 FROM users WHERE id = ?`, userID).Scan(&user.ID, &user.Login, &user.Email, &user.DisplayName,
-		&user.CreatedAt, &user.UpdatedAt); err != nil {
+		&user.AvatarURL, &user.CreatedAt, &user.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
 		}
@@ -131,11 +131,11 @@ func (s *Store) CreateAuthSession(ctx context.Context, session AuthSession) erro
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO users(id, login, email, display_name, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $5)
+INSERT INTO users(id, login, email, display_name, avatar_url, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $6)
 ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
-display_name = excluded.display_name, updated_at = excluded.updated_at`, session.YandexUserID,
-		session.Login, session.Email, session.DisplayName, session.CreatedAt.UTC()); err != nil {
+display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_at = excluded.updated_at`, session.YandexUserID,
+		session.Login, session.Email, session.DisplayName, session.AvatarURL, session.CreatedAt.UTC()); err != nil {
 		return fmt.Errorf("upsert auth session user: %w", err)
 	}
 
@@ -143,10 +143,10 @@ display_name = excluded.display_name, updated_at = excluded.updated_at`, session
 		return fmt.Errorf("delete expired auth sessions: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, allowlist_identity, created_at, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		session.TokenHash, session.YandexUserID, session.Login, session.Email, session.DisplayName,
-		session.AllowlistIdentity, session.CreatedAt.UTC(), session.ExpiresAt.UTC()); err != nil {
+		session.AvatarURL, session.AllowlistIdentity, session.CreatedAt.UTC(), session.ExpiresAt.UTC()); err != nil {
 		return fmt.Errorf("create auth session: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -266,7 +266,7 @@ func (s *Store) ConsumeOAuthState(ctx context.Context, stateHash string, now tim
 func scanAuthSession(row scanner) (AuthSession, error) {
 	var session AuthSession
 	if err := row.Scan(&session.TokenHash, &session.YandexUserID, &session.Login, &session.Email,
-		&session.DisplayName, &session.AllowlistIdentity, &session.CreatedAt, &session.ExpiresAt); err != nil {
+		&session.DisplayName, &session.AvatarURL, &session.AllowlistIdentity, &session.CreatedAt, &session.ExpiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AuthSession{}, ErrNotFound
 		}

@@ -73,6 +73,49 @@ func TestTenantIsolationAndCompositeChannelOwnership(t *testing.T) {
 	}
 }
 
+func TestChannelVisualMetadataRefreshIsTenantScoped(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "channel-visual-tenant.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	for _, id := range []string{"tenant-a", "tenant-b"} {
+		if err := storage.UpsertUser(ctx, User{ID: id, DisplayName: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	channel, err := storage.CreateChannel(ctx, Channel{
+		UserID: "tenant-a", VerifiedMAXOwnerID: "max-a", MAXChatID: "visual-tenant",
+		Title: "A", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := storage.RefreshChannelVisualMetadataForUser(ctx, "tenant-b", channel.ID,
+		"https://cdn.max.ru/foreign.png", 999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign visual metadata refresh error = %v, want ErrNotFound", err)
+	}
+	stored, err := storage.GetChannelForUser(ctx, "tenant-a", channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.IconURL != "" || stored.ParticipantsCount != 0 {
+		t.Fatalf("foreign tenant changed channel metadata: %#v", stored)
+	}
+
+	stored, err = storage.RefreshChannelVisualMetadataForUser(ctx, "tenant-a", channel.ID,
+		"https://cdn.max.ru/owner.png", 25)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.IconURL != "https://cdn.max.ru/owner.png" || stored.ParticipantsCount != 25 {
+		t.Fatalf("owner visual metadata was not refreshed: %#v", stored)
+	}
+}
+
 func TestChannelClaimIsOneTimeOwnerBoundAndConflictsAcrossTenants(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

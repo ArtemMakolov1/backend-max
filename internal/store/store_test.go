@@ -67,6 +67,55 @@ func TestChannelVisualMetadataPersistsAcrossOperations(t *testing.T) {
 	}
 }
 
+func TestObservedChatRefreshesConnectedChannelVisualMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "observed-channel-metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	channel, err := storage.CreateChannel(ctx, Channel{
+		MAXChatID: "visual-refresh-1", Title: "Old title", PublicLink: "https://max.ru/old",
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedAt := time.Now().UTC().Truncate(time.Microsecond)
+	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
+		MAXChatID: "visual-refresh-1", Title: "Fresh title", PublicLink: "https://max.ru/fresh",
+		MAXOwnerID: "owner", IconURL: "https://cdn.max.ru/fresh.png", ParticipantsCount: 42,
+		Active: true, LastSeenAt: observedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	channel, err = storage.GetChannel(ctx, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.Title != "Old title" || channel.PublicLink != "https://max.ru/old" ||
+		channel.IconURL != "https://cdn.max.ru/fresh.png" || channel.ParticipantsCount != 42 {
+		t.Fatalf("connected channel was not refreshed from its observed MAX chat: %#v", channel)
+	}
+
+	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
+		MAXChatID: "visual-refresh-1", Title: "Stale title", IconURL: "https://cdn.max.ru/stale.png",
+		Active: true, LastSeenAt: observedAt.Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	channel, err = storage.GetChannel(ctx, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.Title != "Old title" || channel.IconURL != "https://cdn.max.ru/fresh.png" {
+		t.Fatalf("stale observation replaced current channel metadata: %#v", channel)
+	}
+}
+
 func TestPostLifecycleAndScheduling(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -113,7 +162,7 @@ func TestPostLifecycleAndScheduling(t *testing.T) {
 	if post.Status != PostStatusPublishing {
 		t.Fatalf("status = %q", post.Status)
 	}
-	post, err = storage.MarkPublished(ctx, post.ID, "message-1")
+	post, err = storage.MarkPublished(ctx, post.ID, "message-1", "https://max.ru/test/message-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,11 +211,11 @@ func TestPublishingStateCASAndRecovery(t *testing.T) {
 	if _, err := storage.DuplicatePost(ctx, post.ID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("DuplicatePost() error = %v, want ErrConflict", err)
 	}
-	post, err = storage.MarkPublished(ctx, post.ID, "mid-1")
+	post, err = storage.MarkPublished(ctx, post.ID, "mid-1", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.MarkPublished(ctx, post.ID, "mid-2"); !errors.Is(err, ErrConflict) {
+	if _, err := storage.MarkPublished(ctx, post.ID, "mid-2", ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("second MarkPublished() error = %v, want ErrConflict", err)
 	}
 	if _, err := storage.SetPostScheduled(ctx, post.ID, time.Now().Add(time.Hour)); !errors.Is(err, ErrConflict) {
@@ -259,7 +308,7 @@ func TestChannelDeletionProtectsPublicationDependencies(t *testing.T) {
 	if published, err = storage.ClaimForPublishing(ctx, published.ID); err != nil {
 		t.Fatal(err)
 	}
-	if published, err = storage.MarkPublished(ctx, published.ID, "mid-20"); err != nil {
+	if published, err = storage.MarkPublished(ctx, published.ID, "mid-20", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -546,7 +595,7 @@ func TestStaleAutosaveCannotRevertPublicationOrReschedule(t *testing.T) {
 	if _, err = storage.ClaimScheduledForPublishing(ctx, post.ID, now); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = storage.MarkPublished(ctx, post.ID, "max-message-1"); err != nil {
+	if _, err = storage.MarkPublished(ctx, post.ID, "max-message-1", ""); err != nil {
 		t.Fatal(err)
 	}
 	staleTitle := "stale browser edit"

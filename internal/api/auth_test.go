@@ -51,7 +51,8 @@ func (f *fakeYandexOAuth) UserInfo(_ context.Context, token string) (yandexauth.
 func TestYandexOAuthCreatesServerSessionAndLogoutInvalidatesIt(t *testing.T) {
 	handler, provider, server := newYandexAuthTestHandler(t, []string{"42"}, yandexauth.Profile{
 		ID: "42", PSUID: "app-scoped-42", ClientID: "client-id", Login: "editor",
-		DefaultEmail: "editor@example.ru", DisplayName: "Редактор",
+		DefaultEmail: "editor@example.ru", DisplayName: "Отображаемое имя", RealName: "Полное имя",
+		FirstName: "Анна", LastName: "Иванова", DefaultAvatarID: "1824/2a0000018f-avatar",
 	})
 
 	state, stateCookie := beginYandexAuth(t, handler, "/app/#/calendar")
@@ -94,8 +95,31 @@ func TestYandexOAuthCreatesServerSessionAndLogoutInvalidatesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	user, _ := healthBody["user"].(map[string]any)
-	if healthBody["authenticated"] != true || healthBody["auth_method"] != "yandex" || user["display_name"] != "Редактор" {
+	wantAvatarURL := "https://avatars.yandex.net/get-yapic/1824/2a0000018f-avatar/islands-200"
+	if healthBody["authenticated"] != true || healthBody["auth_method"] != "yandex" ||
+		user["display_name"] != "Анна Иванова" || user["avatar_url"] != wantAvatarURL {
 		t.Fatalf("health auth state = %#v", healthBody)
+	}
+	if strings.Contains(healthResponse.Body.String(), "provider-access-token") {
+		t.Fatal("health response exposed the Yandex OAuth access token")
+	}
+	storedUser, err := server.app.Store().GetUser(context.Background(), "app-scoped-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedSession, err := server.app.Store().GetAuthSession(context.Background(), sha256Hex(sessionCookie.Value), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedUser.DisplayName != "Анна Иванова" || storedUser.AvatarURL != wantAvatarURL ||
+		storedSession.DisplayName != "Анна Иванова" || storedSession.AvatarURL != wantAvatarURL {
+		t.Fatalf("persisted Yandex profile = user %#v, session %#v", storedUser, storedSession)
+	}
+	for _, value := range []string{storedUser.Login, storedUser.Email, storedUser.DisplayName, storedUser.AvatarURL,
+		storedSession.Login, storedSession.Email, storedSession.DisplayName, storedSession.AvatarURL, storedSession.AllowlistIdentity} {
+		if strings.Contains(value, "provider-access-token") {
+			t.Fatal("database persisted the Yandex OAuth access token")
+		}
 	}
 
 	server.yandexAllowed["someone-else"] = struct{}{}
@@ -135,6 +159,30 @@ func TestYandexOAuthCreatesServerSessionAndLogoutInvalidatesIt(t *testing.T) {
 	handler.ServeHTTP(afterLogoutResponse, afterLogout)
 	if afterLogoutResponse.Code != http.StatusUnauthorized {
 		t.Fatalf("after logout status = %d, want 401", afterLogoutResponse.Code)
+	}
+}
+
+func TestYandexDisplayNamePriority(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		profile yandexauth.Profile
+		want    string
+	}{
+		{name: "first and last", profile: yandexauth.Profile{FirstName: " Анна ", LastName: " Иванова ", RealName: "Реальное", DisplayName: "Публичное", Login: "login"}, want: "Анна Иванова"},
+		{name: "real name", profile: yandexauth.Profile{RealName: "Реальное имя", DisplayName: "Публичное", Login: "login"}, want: "Реальное имя"},
+		{name: "display name", profile: yandexauth.Profile{DisplayName: "Публичное", Login: "login"}, want: "Публичное"},
+		{name: "login", profile: yandexauth.Profile{Login: "editor"}, want: "editor"},
+		{name: "fallback", profile: yandexauth.Profile{}, want: "Пользователь Яндекса"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := yandexDisplayName(test.profile); got != test.want {
+				t.Fatalf("yandexDisplayName() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

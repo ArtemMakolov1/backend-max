@@ -17,28 +17,30 @@ import (
 )
 
 type createPostRequest struct {
-	Title              string          `json:"title"`
-	Content            string          `json:"content"`
-	Format             string          `json:"format"`
-	ChannelID          *int64          `json:"channel_id,omitempty"`
-	ImageURL           string          `json:"image_url,omitempty"`
-	ImagePrompt        string          `json:"image_prompt,omitempty"`
-	Notify             *bool           `json:"notify,omitempty"`
-	DisableLinkPreview bool            `json:"disable_link_preview"`
-	ScheduledAt        json.RawMessage `json:"scheduled_at,omitempty"`
+	Title              string             `json:"title"`
+	Content            string             `json:"content"`
+	Format             string             `json:"format"`
+	ChannelID          *int64             `json:"channel_id,omitempty"`
+	ImageURL           string             `json:"image_url,omitempty"`
+	ImagePrompt        string             `json:"image_prompt,omitempty"`
+	LinkButtons        []store.LinkButton `json:"link_buttons,omitempty"`
+	Notify             *bool              `json:"notify,omitempty"`
+	DisableLinkPreview bool               `json:"disable_link_preview"`
+	ScheduledAt        json.RawMessage    `json:"scheduled_at,omitempty"`
 }
 
 type updatePostRequest struct {
-	Title              *string         `json:"title,omitempty"`
-	Content            *string         `json:"content,omitempty"`
-	Format             *string         `json:"format,omitempty"`
-	ChannelID          json.RawMessage `json:"channel_id,omitempty"`
-	ImageURL           json.RawMessage `json:"image_url,omitempty"`
-	ImagePrompt        *string         `json:"image_prompt,omitempty"`
-	Notify             *bool           `json:"notify,omitempty"`
-	DisableLinkPreview *bool           `json:"disable_link_preview,omitempty"`
-	ScheduledAt        json.RawMessage `json:"scheduled_at,omitempty"`
-	ExpectedUpdatedAt  *string         `json:"expected_updated_at,omitempty"`
+	Title              *string             `json:"title,omitempty"`
+	Content            *string             `json:"content,omitempty"`
+	Format             *string             `json:"format,omitempty"`
+	ChannelID          json.RawMessage     `json:"channel_id,omitempty"`
+	ImageURL           json.RawMessage     `json:"image_url,omitempty"`
+	ImagePrompt        *string             `json:"image_prompt,omitempty"`
+	LinkButtons        *[]store.LinkButton `json:"link_buttons,omitempty"`
+	Notify             *bool               `json:"notify,omitempty"`
+	DisableLinkPreview *bool               `json:"disable_link_preview,omitempty"`
+	ScheduledAt        json.RawMessage     `json:"scheduled_at,omitempty"`
+	ExpectedUpdatedAt  *string             `json:"expected_updated_at,omitempty"`
 }
 
 type scheduleRequest struct {
@@ -96,6 +98,10 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	if err := store.ValidateLinkButtonsDraft(request.LinkButtons); err != nil {
+		s.writeError(w, err)
+		return
+	}
 	if request.ChannelID != nil {
 		if *request.ChannelID <= 0 {
 			s.problem(w, http.StatusBadRequest, "validation_error", "channel_id must be positive", nil)
@@ -120,7 +126,7 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		Title:  strings.TrimSpace(request.Title), Content: request.Content, Format: request.Format,
 		Status: store.PostStatusDraft, ChannelID: request.ChannelID, ImageURL: request.ImageURL,
 		ImagePath: imagePath, ImagePrompt: request.ImagePrompt, Notify: notify,
-		DisableLinkPreview: request.DisableLinkPreview,
+		LinkButtons: request.LinkButtons, DisableLinkPreview: request.DisableLinkPreview,
 	}
 	if len(request.ScheduledAt) > 0 {
 		scheduledAt, err := decodeScheduledAt(request.ScheduledAt)
@@ -219,8 +225,15 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 
 	changes := store.PostChanges{
 		Title: request.Title, Content: request.Content, Format: request.Format,
-		ImagePrompt: request.ImagePrompt, Notify: request.Notify,
+		ImagePrompt: request.ImagePrompt, LinkButtons: request.LinkButtons, Notify: request.Notify,
 		DisableLinkPreview: request.DisableLinkPreview,
+	}
+	if request.LinkButtons != nil {
+		if err := store.ValidateLinkButtonsDraft(*request.LinkButtons); err != nil {
+			s.writeError(w, err)
+			return
+		}
+		candidate.LinkButtons = *request.LinkButtons
 	}
 	if len(request.ChannelID) > 0 {
 		channelID, err := decodeNullableInt64(request.ChannelID)

@@ -109,6 +109,34 @@ func TestAIResearchQuotaRejectsBeforeUpstream(t *testing.T) {
 	}
 }
 
+func TestAIFormattingAndResearchShareTheResearchQuota(t *testing.T) {
+	t.Parallel()
+	research := &fakeResearchClient{
+		result:       openairesearch.Result{Topic: "Тема поста"},
+		formatResult: openairesearch.FormatResult{Content: "# Текст поста"},
+	}
+	options := testAILimitOptions()
+	options.ResearchPerMinute = 1
+	server, storage, rawHandler := newAIQuotaTestServer(t, nil, research, options, "format-quota-user")
+	quotaNow := time.Now().UTC().Truncate(time.Minute).Add(30 * time.Second)
+	server.now = func() time.Time { return quotaNow }
+	handler := withTestSession(t, storage, rawHandler, "format-quota-user")
+
+	formatted := performJSONRequest(handler, http.MethodPost, "/api/v1/posts/format-content",
+		`{"content":"Текст поста","format":"markdown"}`)
+	if formatted.Code != http.StatusOK {
+		t.Fatalf("format status = %d, body=%s", formatted.Code, formatted.Body.String())
+	}
+	researchRejected := performJSONRequest(handler, http.MethodPost, "/api/v1/research/generate",
+		`{"topic":"Тема поста","tone":"Деловой","format":"markdown","include_sources":false}`)
+	assertAI429(t, researchRejected, store.AILimitReasonMinute, "30")
+	research.mu.Lock()
+	defer research.mu.Unlock()
+	if len(research.formatRequests) != 1 || len(research.requests) != 0 {
+		t.Fatalf("quota upstream calls: format=%d research=%d", len(research.formatRequests), len(research.requests))
+	}
+}
+
 func TestAIEndpointsReportUnavailableWithoutOpenAIClient(t *testing.T) {
 	t.Parallel()
 	options := testAILimitOptions()

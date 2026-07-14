@@ -126,3 +126,46 @@ func TestOAuthSecretsNeverFollowRedirects(t *testing.T) {
 		t.Fatalf("redirect target calls = %d, want 0", targetCalls.Load())
 	}
 }
+
+func TestAvatarURLAllowsOfficialNestedIDsAndRejectsUnsafeValues(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		profile Profile
+		want    string
+	}{
+		{name: "simple", profile: Profile{DefaultAvatarID: "avatar_42-1"}, want: "https://avatars.yandex.net/get-yapic/avatar_42-1/islands-200"},
+		{name: "official nested id", profile: Profile{DefaultAvatarID: "1824/2a0000018f-avatar"}, want: "https://avatars.yandex.net/get-yapic/1824/2a0000018f-avatar/islands-200"},
+		{name: "empty flag", profile: Profile{DefaultAvatarID: "1824/avatar", IsAvatarEmpty: true}},
+		{name: "missing id", profile: Profile{}},
+		{name: "path traversal", profile: Profile{DefaultAvatarID: "1824/../secret"}},
+		{name: "double dot", profile: Profile{DefaultAvatarID: "avatar..secret"}},
+		{name: "empty segment", profile: Profile{DefaultAvatarID: "1824//avatar"}},
+		{name: "dot segment", profile: Profile{DefaultAvatarID: "1824/./avatar"}},
+		{name: "query", profile: Profile{DefaultAvatarID: "1824/avatar?size=999"}},
+		{name: "fragment", profile: Profile{DefaultAvatarID: "1824/avatar#fragment"}},
+		{name: "backslash", profile: Profile{DefaultAvatarID: `1824\avatar`}},
+		{name: "unicode", profile: Profile{DefaultAvatarID: "1824/аватар"}},
+		{name: "surrounding whitespace", profile: Profile{DefaultAvatarID: " 1824/avatar "}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := AvatarURL(test.profile); got != test.want {
+				t.Fatalf("AvatarURL() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestProfileDecodesAvatarEmptyFlag(t *testing.T) {
+	t.Parallel()
+	var profile Profile
+	if err := json.Unmarshal([]byte(`{"id":"42","default_avatar_id":"1824/avatar","is_avatar_empty":true}`), &profile); err != nil {
+		t.Fatal(err)
+	}
+	if !profile.IsAvatarEmpty || profile.DefaultAvatarID != "1824/avatar" || AvatarURL(profile) != "" {
+		t.Fatalf("profile = %#v", profile)
+	}
+}

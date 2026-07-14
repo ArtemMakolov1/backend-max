@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -39,6 +40,26 @@ type Profile struct {
 	FirstName       string   `json:"first_name"`
 	LastName        string   `json:"last_name"`
 	DefaultAvatarID string   `json:"default_avatar_id"`
+	IsAvatarEmpty   bool     `json:"is_avatar_empty"`
+}
+
+var yandexAvatarIDPattern = regexp.MustCompile(`^[A-Za-z0-9_./-]+$`)
+
+func AvatarURL(profile Profile) string {
+	avatarID := profile.DefaultAvatarID
+	if profile.IsAvatarEmpty || avatarID == "" || avatarID != strings.TrimSpace(avatarID) ||
+		!yandexAvatarIDPattern.MatchString(avatarID) || strings.Contains(avatarID, "..") ||
+		strings.ContainsAny(avatarID, "?#") {
+		return ""
+	}
+	segments := strings.Split(avatarID, "/")
+	for index, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			return ""
+		}
+		segments[index] = url.PathEscape(segment)
+	}
+	return "https://avatars.yandex.net/get-yapic/" + strings.Join(segments, "/") + "/islands-200"
 }
 
 type Error struct {

@@ -126,6 +126,7 @@ func (s *Server) Handler() http.Handler {
 
 			r.Get("/posts", s.listPosts)
 			r.Post("/posts", s.createPost)
+			r.Post("/posts/format-content", s.formatPostContent)
 			r.Get("/posts/{id}", s.getPost)
 			r.Patch("/posts/{id}", s.updatePost)
 			r.Put("/posts/{id}", s.updatePost)
@@ -140,6 +141,10 @@ func (s *Server) Handler() http.Handler {
 			r.Post("/posts/{id}/publish", s.publishPost)
 			r.Post("/posts/{id}/sync", s.updatePublishedPost)
 			r.Post("/posts/{id}/update-published", s.updatePublishedPost)
+			r.Post("/posts/{id}/sync-max", s.syncMAXPublication)
+			r.Post("/posts/{id}/pin", s.pinPost)
+			r.Delete("/posts/{id}/pin", s.unpinPost)
+			r.Get("/posts/{id}/view-history", s.getPostViewHistory)
 			r.Post("/posts/{id}/delete-publication", s.deletePublication)
 			r.Delete("/posts/{id}/publication", s.deletePublication)
 
@@ -169,8 +174,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	status := s.authenticationStatus(r)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok", "max_configured": s.app.MAXConfigured(), "openai_configured": s.app.OpenAIConfigured(),
-		"research_configured": s.app.ResearchConfigured(),
-		"auth_required":       status.Required, "authenticated": status.Authenticated,
+		"research_configured": s.app.ResearchConfigured(), "content_formatting_configured": s.app.ContentFormattingConfigured(),
+		"auth_required": status.Required, "authenticated": status.Authenticated,
 		"auth_methods": status.Methods, "auth_method": status.Method, "user": status.User,
 		"session_expires_at": status.SessionExpiresAt,
 	})

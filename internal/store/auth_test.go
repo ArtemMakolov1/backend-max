@@ -26,7 +26,8 @@ func TestAuthSessionLifecycleAndExpiry(t *testing.T) {
 	tokenHash := strings.Repeat("a", 64)
 	want := AuthSession{
 		TokenHash: tokenHash, YandexUserID: "123456789", Login: "writer",
-		Email: "writer@example.test", DisplayName: "Тестовый автор", AllowlistIdentity: "123456789",
+		Email: "writer@example.test", DisplayName: "Тестовый автор",
+		AvatarURL: "https://avatars.yandex.net/get-yapic/1824/avatar/islands-200", AllowlistIdentity: "123456789",
 		CreatedAt: createdAt, ExpiresAt: expiresAt,
 	}
 	if err := storage.CreateAuthSession(ctx, want); err != nil {
@@ -38,8 +39,16 @@ func TestAuthSessionLifecycleAndExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.TokenHash != want.TokenHash || got.YandexUserID != want.YandexUserID || got.Login != want.Login ||
-		got.Email != want.Email || got.DisplayName != want.DisplayName || got.AllowlistIdentity != want.AllowlistIdentity {
+		got.Email != want.Email || got.DisplayName != want.DisplayName || got.AvatarURL != want.AvatarURL ||
+		got.AllowlistIdentity != want.AllowlistIdentity {
 		t.Fatalf("GetAuthSession() = %#v, want %#v", got, want)
+	}
+	user, err := storage.GetUser(ctx, want.YandexUserID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.DisplayName != want.DisplayName || user.AvatarURL != want.AvatarURL {
+		t.Fatalf("GetUser() = %#v", user)
 	}
 	if !got.CreatedAt.Equal(createdAt) || !got.ExpiresAt.Equal(expiresAt) {
 		t.Fatalf("stored times = (%s, %s), want (%s, %s)", got.CreatedAt, got.ExpiresAt, createdAt, expiresAt)

@@ -36,6 +36,12 @@ type claimWebhookMAX struct {
 	publishRuns       int
 	getChatIDs        []string
 	getLinkErr        error
+	message           maxclient.Message
+	pinnedMessage     *maxclient.Message
+	getMessageErr     error
+	getPinnedErr      error
+	pinRuns           int
+	unpinRuns         int
 }
 
 func (f *claimWebhookMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
@@ -56,6 +62,20 @@ func (f *claimWebhookMAX) GetChatByLink(context.Context, string) (maxclient.Chat
 
 func (f *claimWebhookMAX) GetMembership(context.Context, string) (maxclient.Membership, error) {
 	return f.membership, nil
+}
+func (f *claimWebhookMAX) GetMessage(context.Context, string) (maxclient.Message, error) {
+	return f.message, f.getMessageErr
+}
+func (f *claimWebhookMAX) GetPinnedMessage(context.Context, string) (*maxclient.Message, error) {
+	return f.pinnedMessage, f.getPinnedErr
+}
+func (f *claimWebhookMAX) PinMessage(context.Context, string, string) error {
+	f.pinRuns++
+	return nil
+}
+func (f *claimWebhookMAX) UnpinMessage(context.Context, string) error {
+	f.unpinRuns++
+	return nil
 }
 
 func (f *claimWebhookMAX) SendClaimConfirmation(_ context.Context, maxUserID, title, link, requesterLabel,

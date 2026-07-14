@@ -141,6 +141,43 @@ func TestGenerateUsesWebSearchCitationsThenStructuredOutput(t *testing.T) {
 	}
 }
 
+func TestDraftPayloadRequiresMAXSupportedMarkdownHeading(t *testing.T) {
+	t.Parallel()
+	payload := draftPayload("gpt-5.4-mini", Request{
+		Topic: "Тема поста", Tone: "Деловой", Format: "markdown",
+	}, "Проверенный отчёт", nil)
+	if len(payload.Input) == 0 {
+		t.Fatal("draft payload has no system instruction")
+	}
+	instruction := payload.Input[0].Content
+	for _, required := range []string{
+		"каждый заголовок начинай ровно с `# `",
+		"никогда не используй уровни `##`–`######`",
+		"MAX их не поддерживает",
+		"запрещены списки, таблицы, autolinks, горизонтальные линии, fenced code blocks, HTML и встроенные изображения",
+		"Для html разрешены только <i>, <em>, <b>, <strong>",
+	} {
+		if !strings.Contains(instruction, required) {
+			t.Fatalf("draft instruction is missing %q: %s", required, instruction)
+		}
+	}
+	if strings.Contains(instruction, "ссылки, списки") {
+		t.Fatalf("draft instruction still promises unsupported MAX lists: %s", instruction)
+	}
+}
+
+func TestDecodeDraftRejectsUnsupportedMAXMarkup(t *testing.T) {
+	t.Parallel()
+	for _, content := range []string{"## Заголовок", "- пункт", "<b>HTML в markdown</b>", "[сайт](http://example.com)"} {
+		value, _ := json.Marshal(Draft{
+			Title: "Заголовок", Content: content, Format: "markdown", ImagePrompt: "Иллюстрация",
+		})
+		if _, err := decodeDraft(string(value), "markdown"); err == nil {
+			t.Fatalf("decodeDraft() accepted unsupported content %q", content)
+		}
+	}
+}
+
 func TestResearchAPIKeyNeverFollowsRedirect(t *testing.T) {
 	t.Parallel()
 	var targetCalls atomic.Int32
