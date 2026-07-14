@@ -9,7 +9,8 @@ fi
 
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
-install -d "$fixture/bin" "$fixture/backups" "$fixture/state-success" "$fixture/state-failure"
+install -d "$fixture/bin" "$fixture/backups" "$fixture/state-success" "$fixture/state-retry" \
+  "$fixture/state-ambiguous" "$fixture/state-failure"
 ln -s "$repo_root/deploy/tests/fake-backup-curl.sh" "$fixture/bin/curl"
 for command in jq openssl sha256sum stat tar readlink sleep awk basename dirname mktemp chmod rm; do
   ln -s "$(type -P "$command")" "$fixture/bin/$command"
@@ -49,10 +50,43 @@ PATH="$fixture/bin:/usr/bin:/bin" \
   "$dump" "$media" "$manifest" "$image" >/dev/null
 
 [[ -s "$fixture/state-success/asset" && ! -e "$fixture/state-success/deleted" ]]
+[[ $(<"$fixture/state-success/create-calls") == 1 ]]
 openssl cms -decrypt -binary -inform DER -inkey "$fixture/private-key.pem" \
   -in "$fixture/state-success/asset" -out "$fixture/roundtrip.tar"
 tar -tf "$fixture/roundtrip.tar" | grep -Fx metadata.json >/dev/null
 tar -tf "$fixture/roundtrip.tar" | grep -Fx "$(basename "$dump")" >/dev/null
+
+PATH="$fixture/bin:/usr/bin:/bin" \
+  TEST_CURL_STATE="$fixture/state-retry" TEST_CONNECT_FAILURE_ONCE=true \
+  MAXPOSTY_BACKUP_CONNECT_ATTEMPTS=2 MAXPOSTY_BACKUP_CONNECT_RETRY_DELAY=0 \
+  MAXPOSTY_BACKUP_CURL_CONFIG="$fixture/curl.config" \
+  MAXPOSTY_BACKUP_REPOSITORY=example/backend \
+  MAXPOSTY_BACKUP_SOURCE_SHA="$sha" \
+  MAXPOSTY_BACKUP_RECIPIENT_CERT="$fixture/recipient.pem" \
+  MAXPOSTY_BACKUP_API_URL=http://127.0.0.1:8123 \
+  MAXPOSTY_BACKUP_UPLOAD_URL=http://127.0.0.1:8123 \
+  "$repo_root/deploy/backup/after-backup-github-release.sh" \
+  "$dump" "$media" "$manifest" "$image" >/dev/null
+[[ -e "$fixture/state-retry/connect-failure-injected" ]]
+[[ -s "$fixture/state-retry/asset" && ! -e "$fixture/state-retry/deleted" ]]
+[[ $(<"$fixture/state-retry/create-calls") == 2 ]]
+
+if PATH="$fixture/bin:/usr/bin:/bin" \
+  TEST_CURL_STATE="$fixture/state-ambiguous" TEST_ESTABLISHED_TIMEOUT_ONCE=true \
+  MAXPOSTY_BACKUP_CONNECT_ATTEMPTS=2 MAXPOSTY_BACKUP_CONNECT_RETRY_DELAY=0 \
+  MAXPOSTY_BACKUP_CURL_CONFIG="$fixture/curl.config" \
+  MAXPOSTY_BACKUP_REPOSITORY=example/backend \
+  MAXPOSTY_BACKUP_SOURCE_SHA="$sha" \
+  MAXPOSTY_BACKUP_RECIPIENT_CERT="$fixture/recipient.pem" \
+  MAXPOSTY_BACKUP_API_URL=http://127.0.0.1:8123 \
+  MAXPOSTY_BACKUP_UPLOAD_URL=http://127.0.0.1:8123 \
+  "$repo_root/deploy/backup/after-backup-github-release.sh" \
+  "$dump" "$media" "$manifest" "$image" >/dev/null 2>&1; then
+  echo "Offsite backup retried an ambiguous request after connecting" >&2
+  exit 1
+fi
+[[ -e "$fixture/state-ambiguous/established-timeout-injected" ]]
+[[ $(<"$fixture/state-ambiguous/create-calls") == 1 ]]
 
 cp "$fixture/state-success/asset" "$fixture/tampered.cms"
 size=$(stat -c '%s' "$fixture/tampered.cms")

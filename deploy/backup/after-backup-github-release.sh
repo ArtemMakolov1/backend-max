@@ -20,6 +20,8 @@ recipient_cert=${MAXPOSTY_BACKUP_RECIPIENT_CERT:-/opt/maxposty/backend/certs/bac
 api_url=${MAXPOSTY_BACKUP_API_URL:-https://api.github.com}
 upload_url=${MAXPOSTY_BACKUP_UPLOAD_URL:-https://uploads.github.com}
 max_plaintext_bytes=${MAXPOSTY_BACKUP_MAX_PLAINTEXT_BYTES:-536870912}
+connect_attempts=${MAXPOSTY_BACKUP_CONNECT_ATTEMPTS:-4}
+connect_retry_delay=${MAXPOSTY_BACKUP_CONNECT_RETRY_DELAY:-2}
 
 fail() {
   echo "Offsite backup failed: $*" >&2
@@ -38,6 +40,12 @@ done
 [[ "$api_url" =~ ^https://[^[:space:]]+$ || "$api_url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || fail "invalid GitHub API URL"
 [[ "$upload_url" =~ ^https://[^[:space:]]+$ || "$upload_url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || fail "invalid GitHub upload URL"
 [[ "$max_plaintext_bytes" =~ ^[1-9][0-9]*$ ]] || fail "invalid backup size limit"
+if [[ ! "$connect_attempts" =~ ^[1-9][0-9]*$ ]] || (( connect_attempts > 10 )); then
+  fail "invalid GitHub connect attempt limit"
+fi
+if [[ ! "$connect_retry_delay" =~ ^[0-9]+$ ]] || (( connect_retry_delay > 30 )); then
+  fail "invalid GitHub connect retry delay"
+fi
 
 [[ -f "$curl_config" && ! -L "$curl_config" ]] || fail "temporary GitHub credentials are unavailable"
 [[ $(stat -c '%a' "$curl_config") == 600 ]] || fail "temporary GitHub credentials must have mode 0600"
@@ -106,6 +114,44 @@ cleanup() {
 trap cleanup EXIT INT TERM
 umask 077
 
+# Mutating GitHub requests must not be retried after a connection was
+# established: the remote operation may have succeeded even when its response
+# was lost. A DNS failure, refusal, or connect timeout with time_connect=0 is
+# unambiguous, however, and is safe to retry without creating duplicate
+# releases or assets.
+github_curl() {
+  local output=$1
+  shift
+  local attempt=1
+  local curl_status=0
+  local time_connect=''
+  local timing="$temporary/curl-time-connect.$$.txt"
+
+  while true; do
+    : >"$output"
+    : >"$timing"
+    if curl --config "$curl_config" --silent --show-error --fail-with-body \
+      --write-out '%{time_connect}' -o "$output" "$@" >"$timing"; then
+      rm -f "$timing"
+      return 0
+    else
+      curl_status=$?
+    fi
+
+    time_connect=$(<"$timing")
+    if (( attempt >= connect_attempts )) ||
+      [[ ! "$curl_status" =~ ^(6|7|28)$ ]] ||
+      [[ ! "$time_connect" =~ ^0([.]0+)?$ ]]; then
+      rm -f "$timing"
+      return "$curl_status"
+    fi
+
+    echo "GitHub connection failed before a request was sent (curl $curl_status); retrying $attempt/$connect_attempts" >&2
+    sleep "$connect_retry_delay"
+    attempt=$((attempt + 1))
+  done
+}
+
 dump_sha=$(sha256sum "$dump" | awk '{print $1}')
 media_sha=$(sha256sum "$media" | awk '{print $1}')
 manifest_sha=$(sha256sum "$manifest" | awk '{print $1}')
@@ -147,17 +193,17 @@ jq -n --arg tag "$tag" --arg sha "$source_sha" --arg name "Encrypted production 
   --arg body "Encrypted MaxPosty backup. Recovery requires the offline private key. Source commit: ${source_sha}." \
   '{tag_name: $tag, target_commitish: $sha, name: $name, body: $body,
     draft: true, prerelease: true, make_latest: "false"}' >"$create_request"
-curl --config "$curl_config" --silent --show-error --fail-with-body --max-time 60 \
+github_curl "$create_response" --max-time 60 \
   -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' \
-  -X POST --data-binary "@$create_request" "$api_url/repos/$repository/releases" >"$create_response"
+  -X POST --data-binary "@$create_request" "$api_url/repos/$repository/releases"
 release_id=$(jq -er '.id | select(type == "number" and . > 0)' "$create_response") || fail "GitHub did not return a release id"
 jq -e --arg tag "$tag" '.draft == true and .tag_name == $tag' "$create_response" >/dev/null || fail "GitHub created an unexpected release"
 
 upload_response="$temporary/upload-response.json"
-curl --config "$curl_config" --silent --show-error --fail-with-body --max-time 600 \
+github_curl "$upload_response" --max-time 600 \
   -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/octet-stream' \
   -X POST --data-binary "@$encrypted" \
-  "$upload_url/repos/$repository/releases/$release_id/assets?name=$asset_name" >"$upload_response"
+  "$upload_url/repos/$repository/releases/$release_id/assets?name=$asset_name"
 asset_id=$(jq -er '.id | select(type == "number" and . > 0)' "$upload_response") || fail "GitHub did not return an asset id"
 remote_name=$(jq -er '.name' "$upload_response")
 remote_state=$(jq -er '.state' "$upload_response")
@@ -168,9 +214,9 @@ remote_digest=$(jq -er '.digest | select(type == "string")' "$upload_response")
 [[ "$remote_digest" == "sha256:$encrypted_sha" ]] || fail "uploaded asset digest does not match"
 
 redownloaded="$temporary/redownloaded.cms"
-curl --config "$curl_config" --silent --show-error --fail-with-body --location --max-time 600 \
+github_curl "$redownloaded" --location --max-time 600 \
   -H 'Accept: application/octet-stream' \
-  "$api_url/repos/$repository/releases/assets/$asset_id" -o "$redownloaded"
+  "$api_url/repos/$repository/releases/assets/$asset_id"
 [[ $(stat -c '%s' "$redownloaded") == "$encrypted_size" ]] || fail "redownloaded asset size does not match"
 [[ $(sha256sum "$redownloaded" | awk '{print $1}') == "$encrypted_sha" ]] || fail "redownloaded asset digest does not match"
 
@@ -180,19 +226,19 @@ printf '%s\n' '{"draft":false}' >"$publish_request"
 # From this point an ambiguous network error may still mean GitHub published the
 # immutable release. Preserve it instead of risking deletion of the only offsite copy.
 release_published=true
-curl --config "$curl_config" --silent --show-error --fail-with-body --max-time 60 \
+github_curl "$publish_response" --max-time 60 \
   -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' \
-  -X PATCH --data-binary "@$publish_request" "$api_url/repos/$repository/releases/$release_id" >"$publish_response"
+  -X PATCH --data-binary "@$publish_request" "$api_url/repos/$repository/releases/$release_id"
 
 verified=false
 for _ in {1..10}; do
-  curl --config "$curl_config" --silent --show-error --fail-with-body --max-time 60 \
+  if github_curl "$publish_response" --max-time 60 \
     -H 'Accept: application/vnd.github+json' \
-    "$api_url/repos/$repository/releases/$release_id" >"$publish_response"
-  if jq -e --arg tag "$tag" --arg name "$asset_name" --arg digest "sha256:$encrypted_sha" \
+    "$api_url/repos/$repository/releases/$release_id" &&
+    jq -e --arg tag "$tag" --arg name "$asset_name" --arg digest "sha256:$encrypted_sha" \
     '.draft == false and .immutable == true and .tag_name == $tag and
      ([.assets[] | select(.name == $name and .state == "uploaded" and .digest == $digest)] | length == 1)' \
-    "$publish_response" >/dev/null; then
+      "$publish_response" >/dev/null; then
     verified=true
     break
   fi

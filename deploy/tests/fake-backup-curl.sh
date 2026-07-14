@@ -6,6 +6,7 @@ method=GET
 output=''
 data=''
 url=''
+write_out=''
 
 while (($#)); do
   case "$1" in
@@ -20,8 +21,12 @@ while (($#)); do
       data=${2#@}
       shift 2
       ;;
-    -o)
+    -o|--output)
       output=$2
+      shift 2
+      ;;
+    --write-out)
+      write_out=$2
       shift 2
       ;;
     --silent|--show-error|--fail-with-body|--location)
@@ -47,6 +52,24 @@ respond() {
 }
 
 mkdir -p "$state"
+if [[ "$method" == POST && "$url" == */releases ]]; then
+  create_calls=0
+  [[ ! -f "$state/create-calls" ]] || create_calls=$(<"$state/create-calls")
+  printf '%s' "$((create_calls + 1))" >"$state/create-calls"
+fi
+if [[ ${TEST_CONNECT_FAILURE_ONCE:-false} == true && ! -e "$state/connect-failure-injected" ]]; then
+  : >"$state/connect-failure-injected"
+  [[ -z "$output" ]] || : >"$output"
+  [[ -z "$write_out" ]] || printf '0.000000'
+  exit 28
+fi
+if [[ ${TEST_ESTABLISHED_TIMEOUT_ONCE:-false} == true && ! -e "$state/established-timeout-injected" ]]; then
+  : >"$state/established-timeout-injected"
+  [[ -z "$output" ]] || : >"$output"
+  [[ -z "$write_out" ]] || printf '0.010000'
+  exit 28
+fi
+
 if [[ "$method" == POST && "$url" == */releases ]]; then
   tag=$(jq -er '.tag_name' "$data")
   printf '%s' "$tag" >"$state/tag"
@@ -79,4 +102,12 @@ elif [[ "$method" == DELETE && "$url" == */releases/42 ]]; then
 else
   echo "Unexpected fake curl request: $method $url" >&2
   exit 2
+fi
+
+if [[ -n "$write_out" ]]; then
+  [[ "$write_out" == '%{time_connect}' ]] || {
+    echo "Unexpected fake curl write-out format: $write_out" >&2
+    exit 2
+  }
+  printf '0.010000'
 fi
