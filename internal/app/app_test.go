@@ -59,7 +59,7 @@ func (f *fakeMAX) GetMembership(context.Context, string) (maxclient.Membership, 
 func (f *fakeMAX) SendClaimConfirmation(context.Context, string, string, string, string, string, string, string) error {
 	return nil
 }
-func (f *fakeMAX) AnswerCallback(context.Context, string, string) error { return nil }
+func (f *fakeMAX) AnswerCallback(context.Context, string, string, string) error { return nil }
 func (f *fakeMAX) UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error) {
 	return maxclient.UploadResult{Token: "image-token"}, nil
 }

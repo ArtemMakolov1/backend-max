@@ -103,6 +103,13 @@ func TestMAXIdentityLinkDiscoversAndConnectsOwnedObservedChannels(t *testing.T) 
 	if response = performMAXWebhook(handler, confirmation); response.Code != http.StatusOK {
 		t.Fatalf("identity confirmation=%d %s", response.Code, response.Body.String())
 	}
+	if len(fake.callbackAnswers) != 1 || !strings.Contains(fake.callbackAnswers[0], "Профиль MAX связан") {
+		t.Fatalf("identity callback answers=%#v", fake.callbackAnswers)
+	}
+	if len(fake.callbackMessages) != 1 ||
+		fake.callbackMessages[0] != "✅ Готово! Профиль MAX связан с MaxPosty.\n\nВернитесь в MaxPosty — теперь можно подключить канал." {
+		t.Fatalf("identity callback replacement messages=%#v", fake.callbackMessages)
+	}
 	linkedPoll := performJSONRequest(handler, http.MethodGet, "/api/v1/integration/max/identity", "")
 	if linkedPoll.Code != http.StatusOK || !strings.Contains(linkedPoll.Body.String(), `"status":"linked"`) ||
 		!strings.Contains(linkedPoll.Body.String(), `"max_user_id":"777"`) || strings.Contains(linkedPoll.Body.String(), "bot_url") {

@@ -30,6 +30,7 @@ type claimWebhookMAX struct {
 	confirmPayload    string
 	cancelPayload     string
 	callbackAnswers   []string
+	callbackMessages  []string
 	publishRuns       int
 }
 
@@ -62,8 +63,9 @@ func (f *claimWebhookMAX) SendClaimConfirmation(_ context.Context, maxUserID, ti
 	return nil
 }
 
-func (f *claimWebhookMAX) AnswerCallback(_ context.Context, callbackID, notification string) error {
+func (f *claimWebhookMAX) AnswerCallback(_ context.Context, callbackID, notification, messageText string) error {
 	f.callbackAnswers = append(f.callbackAnswers, callbackID+":"+notification)
+	f.callbackMessages = append(f.callbackMessages, messageText)
 	return nil
 }
 
@@ -170,6 +172,10 @@ func TestMAXCallbackCompletesChannelClaimWithoutBrowserPoll(t *testing.T) {
 	}
 	if len(fake.callbackAnswers) != 1 || !strings.Contains(fake.callbackAnswers[0], "Канал подключён") {
 		t.Fatalf("callback answers = %#v", fake.callbackAnswers)
+	}
+	if len(fake.callbackMessages) != 1 || !strings.Contains(fake.callbackMessages[0], "✅ Готово!") ||
+		!strings.Contains(fake.callbackMessages[0], "публиковать посты") {
+		t.Fatalf("callback replacement messages = %#v", fake.callbackMessages)
 	}
 
 	response = performMAXWebhook(handler, confirmation)

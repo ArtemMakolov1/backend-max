@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -208,12 +209,40 @@ func (c *Client) SendIdentityLinkConfirmation(ctx context.Context, userID, reque
 	return c.doJSON(ctx, http.MethodPost, "/messages", url.Values{"user_id": {userID}}, body, nil)
 }
 
-func (c *Client) AnswerCallback(ctx context.Context, callbackID, notification string) error {
+type callbackAnswerMessage struct {
+	Text        string `json:"text"`
+	Attachments []any  `json:"attachments"`
+}
+
+type callbackAnswerRequest struct {
+	Notification string                 `json:"notification,omitempty"`
+	Message      *callbackAnswerMessage `json:"message,omitempty"`
+}
+
+// AnswerCallback acknowledges a button press and can replace the source
+// message in the same atomic MAX API call. An empty attachments array removes
+// the now-obsolete inline keyboard so a completed action cannot be repeated.
+func (c *Client) AnswerCallback(ctx context.Context, callbackID, notification, messageText string) error {
 	if strings.TrimSpace(callbackID) == "" {
 		return errors.New("answer callback: callback ID is required")
 	}
-	body := map[string]string{"notification": notification}
-	return c.doJSON(ctx, http.MethodPost, "/answers", url.Values{"callback_id": {callbackID}}, body, nil)
+	notification = strings.TrimSpace(notification)
+	messageText = strings.TrimSpace(messageText)
+	if notification == "" && messageText == "" {
+		return errors.New("answer callback: notification or replacement message is required")
+	}
+	if utf8.RuneCountInString(messageText) > 4000 {
+		return errors.New("answer callback: replacement message exceeds 4000 characters")
+	}
+	body := callbackAnswerRequest{Notification: notification}
+	if messageText != "" {
+		body.Message = &callbackAnswerMessage{Text: messageText, Attachments: []any{}}
+	}
+	var response operationResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/answers", url.Values{"callback_id": {callbackID}}, body, &response); err != nil {
+		return err
+	}
+	return response.asError(http.StatusOK)
 }
 
 // UploadImage reserves an image upload, sends multipart field "data" to the
