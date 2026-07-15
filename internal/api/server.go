@@ -152,6 +152,7 @@ func (s *Server) Handler() http.Handler {
 			r.Delete("/channels/{id}", s.deleteChannel)
 			r.Post("/channels/{id}/test", s.testChannel)
 			r.Get("/channels/{id}/participant-history", s.getChannelParticipantHistory)
+			r.Get("/analytics", s.getAnalytics)
 
 			r.Get("/posts", s.listPosts)
 			r.Post("/posts", s.createPost)
