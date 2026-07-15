@@ -90,7 +90,11 @@ fi
 
 cp "$fixture/state-success/asset" "$fixture/tampered.cms"
 size=$(stat -c '%s' "$fixture/tampered.cms")
-printf '\001' | dd of="$fixture/tampered.cms" bs=1 seek=$((size - 8)) conv=notrunc status=none
+tamper_offset=$((size / 2))
+original_byte=$(od -An -tu1 -j "$tamper_offset" -N 1 "$fixture/tampered.cms" | tr -d '[:space:]')
+tampered_byte=$((original_byte ^ 1))
+printf -v tampered_octal '\\%03o' "$tampered_byte"
+printf '%b' "$tampered_octal" | dd of="$fixture/tampered.cms" bs=1 seek="$tamper_offset" conv=notrunc status=none
 if openssl cms -decrypt -binary -inform DER -inkey "$fixture/private-key.pem" \
   -in "$fixture/tampered.cms" -out "$fixture/tampered.tar" 2>/dev/null; then
   echo "CMS authentication accepted a modified backup" >&2
