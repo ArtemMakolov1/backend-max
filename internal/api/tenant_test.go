@@ -79,6 +79,7 @@ func TestTenantAPIReturnsNotFoundForForeignResources(t *testing.T) {
 		{http.MethodPatch, fmt.Sprintf("/api/v1/channels/%d", channel.ID), `{"active":false}`},
 		{http.MethodDelete, fmt.Sprintf("/api/v1/channels/%d", channel.ID), ""},
 		{http.MethodPost, fmt.Sprintf("/api/v1/channels/%d/test", channel.ID), `{}`},
+		{http.MethodGet, fmt.Sprintf("/api/v1/channels/%d/participant-history", channel.ID), ""},
 		{http.MethodGet, fmt.Sprintf("/api/v1/posts/%d", post.ID), ""},
 		{http.MethodPatch, fmt.Sprintf("/api/v1/posts/%d", post.ID), `{"title":"stolen"}`},
 		{http.MethodDelete, fmt.Sprintf("/api/v1/posts/%d", post.ID), ""},

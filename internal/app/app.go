@@ -32,7 +32,10 @@ var (
 	ErrConflict                = errors.New("resource state conflict")
 )
 
-const manualMAXStatsCooldown = 15 * time.Second
+const (
+	manualMAXStatsCooldown          = 15 * time.Second
+	channelParticipantStatsInterval = time.Hour
+)
 
 type MAXClient interface {
 	GetMe(context.Context) (maxclient.BotInfo, error)
@@ -539,8 +542,11 @@ func (a *App) TestChannelForUser(ctx context.Context, userID string, channelID i
 	if err != nil {
 		return ChannelCheck{}, err
 	}
-	channel, err = a.store.RefreshChannelVisualMetadataForUser(ctx, userID, channel.ID,
-		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount)
+	if err := validateChannelParticipantInfo(channel, info); err != nil {
+		return ChannelCheck{}, err
+	}
+	channel, err = a.store.SyncChannelParticipantStatsForUser(ctx, userID, channel.ID, channel.MAXChatID,
+		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount, a.now().UTC())
 	if err != nil {
 		return ChannelCheck{}, err
 	}
@@ -918,13 +924,19 @@ func (a *App) UnpinPost(ctx context.Context, userID string, postID int64) (resul
 		return store.Post{}, err
 	}
 	if current == nil {
-		return store.Post{}, fmt.Errorf("%w: this post is not currently pinned in MAX", ErrConflict)
+		// DELETE is intentionally idempotent. The pin may have been removed in
+		// MAX directly, or the pinned publication may already have been deleted.
+		// In both cases the requested end state is reached, so reconcile the
+		// stale local flag instead of returning a conflict.
+		return a.store.SetPublicationPinnedForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, false)
 	}
 	if err := validateMAXMessageChannel(*current, channel.MAXChatID); err != nil {
 		return store.Post{}, err
 	}
 	if current.MessageID != post.MAXMessageID {
-		return store.Post{}, fmt.Errorf("%w: this post is not currently pinned in MAX", ErrConflict)
+		// Another post is pinned now. Do not remove that pin; only reconcile this
+		// post, which is already unpinned in MAX.
+		return a.store.SetPublicationPinnedForUser(ctx, userID, post.ID, channel.ID, post.MAXMessageID, false)
 	}
 	if err := a.max.UnpinMessage(ctx, channel.MAXChatID); err != nil {
 		return store.Post{}, err
@@ -1032,6 +1044,7 @@ func (a *App) runSchedulerCycle(ctx context.Context, now time.Time) {
 	}()
 	a.publishDueAt(ctx, now)
 	a.syncDueMAXStats(ctx, now)
+	a.syncDueChannelParticipantStats(ctx, now)
 }
 
 func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {
@@ -1096,6 +1109,88 @@ func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {
 	}
 	close(jobs)
 	workers.Wait()
+}
+
+func (a *App) syncDueChannelParticipantStats(ctx context.Context, now time.Time) {
+	if a.max == nil {
+		return
+	}
+	channels, err := a.store.ListChannelsDueForParticipantStats(ctx, now.UTC(), channelParticipantStatsInterval, 10)
+	if err != nil {
+		a.metrics.ObserveSchedulerJob("channel_participants_scan", "error")
+		a.logger.Error("scheduler could not list channels due for MAX participant stats", "error", err)
+		return
+	}
+	a.metrics.ObserveSchedulerJob("channel_participants_scan", "success")
+	a.metrics.SetSchedulerDue("channel_participants_sync", len(channels))
+	const parallelism = 2
+	workerCount := min(parallelism, len(channels))
+	jobs := make(chan store.Channel)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for channel := range jobs {
+				claimed, claimErr := a.store.ClaimChannelParticipantStatsAttemptForUser(ctx, channel.UserID, channel.ID,
+					channel.MAXChatID, now.UTC(), channelParticipantStatsInterval)
+				if claimErr != nil {
+					a.metrics.ObserveSchedulerJob("channel_participants_sync", "error")
+					a.logger.Warn("could not claim MAX channel participant statistics synchronization", "channel_id", channel.ID, "error", claimErr)
+					continue
+				}
+				if !claimed {
+					a.metrics.ObserveSchedulerJob("channel_participants_sync", "skipped")
+					continue
+				}
+				syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				_, syncErr := a.syncClaimedChannelParticipantStats(syncCtx, channel, a.now().UTC())
+				cancel()
+				if syncErr != nil {
+					a.metrics.ObserveSchedulerJob("channel_participants_sync", "error")
+					a.logger.Warn("could not synchronize MAX channel participant statistics", "channel_id", channel.ID, "error", syncErr)
+				} else {
+					a.metrics.ObserveSchedulerJob("channel_participants_sync", "success")
+				}
+			}
+		}()
+	}
+	for _, channel := range channels {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			workers.Wait()
+			return
+		case jobs <- channel:
+		}
+	}
+	close(jobs)
+	workers.Wait()
+}
+
+func (a *App) syncClaimedChannelParticipantStats(ctx context.Context, channel store.Channel, capturedAt time.Time) (store.Channel, error) {
+	info, err := a.max.GetChat(ctx, channel.MAXChatID)
+	if err != nil {
+		return store.Channel{}, err
+	}
+	if err := validateChannelParticipantInfo(channel, info); err != nil {
+		return store.Channel{}, err
+	}
+	return a.store.SyncChannelParticipantStatsForUser(ctx, channel.UserID, channel.ID, channel.MAXChatID,
+		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount, capturedAt.UTC())
+}
+
+func validateChannelParticipantInfo(channel store.Channel, info maxclient.ChatInfo) error {
+	if info.ChatID != channel.MAXChatID {
+		return fmt.Errorf("%w: MAX participant stats returned another channel", ErrConflict)
+	}
+	if channel.VerifiedMAXOwnerID == "" || info.OwnerID == "" || info.OwnerID != channel.VerifiedMAXOwnerID {
+		return fmt.Errorf("%w: MAX channel ownership changed before participant statistics were synchronized", ErrConflict)
+	}
+	if info.Type != "channel" || info.Status != "active" {
+		return fmt.Errorf("%w: MAX participant stats require an active channel", ErrConflict)
+	}
+	return nil
 }
 
 func (a *App) publishDueAt(ctx context.Context, now time.Time) {

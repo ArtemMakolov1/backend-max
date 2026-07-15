@@ -225,6 +225,8 @@ func TestConnectedChannelIconIsSanitizedAndRefreshedForItsTenant(t *testing.T) {
 		},
 	}
 	application, storage := newTestApp(t, fake)
+	capturedAt := time.Date(2041, time.August, 12, 13, 14, 15, 0, time.UTC)
+	application.now = func() time.Time { return capturedAt }
 
 	connected, err := application.ConnectChannel(context.Background(), "", "-124", "")
 	if err != nil {
@@ -249,6 +251,82 @@ func TestConnectedChannelIconIsSanitizedAndRefreshedForItsTenant(t *testing.T) {
 	}
 	if stored.IconURL != fake.chat.Icon.URL || stored.ParticipantsCount != 73 {
 		t.Fatalf("stored channel visual metadata = %#v", stored)
+	}
+	history, err := storage.ListChannelParticipantSnapshotsForUser(context.Background(), connected.Channel.UserID,
+		connected.Channel.ID, capturedAt, capturedAt)
+	if err != nil || len(history) != 1 || history[0].ParticipantsCount != 73 || !history[0].CapturedAt.Equal(capturedAt) {
+		t.Fatalf("manual channel participant history = %#v, %v", history, err)
+	}
+
+	fake.chat.ChatID = "another-channel"
+	fake.chat.ParticipantsCount = 9000
+	if _, err := application.TestChannelForUser(context.Background(), connected.Channel.UserID, connected.Channel.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("mismatched manual participant refresh error = %v, want ErrConflict", err)
+	}
+	stored, err = storage.GetChannelForUser(context.Background(), connected.Channel.UserID, connected.Channel.ID)
+	if err != nil || stored.ParticipantsCount != 73 {
+		t.Fatalf("mismatched manual refresh changed channel = %#v, %v", stored, err)
+	}
+}
+
+func TestChannelParticipantStatsWorkerRefreshesAndBacksOffWithoutMembershipLookup(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2041, time.September, 2, 10, 0, 0, 0, time.UTC)
+	fake := &fakeMAX{chat: maxclient.ChatInfo{
+		ChatID: "-125", OwnerID: "test-max-owner", Type: "channel", Status: "active", Title: "Channel",
+		Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/channels/worker.png"}, ParticipantsCount: 88,
+	}}
+	application, storage := newTestApp(t, fake)
+	application.now = func() time.Time { return now }
+	metrics := newRecordingMetrics()
+	application.metrics = metrics
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{
+		VerifiedMAXOwnerID: "test-max-owner", MAXChatID: fake.chat.ChatID, Title: "Channel",
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	application.syncDueChannelParticipantStats(context.Background(), now)
+	stored, err := storage.GetChannel(context.Background(), channel.ID)
+	if err != nil || stored.ParticipantsCount != 88 || stored.IconURL != fake.chat.Icon.URL {
+		t.Fatalf("worker channel = %#v, %v", stored, err)
+	}
+	history, err := storage.ListChannelParticipantSnapshotsForUser(context.Background(), channel.UserID, channel.ID, now, now)
+	if err != nil || len(history) != 1 || history[0].ParticipantsCount != 88 {
+		t.Fatalf("worker participant history = %#v, %v", history, err)
+	}
+	if fake.getChatCalls != 1 || fake.memberCalls != 0 {
+		t.Fatalf("worker MAX calls = %#v", fake)
+	}
+	if metrics.due["channel_participants_sync"] != 1 ||
+		metrics.jobs["channel_participants_scan:success"] != 1 ||
+		metrics.jobs["channel_participants_sync:success"] != 1 {
+		t.Fatalf("participant worker metrics: due=%#v jobs=%#v", metrics.due, metrics.jobs)
+	}
+
+	application.now = func() time.Time { return now.Add(30 * time.Minute) }
+	application.syncDueChannelParticipantStats(context.Background(), now.Add(30*time.Minute))
+	if fake.getChatCalls != 1 {
+		t.Fatal("participant worker synchronized a channel more than once per hour")
+	}
+
+	fake.chat.OwnerID = "another-owner"
+	failedAt := now.Add(time.Hour)
+	application.now = func() time.Time { return failedAt }
+	application.syncDueChannelParticipantStats(context.Background(), failedAt)
+	if fake.getChatCalls != 2 || metrics.jobs["channel_participants_sync:error"] != 1 {
+		t.Fatalf("ownership mismatch was not rejected: fake=%#v jobs=%#v", fake, metrics.jobs)
+	}
+	application.now = func() time.Time { return failedAt.Add(time.Minute) }
+	application.syncDueChannelParticipantStats(context.Background(), failedAt.Add(time.Minute))
+	if fake.getChatCalls != 2 {
+		t.Fatal("failed participant lookup was retried before the one-hour backoff")
+	}
+	stored, err = storage.GetChannel(context.Background(), channel.ID)
+	if err != nil || stored.ParticipantsCount != 88 {
+		t.Fatalf("ownership mismatch changed participant count: %#v, %v", stored, err)
 	}
 }
 

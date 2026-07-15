@@ -86,7 +86,7 @@ func TestObservedChatRefreshesConnectedChannelVisualMetadata(t *testing.T) {
 	observedAt := time.Now().UTC().Truncate(time.Microsecond)
 	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
 		MAXChatID: "visual-refresh-1", Title: "Fresh title", PublicLink: "https://max.ru/fresh",
-		MAXOwnerID: "owner", IconURL: "https://cdn.max.ru/fresh.png", ParticipantsCount: 42,
+		MAXOwnerID: channel.VerifiedMAXOwnerID, IconURL: "https://cdn.max.ru/fresh.png", ParticipantsCount: 42,
 		Active: true, LastSeenAt: observedAt,
 	}); err != nil {
 		t.Fatal(err)

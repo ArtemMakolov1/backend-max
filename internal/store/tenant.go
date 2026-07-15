@@ -35,14 +35,15 @@ ON CONFLICT(max_chat_id) DO UPDATE SET public_link=excluded.public_link, title=e
 max_owner_id=excluded.max_owner_id, icon_url=excluded.icon_url, participants_count=excluded.participants_count,
 active=excluded.active, last_seen_at=excluded.last_seen_at, removed_at=excluded.removed_at
 WHERE excluded.last_seen_at > observed_bot_chats.last_seen_at
-RETURNING max_chat_id, icon_url, participants_count, last_seen_at
+RETURNING max_chat_id, max_owner_id, icon_url, participants_count, last_seen_at
 )
 UPDATE channels AS connected SET
 icon_url=refreshed_chat.icon_url,
 participants_count=refreshed_chat.participants_count,
 updated_at=refreshed_chat.last_seen_at
 FROM refreshed_chat
-WHERE connected.max_chat_id=refreshed_chat.max_chat_id`, chat.MAXChatID, chat.PublicLink, chat.Title, chat.MAXOwnerID,
+WHERE connected.max_chat_id=refreshed_chat.max_chat_id
+  AND connected.verified_max_owner_id=refreshed_chat.max_owner_id`, chat.MAXChatID, chat.PublicLink, chat.Title, chat.MAXOwnerID,
 		chat.IconURL, chat.ParticipantsCount, chat.Active, chat.LastSeenAt.UTC(), removedAt)
 	if err != nil {
 		return fmt.Errorf("upsert observed MAX chat: %w", err)

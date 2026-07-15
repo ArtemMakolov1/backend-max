@@ -105,6 +105,11 @@ func TestPublicationMetadataPinAndBoundedHistoryAPI(t *testing.T) {
 	if post.MAXIsPinned || fake.unpinRuns != 1 {
 		t.Fatalf("unpin response = %#v, calls=%d", post, fake.unpinRuns)
 	}
+	fake.pinnedMessage = nil
+	post = performPostRequest(t, handler, http.MethodDelete, "/api/v1/posts/"+postID(post.ID)+"/pin", "", http.StatusOK)
+	if post.MAXIsPinned || fake.unpinRuns != 1 {
+		t.Fatalf("repeated unpin response = %#v, calls=%d", post, fake.unpinRuns)
+	}
 
 	historyResponse := performJSONRequest(handler, http.MethodGet,
 		"/api/v1/posts/"+postID(post.ID)+"/view-history?limit=1", "")

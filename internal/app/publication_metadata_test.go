@@ -401,9 +401,25 @@ func TestPinAndUnpinRequireOptionalPinPermission(t *testing.T) {
 	if post.MAXIsPinned || fake.unpinCalls != 1 || fake.getPinnedCalls != 1 {
 		t.Fatalf("unpinned post = %#v, fake=%#v", post, fake)
 	}
-	fake.pinnedMessage.MessageID = "mid.other"
-	if _, err := application.UnpinPost(context.Background(), "test-owner", post.ID); !errors.Is(err, ErrConflict) {
-		t.Fatalf("stale unpin error = %v, want conflict", err)
+
+	// Repeating DELETE after MAX has already removed the pin is successful and
+	// does not issue another destructive request.
+	fake.pinnedMessage = nil
+	post, err = application.UnpinPost(context.Background(), "test-owner", post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.MAXIsPinned || fake.unpinCalls != 1 || fake.getPinnedCalls != 2 {
+		t.Fatalf("idempotent unpin = %#v, fake=%#v", post, fake)
+	}
+
+	fake.pinnedMessage = &maxclient.Message{MessageID: "mid.other", ChatID: "-203"}
+	post, err = application.UnpinPost(context.Background(), "test-owner", post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.MAXIsPinned {
+		t.Fatalf("post remained locally pinned after MAX pinned a different message: %#v", post)
 	}
 	if fake.unpinCalls != 1 {
 		t.Fatal("stale unpin removed another MAX message")

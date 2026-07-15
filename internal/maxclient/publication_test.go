@@ -21,7 +21,7 @@ func TestPublicationMetadataAndPinContracts(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/messages/"+messageID:
 			_, _ = io.WriteString(w, `{"recipient":{"chat_id":-13549123},"body":{"mid":"`+messageID+`","text":"Привет"},"url":"https://max.ru/se13549123_biz/abc","stat":{"views":42}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/chats/"+chatID+"/pin":
-			_, _ = io.WriteString(w, `{"recipient":{"chat_id":-13549123},"body":{"mid":"`+messageID+`"},"url":"https://max.ru/se13549123_biz/abc","stat":{"views":43}}`)
+			_, _ = io.WriteString(w, `{"message":{"recipient":{"chat_id":-13549123},"body":{"mid":"`+messageID+`"},"url":"https://max.ru/se13549123_biz/abc","stat":{"views":43}}}`)
 		case r.Method == http.MethodPut && r.URL.Path == "/chats/"+chatID+"/pin":
 			pinCalls++
 			var body struct {
@@ -76,13 +76,27 @@ func TestGetPinnedMessageAcceptsOfficialNullResponse(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `null`)
+		_, _ = io.WriteString(w, `{"message":null}`)
 	}))
 	defer server.Close()
 	client := mustClient(t, server.URL, "token", server.Client())
 	pinned, err := client.GetPinnedMessage(context.Background(), "-1")
 	if err != nil || pinned != nil {
 		t.Fatalf("GetPinnedMessage() = %#v, %v; want nil, nil", pinned, err)
+	}
+}
+
+func TestGetPinnedMessageAcceptsLegacyDirectResponseDuringMigration(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"recipient":{"chat_id":-1},"body":{"mid":"mid.legacy"}}`)
+	}))
+	defer server.Close()
+	client := mustClient(t, server.URL, "token", server.Client())
+	pinned, err := client.GetPinnedMessage(context.Background(), "-1")
+	if err != nil || pinned == nil || pinned.MessageID != "mid.legacy" || pinned.ChatID != "-1" {
+		t.Fatalf("GetPinnedMessage() = %#v, %v", pinned, err)
 	}
 }
 

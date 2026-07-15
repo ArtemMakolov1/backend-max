@@ -50,7 +50,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "008_user_activity_daily.sql"
+const RequiredSchemaVersion = "009_channel_participant_snapshots.sql"
 
 type schemaMigration struct {
 	version        string
@@ -704,16 +704,12 @@ func (s *Store) RefreshChannelVisualMetadataForUser(ctx context.Context, userID 
 	if participantsCount < 0 {
 		participantsCount = 0
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE channels
-SET icon_url = ?, participants_count = ?, updated_at = ?
-WHERE owner_id = ? AND id = ?`, iconURL, participantsCount, nowText(), userID, id)
+	channel, err := s.GetChannelForUser(ctx, userID, id)
 	if err != nil {
-		return Channel{}, fmt.Errorf("refresh user channel visual metadata: %w", err)
+		return Channel{}, err
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
-		return Channel{}, ErrNotFound
-	}
-	return s.GetChannelForUser(ctx, userID, id)
+	return s.SyncChannelParticipantStatsForUser(ctx, userID, id, channel.MAXChatID,
+		iconURL, participantsCount, time.Now().UTC())
 }
 
 func (s *Store) DeleteChannel(ctx context.Context, id int64) error {

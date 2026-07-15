@@ -265,14 +265,21 @@ func (c *Client) GetPinnedMessage(ctx context.Context, chatID string) (*Message,
 	if !numericID(chatID) {
 		return nil, errors.New("get pinned MAX message: chat ID must be numeric")
 	}
-	var response *apiMessage
+	// The official MAX contract wraps the nullable message in a top-level
+	// `message` property. Keep accepting the former direct-message shape during
+	// the API transition, but prefer and validate the documented envelope.
+	var response json.RawMessage
 	if err := c.doJSON(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/pin", nil, nil, &response); err != nil {
 		return nil, err
 	}
-	if response == nil {
+	wireMessage, err := decodePinnedMessage(response)
+	if err != nil {
+		return nil, err
+	}
+	if wireMessage == nil {
 		return nil, nil
 	}
-	message := response.publicMessage()
+	message := wireMessage.publicMessage()
 	if !validMessageID(message.MessageID) {
 		return nil, errors.New("MAX pinned message response does not contain a valid message ID")
 	}
@@ -281,6 +288,41 @@ func (c *Client) GetPinnedMessage(ctx context.Context, chatID string) (*Message,
 	}
 	if message.Views != nil && *message.Views < 0 {
 		return nil, errors.New("MAX pinned message response contains a negative view count")
+	}
+	return &message, nil
+}
+
+func decodePinnedMessage(response json.RawMessage) (*apiMessage, error) {
+	trimmed := bytes.TrimSpace(response)
+	if bytes.Equal(trimmed, []byte("null")) {
+		return nil, nil
+	}
+
+	var envelope struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
+		return nil, fmt.Errorf("decode MAX pinned message response: %w", err)
+	}
+	if len(envelope.Message) != 0 {
+		if bytes.Equal(bytes.TrimSpace(envelope.Message), []byte("null")) {
+			return nil, nil
+		}
+		var message apiMessage
+		if err := json.Unmarshal(envelope.Message, &message); err != nil {
+			return nil, fmt.Errorf("decode MAX pinned message: %w", err)
+		}
+		return &message, nil
+	}
+
+	// Older MAX responses exposed Message as the root object. An empty object
+	// is also a valid representation of the documented optional result.
+	var message apiMessage
+	if err := json.Unmarshal(trimmed, &message); err != nil {
+		return nil, fmt.Errorf("decode legacy MAX pinned message: %w", err)
+	}
+	if !validMessageID(message.publicMessage().MessageID) {
+		return nil, nil
 	}
 	return &message, nil
 }
