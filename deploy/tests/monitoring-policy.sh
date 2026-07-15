@@ -49,6 +49,38 @@ grep -F "grep -Eq '^pgbouncer_up 1" "$repo_root/deploy/deploy-production.sh" >/d
 grep -F 'wait_for_prometheus_target' "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F 'wait_for_grafana_provisioning' "$repo_root/deploy/deploy-production.sh" >/dev/null
 
+for compose_file in "$production_compose" "$local_compose"; do
+  grep -F -- '--collector.stat_statements.include_query' "$compose_file" >/dev/null
+  grep -F -- '--collector.stat_statements.query_length=300' "$compose_file" >/dev/null
+  grep -F -- '--collector.stat_statements.limit=25' "$compose_file" >/dev/null
+  grep -F -- '--collector.stat_statements.exclude_users=' "$compose_file" >/dev/null
+  grep -F -- 'pg_stat_statements.track_utility=off' "$compose_file" >/dev/null
+  if grep -F -- '--no-collector.stat_statements.include_query' "$compose_file" >/dev/null; then
+    echo "SQL templates must be available for the private slow-query dashboard" >&2
+    exit 1
+  fi
+done
+
+grep -F -- '--collector.stat_statements.exclude_users=${POSTGRES_OWNER_USER:-maxstudio_owner},${POSTGRES_MONITOR_USER:-maxstudio_monitor}' "$local_compose" >/dev/null
+grep -F -- '--collector.stat_statements.exclude_users=${POSTGRES_OWNER_USER},${POSTGRES_MONITOR_USER}' "$production_compose" >/dev/null
+
+infrastructure_dashboard="$repo_root/monitoring/grafana/dashboards/maxposty-infrastructure.json"
+jq -e '
+  any(.panels[];
+    .title == "Самые долгие SQL-запросы (среднее)" and
+    .type == "table" and
+    any(.targets[]?;
+      (.expr | contains("pg_stat_statements_query_id")) and
+      (.expr | contains("on(queryid)")) and
+      (.expr | contains("group_left(query)")) and
+      (.expr | contains("max by (queryid, query)")) and
+      .format == "table" and
+      .instant == true and
+      .legendFormat == "{{query}}"
+    )
+  )
+' "$infrastructure_dashboard" >/dev/null
+
 for service in postgres-exporter pgbouncer-exporter prometheus grafana; do
   service_block=$(awk -v service="$service" '
     $0 == "  " service ":" { inside=1; next }

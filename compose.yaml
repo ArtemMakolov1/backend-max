@@ -24,6 +24,8 @@ services:
       - -c
       - pg_stat_statements.track=all
       - -c
+      - pg_stat_statements.track_utility=off
+      - -c
       - compute_query_id=on
       - -c
       - track_io_timing=on
@@ -206,7 +208,12 @@ services:
       - --collector.long_running_transactions
       - --collector.stat_statements
       - --collector.stat_statements.limit=25
-      - --no-collector.stat_statements.include_query
+      # Export only normalized application SQL templates. Owner/monitor
+      # statements are excluded so role setup and exporter queries cannot
+      # leak credentials into Prometheus labels.
+      - --collector.stat_statements.include_query
+      - --collector.stat_statements.query_length=300
+      - --collector.stat_statements.exclude_users=${POSTGRES_OWNER_USER:-maxstudio_owner},${POSTGRES_MONITOR_USER:-maxstudio_monitor}
       - --log.level=warn
     environment:
       DATA_SOURCE_URI: postgres:5432/${POSTGRES_DB:-maxstudio}?sslmode=disable
