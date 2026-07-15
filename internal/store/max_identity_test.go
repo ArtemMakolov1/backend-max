@@ -144,6 +144,132 @@ func TestDiscoverableChannelsAreIdentityAndTenantScoped(t *testing.T) {
 	}
 }
 
+func TestDiscoverableRefreshCandidatesAreBoundedAndTenantSafe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "discoverable-refresh-candidates.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	for _, userID := range []string{"tenant-a", "tenant-b"} {
+		if err := storage.UpsertUser(ctx, User{ID: userID, DisplayName: userID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	linkIdentityForTest(t, storage, "tenant-a", "777", now.Add(-time.Hour))
+	for _, chat := range []ObservedBotChat{
+		{MAXChatID: "100", MAXOwnerID: "777", Title: "Verified", Active: true, LastSeenAt: now.Add(-time.Minute)},
+		{MAXChatID: "101", Title: "Recent incomplete", Active: true, LastSeenAt: now.Add(-time.Minute)},
+		{MAXChatID: "102", Title: "Old incomplete", Active: true, LastSeenAt: now.Add(-8 * 24 * time.Hour)},
+		{MAXChatID: "103", MAXOwnerID: "999", Title: "Foreign owner", Active: true, LastSeenAt: now},
+		{MAXChatID: "104", Title: "Connected elsewhere", Active: true, LastSeenAt: now},
+		{MAXChatID: "105", Title: "Another recent incomplete", Active: true, LastSeenAt: now},
+		{MAXChatID: "106", Title: "Connected here with incomplete owner", Active: true, LastSeenAt: now.Add(-2 * time.Minute)},
+	} {
+		if err := storage.UpsertObservedBotChat(ctx, chat); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := storage.CreateChannel(ctx, Channel{
+		UserID: "tenant-b", VerifiedMAXOwnerID: "888", MAXChatID: "104", Title: "Foreign tenant",
+		IsChannel: true, Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateChannel(ctx, Channel{
+		UserID: "tenant-a", VerifiedMAXOwnerID: "777", MAXChatID: "106", Title: "Current tenant",
+		IsChannel: true, Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	candidates, err := storage.ListDiscoverableChannelRefreshCandidatesForUser(ctx, "tenant-a", now.Add(-7*24*time.Hour), 20, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates.Owned) != 2 || candidates.Owned[0].MAXChatID != "100" || candidates.Owned[1].MAXChatID != "106" {
+		t.Fatalf("owned refresh candidates = %#v", candidates.Owned)
+	}
+	if len(candidates.Unknown) != 2 || candidates.Unknown[0].MAXChatID != "105" || candidates.Unknown[1].MAXChatID != "101" {
+		t.Fatalf("unknown refresh candidates = %#v", candidates.Unknown)
+	}
+	bounded, err := storage.ListDiscoverableChannelRefreshCandidatesForUser(ctx, "tenant-a", now.Add(-7*24*time.Hour), 1, 1)
+	if err != nil || len(bounded.Owned) != 1 || bounded.Owned[0].MAXChatID != "100" ||
+		len(bounded.Unknown) != 1 || bounded.Unknown[0].MAXChatID != "105" {
+		t.Fatalf("bounded refresh candidates = %#v err=%v", bounded, err)
+	}
+	if unlinked, err := storage.ListDiscoverableChannelRefreshCandidatesForUser(ctx, "tenant-b", now.Add(-7*24*time.Hour), 20, 4); err != nil ||
+		len(unlinked.Owned) != 0 || len(unlinked.Unknown) != 0 {
+		t.Fatalf("unlinked tenant candidates = %#v err=%v", unlinked, err)
+	}
+}
+
+func TestDiscoverableConnectedChannelUsesTenantMetadataDespiteStaleObservedOwner(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "discoverable-connected-metadata.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	for _, userID := range []string{"tenant-a", "tenant-b"} {
+		if err := storage.UpsertUser(ctx, User{ID: userID, DisplayName: userID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	linkIdentityForTest(t, storage, "tenant-a", "777", now.Add(-time.Hour))
+	owned, err := storage.CreateChannel(ctx, Channel{
+		UserID: "tenant-a", VerifiedMAXOwnerID: "777", MAXChatID: "100", Title: "Актуальное название",
+		PublicLink: "https://max.ru/current", IconURL: "https://cdn.max.ru/current.png", ParticipantsCount: 55,
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.CreateChannel(ctx, Channel{
+		UserID: "tenant-b", VerifiedMAXOwnerID: "888", MAXChatID: "300", Title: "Другой кабинет",
+		PublicLink: "https://max.ru/foreign", IconURL: "https://cdn.max.ru/foreign.png",
+		IsChannel: true, Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, observed := range []ObservedBotChat{
+		{MAXChatID: "100", Title: "Устаревшее название", PublicLink: "https://max.ru/stale", IconURL: "https://cdn.max.ru/stale.png", ParticipantsCount: 1, Active: true, LastSeenAt: now},
+		{MAXChatID: "200", MAXOwnerID: "999", Title: "Чужой неподключённый", Active: true, LastSeenAt: now},
+		{MAXChatID: "300", MAXOwnerID: "777", Title: "Наблюдаемый, но чужой tenant", Active: true, LastSeenAt: now},
+	} {
+		if err := storage.UpsertObservedBotChat(ctx, observed); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	channels, err := storage.ListDiscoverableChannelsForUser(ctx, "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(channels) != 1 {
+		t.Fatalf("discoverable channels = %#v, want only current tenant's connected channel", channels)
+	}
+	channel := channels[0]
+	if channel.MAXChatID != "100" || !channel.Connected || channel.ConnectedChannelID == nil || *channel.ConnectedChannelID != owned.ID ||
+		channel.Title != "Актуальное название" || channel.PublicLink != "https://max.ru/current" ||
+		channel.IconURL != "https://cdn.max.ru/current.png" || channel.ParticipantsCount != 55 {
+		t.Fatalf("connected discoverable channel = %#v", channel)
+	}
+	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
+		MAXChatID: "100", MAXOwnerID: "999", Title: "Transferred", Active: true, LastSeenAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	channels, err = storage.ListDiscoverableChannelsForUser(ctx, "tenant-a")
+	if err != nil || len(channels) != 0 {
+		t.Fatalf("channel with an authoritative foreign owner remained discoverable: %#v err=%v", channels, err)
+	}
+}
+
 func linkIdentityForTest(t *testing.T, storage *Store, userID, maxUserID string, now time.Time) {
 	t.Helper()
 	attempt := MAXIdentityLinkAttempt{

@@ -266,6 +266,27 @@ func (s *Store) GetMAXIdentityLinkForUser(ctx context.Context, userID string) (M
 	return link, nil
 }
 
+// GetMAXIdentityLinkForMAXUser resolves the tenant that explicitly linked a
+// MAX profile. It is used only to authenticate owner fallback data returned by
+// the MAX administrators endpoint; the one-to-one database constraint keeps
+// the result unambiguous.
+func (s *Store) GetMAXIdentityLinkForMAXUser(ctx context.Context, maxUserID string) (MAXIdentityLink, error) {
+	if strings.TrimSpace(maxUserID) == "" {
+		return MAXIdentityLink{}, ErrNotFound
+	}
+	var link MAXIdentityLink
+	err := s.db.QueryRowContext(ctx, `SELECT owner_id, max_user_id, linked_at, updated_at FROM max_identity_links WHERE max_user_id=?`, maxUserID).
+		Scan(&link.UserID, &link.MAXUserID, &link.LinkedAt, &link.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return MAXIdentityLink{}, ErrNotFound
+	}
+	if err != nil {
+		return MAXIdentityLink{}, fmt.Errorf("get MAX identity link by MAX user: %w", err)
+	}
+	link.LinkedAt, link.UpdatedAt = link.LinkedAt.UTC(), link.UpdatedAt.UTC()
+	return link, nil
+}
+
 func (s *Store) GetLatestMAXIdentityLinkAttemptForUser(ctx context.Context, userID string, now time.Time) (MAXIdentityLinkAttempt, error) {
 	attempt, err := scanMAXIdentityLinkAttempt(s.db.QueryRowContext(ctx, `SELECT `+maxIdentityAttemptColumns+`
 FROM max_identity_link_attempts WHERE owner_id=? ORDER BY created_at DESC, id DESC LIMIT 1`, userID))
@@ -281,13 +302,22 @@ WHERE owner_id=? AND id=? AND status IN ('pending','awaiting_confirmation')`, no
 }
 
 func (s *Store) ListDiscoverableChannelsForUser(ctx context.Context, userID string) ([]DiscoverableChannel, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id, o.title, o.public_link,
-COALESCE(o.icon_url, ''), COALESCE(o.participants_count, 0), c.id, COALESCE(c.active, FALSE)
+	rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id,
+CASE WHEN c.id IS NOT NULL THEN c.title ELSE o.title END,
+CASE WHEN c.id IS NOT NULL THEN c.public_link ELSE o.public_link END,
+CASE WHEN c.id IS NOT NULL THEN COALESCE(c.icon_url, '') ELSE COALESCE(o.icon_url, '') END,
+CASE WHEN c.id IS NOT NULL THEN COALESCE(c.participants_count, 0) ELSE COALESCE(o.participants_count, 0) END,
+c.id, COALESCE(c.active, FALSE)
 FROM max_identity_links l
-JOIN observed_bot_chats o ON o.active AND o.max_owner_id=l.max_user_id
+JOIN observed_bot_chats o ON o.active
 LEFT JOIN channels c ON c.max_chat_id=o.max_chat_id
-WHERE l.owner_id=? AND (c.id IS NULL OR c.owner_id=l.owner_id)
-ORDER BY lower(o.title), o.max_chat_id`, userID)
+WHERE l.owner_id=?
+  AND (
+    (c.id IS NOT NULL AND c.owner_id=l.owner_id
+      AND (trim(COALESCE(o.max_owner_id, ''))='' OR o.max_owner_id=l.max_user_id))
+    OR (c.id IS NULL AND o.max_owner_id=l.max_user_id)
+  )
+ORDER BY lower(CASE WHEN c.id IS NOT NULL THEN c.title ELSE o.title END), o.max_chat_id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list discoverable MAX channels: %w", err)
 	}
@@ -309,6 +339,96 @@ ORDER BY lower(o.title), o.max_chat_id`, userID)
 		channels = append(channels, channel)
 	}
 	return channels, rows.Err()
+}
+
+// ListDiscoverableChannelRefreshCandidatesForUser returns two independently
+// bounded inventories. Owned rows are selected first and cannot be displaced
+// by another tenant's incomplete webhook records. Unknown rows are an explicit
+// small fallback that the caller must resolve authoritatively before exposing
+// or counting anything for the requester.
+func (s *Store) ListDiscoverableChannelRefreshCandidatesForUser(ctx context.Context, userID string,
+	incompleteSince time.Time, ownedLimit, unknownLimit int,
+) (DiscoverableChannelRefreshCandidates, error) {
+	if strings.TrimSpace(userID) == "" || incompleteSince.IsZero() {
+		return DiscoverableChannelRefreshCandidates{}, errors.New("user id and incomplete refresh cutoff are required")
+	}
+	if ownedLimit < 0 || unknownLimit < 0 {
+		return DiscoverableChannelRefreshCandidates{}, errors.New("refresh candidate limits cannot be negative")
+	}
+	if ownedLimit > 20 {
+		ownedLimit = 20
+	}
+	if unknownLimit > 4 {
+		unknownLimit = 4
+	}
+	result := DiscoverableChannelRefreshCandidates{
+		Owned: make([]ObservedBotChat, 0, ownedLimit), Unknown: make([]ObservedBotChat, 0, unknownLimit),
+	}
+	if ownedLimit > 0 {
+		rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id, o.public_link, o.title, o.max_owner_id,
+COALESCE(o.icon_url, ''), COALESCE(o.participants_count, 0), o.active, o.last_seen_at, o.removed_at
+FROM max_identity_links l
+JOIN observed_bot_chats o ON o.active
+LEFT JOIN channels c ON c.max_chat_id=o.max_chat_id
+WHERE l.owner_id=?
+  AND (
+    (c.id IS NOT NULL AND c.owner_id=l.owner_id)
+    OR (c.id IS NULL AND o.max_owner_id=l.max_user_id)
+  )
+ORDER BY o.last_seen_at DESC, o.max_chat_id
+LIMIT ?`, userID, ownedLimit)
+		if err != nil {
+			return DiscoverableChannelRefreshCandidates{}, fmt.Errorf("list owned MAX channel refresh candidates: %w", err)
+		}
+		result.Owned, err = scanObservedBotChats(rows, ownedLimit)
+		if err != nil {
+			return DiscoverableChannelRefreshCandidates{}, fmt.Errorf("list owned MAX channel refresh candidates: %w", err)
+		}
+	}
+	if unknownLimit > 0 {
+		rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id, o.public_link, o.title, o.max_owner_id,
+COALESCE(o.icon_url, ''), COALESCE(o.participants_count, 0), o.active, o.last_seen_at, o.removed_at
+FROM max_identity_links l
+JOIN observed_bot_chats o ON o.active
+LEFT JOIN channels c ON c.max_chat_id=o.max_chat_id
+WHERE l.owner_id=?
+  AND c.id IS NULL
+  AND trim(COALESCE(o.max_owner_id, ''))=''
+  AND o.last_seen_at>=?
+ORDER BY o.last_seen_at DESC, o.max_chat_id
+LIMIT ?`, userID, incompleteSince.UTC(), unknownLimit)
+		if err != nil {
+			return DiscoverableChannelRefreshCandidates{}, fmt.Errorf("list unknown MAX channel refresh candidates: %w", err)
+		}
+		result.Unknown, err = scanObservedBotChats(rows, unknownLimit)
+		if err != nil {
+			return DiscoverableChannelRefreshCandidates{}, fmt.Errorf("list unknown MAX channel refresh candidates: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func scanObservedBotChats(rows *sql.Rows, capacity int) ([]ObservedBotChat, error) {
+	defer func() { _ = rows.Close() }()
+	candidates := make([]ObservedBotChat, 0, capacity)
+	for rows.Next() {
+		var candidate ObservedBotChat
+		var removed sql.NullTime
+		if err := rows.Scan(&candidate.MAXChatID, &candidate.PublicLink, &candidate.Title, &candidate.MAXOwnerID,
+			&candidate.IconURL, &candidate.ParticipantsCount, &candidate.Active, &candidate.LastSeenAt, &removed); err != nil {
+			return nil, fmt.Errorf("scan MAX channel refresh candidate: %w", err)
+		}
+		candidate.LastSeenAt = candidate.LastSeenAt.UTC()
+		if removed.Valid {
+			value := removed.Time.UTC()
+			candidate.RemovedAt = &value
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate observed MAX chats: %w", err)
+	}
+	return candidates, nil
 }
 
 // ConnectDiscoverableChannelForUser is the final transactional authorization

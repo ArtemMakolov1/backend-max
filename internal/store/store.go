@@ -719,8 +719,7 @@ WHERE id = ?
   AND NOT EXISTS (
 	SELECT 1 FROM posts
 	WHERE channel_id = ?
-	  AND (max_message_id != '' OR status IN (?, ?, ?))
-  )`, id, id, PostStatusScheduled, PostStatusPublishing, PostStatusPublished)
+  )`, id, id)
 	if err != nil {
 		return fmt.Errorf("delete channel: %w", err)
 	}
@@ -739,7 +738,7 @@ WHERE id = ?
 	if err != nil {
 		return err
 	}
-	return fmt.Errorf("%w: channel has %d scheduled, publishing, or published post(s)", ErrConflict, count)
+	return fmt.Errorf("%w: channel has %d linked post(s); delete or move them before deleting the channel", ErrConflict, count)
 }
 
 func (s *Store) DeleteChannelForUser(ctx context.Context, userID string, id int64) error {
@@ -748,9 +747,8 @@ DELETE FROM channels
 WHERE owner_id = ? AND id = ?
   AND NOT EXISTS (
 	SELECT 1 FROM posts
-	WHERE owner_id = ? AND channel_id = ?
-	  AND (max_message_id != '' OR status IN (?, ?, ?))
-  )`, userID, id, userID, id, PostStatusScheduled, PostStatusPublishing, PostStatusPublished)
+	WHERE channel_id = ?
+  )`, userID, id, id)
 	if err != nil {
 		return fmt.Errorf("delete user channel: %w", err)
 	}
@@ -760,20 +758,18 @@ WHERE owner_id = ? AND id = ?
 	if _, err := s.GetChannelForUser(ctx, userID, id); err != nil {
 		return err
 	}
-	return fmt.Errorf("%w: channel has scheduled, publishing, or published posts", ErrConflict)
+	return fmt.Errorf("%w: channel has linked posts; delete or move them before deleting the channel", ErrConflict)
 }
 
-// CountChannelBlockingPosts reports posts whose MAX publication lifecycle
-// would become unmanageable if the channel foreign key were cleared.
+// CountChannelBlockingPosts reports every post whose channel association would
+// be cleared by the database foreign key if the channel were deleted.
 func (s *Store) CountChannelBlockingPosts(ctx context.Context, id int64) (int64, error) {
 	var count int64
 	err := s.db.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM posts
-WHERE channel_id = ?
-  AND (max_message_id != '' OR status IN (?, ?, ?))`,
-		id, PostStatusScheduled, PostStatusPublishing, PostStatusPublished).Scan(&count)
+WHERE channel_id = ?`, id).Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("count channel publication dependencies: %w", err)
+		return 0, fmt.Errorf("count channel post dependencies: %w", err)
 	}
 	return count, nil
 }

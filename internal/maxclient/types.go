@@ -75,6 +75,20 @@ type Membership struct {
 	Permissions []Permission `json:"permissions,omitempty"`
 }
 
+// ChatMember is the subset of the official ChatMember object needed when the
+// chat metadata omits owner_id. GET /chats/{chatId}/members/admins is the
+// authoritative fallback for distinguishing the owner from ordinary admins.
+type ChatMember struct {
+	UserID      int64        `json:"user_id"`
+	FirstName   string       `json:"first_name"`
+	LastName    string       `json:"last_name,omitempty"`
+	Username    string       `json:"username,omitempty"`
+	IsBot       bool         `json:"is_bot"`
+	IsOwner     bool         `json:"is_owner"`
+	IsAdmin     bool         `json:"is_admin"`
+	Permissions []Permission `json:"permissions,omitempty"`
+}
+
 // HasPermission accepts both current permission names and legacy names that
 // MAX can still return for existing channel administrators.
 func (m Membership) HasPermission(required Permission) bool {

@@ -97,6 +97,15 @@ type DiscoverableChannel struct {
 	ConnectedChannelID *int64 `json:"connected_channel_id,omitempty"`
 }
 
+// DiscoverableChannelRefreshCandidates keeps tenant-associated inventory
+// separate from the small global fallback needed to recover legacy rows whose
+// MAX owner was temporarily missing. Unknown rows must never consume the
+// tenant-owned quota or be exposed directly to the requester.
+type DiscoverableChannelRefreshCandidates struct {
+	Owned   []ObservedBotChat
+	Unknown []ObservedBotChat
+}
+
 type Post struct {
 	ID                  int64        `json:"id"`
 	UserID              string       `json:"-"`

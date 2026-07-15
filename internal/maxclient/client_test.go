@@ -149,6 +149,35 @@ func TestGetChatAndMembershipAreReadOnly(t *testing.T) {
 	}
 }
 
+func TestGetChatAdminsReturnsOwnerAndOrdinaryAdmins(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/-9223372036854775807/members/admins" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"members":[{"user_id":777,"first_name":"Owner","is_owner":true,"is_admin":true,"permissions":["view_stats"]},{"user_id":999,"first_name":"Admin","is_owner":false,"is_admin":true,"permissions":["write"]}]}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	admins, err := client.GetChatAdmins(context.Background(), "-9223372036854775807")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(admins) != 2 || admins[0].UserID != 777 || !admins[0].IsOwner || !admins[0].IsAdmin ||
+		admins[1].UserID != 999 || admins[1].IsOwner || !admins[1].IsAdmin {
+		t.Fatalf("GetChatAdmins() = %#v", admins)
+	}
+	if _, err := client.GetChatAdmins(context.Background(), "not-a-chat"); err == nil {
+		t.Fatal("GetChatAdmins accepted a non-numeric chat id")
+	}
+}
+
 func TestSendIdentityLinkConfirmationUsesPrivateCallbackButtons(t *testing.T) {
 	t.Parallel()
 

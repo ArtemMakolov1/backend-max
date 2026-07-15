@@ -34,9 +34,13 @@ func TestMAXIdentityLinkDiscoversAndConnectsOwnedObservedChannels(t *testing.T) 
 	now := time.Now().UTC().Truncate(time.Second)
 	fake := &claimWebhookMAX{
 		chat: maxclient.ChatInfo{
-			ChatID: "-13549123", OwnerID: "777", Type: "channel", Status: "active", Title: "Тестовый канал",
+			ChatID: "-13549123", Type: "channel", Status: "active", Title: "Тестовый канал",
 			Link: "https://max.ru/se13549123_biz", Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/channel.png"},
 			ParticipantsCount: 42,
+		},
+		admins: []maxclient.ChatMember{
+			{UserID: 888, IsAdmin: true},
+			{UserID: 777, IsOwner: true, IsAdmin: true},
 		},
 		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
 			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionEdit, maxclient.PermissionDelete,
@@ -120,11 +124,32 @@ func TestMAXIdentityLinkDiscoversAndConnectsOwnedObservedChannels(t *testing.T) 
 		t.Fatalf("linked identity restart=%d body=%s", restart.Code, restart.Body.String())
 	}
 
+	// bot_added can arrive while MAX still returns an empty owner. The explicit
+	// refresh route must reconcile that incomplete inventory row and immediately
+	// return the fresh avatar/title to this tenant.
 	if err := storage.UpsertObservedBotChat(ctx, store.ObservedBotChat{
-		MAXChatID: fake.chat.ChatID, MAXOwnerID: fake.chat.OwnerID, Title: fake.chat.Title, PublicLink: fake.chat.Link,
-		IconURL: fake.chat.Icon.URL, ParticipantsCount: fake.chat.ParticipantsCount, Active: true, LastSeenAt: now,
+		MAXChatID: fake.chat.ChatID, Title: "Старое название", IconURL: "https://cdn.max.ru/old.png",
+		Active: true, LastSeenAt: now,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	refresh := performJSONRequest(handler, http.MethodPost, "/api/v1/channels/discoverable/refresh", "")
+	if refresh.Code != http.StatusOK || refresh.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(refresh.Body.String(), `"refreshed":1`) ||
+		!strings.Contains(refresh.Body.String(), `"icon_url":"https://cdn.max.ru/channel.png"`) {
+		t.Fatalf("discoverable refresh=%d cache=%q body=%s", refresh.Code, refresh.Header().Get("Cache-Control"), refresh.Body.String())
+	}
+	maxCalls, adminCalls := len(fake.getChatIDs), len(fake.getAdminChatIDs)
+	repeatedRefresh := performJSONRequest(handler, http.MethodPost, "/api/v1/channels/discoverable/refresh", "")
+	if repeatedRefresh.Code != http.StatusTooManyRequests || repeatedRefresh.Header().Get("Cache-Control") != "no-store" ||
+		repeatedRefresh.Header().Get("Retry-After") != "15" ||
+		!strings.Contains(repeatedRefresh.Body.String(), `"code":"channels_refresh_cooldown"`) ||
+		!strings.Contains(repeatedRefresh.Body.String(), `"retry_after_seconds":15`) {
+		t.Fatalf("repeated refresh=%d retry=%q body=%s", repeatedRefresh.Code,
+			repeatedRefresh.Header().Get("Retry-After"), repeatedRefresh.Body.String())
+	}
+	if len(fake.getChatIDs) != maxCalls || len(fake.getAdminChatIDs) != adminCalls {
+		t.Fatalf("cooldown reached MAX: chats=%#v admins=%#v", fake.getChatIDs, fake.getAdminChatIDs)
 	}
 	discoverable := performJSONRequest(handler, http.MethodGet, "/api/v1/channels/discoverable", "")
 	if discoverable.Code != http.StatusOK || discoverable.Header().Get("Cache-Control") != "no-store" ||

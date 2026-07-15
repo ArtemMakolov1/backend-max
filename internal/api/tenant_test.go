@@ -150,6 +150,19 @@ func TestTenantAPIReturnsNotFoundForForeignResources(t *testing.T) {
 	if err != nil || storedPost.Title != "Private post A" || storedPost.Status != store.PostStatusDraft {
 		t.Fatalf("foreign requests mutated owner post: %#v, %v", storedPost, err)
 	}
+
+	ownerHandler := withTestSession(t, storage,
+		New(application, logger, "http://localhost:4321", "webhook-secret", AuthOptions{
+			YandexClient: &fakeYandexOAuth{},
+		}).Handler(), "owner-a")
+	response = performJSONRequest(ownerHandler, http.MethodDelete, fmt.Sprintf("/api/v1/channels/%d", channel.ID), "")
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "linked posts") {
+		t.Fatalf("channel delete with linked draft = %d %s, want clear 409 conflict", response.Code, response.Body.String())
+	}
+	storedPost, err = storage.GetPostForUser(ctx, "owner-a", post.ID)
+	if err != nil || storedPost.ChannelID == nil || *storedPost.ChannelID != channel.ID {
+		t.Fatalf("blocked channel delete orphaned owner post: %#v, %v", storedPost, err)
+	}
 }
 
 func TestSafeRequesterLabelRemovesControlsAndCapsRunes(t *testing.T) {

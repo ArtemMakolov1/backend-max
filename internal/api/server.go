@@ -142,6 +142,7 @@ func (s *Server) Handler() http.Handler {
 
 			r.Get("/channels", s.listChannels)
 			r.Get("/channels/discoverable", s.listDiscoverableChannels)
+			r.Post("/channels/discoverable/refresh", s.refreshDiscoverableChannels)
 			r.Post("/channels/connect/observed", s.connectObservedChannel)
 			r.Post("/channels/connect/start", s.startChannelConnect)
 			r.Get("/channels/connect/{claim_id}", s.getChannelConnect)
@@ -429,6 +430,16 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
 		s.problem(w, http.StatusTooManyRequests, "stats_refresh_cooldown",
 			"Статистика только что обновлялась. Повторите через несколько секунд.",
+			map[string]any{"retry_after_seconds": retryAfter})
+		return
+	}
+	var refreshCooldownErr *app.DiscoverableRefreshCooldownError
+	if errors.As(err, &refreshCooldownErr) {
+		retryAfter := retryAfterSeconds(refreshCooldownErr.RetryAfter)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+		s.problem(w, http.StatusTooManyRequests, "channels_refresh_cooldown",
+			"Список каналов недавно обновлялся. Повторите через несколько секунд.",
 			map[string]any{"retry_after_seconds": retryAfter})
 		return
 	}

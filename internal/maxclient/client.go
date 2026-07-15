@@ -235,6 +235,27 @@ func (c *Client) GetMembership(ctx context.Context, chatID string) (Membership, 
 	return membership, nil
 }
 
+// GetChatAdmins returns the official administrator inventory for a chat or
+// channel. The endpoint includes is_owner, which is required because owner_id
+// is nullable in GET /chats/{chatId} and can remain absent for channels.
+func (c *Client) GetChatAdmins(ctx context.Context, chatID string) ([]ChatMember, error) {
+	if !numericID(chatID) {
+		return nil, errors.New("get MAX chat admins: chat ID must be numeric")
+	}
+	var response struct {
+		Members []ChatMember `json:"members"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/members/admins", nil, nil, &response); err != nil {
+		return nil, err
+	}
+	for _, member := range response.Members {
+		if member.UserID <= 0 {
+			return nil, errors.New("MAX chat admins response contains an invalid user_id")
+		}
+	}
+	return response.Members, nil
+}
+
 // GetMessage returns the current message metadata exposed by MAX, including
 // the canonical public URL and view count. It is intentionally read-only.
 func (c *Client) GetMessage(ctx context.Context, messageID string) (Message, error) {

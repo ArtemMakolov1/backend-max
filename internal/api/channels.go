@@ -54,6 +54,23 @@ func (s *Server) listDiscoverableChannels(w http.ResponseWriter, r *http.Request
 	s.writeJSON(w, http.StatusOK, map[string]any{"channels": channels})
 }
 
+func (s *Server) refreshDiscoverableChannels(w http.ResponseWriter, r *http.Request) {
+	userID, err := authenticatedUserID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	ctx, cancel := contextWithTimeout(r, 15*time.Second)
+	defer cancel()
+	result, err := s.app.RefreshDiscoverableChannelsForUser(ctx, userID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, result)
+}
+
 func (s *Server) connectObservedChannel(w http.ResponseWriter, r *http.Request) {
 	userID, err := authenticatedUserID(r)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,21 +26,27 @@ import (
 )
 
 var (
-	ErrMAXNotConfigured        = errors.New("MAX integration is not configured")
-	ErrMAXChannelEventRequired = errors.New("MAX channel event is required to discover the channel id")
-	ErrOpenAINotConfigured     = errors.New("OpenAI integration is not configured")
-	ErrResearchNotConfigured   = errors.New("OpenAI research integration is not configured")
-	ErrConflict                = errors.New("resource state conflict")
+	ErrMAXNotConfigured             = errors.New("MAX integration is not configured")
+	ErrMAXChannelEventRequired      = errors.New("MAX channel event is required to discover the channel id")
+	ErrMAXChannelMetadataIncomplete = errors.New("MAX channel metadata is incomplete")
+	ErrOpenAINotConfigured          = errors.New("OpenAI integration is not configured")
+	ErrResearchNotConfigured        = errors.New("OpenAI research integration is not configured")
+	ErrConflict                     = errors.New("resource state conflict")
 )
 
 const (
 	manualMAXStatsCooldown          = 15 * time.Second
 	channelParticipantStatsInterval = time.Hour
+	discoverableRefreshCooldown     = 15 * time.Second
+	discoverableOwnedRefreshLimit   = 8
+	discoverableUnknownRefreshLimit = 2
+	incompleteObservedChatWindow    = 7 * 24 * time.Hour
 )
 
 type MAXClient interface {
 	GetMe(context.Context) (maxclient.BotInfo, error)
 	GetChat(context.Context, string) (maxclient.ChatInfo, error)
+	GetChatAdmins(context.Context, string) ([]maxclient.ChatMember, error)
 	GetChatByLink(context.Context, string) (maxclient.ChatInfo, error)
 	GetMembership(context.Context, string) (maxclient.Membership, error)
 	GetMessage(context.Context, string) (maxclient.Message, error)
@@ -92,6 +99,21 @@ func (e *MAXStatsCooldownError) Unwrap() error {
 	return ErrConflict
 }
 
+// DiscoverableRefreshCooldownError prevents repeated browser clicks and
+// concurrent requests from multiplying calls made with the shared MAX bot
+// token. RetryAfter is suitable for both the HTTP Retry-After header and UI.
+type DiscoverableRefreshCooldownError struct {
+	RetryAfter time.Duration
+}
+
+func (e *DiscoverableRefreshCooldownError) Error() string {
+	return "MAX channel inventory was refreshed recently"
+}
+
+func (e *DiscoverableRefreshCooldownError) Unwrap() error {
+	return ErrConflict
+}
+
 func (e *ChannelAccessError) Error() string {
 	if e.Message != "" {
 		return e.Message
@@ -133,6 +155,11 @@ func (noopMetrics) SetSchedulerDue(string, int)                               {}
 func (noopMetrics) ObserveSchedulerCycle(time.Duration, time.Time)            {}
 func (noopMetrics) AddRecoveredPublications(int64)                            {}
 
+type discoverableRefreshState struct {
+	inFlight bool
+	retryAt  time.Time
+}
+
 type App struct {
 	store    *store.Store
 	media    *media.Store
@@ -145,7 +172,10 @@ type App struct {
 	// messageChatDiscovery collapses webhook retries for a channel that has not
 	// entered the authenticated inventory yet. Lifecycle events intentionally do
 	// not use it because bot_added must refresh the stored channel metadata.
-	messageChatDiscovery singleflight.Group
+	messageChatDiscovery         singleflight.Group
+	discoverableRefreshMu        sync.Mutex
+	discoverableRefreshes        map[string]discoverableRefreshState
+	discoverableRefreshLastSweep time.Time
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {
@@ -162,6 +192,7 @@ func NewWithMetrics(storage *store.Store, mediaStore *media.Store, max MAXClient
 	return &App{
 		store: storage, media: mediaStore, max: max, images: images, research: research,
 		logger: logger, metrics: metrics, now: time.Now,
+		discoverableRefreshes: make(map[string]discoverableRefreshState),
 	}
 }
 
@@ -201,6 +232,112 @@ func (a *App) TestMAX(ctx context.Context) (maxclient.BotInfo, error) {
 	return a.max.GetMe(ctx)
 }
 
+// normalizeObservedMAXChat validates the ownership and lifecycle fields that
+// are required before an upstream chat can enter the authenticated inventory.
+// MAX may briefly return an empty owner immediately after bot_added; treating
+// that response as an error lets the webhook delivery be retried instead of
+// persisting an undiscoverable channel indefinitely.
+func normalizeObservedMAXChat(requestedID string, info maxclient.ChatInfo, fallbackLink string,
+	observedAt time.Time,
+) (maxclient.ChatInfo, store.ObservedBotChat, error) {
+	requestedID = strings.TrimSpace(requestedID)
+	info.ChatID = strings.TrimSpace(info.ChatID)
+	info.OwnerID = strings.TrimSpace(info.OwnerID)
+	info.Type = strings.TrimSpace(info.Type)
+	info.Status = strings.TrimSpace(info.Status)
+	info.Title = strings.TrimSpace(info.Title)
+	if info.ChatID == "" || (requestedID != "" && info.ChatID != requestedID) {
+		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: chat id is missing or mismatched", ErrMAXChannelMetadataIncomplete)
+	}
+	if info.OwnerID == "" {
+		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: owner id is missing", ErrMAXChannelMetadataIncomplete)
+	}
+	if info.Type != "channel" || info.Status != "active" {
+		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: chat is not an active channel", ErrMAXChannelMetadataIncomplete)
+	}
+	if info.ParticipantsCount < 0 {
+		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: participants count is invalid", ErrMAXChannelMetadataIncomplete)
+	}
+
+	canonicalLink := strings.TrimRight(strings.TrimSpace(info.Link), "/")
+	if canonicalLink == "" {
+		canonicalLink = strings.TrimRight(strings.TrimSpace(fallbackLink), "/")
+	}
+	if canonicalLink != "" {
+		slug, err := maxclient.NormalizeChatLink(canonicalLink)
+		if err != nil {
+			return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: public link is invalid", ErrMAXChannelMetadataIncomplete)
+		}
+		canonicalLink = "https://max.ru/" + strings.TrimPrefix(slug, "@")
+	}
+	iconURL := maxclient.SafeAssetURL(info.Icon.URL)
+	if strings.TrimSpace(info.Icon.URL) != "" && iconURL == "" {
+		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: icon URL is invalid", ErrMAXChannelMetadataIncomplete)
+	}
+	info.Link = canonicalLink
+	info.Icon.URL = iconURL
+	return info, store.ObservedBotChat{
+		MAXChatID: info.ChatID, PublicLink: canonicalLink, Title: info.Title, MAXOwnerID: info.OwnerID,
+		IconURL: iconURL, ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: observedAt.UTC(),
+	}, nil
+}
+
+// resolveMAXChatOwner fills the nullable owner_id from the official
+// administrators endpoint. An expected owner is always matched by exact MAX
+// user id and must carry the owner flag; an ordinary administrator can never
+// become a verified owner. Webhook discovery additionally requires the owner
+// profile to have been linked to a MaxPosty tenant already.
+func (a *App) resolveMAXChatOwner(ctx context.Context, info maxclient.ChatInfo, expectedOwnerID string,
+	requireLinkedOwner bool,
+) (maxclient.ChatInfo, error) {
+	info.OwnerID = strings.TrimSpace(info.OwnerID)
+	if info.OwnerID != "" {
+		return info, nil
+	}
+	admins, err := a.max.GetChatAdmins(ctx, strings.TrimSpace(info.ChatID))
+	if err != nil {
+		return maxclient.ChatInfo{}, err
+	}
+	expectedOwnerID = strings.TrimSpace(expectedOwnerID)
+	if expectedOwnerID != "" {
+		expected, parseErr := strconv.ParseInt(expectedOwnerID, 10, 64)
+		if parseErr != nil || expected <= 0 {
+			return maxclient.ChatInfo{}, fmt.Errorf("%w: linked owner id is invalid", ErrMAXChannelMetadataIncomplete)
+		}
+		for _, admin := range admins {
+			if admin.UserID == expected && admin.IsOwner && admin.IsAdmin && !admin.IsBot {
+				info.OwnerID = expectedOwnerID
+				return info, nil
+			}
+		}
+		return maxclient.ChatInfo{}, fmt.Errorf("%w: linked MAX profile is not the current channel owner", ErrMAXChannelMetadataIncomplete)
+	}
+
+	owners := make(map[string]struct{}, 1)
+	for _, admin := range admins {
+		if !admin.IsOwner || !admin.IsAdmin || admin.IsBot || admin.UserID <= 0 {
+			continue
+		}
+		ownerID := strconv.FormatInt(admin.UserID, 10)
+		if requireLinkedOwner {
+			if _, linkErr := a.store.GetMAXIdentityLinkForMAXUser(ctx, ownerID); linkErr != nil {
+				if errors.Is(linkErr, store.ErrNotFound) {
+					continue
+				}
+				return maxclient.ChatInfo{}, linkErr
+			}
+		}
+		owners[ownerID] = struct{}{}
+	}
+	if len(owners) != 1 {
+		return maxclient.ChatInfo{}, fmt.Errorf("%w: current channel owner was not uniquely verified", ErrMAXChannelMetadataIncomplete)
+	}
+	for ownerID := range owners {
+		info.OwnerID = ownerID
+	}
+	return info, nil
+}
+
 func (a *App) ObserveMAXChat(ctx context.Context, maxChatID string, active bool, eventAt time.Time) error {
 	if a.max == nil {
 		return ErrMAXNotConfigured
@@ -213,11 +350,15 @@ func (a *App) ObserveMAXChat(ctx context.Context, maxChatID string, active bool,
 	if err != nil {
 		return err
 	}
-	return a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
-		MAXChatID: info.ChatID, PublicLink: strings.TrimRight(strings.TrimSpace(info.Link), "/"),
-		Title: info.Title, MAXOwnerID: info.OwnerID, IconURL: maxclient.SafeAssetURL(info.Icon.URL),
-		ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: now,
-	})
+	info, err = a.resolveMAXChatOwner(ctx, info, "", true)
+	if err != nil {
+		return err
+	}
+	_, observed, err := normalizeObservedMAXChat(maxChatID, info, "", now)
+	if err != nil {
+		return err
+	}
+	return a.store.UpsertObservedBotChat(ctx, observed)
 }
 
 // DiscoverMAXChatFromMessage learns a channel from message_created only when
@@ -227,20 +368,161 @@ func (a *App) DiscoverMAXChatFromMessage(ctx context.Context, maxChatID string, 
 	if a.max == nil {
 		return ErrMAXNotConfigured
 	}
-	if _, err := a.store.GetActiveObservedBotChat(ctx, "", maxChatID); err == nil {
-		return nil
+	if observed, err := a.store.GetActiveObservedBotChat(ctx, "", maxChatID); err == nil {
+		if strings.TrimSpace(observed.MAXOwnerID) != "" {
+			return nil
+		}
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
 	_, err, _ := a.messageChatDiscovery.Do(maxChatID, func() (any, error) {
-		if _, lookupErr := a.store.GetActiveObservedBotChat(ctx, "", maxChatID); lookupErr == nil {
-			return nil, nil
+		if observed, lookupErr := a.store.GetActiveObservedBotChat(ctx, "", maxChatID); lookupErr == nil {
+			if strings.TrimSpace(observed.MAXOwnerID) != "" {
+				return nil, nil
+			}
 		} else if !errors.Is(lookupErr, store.ErrNotFound) {
 			return nil, lookupErr
 		}
 		return nil, a.ObserveMAXChat(ctx, maxChatID, true, eventAt)
 	})
 	return err
+}
+
+type DiscoverableChannelRefresh struct {
+	Channels  []store.DiscoverableChannel `json:"channels"`
+	Refreshed int                         `json:"refreshed"`
+	Failed    int                         `json:"failed"`
+}
+
+func (a *App) beginDiscoverableRefresh(userID string, now time.Time) error {
+	a.discoverableRefreshMu.Lock()
+	defer a.discoverableRefreshMu.Unlock()
+	if a.discoverableRefreshes == nil {
+		a.discoverableRefreshes = make(map[string]discoverableRefreshState)
+	}
+	if a.discoverableRefreshLastSweep.IsZero() || now.Before(a.discoverableRefreshLastSweep) ||
+		now.Sub(a.discoverableRefreshLastSweep) >= discoverableRefreshCooldown {
+		for ownerID, state := range a.discoverableRefreshes {
+			if !state.inFlight && !now.Before(state.retryAt) {
+				delete(a.discoverableRefreshes, ownerID)
+			}
+		}
+		a.discoverableRefreshLastSweep = now
+	}
+	if state, ok := a.discoverableRefreshes[userID]; ok && (state.inFlight || now.Before(state.retryAt)) {
+		retryAfter := state.retryAt.Sub(now)
+		if retryAfter <= 0 {
+			retryAfter = time.Second
+		}
+		return &DiscoverableRefreshCooldownError{RetryAfter: retryAfter}
+	}
+	a.discoverableRefreshes[userID] = discoverableRefreshState{
+		inFlight: true, retryAt: now.Add(discoverableRefreshCooldown),
+	}
+	return nil
+}
+
+func (a *App) finishDiscoverableRefresh(userID string) {
+	a.discoverableRefreshMu.Lock()
+	defer a.discoverableRefreshMu.Unlock()
+	state, ok := a.discoverableRefreshes[userID]
+	if !ok {
+		return
+	}
+	state.inFlight = false
+	a.discoverableRefreshes[userID] = state
+}
+
+// RefreshDiscoverableChannelsForUser reconciles only a bounded, tenant-safe
+// set derived from the authenticated inventory. The request never accepts a
+// chat id, so it cannot be used to probe arbitrary channels through the shared
+// bot. Authoritative owner metadata is persisted before the normal tenant
+// query decides which rows may be returned.
+func (a *App) RefreshDiscoverableChannelsForUser(ctx context.Context, userID string) (DiscoverableChannelRefresh, error) {
+	if a.max == nil {
+		return DiscoverableChannelRefresh{}, ErrMAXNotConfigured
+	}
+	link, err := a.store.GetMAXIdentityLinkForUser(ctx, userID)
+	if err != nil {
+		return DiscoverableChannelRefresh{}, err
+	}
+	gateNow := a.now()
+	if err := a.beginDiscoverableRefresh(userID, gateNow); err != nil {
+		return DiscoverableChannelRefresh{}, err
+	}
+	defer a.finishDiscoverableRefresh(userID)
+	now := gateNow.UTC()
+	candidates, err := a.store.ListDiscoverableChannelRefreshCandidatesForUser(
+		ctx, userID, now.Add(-incompleteObservedChatWindow),
+		discoverableOwnedRefreshLimit, discoverableUnknownRefreshLimit,
+	)
+	if err != nil {
+		return DiscoverableChannelRefresh{}, err
+	}
+	result := DiscoverableChannelRefresh{}
+	var firstOwnedErr error
+	refreshCandidate := func(candidate store.ObservedBotChat, tenantAssociated bool) {
+		info, getErr := a.max.GetChat(ctx, candidate.MAXChatID)
+		if getErr != nil {
+			if tenantAssociated {
+				result.Failed++
+				if firstOwnedErr == nil {
+					firstOwnedErr = getErr
+				}
+			}
+			return
+		}
+		// Resolve the authoritative owner before deciding whether any outcome is
+		// visible in this tenant's counters. Persisting a verified foreign owner
+		// only repairs the shared bot inventory; the tenant query still hides it.
+		info, getErr = a.resolveMAXChatOwner(ctx, info, "", false)
+		if getErr != nil {
+			if tenantAssociated {
+				result.Failed++
+				if firstOwnedErr == nil {
+					firstOwnedErr = getErr
+				}
+			}
+			return
+		}
+		requesterOwned := info.OwnerID == link.MAXUserID
+		_, observed, normalizeErr := normalizeObservedMAXChat(candidate.MAXChatID, info, candidate.PublicLink, now)
+		if normalizeErr != nil {
+			if requesterOwned {
+				result.Failed++
+				if firstOwnedErr == nil {
+					firstOwnedErr = normalizeErr
+				}
+			}
+			return
+		}
+		if upsertErr := a.store.UpsertObservedBotChat(ctx, observed); upsertErr != nil {
+			if requesterOwned {
+				result.Failed++
+				if firstOwnedErr == nil {
+					firstOwnedErr = upsertErr
+				}
+			}
+			return
+		}
+		if requesterOwned {
+			result.Refreshed++
+		}
+	}
+	for _, candidate := range candidates.Owned {
+		refreshCandidate(candidate, true)
+	}
+	for _, candidate := range candidates.Unknown {
+		refreshCandidate(candidate, false)
+	}
+	if result.Refreshed == 0 && firstOwnedErr != nil {
+		return DiscoverableChannelRefresh{}, firstOwnedErr
+	}
+	result.Channels, err = a.store.ListDiscoverableChannelsForUser(ctx, userID)
+	if err != nil {
+		return DiscoverableChannelRefresh{}, err
+	}
+	return result, nil
 }
 
 func (a *App) ConnectChannel(ctx context.Context, publicLink, maxChatID, requestedTitle string) (ChannelCheck, error) {
@@ -254,6 +536,10 @@ func (a *App) ConnectChannel(ctx context.Context, publicLink, maxChatID, request
 		return ChannelCheck{}, errors.New("the shared bot must be added to the channel as an administrator before connecting")
 	}
 	info, err := a.max.GetChat(ctx, observed.MAXChatID)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	info, err = a.resolveMAXChatOwner(ctx, info, observed.MAXOwnerID, false)
 	if err != nil {
 		return ChannelCheck{}, err
 	}
@@ -316,9 +602,14 @@ func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID str
 
 	observed, observedErr := a.store.GetActiveObservedBotChat(ctx, publicLink, maxChatID)
 	var info maxclient.ChatInfo
-	discoveredByLink := false
+	var err error
+	fallbackLink := publicLink
+	requestedChatID := maxChatID
+	expectedOwnerID := ""
 	if observedErr == nil {
-		var err error
+		fallbackLink = observed.PublicLink
+		requestedChatID = observed.MAXChatID
+		expectedOwnerID = observed.MAXOwnerID
 		info, err = a.max.GetChat(ctx, observed.MAXChatID)
 		if err != nil {
 			return ChannelClaimCandidate{}, err
@@ -333,7 +624,6 @@ func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID str
 		if publicLink == "" || maxChatID != "" {
 			return ChannelClaimCandidate{}, errors.New("first add the MaxPosty bot to the channel as an administrator, then retry")
 		}
-		var err error
 		info, err = a.max.GetChatByLink(ctx, slug)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -351,13 +641,14 @@ func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID str
 			}
 			return ChannelClaimCandidate{}, err
 		}
-		if info.Type != "channel" || info.Status != "active" {
-			return ChannelClaimCandidate{}, &ChannelAccessError{
-				Diagnostics: ChannelDiagnostics{ChatID: info.ChatID, Type: info.Type, Status: info.Status},
-				Message:     "The public link must point to an active MAX channel",
-			}
-		}
-		discoveredByLink = true
+	}
+	info, err = a.resolveMAXChatOwner(ctx, info, expectedOwnerID, false)
+	if err != nil {
+		return ChannelClaimCandidate{}, err
+	}
+	info, freshObserved, err := normalizeObservedMAXChat(requestedChatID, info, fallbackLink, a.now().UTC())
+	if err != nil {
+		return ChannelClaimCandidate{}, err
 	}
 	membership, err := a.max.GetMembership(ctx, info.ChatID)
 	if err != nil {
@@ -368,23 +659,10 @@ func (a *App) PrepareChannelClaim(ctx context.Context, publicLink, maxChatID str
 		return ChannelClaimCandidate{}, &ChannelAccessError{Diagnostics: diagnostics,
 			Message: "The shared bot must be an active channel administrator with read_all_messages and write permissions"}
 	}
-	if discoveredByLink {
-		canonicalLink := strings.TrimRight(strings.TrimSpace(info.Link), "/")
-		if canonicalLink == "" {
-			canonicalLink = publicLink
-		} else if normalized, normalizeErr := maxclient.NormalizeChatLink(canonicalLink); normalizeErr == nil {
-			canonicalLink = "https://max.ru/" + strings.TrimPrefix(normalized, "@")
-		} else {
-			// Never persist an unexpected URL returned by the upstream API.
-			canonicalLink = publicLink
-		}
-		info.Link = canonicalLink
-		if err := a.store.UpsertObservedBotChat(ctx, store.ObservedBotChat{
-			MAXChatID: info.ChatID, PublicLink: canonicalLink, Title: info.Title, MAXOwnerID: info.OwnerID,
-			IconURL: maxclient.SafeAssetURL(info.Icon.URL), ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: a.now().UTC(),
-		}); err != nil {
-			return ChannelClaimCandidate{}, err
-		}
+	// Refresh both link-discovered and already observed rows. Without this,
+	// claims could keep serving an old channel avatar/title indefinitely.
+	if err := a.store.UpsertObservedBotChat(ctx, freshObserved); err != nil {
+		return ChannelClaimCandidate{}, err
 	}
 	bot, err := a.max.GetMe(ctx)
 	if err != nil {
@@ -402,6 +680,17 @@ func (a *App) CompleteChannelClaim(ctx context.Context, claim store.ChannelClaim
 	}
 	info, err := a.max.GetChat(ctx, claim.MAXChatID)
 	if err != nil {
+		return store.Channel{}, ChannelDiagnostics{}, err
+	}
+	info, err = a.resolveMAXChatOwner(ctx, info, claim.MAXUserID, false)
+	if err != nil {
+		return store.Channel{}, ChannelDiagnostics{}, err
+	}
+	info, freshObserved, err := normalizeObservedMAXChat(claim.MAXChatID, info, claim.PublicLink, a.now().UTC())
+	if err != nil {
+		return store.Channel{}, ChannelDiagnostics{}, err
+	}
+	if err := a.store.UpsertObservedBotChat(ctx, freshObserved); err != nil {
 		return store.Channel{}, ChannelDiagnostics{}, err
 	}
 	membership, err := a.max.GetMembership(ctx, claim.MAXChatID)
@@ -496,6 +785,17 @@ func (a *App) ConnectDiscoverableChannelForUser(ctx context.Context, userID, max
 	}
 	info, err := a.max.GetChat(ctx, maxChatID)
 	if err != nil {
+		return ChannelCheck{}, err
+	}
+	info, err = a.resolveMAXChatOwner(ctx, info, link.MAXUserID, false)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	info, freshObserved, err := normalizeObservedMAXChat(maxChatID, info, observed.PublicLink, a.now().UTC())
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	if err := a.store.UpsertObservedBotChat(ctx, freshObserved); err != nil {
 		return ChannelCheck{}, err
 	}
 	membership, err := a.max.GetMembership(ctx, maxChatID)
@@ -1359,6 +1659,10 @@ func maxLinkButtons(buttons []store.LinkButton) []maxclient.LinkButton {
 
 func (a *App) inspectChannel(ctx context.Context, channel store.Channel) (maxclient.ChatInfo, maxclient.Membership, error) {
 	info, err := a.max.GetChat(ctx, channel.MAXChatID)
+	if err != nil {
+		return maxclient.ChatInfo{}, maxclient.Membership{}, err
+	}
+	info, err = a.resolveMAXChatOwner(ctx, info, channel.VerifiedMAXOwnerID, false)
 	if err != nil {
 		return maxclient.ChatInfo{}, maxclient.Membership{}, err
 	}

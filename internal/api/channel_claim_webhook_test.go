@@ -22,6 +22,7 @@ import (
 
 type claimWebhookMAX struct {
 	chat              maxclient.ChatInfo
+	admins            []maxclient.ChatMember
 	membership        maxclient.Membership
 	confirmationRuns  int
 	confirmationUser  string
@@ -35,6 +36,7 @@ type claimWebhookMAX struct {
 	callbackMessages  []string
 	publishRuns       int
 	getChatIDs        []string
+	getAdminChatIDs   []string
 	getLinkErr        error
 	message           maxclient.Message
 	pinnedMessage     *maxclient.Message
@@ -51,6 +53,11 @@ func (f *claimWebhookMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 func (f *claimWebhookMAX) GetChat(_ context.Context, chatID string) (maxclient.ChatInfo, error) {
 	f.getChatIDs = append(f.getChatIDs, chatID)
 	return f.chat, nil
+}
+
+func (f *claimWebhookMAX) GetChatAdmins(_ context.Context, chatID string) ([]maxclient.ChatMember, error) {
+	f.getAdminChatIDs = append(f.getAdminChatIDs, chatID)
+	return f.admins, nil
 }
 
 func (f *claimWebhookMAX) GetChatByLink(context.Context, string) (maxclient.ChatInfo, error) {
@@ -301,6 +308,58 @@ func TestMAXMessageCreatedIgnoresNonChannelAndInvalidNestedRecipient(t *testing.
 	}
 	if _, err := storage.GetActiveObservedBotChat(ctx, "", "-1"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("ignored event entered inventory: %v", err)
+	}
+}
+
+func TestMAXBotAddedAcceptsOnlyLinkedOwnerFromAdmins(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := store.Open(ctx, filepath.Join(t.TempDir(), "bot-added-owner-retry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := storage.UpsertUser(ctx, store.User{ID: "tenant-a", Login: "alice", DisplayName: "Alice"}); err != nil {
+		t.Fatal(err)
+	}
+	linkMAXIdentityForChannelTest(t, storage, "tenant-a", "777", now.Add(-time.Minute))
+	fake := &claimWebhookMAX{chat: maxclient.ChatInfo{
+		ChatID: "-13549123", Type: "channel", Status: "active", Title: "Тестовый канал",
+		Link: "https://max.ru/se13549123_biz", Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/channel.png"},
+	}, admins: []maxclient.ChatMember{
+		{UserID: 777, IsAdmin: true},
+		{UserID: 999, IsOwner: true, IsAdmin: true},
+	}}
+	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(app.New(storage, mediaStore, fake, nil, nil, logger), logger,
+		"http://localhost:4321", "webhook-secret")
+	server.now = func() time.Time { return now }
+	body := fmt.Sprintf(`{"update_type":"bot_added","timestamp":%d,"chat_id":-13549123,"is_channel":true}`, now.UnixMilli())
+
+	response := performMAXWebhook(server.Handler(), body)
+	if response.Code == http.StatusOK {
+		t.Fatalf("ordinary linked admin was accepted as owner: %d %s", response.Code, response.Body.String())
+	}
+	if _, err := storage.GetActiveObservedBotChat(ctx, "", "-13549123"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("incomplete bot_added entered inventory: %v", err)
+	}
+
+	fake.admins = append(fake.admins, maxclient.ChatMember{UserID: 777, IsOwner: true, IsAdmin: true})
+	response = performMAXWebhook(server.Handler(), body)
+	if response.Code != http.StatusOK {
+		t.Fatalf("complete bot_added retry=%d %s", response.Code, response.Body.String())
+	}
+	observed, err := storage.GetActiveObservedBotChat(ctx, "", "-13549123")
+	if err != nil || observed.MAXOwnerID != "777" || observed.IconURL != "https://cdn.max.ru/channel.png" {
+		t.Fatalf("retried bot_added observation=%#v err=%v", observed, err)
+	}
+	if len(fake.getAdminChatIDs) != 2 || fake.getAdminChatIDs[0] != "-13549123" || fake.getAdminChatIDs[1] != "-13549123" {
+		t.Fatalf("admins fallback chat ids=%#v", fake.getAdminChatIDs)
 	}
 }
 

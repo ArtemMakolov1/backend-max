@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,10 +21,14 @@ import (
 
 type fakeMAX struct {
 	chat               maxclient.ChatInfo
+	admins             []maxclient.ChatMember
 	membership         maxclient.Membership
+	getChatFn          func(string) (maxclient.ChatInfo, error)
 	getChatErr         error
+	getAdminsErr       error
 	getLinkErr         error
 	getChatCalls       int
+	getAdminsCalls     int
 	getLinkCalls       int
 	lastChatLink       string
 	memberCalls        int
@@ -46,6 +51,29 @@ type fakeMAX struct {
 	getPinnedCalls     int
 	pinCalls           int
 	unpinCalls         int
+}
+
+type blockingRefreshMAX struct {
+	*fakeMAX
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	calls     atomic.Int32
+}
+
+func (f *blockingRefreshMAX) GetChat(ctx context.Context, chatID string) (maxclient.ChatInfo, error) {
+	f.calls.Add(1)
+	f.startOnce.Do(func() { close(f.started) })
+	select {
+	case <-ctx.Done():
+		return maxclient.ChatInfo{}, context.Cause(ctx)
+	case <-f.release:
+	}
+	chat := f.chat
+	if chat.ChatID == "" {
+		chat.ChatID = chatID
+	}
+	return chat, nil
 }
 
 type recordingMetrics struct {
@@ -89,8 +117,11 @@ func (m *recordingMetrics) AddRecoveredPublications(int64) {}
 func (f *fakeMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 	return maxclient.BotInfo{UserID: 1, Username: "studio_bot", IsBot: true}, nil
 }
-func (f *fakeMAX) GetChat(context.Context, string) (maxclient.ChatInfo, error) {
+func (f *fakeMAX) GetChat(_ context.Context, chatID string) (maxclient.ChatInfo, error) {
 	f.getChatCalls++
+	if f.getChatFn != nil {
+		return f.getChatFn(chatID)
+	}
 	if f.getChatErr != nil {
 		return maxclient.ChatInfo{}, f.getChatErr
 	}
@@ -99,6 +130,10 @@ func (f *fakeMAX) GetChat(context.Context, string) (maxclient.ChatInfo, error) {
 		chat.OwnerID = "test-max-owner"
 	}
 	return chat, nil
+}
+func (f *fakeMAX) GetChatAdmins(context.Context, string) ([]maxclient.ChatMember, error) {
+	f.getAdminsCalls++
+	return f.admins, f.getAdminsErr
 }
 func (f *fakeMAX) GetChatByLink(_ context.Context, link string) (maxclient.ChatInfo, error) {
 	f.getLinkCalls++
@@ -477,6 +512,251 @@ func TestDiscoverMAXChatFromMessageSkipsKnownChannelRetries(t *testing.T) {
 	observed, err := storage.GetActiveObservedBotChat(context.Background(), "", fake.chat.ChatID)
 	if err != nil || observed.MAXChatID != fake.chat.ChatID || !observed.Active {
 		t.Fatalf("observed channel = %#v, %v", observed, err)
+	}
+}
+
+func TestObserveMAXChatRejectsIncompleteOwnerAndMessageRetriesExistingIncompleteRow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	eventAt := time.Now().UTC().Truncate(time.Microsecond)
+	fake := &fakeMAX{getChatFn: func(chatID string) (maxclient.ChatInfo, error) {
+		return maxclient.ChatInfo{ChatID: chatID, Type: "channel", Status: "active", Title: "Без владельца"}, nil
+	}}
+	application, storage := newTestApp(t, fake)
+	if err := application.ObserveMAXChat(ctx, "100", true, eventAt); !errors.Is(err, ErrMAXChannelMetadataIncomplete) {
+		t.Fatalf("ObserveMAXChat() error = %v, want incomplete metadata", err)
+	}
+	if _, err := storage.GetActiveObservedBotChat(ctx, "", "100"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("incomplete lifecycle event entered inventory: %v", err)
+	}
+
+	if err := storage.UpsertObservedBotChat(ctx, store.ObservedBotChat{
+		MAXChatID: "100", Title: "Старое название", Active: true, LastSeenAt: eventAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake.getChatFn = func(chatID string) (maxclient.ChatInfo, error) {
+		return maxclient.ChatInfo{
+			ChatID: chatID, OwnerID: "777", Type: "channel", Status: "active", Title: "Новое название",
+			Link: "https://max.ru/new_channel", Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/new.png"}, ParticipantsCount: 15,
+		}, nil
+	}
+	if err := application.DiscoverMAXChatFromMessage(ctx, "100", eventAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := storage.GetActiveObservedBotChat(ctx, "", "100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.MAXOwnerID != "777" || observed.Title != "Новое название" || observed.IconURL != "https://cdn.max.ru/new.png" {
+		t.Fatalf("retried incomplete observation = %#v", observed)
+	}
+}
+
+func TestRefreshDiscoverableChannelsReconcilesMetadataAndHidesForeignOwner(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	fake := &fakeMAX{}
+	application, storage := newTestApp(t, fake)
+	application.now = func() time.Time { return now.Add(time.Minute) }
+	linkMAXIdentityForAppTest(t, storage, "test-owner", "777", now.Add(-time.Hour))
+	fake.admins = []maxclient.ChatMember{
+		{UserID: 999, IsAdmin: true},
+		{UserID: 777, IsOwner: true, IsAdmin: true},
+	}
+	for _, chat := range []store.ObservedBotChat{
+		{MAXChatID: "100", Title: "Старое название", Active: true, LastSeenAt: now.Add(-time.Minute)},
+		{MAXChatID: "101", Title: "Чужой канал", Active: true, LastSeenAt: now.Add(-time.Minute)},
+		{MAXChatID: "102", MAXOwnerID: "777", Title: "Временно недоступен", Active: true, LastSeenAt: now.Add(-time.Minute)},
+	} {
+		if err := storage.UpsertObservedBotChat(ctx, chat); err != nil {
+			t.Fatal(err)
+		}
+	}
+	connected, err := storage.CreateChannel(ctx, store.Channel{
+		UserID: "test-owner", VerifiedMAXOwnerID: "777", MAXChatID: "100", Title: "Старое название",
+		PublicLink: "https://max.ru/old_channel", IconURL: "https://cdn.max.ru/old.png",
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.getChatFn = func(chatID string) (maxclient.ChatInfo, error) {
+		if chatID == "101" {
+			return maxclient.ChatInfo{ChatID: chatID, OwnerID: "999", Type: "channel", Status: "active", Title: "Чужой канал"}, nil
+		}
+		if chatID == "102" {
+			return maxclient.ChatInfo{}, errors.New("temporary MAX failure")
+		}
+		return maxclient.ChatInfo{
+			ChatID: chatID, Type: "channel", Status: "active", Title: "Новое название",
+			Link: "https://max.ru/new_channel", Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/new.png"}, ParticipantsCount: 42,
+		}, nil
+	}
+
+	result, err := application.RefreshDiscoverableChannelsForUser(ctx, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Refreshed != 1 || result.Failed != 1 || len(result.Channels) != 2 {
+		t.Fatalf("refresh result = %#v", result)
+	}
+	channelIDs := map[string]bool{}
+	for _, channel := range result.Channels {
+		channelIDs[channel.MAXChatID] = true
+	}
+	if !channelIDs["100"] || !channelIDs["102"] || channelIDs["101"] {
+		t.Fatalf("refresh channels = %#v", result.Channels)
+	}
+	if fake.getAdminsCalls != 1 {
+		t.Fatalf("GetChatAdmins calls = %d, want owner fallback for one channel", fake.getAdminsCalls)
+	}
+	updated, err := storage.GetChannel(ctx, connected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Title != "Новое название" || updated.PublicLink != "https://max.ru/new_channel" ||
+		updated.IconURL != "https://cdn.max.ru/new.png" || updated.ParticipantsCount != 42 {
+		t.Fatalf("connected channel metadata = %#v", updated)
+	}
+	foreign, err := storage.GetActiveObservedBotChat(ctx, "", "101")
+	if err != nil || foreign.MAXOwnerID != "999" {
+		t.Fatalf("foreign owner was not authoritatively recorded: %#v err=%v", foreign, err)
+	}
+}
+
+func TestRefreshDiscoverableChannelsCooldownCollapsesConcurrentMAXCalls(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	max := &blockingRefreshMAX{
+		fakeMAX: &fakeMAX{chat: maxclient.ChatInfo{
+			ChatID: "100", OwnerID: "777", Type: "channel", Status: "active", Title: "Owned",
+		}},
+		started: make(chan struct{}), release: make(chan struct{}),
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(max.release)
+		}
+	}()
+	application, storage := newTestApp(t, max)
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	application.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	linkMAXIdentityForAppTest(t, storage, "test-owner", "777", now.Add(-time.Hour))
+	if err := storage.UpsertObservedBotChat(ctx, store.ObservedBotChat{
+		MAXChatID: "100", MAXOwnerID: "777", Title: "Owned", Active: true, LastSeenAt: now.Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	type refreshResult struct {
+		value DiscoverableChannelRefresh
+		err   error
+	}
+	firstDone := make(chan refreshResult, 1)
+	go func() {
+		value, err := application.RefreshDiscoverableChannelsForUser(ctx, "test-owner")
+		firstDone <- refreshResult{value: value, err: err}
+	}()
+	select {
+	case <-max.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first refresh did not reach MAX")
+	}
+
+	secondCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if _, err := application.RefreshDiscoverableChannelsForUser(secondCtx, "test-owner"); err == nil {
+		t.Fatal("concurrent refresh was not rate limited")
+	} else {
+		var cooldownErr *DiscoverableRefreshCooldownError
+		if !errors.As(err, &cooldownErr) || cooldownErr.RetryAfter != discoverableRefreshCooldown {
+			t.Fatalf("concurrent refresh error = %#v", err)
+		}
+	}
+	if calls := max.calls.Load(); calls != 1 {
+		t.Fatalf("concurrent refresh MAX calls = %d, want 1", calls)
+	}
+
+	close(max.release)
+	released = true
+	first := <-firstDone
+	if first.err != nil || first.value.Refreshed != 1 {
+		t.Fatalf("first refresh = %#v err=%v", first.value, first.err)
+	}
+	if _, err := application.RefreshDiscoverableChannelsForUser(ctx, "test-owner"); err == nil {
+		t.Fatal("immediate sequential refresh was not rate limited")
+	}
+	if calls := max.calls.Load(); calls != 1 {
+		t.Fatalf("sequential cooldown MAX calls = %d, want 1", calls)
+	}
+
+	clock.Store(now.Add(discoverableRefreshCooldown).UnixNano())
+	afterCooldown, err := application.RefreshDiscoverableChannelsForUser(ctx, "test-owner")
+	if err != nil || afterCooldown.Refreshed != 1 || max.calls.Load() != 2 {
+		t.Fatalf("refresh after cooldown = %#v calls=%d err=%v", afterCooldown, max.calls.Load(), err)
+	}
+}
+
+func TestDiscoverableRefreshGateIsPerUserAndReportsRemainingCooldown(t *testing.T) {
+	t.Parallel()
+	application := &App{}
+	now := time.Date(2026, time.July, 15, 13, 0, 0, 0, time.UTC)
+	if err := application.beginDiscoverableRefresh("tenant-a", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.beginDiscoverableRefresh("tenant-b", now); err != nil {
+		t.Fatalf("tenant B was blocked by tenant A: %v", err)
+	}
+	application.finishDiscoverableRefresh("tenant-a")
+	application.finishDiscoverableRefresh("tenant-b")
+
+	err := application.beginDiscoverableRefresh("tenant-a", now.Add(5*time.Second))
+	var cooldownErr *DiscoverableRefreshCooldownError
+	if !errors.As(err, &cooldownErr) || cooldownErr.RetryAfter != 10*time.Second {
+		t.Fatalf("partial cooldown error = %#v", err)
+	}
+	if err := application.beginDiscoverableRefresh("tenant-a", now.Add(discoverableRefreshCooldown)); err != nil {
+		t.Fatalf("refresh remained blocked after cooldown: %v", err)
+	}
+	application.finishDiscoverableRefresh("tenant-a")
+}
+
+func TestPrepareChannelClaimRefreshesExistingObservedMetadata(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	fake := &fakeMAX{
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+		}},
+	}
+	application, storage := newTestApp(t, fake)
+	fake.chat = maxclient.ChatInfo{
+		ChatID: "100", OwnerID: "777", Type: "channel", Status: "active", Title: "Новое название",
+		Link: "https://max.ru/new_channel", Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/new.png"}, ParticipantsCount: 22,
+	}
+	application.now = func() time.Time { return now.Add(time.Minute) }
+	if err := storage.UpsertObservedBotChat(ctx, store.ObservedBotChat{
+		MAXChatID: "100", PublicLink: "https://max.ru/old_channel", Title: "Старое название", MAXOwnerID: "777",
+		IconURL: "https://cdn.max.ru/old.png", Active: true, LastSeenAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.PrepareChannelClaim(ctx, "", "100"); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := storage.GetActiveObservedBotChat(ctx, "", "100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.Title != "Новое название" || observed.PublicLink != "https://max.ru/new_channel" ||
+		observed.IconURL != "https://cdn.max.ru/new.png" || observed.ParticipantsCount != 22 {
+		t.Fatalf("existing observation was not refreshed: %#v", observed)
 	}
 }
 
@@ -1039,6 +1319,25 @@ func newTestApp(t *testing.T, maxClient MAXClient) (*App, *store.Store) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	return New(storage, mediaStore, maxClient, nil, nil, logger), storage
+}
+
+func linkMAXIdentityForAppTest(t *testing.T, storage *store.Store, userID, maxUserID string, now time.Time) {
+	t.Helper()
+	attempt := store.MAXIdentityLinkAttempt{
+		ID: "link-" + userID, TokenHash: strings.Repeat("a", 64), UserID: userID,
+		RequesterLabel: userID, ComparisonCode: "123456", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+	}
+	if err := storage.CreateMAXIdentityLinkAttempt(context.Background(), attempt); err != nil {
+		t.Fatal(err)
+	}
+	confirmHash := strings.Repeat("b", 64)
+	if _, _, err := storage.StartMAXIdentityLinkConfirmation(context.Background(), attempt.TokenHash, maxUserID,
+		confirmHash, strings.Repeat("c", 64), now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.ConfirmMAXIdentityLink(context.Background(), confirmHash, maxUserID, true, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func contains(values []string, want string) bool {

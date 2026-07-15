@@ -96,9 +96,32 @@ func TestObservedChatRefreshesConnectedChannelVisualMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if channel.Title != "Old title" || channel.PublicLink != "https://max.ru/old" ||
+	if channel.Title != "Fresh title" || channel.PublicLink != "https://max.ru/fresh" ||
 		channel.IconURL != "https://cdn.max.ru/fresh.png" || channel.ParticipantsCount != 42 {
 		t.Fatalf("connected channel was not refreshed from its observed MAX chat: %#v", channel)
+	}
+
+	manualUpdateAt := observedAt.Add(2 * time.Second)
+	if _, err := storage.db.ExecContext(ctx, `UPDATE channels
+SET title=$1, public_link=$2, updated_at=$3 WHERE id=$4`,
+		"Manual title", "https://max.ru/manual", manualUpdateAt, channel.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
+		MAXChatID: "visual-refresh-1", Title: "Delayed official title", PublicLink: "https://max.ru/delayed",
+		MAXOwnerID: channel.VerifiedMAXOwnerID, IconURL: "https://cdn.max.ru/delayed.png", ParticipantsCount: 43,
+		Active: true, LastSeenAt: observedAt.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	channel, err = storage.GetChannel(ctx, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.Title != "Manual title" || channel.PublicLink != "https://max.ru/manual" ||
+		channel.IconURL != "https://cdn.max.ru/fresh.png" || channel.ParticipantsCount != 42 ||
+		!channel.UpdatedAt.Equal(manualUpdateAt) {
+		t.Fatalf("delayed observation replaced newer channel metadata: %#v", channel)
 	}
 
 	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
@@ -111,7 +134,7 @@ func TestObservedChatRefreshesConnectedChannelVisualMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if channel.Title != "Old title" || channel.IconURL != "https://cdn.max.ru/fresh.png" {
+	if channel.Title != "Manual title" || channel.PublicLink != "https://max.ru/manual" || channel.IconURL != "https://cdn.max.ru/fresh.png" {
 		t.Fatalf("stale observation replaced current channel metadata: %#v", channel)
 	}
 }
@@ -311,7 +334,7 @@ func TestDeletePostForUserIsTenantScopedAndBlocksActivePublication(t *testing.T)
 	}
 }
 
-func TestChannelDeletionProtectsPublicationDependencies(t *testing.T) {
+func TestChannelDeletionProtectsAllLinkedPosts(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	storage, err := Open(ctx, filepath.Join(t.TempDir(), "channel-delete.db"))
@@ -359,8 +382,8 @@ func TestChannelDeletionProtectsPublicationDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
-		t.Fatalf("blocking post count = %d, want 3", count)
+	if count != 4 {
+		t.Fatalf("blocking post count = %d, want 4", count)
 	}
 	if err := storage.DeleteChannel(ctx, channel.ID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("DeleteChannel() error = %v, want ErrConflict", err)
@@ -382,20 +405,23 @@ func TestChannelDeletionProtectsPublicationDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 {
-		t.Fatalf("blocking post count after cleanup = %d, want 0", count)
+	if count != 4 {
+		t.Fatalf("blocking post count after publication cleanup = %d, want 4", count)
 	}
-	if err := storage.DeleteChannel(ctx, channel.ID); err != nil {
-		t.Fatal(err)
+	if err := storage.DeleteChannel(ctx, channel.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("DeleteChannel() with draft and failed posts error = %v, want ErrConflict", err)
 	}
 	for _, postID := range []int64{draft.ID, scheduled.ID, publishing.ID, published.ID} {
 		post, getErr := storage.GetPost(ctx, postID)
-		if getErr != nil {
-			t.Fatal(getErr)
+		if getErr != nil || post.ChannelID == nil || *post.ChannelID != channel.ID {
+			t.Fatalf("protected post %d lost its channel: %#v, %v", postID, post, getErr)
 		}
-		if post.ChannelID != nil {
-			t.Errorf("post %d channel_id = %d after channel deletion, want nil", postID, *post.ChannelID)
+		if err := storage.DeletePost(ctx, postID); err != nil {
+			t.Fatalf("DeletePost(%d): %v", postID, err)
 		}
+	}
+	if err := storage.DeleteChannel(ctx, channel.ID); err != nil {
+		t.Fatal(err)
 	}
 }
 
