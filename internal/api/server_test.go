@@ -12,10 +12,38 @@ import (
 	"testing"
 
 	"maxpilot/backend/internal/app"
+	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/store"
 )
+
+func TestWriteErrorTranslatesUnsupportedMAXChannelNotification(t *testing.T) {
+	t.Parallel()
+
+	server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	response := httptest.NewRecorder()
+	server.writeError(response, &maxclient.Error{
+		StatusCode: http.StatusBadRequest,
+		Message:    "errors.send-message.channel-notify",
+	})
+
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusUnprocessableEntity, response.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Error.Code != "max_channel_notify_unsupported" || strings.Contains(payload.Error.Message, "errors.send-message") {
+		t.Fatalf("error payload = %#v", payload.Error)
+	}
+}
 
 func TestMetricsEndpointAllowsOnlyDirectPrivateScrapers(t *testing.T) {
 	t.Parallel()

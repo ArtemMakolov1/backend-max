@@ -472,6 +472,12 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		}
 		if errors.As(err, &maxErr) {
 			details := map[string]any{"upstream_status": maxErr.StatusCode, "request_id": maxErr.RequestID}
+			if maxErr.StatusCode == http.StatusBadRequest &&
+				(maxErr.Code == "errors.send-message.channel-notify" || maxErr.Message == "errors.send-message.channel-notify") {
+				s.problem(w, http.StatusUnprocessableEntity, "max_channel_notify_unsupported",
+					"MAX currently requires subscriber notifications for channel posts", details)
+				return
+			}
 			s.problem(w, http.StatusBadGateway, "max_api_error", maxErr.Message, details)
 			return
 		}

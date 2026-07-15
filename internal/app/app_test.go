@@ -1181,7 +1181,9 @@ func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	}
 	post, err := storage.CreatePost(context.Background(), store.Post{
 		Title: "Buttons", Content: "Body", Format: store.FormatMarkdown, ChannelID: &channel.ID,
-		ImageURL: "http://localhost:8080/media/post.png", ImagePath: imagePath, Notify: true,
+		// Simulate a legacy draft saved before MAX stopped accepting silent
+		// channel publications. The application must omit the unsupported field.
+		ImageURL: "http://localhost:8080/media/post.png", ImagePath: imagePath, Notify: false,
 		LinkButtons: []store.LinkButton{
 			{Text: "  Сайт ", URL: " https://example.com "},
 			{Text: "Каталог", URL: "https://example.com/catalog"},
@@ -1201,6 +1203,9 @@ func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 		fake.lastPublishRequest.LinkButtons[0].Text != "Сайт" || fake.lastPublishRequest.LinkButtons[0].URL != "https://example.com" {
 		t.Fatalf("publish request = %#v", fake.lastPublishRequest)
 	}
+	if fake.lastPublishRequest.Notify != nil {
+		t.Fatalf("publish Notify = %#v, want omitted for channel publication", fake.lastPublishRequest.Notify)
+	}
 
 	cleared := []store.LinkButton{}
 	if _, err := storage.UpdatePost(context.Background(), post.ID, store.PostChanges{LinkButtons: &cleared}); err != nil {
@@ -1214,6 +1219,9 @@ func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	}
 	if fake.lastEditRequest.LinkButtons == nil || len(fake.lastEditRequest.LinkButtons) != 0 {
 		t.Fatalf("edit LinkButtons = %#v, want explicit empty slice", fake.lastEditRequest.LinkButtons)
+	}
+	if fake.lastEditRequest.Notify != nil {
+		t.Fatalf("edit Notify = %#v, want omitted for channel publication", fake.lastEditRequest.Notify)
 	}
 }
 

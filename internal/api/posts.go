@@ -117,15 +117,11 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	notify := true
-	if request.Notify != nil {
-		notify = *request.Notify
-	}
 	post := store.Post{
 		UserID: userID,
 		Title:  strings.TrimSpace(request.Title), Content: request.Content, Format: request.Format,
 		Status: store.PostStatusDraft, ChannelID: request.ChannelID, ImageURL: request.ImageURL,
-		ImagePath: imagePath, ImagePrompt: request.ImagePrompt, Notify: notify,
+		ImagePath: imagePath, ImagePrompt: request.ImagePrompt, Notify: true,
 		LinkButtons: request.LinkButtons, DisableLinkPreview: request.DisableLinkPreview,
 	}
 	if len(request.ScheduledAt) > 0 {
@@ -225,8 +221,18 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 
 	changes := store.PostChanges{
 		Title: request.Title, Content: request.Content, Format: request.Format,
-		ImagePrompt: request.ImagePrompt, LinkButtons: request.LinkButtons, Notify: request.Notify,
+		ImagePrompt: request.ImagePrompt, LinkButtons: request.LinkButtons,
 		DisableLinkPreview: request.DisableLinkPreview,
+	}
+	// MAX currently rejects notify=false for channel posts with
+	// errors.send-message.channel-notify even though the generic message schema
+	// documents the field. MaxPosty manages channels only, so keep persisted
+	// drafts aligned with the only mode MAX accepts instead of promising a
+	// silent publication that the platform cannot deliver.
+	if request.Notify != nil {
+		notify := true
+		changes.Notify = &notify
+		candidate.Notify = true
 	}
 	if request.LinkButtons != nil {
 		if err := store.ValidateLinkButtonsDraft(*request.LinkButtons); err != nil {
@@ -287,9 +293,6 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 	}
 	if request.ImagePrompt != nil {
 		candidate.ImagePrompt = *request.ImagePrompt
-	}
-	if request.Notify != nil {
-		candidate.Notify = *request.Notify
 	}
 	if request.DisableLinkPreview != nil {
 		candidate.DisableLinkPreview = *request.DisableLinkPreview

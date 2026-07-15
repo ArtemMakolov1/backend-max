@@ -164,6 +164,31 @@ func TestUpdatePostRejectsStaleClientRevision(t *testing.T) {
 	}
 }
 
+func TestPostAPINormalizesUnsupportedSilentChannelDelivery(t *testing.T) {
+	t.Parallel()
+	handler, storage, channel := newCalendarTestHandler(t)
+	createBody, _ := json.Marshal(map[string]any{
+		"title": "Channel notification", "content": "body", "format": "markdown",
+		"channel_id": channel.ID, "notify": false,
+	})
+	created := performPostRequest(t, handler, http.MethodPost, "/api/v1/posts", string(createBody), http.StatusCreated)
+	if !created.Notify {
+		t.Fatal("create API kept unsupported notify=false for a MAX channel")
+	}
+
+	updated := performPostRequest(t, handler, http.MethodPatch, "/api/v1/posts/"+postID(created.ID), `{"notify":false}`, http.StatusOK)
+	if !updated.Notify {
+		t.Fatal("update API kept unsupported notify=false for a MAX channel")
+	}
+	stored, err := storage.GetPost(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Notify {
+		t.Fatal("unsupported notify=false was persisted for a MAX channel")
+	}
+}
+
 func newCalendarTestHandler(t *testing.T) (http.Handler, *store.Store, store.Channel) {
 	t.Helper()
 	storage, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "calendar-api.db"))

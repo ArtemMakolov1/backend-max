@@ -989,11 +989,10 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (result s
 	if err != nil {
 		return a.fail(postID, err)
 	}
-	notify := post.Notify
 	message, err := a.publishWithAttachmentRetry(ctx, maxclient.PublishRequest{
 		ChatID: channel.MAXChatID, Text: post.Content, Format: maxclient.Format(post.Format),
 		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons),
-		DisableLinkPreview: post.DisableLinkPreview, Notify: &notify,
+		DisableLinkPreview: post.DisableLinkPreview,
 	})
 	if err != nil {
 		return a.fail(postID, err)
@@ -1051,10 +1050,9 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result sto
 			return store.Post{}, err
 		}
 	}
-	notify := post.Notify
 	err = a.editWithAttachmentRetry(ctx, maxclient.EditRequest{
 		MessageID: post.MAXMessageID, Text: post.Content, Format: maxclient.Format(post.Format),
-		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons), Notify: &notify,
+		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons),
 	})
 	if err != nil {
 		// MAX edit operations can return HTTP 200 with success=false and no
