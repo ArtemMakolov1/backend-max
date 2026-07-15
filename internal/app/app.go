@@ -1794,8 +1794,31 @@ func (a *App) editWithAttachmentRetry(ctx context.Context, request maxclient.Edi
 }
 
 func (a *App) fail(postID int64, cause error) (store.Post, error) {
-	if _, err := a.store.MarkPublishFailed(context.Background(), postID, cause.Error()); err != nil {
+	a.logger.Warn("MAX publication failed", "post_id", postID, "error", cause)
+	if _, err := a.store.MarkPublishFailed(context.Background(), postID, publicationFailureMessage(cause)); err != nil {
 		a.logger.Error("could not persist publication failure", "post_id", postID, "error", err)
 	}
 	return store.Post{}, cause
+}
+
+func publicationFailureMessage(cause error) string {
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return "MAX не ответил вовремя. Проверьте канал и попробуйте опубликовать ещё раз."
+	}
+	var channelErr *ChannelAccessError
+	if errors.As(cause, &channelErr) {
+		return "Помощнику MaxPosty не хватает прав для публикации. Проверьте его права администратора в канале."
+	}
+	var maxErr *maxclient.Error
+	if errors.As(cause, &maxErr) {
+		if maxErr.Code == "errors.send-message.channel-notify" ||
+			maxErr.Message == "errors.send-message.channel-notify" {
+			return "MAX требует уведомить подписчиков о публикации. Уведомления включены автоматически — попробуйте ещё раз."
+		}
+		return "MAX не смог опубликовать пост. Проверьте подключение канала и попробуйте ещё раз."
+	}
+	if strings.Contains(strings.ToLower(cause.Error()), "returned no message id") {
+		return "MAX принял публикацию, но не подтвердил её. Проверьте канал перед повторной попыткой."
+	}
+	return "Не удалось опубликовать пост. Проверьте канал и попробуйте ещё раз."
 }

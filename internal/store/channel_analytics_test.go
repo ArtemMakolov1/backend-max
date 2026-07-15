@@ -121,7 +121,10 @@ func TestChannelAnalyticsIsTenantScopedAndUsesObservedData(t *testing.T) {
 	if report.Summary.TotalViews == nil || *report.Summary.TotalViews != 26 {
 		t.Fatalf("total views = %#v", report.Summary.TotalViews)
 	}
-	if report.Summary.ViewsChange == nil || *report.Summary.ViewsChange != 9 {
+	// The removed post has only one snapshot (4 views), so its initial
+	// cumulative counter must not be presented as growth. Only the comparable
+	// 10 -> 15 observations of Growing post contribute to the delta.
+	if report.Summary.ViewsChange == nil || *report.Summary.ViewsChange != 5 {
 		t.Fatalf("view change = %#v", report.Summary.ViewsChange)
 	}
 	if report.Summary.ParticipantsCurrent == nil || *report.Summary.ParticipantsCurrent != 105 ||
@@ -149,7 +152,7 @@ func TestChannelAnalyticsIsTenantScopedAndUsesObservedData(t *testing.T) {
 	if len(report.Daily) != 2 || report.Daily[0].Date != fromDay.Format(time.DateOnly) || report.Daily[0].Views != nil ||
 		report.Daily[0].ViewsTotal == nil || *report.Daily[0].ViewsTotal != 10 ||
 		report.Daily[0].ParticipantsCount == nil || *report.Daily[0].ParticipantsCount != 103 ||
-		report.Daily[1].Views == nil || *report.Daily[1].Views != 9 ||
+		report.Daily[1].Views == nil || *report.Daily[1].Views != 5 ||
 		report.Daily[1].ViewsTotal == nil || *report.Daily[1].ViewsTotal != 19 ||
 		report.Daily[1].ParticipantsCount == nil || *report.Daily[1].ParticipantsCount != 105 {
 		t.Fatalf("daily = %#v", report.Daily)
@@ -164,6 +167,34 @@ func TestChannelAnalyticsIsTenantScopedAndUsesObservedData(t *testing.T) {
 	if _, err := storage.GetChannelAnalyticsForUser(ctx, "analytics-owner", channel.ID,
 		toDay.AddDate(0, 0, -MaxChannelAnalyticsDays), toDay); err == nil {
 		t.Fatal("oversized analytics range succeeded")
+	}
+}
+
+func TestBuildAnalyticsDailyRequiresComparablePublicationSnapshots(t *testing.T) {
+	t.Parallel()
+	dayOne := time.Date(2026, time.July, 13, 10, 0, 0, 0, time.UTC)
+	dayTwo := dayOne.AddDate(0, 0, 1)
+	observations := []analyticsViewObservation{
+		{PostID: 1, MAXMessageID: "first", Views: 10, CapturedAt: dayOne},
+		{PostID: 1, MAXMessageID: "first", Views: 13, CapturedAt: dayTwo},
+		// The first observation of another publication increases the
+		// cumulative total but is not a comparable period delta.
+		{PostID: 2, MAXMessageID: "second", Views: 7, CapturedAt: dayTwo.Add(time.Minute)},
+	}
+
+	daily, change := buildAnalyticsDaily(observations, nil)
+	if len(daily) != 2 {
+		t.Fatalf("daily = %#v", daily)
+	}
+	if daily[0].Views != nil || daily[0].ViewsTotal == nil || *daily[0].ViewsTotal != 10 {
+		t.Fatalf("first day = %#v", daily[0])
+	}
+	if daily[1].Views == nil || *daily[1].Views != 3 || daily[1].ViewsTotal == nil ||
+		*daily[1].ViewsTotal != 20 {
+		t.Fatalf("second day = %#v", daily[1])
+	}
+	if change == nil || *change != 3 {
+		t.Fatalf("change = %#v", change)
 	}
 }
 

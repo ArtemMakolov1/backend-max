@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,6 +18,7 @@ import (
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/observability"
+	"maxpilot/backend/internal/openaiimg"
 	"maxpilot/backend/internal/store"
 )
 
@@ -42,6 +46,90 @@ func TestWriteErrorTranslatesUnsupportedMAXChannelNotification(t *testing.T) {
 	}
 	if payload.Error.Code != "max_channel_notify_unsupported" || strings.Contains(payload.Error.Message, "errors.send-message") {
 		t.Fatalf("error payload = %#v", payload.Error)
+	}
+}
+
+func TestWriteErrorDoesNotExposeUpstreamOrConflictDetails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		err          error
+		wantCode     string
+		forbidden    []string
+		wantCauseLog bool
+	}{
+		{
+			name:      "MAX protocol error",
+			err:       &maxclient.Error{StatusCode: http.StatusBadRequest, Code: "proto.payload", Message: "errors.send-message.internal-secret", RequestID: "upstream-secret"},
+			wantCode:  "max_api_error",
+			forbidden: []string{"errors.send-message", "upstream-secret", "upstream_status", "request_id"},
+		},
+		{
+			name:      "OpenAI location error",
+			err:       &openaiimg.Error{StatusCode: http.StatusForbidden, Code: "unsupported_country_region_territory", Message: "Country, region, or territory not supported", RequestID: "openai-secret"},
+			wantCode:  "openai_api_error",
+			forbidden: []string{"Country, region", "openai-secret", "upstream_status", "request_id"},
+		},
+		{
+			name:      "stale editor revision",
+			err:       fmt.Errorf("%w: post changed in another session; reload before saving", store.ErrConflict),
+			wantCode:  "state_conflict",
+			forbidden: []string{"another session"},
+		},
+		{
+			name:         "untyped invalid upstream response",
+			err:          errors.New("MAX message response contains an invalid chat ID"),
+			wantCode:     "validation_error",
+			forbidden:    []string{"invalid chat ID", "MAX message response"},
+			wantCauseLog: true,
+		},
+		{
+			name:         "untyped unsupported upstream response",
+			err:          errors.New("unsupported MAX message envelope: proto.payload"),
+			wantCode:     "validation_error",
+			forbidden:    []string{"unsupported MAX", "proto.payload"},
+			wantCauseLog: true,
+		},
+		{
+			name:         "untyped internal required error",
+			err:          errors.New("database connection string is required: secret-db.internal"),
+			wantCode:     "validation_error",
+			forbidden:    []string{"database connection", "secret-db.internal"},
+			wantCauseLog: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var logs bytes.Buffer
+			server := &Server{logger: slog.New(slog.NewTextHandler(&logs, nil))}
+			response := httptest.NewRecorder()
+			server.writeError(response, test.err)
+
+			var payload struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if payload.Error.Code != test.wantCode {
+				t.Fatalf("code = %q, want %q", payload.Error.Code, test.wantCode)
+			}
+			body := response.Body.String()
+			for _, forbidden := range test.forbidden {
+				if strings.Contains(body, forbidden) {
+					t.Fatalf("technical detail %q leaked in %q", forbidden, body)
+				}
+			}
+			if test.wantCauseLog && !strings.Contains(logs.String(), test.err.Error()) {
+				t.Fatalf("server log omitted original cause %q: %s", test.err, logs.String())
+			}
+		})
 	}
 }
 

@@ -19,6 +19,36 @@ import (
 	"maxpilot/backend/internal/store"
 )
 
+func TestPublicationFailureMessageDoesNotExposeProviderDetails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		err       error
+		forbidden string
+	}{
+		{
+			name:      "MAX protocol detail",
+			err:       &maxclient.Error{StatusCode: http.StatusBadRequest, Code: "proto.payload", Message: "errors.send-message.channel-internal"},
+			forbidden: "errors.send-message",
+		},
+		{
+			name:      "generic internal detail",
+			err:       errors.New("database password accidentally appeared here"),
+			forbidden: "password",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message := publicationFailureMessage(test.err)
+			if message == "" || strings.Contains(strings.ToLower(message), strings.ToLower(test.forbidden)) {
+				t.Fatalf("unsafe publication message %q", message)
+			}
+		})
+	}
+}
+
 type fakeMAX struct {
 	chat               maxclient.ChatInfo
 	admins             []maxclient.ChatMember

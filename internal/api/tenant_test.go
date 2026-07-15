@@ -156,7 +156,7 @@ func TestTenantAPIReturnsNotFoundForForeignResources(t *testing.T) {
 			YandexClient: &fakeYandexOAuth{},
 		}).Handler(), "owner-a")
 	response = performJSONRequest(ownerHandler, http.MethodDelete, fmt.Sprintf("/api/v1/channels/%d", channel.ID), "")
-	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "linked posts") {
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "связанные с этим каналом") {
 		t.Fatalf("channel delete with linked draft = %d %s, want clear 409 conflict", response.Code, response.Body.String())
 	}
 	storedPost, err = storage.GetPostForUser(ctx, "owner-a", post.ID)

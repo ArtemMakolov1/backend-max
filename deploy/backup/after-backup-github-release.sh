@@ -114,34 +114,43 @@ cleanup() {
 trap cleanup EXIT INT TERM
 umask 077
 
-# Mutating GitHub requests must not be retried after a connection was
-# established: the remote operation may have succeeded even when its response
-# was lost. A DNS failure, refusal, or connect timeout with time_connect=0 is
-# unambiguous, however, and is safe to retry without creating duplicate
-# releases or assets.
+# Mutating GitHub requests must not be retried after their application transport
+# was established: the remote operation may have succeeded even when its
+# response was lost. For HTTPS, a completed TCP connection is not enough to
+# send HTTP bytes; TLS must finish first. Retrying a DNS/TCP/TLS-connect failure
+# is therefore unambiguous, while an error after TLS (or after TCP for HTTP test
+# endpoints) remains fail-closed to avoid duplicate releases or assets.
 github_curl() {
   local output=$1
   shift
   local attempt=1
   local curl_status=0
   local time_connect=''
-  local timing="$temporary/curl-time-connect.$$.txt"
+  local time_appconnect=''
+  local endpoint=${!#}
+  local transport_time=''
+  local timing="$temporary/curl-transport-timing.$$.txt"
 
   while true; do
     : >"$output"
     : >"$timing"
     if curl --config "$curl_config" --silent --show-error --fail-with-body \
-      --write-out '%{time_connect}' -o "$output" "$@" >"$timing"; then
+      --write-out '%{time_connect}\t%{time_appconnect}' -o "$output" "$@" >"$timing"; then
       rm -f "$timing"
       return 0
     else
       curl_status=$?
     fi
 
-    time_connect=$(<"$timing")
+    IFS=$'\t' read -r time_connect time_appconnect <"$timing" || true
+    case "$endpoint" in
+      https://*) transport_time=$time_appconnect ;;
+      http://*) transport_time=$time_connect ;;
+      *) transport_time=invalid ;;
+    esac
     if (( attempt >= connect_attempts )) ||
       [[ ! "$curl_status" =~ ^(6|7|28)$ ]] ||
-      [[ ! "$time_connect" =~ ^0([.]0+)?$ ]]; then
+      [[ ! "$transport_time" =~ ^0([.]0+)?$ ]]; then
       rm -f "$timing"
       return "$curl_status"
     fi

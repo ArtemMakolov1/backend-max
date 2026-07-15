@@ -88,7 +88,7 @@ func TestFormatPostContentReportsUnavailableAndUpstreamFailure(t *testing.T) {
 		handler := newResearchTestHandler(t, fake, "")
 		response := performJSONRequest(handler, http.MethodPost, "/api/v1/posts/format-content", body)
 		assertProblemCode(t, response, http.StatusBadGateway, "openai_research_error")
-		if strings.Contains(response.Body.String(), "rate_limit") || !strings.Contains(response.Body.String(), "req-format-123") {
+		if strings.Contains(response.Body.String(), "rate_limit") || strings.Contains(response.Body.String(), "req-format-123") {
 			t.Fatalf("upstream problem body = %s", response.Body.String())
 		}
 	})

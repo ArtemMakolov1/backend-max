@@ -44,11 +44,11 @@ type AnalyticsSummary struct {
 	ViewsChange         *int64 `json:"views_change"`
 }
 
-// AnalyticsDailyPoint contains observations only. Views is the increase from
-// the previous comparable observed day; it is nil for the first observed day
-// or when no view snapshot was captured that day. ViewsTotal is the latest
-// known cumulative total on the date. Dates with no MAX observation are not
-// manufactured as zero-valued points.
+// AnalyticsDailyPoint contains observations only. Views is the change between
+// comparable snapshots of the same MAX publications captured in the period;
+// a publication's first observed counter is never presented as growth.
+// ViewsTotal is the latest known cumulative total on the date. Dates with no
+// MAX observation are not manufactured as zero-valued points.
 type AnalyticsDailyPoint struct {
 	Date              string `json:"date"`
 	Views             *int64 `json:"views"`
@@ -293,27 +293,35 @@ func buildAnalyticsDaily(viewObservations []analyticsViewObservation,
 	sort.Strings(viewDayKeys)
 
 	publicationViews := make(map[analyticsPublicationKey]int64)
-	var previousTotal *int64
-	var firstComparableTotal *int64
+	var viewsChange int64
+	var hasComparableViews bool
 	for _, day := range viewDayKeys {
+		var dayChange int64
+		var hasComparableDayViews bool
 		for _, observation := range viewDays[day] {
 			key := analyticsPublicationKey{PostID: observation.PostID, MAXMessageID: observation.MAXMessageID}
-			if current, exists := publicationViews[key]; !exists || observation.Views > current {
-				publicationViews[key] = observation.Views
+			if previous, exists := publicationViews[key]; exists {
+				// MAX counters are cumulative. Compare only observations of the
+				// same publication, otherwise the first snapshot of a newly
+				// published post would be incorrectly counted as period growth.
+				delta := observation.Views - previous
+				dayChange += delta
+				viewsChange += delta
+				hasComparableDayViews = true
+				hasComparableViews = true
 			}
+			// Keep the latest observation, including a possible upstream
+			// correction. Taking MAX() would conceal real counter changes.
+			publicationViews[key] = observation.Views
 		}
 		var total int64
 		for _, views := range publicationViews {
 			total += views
 		}
 		point := &AnalyticsDailyPoint{Date: day, ViewsTotal: int64Pointer(total)}
-		if previousTotal != nil {
-			delta := total - *previousTotal
-			point.Views = &delta
-		} else {
-			firstComparableTotal = int64Pointer(total)
+		if hasComparableDayViews {
+			point.Views = int64Pointer(dayChange)
 		}
-		previousTotal = int64Pointer(total)
 		points[day] = point
 	}
 
@@ -336,12 +344,11 @@ func buildAnalyticsDaily(viewObservations []analyticsViewObservation,
 	for _, day := range days {
 		result = append(result, *points[day])
 	}
-	var viewsChange *int64
-	if len(viewDayKeys) >= 2 && previousTotal != nil && firstComparableTotal != nil {
-		change := *previousTotal - *firstComparableTotal
-		viewsChange = &change
+	var observedViewsChange *int64
+	if hasComparableViews {
+		observedViewsChange = int64Pointer(viewsChange)
 	}
-	return result, viewsChange
+	return result, observedViewsChange
 }
 
 func int64Pointer(value int64) *int64 {

@@ -10,7 +10,7 @@ fi
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 install -d "$fixture/bin" "$fixture/backups" "$fixture/state-success" "$fixture/state-retry" \
-  "$fixture/state-ambiguous" "$fixture/state-failure"
+  "$fixture/state-tls-retry" "$fixture/state-ambiguous" "$fixture/state-failure"
 ln -s "$repo_root/deploy/tests/fake-backup-curl.sh" "$fixture/bin/curl"
 for command in jq openssl sha256sum stat tar readlink sleep awk basename dirname mktemp chmod rm; do
   ln -s "$(type -P "$command")" "$fixture/bin/$command"
@@ -71,6 +71,24 @@ PATH="$fixture/bin:/usr/bin:/bin" \
 [[ -s "$fixture/state-retry/asset" && ! -e "$fixture/state-retry/deleted" ]]
 [[ $(<"$fixture/state-retry/create-calls") == 2 ]]
 
+# A TCP connection followed by an HTTPS handshake timeout cannot have sent the
+# mutating HTTP request and is safe to retry. This is the production failure
+# mode that time_connect alone cannot distinguish from an ambiguous response.
+PATH="$fixture/bin:/usr/bin:/bin" \
+  TEST_CURL_STATE="$fixture/state-tls-retry" TEST_TLS_HANDSHAKE_TIMEOUT_ONCE=true \
+  MAXPOSTY_BACKUP_CONNECT_ATTEMPTS=2 MAXPOSTY_BACKUP_CONNECT_RETRY_DELAY=0 \
+  MAXPOSTY_BACKUP_CURL_CONFIG="$fixture/curl.config" \
+  MAXPOSTY_BACKUP_REPOSITORY=example/backend \
+  MAXPOSTY_BACKUP_SOURCE_SHA="$sha" \
+  MAXPOSTY_BACKUP_RECIPIENT_CERT="$fixture/recipient.pem" \
+  MAXPOSTY_BACKUP_API_URL=https://api.example.test \
+  MAXPOSTY_BACKUP_UPLOAD_URL=https://uploads.example.test \
+  "$repo_root/deploy/backup/after-backup-github-release.sh" \
+  "$dump" "$media" "$manifest" "$image" >/dev/null
+[[ -e "$fixture/state-tls-retry/tls-handshake-timeout-injected" ]]
+[[ -s "$fixture/state-tls-retry/asset" && ! -e "$fixture/state-tls-retry/deleted" ]]
+[[ $(<"$fixture/state-tls-retry/create-calls") == 2 ]]
+
 if PATH="$fixture/bin:/usr/bin:/bin" \
   TEST_CURL_STATE="$fixture/state-ambiguous" TEST_ESTABLISHED_TIMEOUT_ONCE=true \
   MAXPOSTY_BACKUP_CONNECT_ATTEMPTS=2 MAXPOSTY_BACKUP_CONNECT_RETRY_DELAY=0 \
@@ -78,8 +96,8 @@ if PATH="$fixture/bin:/usr/bin:/bin" \
   MAXPOSTY_BACKUP_REPOSITORY=example/backend \
   MAXPOSTY_BACKUP_SOURCE_SHA="$sha" \
   MAXPOSTY_BACKUP_RECIPIENT_CERT="$fixture/recipient.pem" \
-  MAXPOSTY_BACKUP_API_URL=http://127.0.0.1:8123 \
-  MAXPOSTY_BACKUP_UPLOAD_URL=http://127.0.0.1:8123 \
+  MAXPOSTY_BACKUP_API_URL=https://api.example.test \
+  MAXPOSTY_BACKUP_UPLOAD_URL=https://uploads.example.test \
   "$repo_root/deploy/backup/after-backup-github-release.sh" \
   "$dump" "$media" "$manifest" "$image" >/dev/null 2>&1; then
   echo "Offsite backup retried an ambiguous request after connecting" >&2

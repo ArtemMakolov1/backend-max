@@ -42,6 +42,67 @@ func TestMigrateStoresSHA256AndRejectsChangedAppliedSQL(t *testing.T) {
 	}
 }
 
+func TestSanitizePublicationErrorsMigrationRemovesProviderDetails(t *testing.T) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(migrations) == 0 {
+		t.Fatal("no embedded migrations loaded")
+	}
+	if migrations[len(migrations)-1].version != "012_sanitize_publication_errors.sql" {
+		t.Fatalf("last migration = %q, want 012_sanitize_publication_errors.sql", migrations[len(migrations)-1].version)
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:len(migrations)-1]); err != nil {
+		t.Fatalf("apply prerequisite migrations: %v", err)
+	}
+
+	now := time.Now().UTC()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO users(id, display_name, created_at, updated_at) VALUES ('owner', 'Owner', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	legacyErrors := []string{
+		"MAX API error (status 400, code proto.payload): errors.send-message.channel-notify",
+		"Previous publication was interrupted; check the MAX channel before retrying to avoid a duplicate post.",
+	}
+	for _, message := range legacyErrors {
+		if _, err := db.ExecContext(ctx, `
+INSERT INTO posts(owner_id, title, content, last_error, created_at, updated_at)
+VALUES ('owner', 'Legacy post', 'Body', $1, $2, $2)`, message, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := runMigrationSet(ctx, testURL, migrations); err != nil {
+		t.Fatalf("apply sanitizing migration: %v", err)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT last_error FROM posts ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	count := 0
+	for rows.Next() {
+		count++
+		var message string
+		if err := rows.Scan(&message); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(message, "MAX API error") || strings.Contains(message, "proto.payload") || strings.Contains(message, "errors.send-message") || strings.Contains(message, "Previous publication") {
+			t.Fatalf("migration kept provider or protocol details in %q", message)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count != len(legacyErrors) {
+		t.Fatalf("sanitized rows = %d, want %d", count, len(legacyErrors))
+	}
+}
+
 func TestMigrationIntegrityFailsClosedAtRuntimeAndMigrator(t *testing.T) {
 	ctx := context.Background()
 	testURL, db := newMigrationTestSchema(t)
@@ -80,7 +141,7 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "012_future_additive.sql"
+	const futureVersion = "013_future_additive.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {

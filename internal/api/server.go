@@ -419,7 +419,7 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		retryAfter := retryAfterSeconds(aiLimitErr.RetryAfter)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
-		s.problem(w, http.StatusTooManyRequests, "ai_rate_limited", "AI request limit reached; retry later", map[string]any{
+		s.problem(w, http.StatusTooManyRequests, "ai_rate_limited", "Лимит запросов к ИИ временно исчерпан. Попробуйте позже.", map[string]any{
 			"reason": aiLimitErr.Reason, "retry_after_seconds": retryAfter,
 		})
 		return
@@ -446,57 +446,87 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		s.problem(w, http.StatusNotFound, "not_found", "Resource was not found", nil)
+		s.problem(w, http.StatusNotFound, "not_found", "Запрошенные данные не найдены.", nil)
 	case errors.Is(err, store.ErrConflict):
-		s.problem(w, http.StatusConflict, "state_conflict", err.Error(), nil)
+		s.problem(w, http.StatusConflict, "state_conflict", storeConflictMessage(err), nil)
 	case errors.Is(err, app.ErrMAXNotConfigured):
-		s.problem(w, http.StatusServiceUnavailable, "max_not_configured", err.Error(), nil)
+		s.problem(w, http.StatusServiceUnavailable, "max_not_configured",
+			"Помощник MAX пока не настроен. Обратитесь в поддержку MaxPosty.", nil)
 	case errors.Is(err, app.ErrOpenAINotConfigured):
-		s.problem(w, http.StatusServiceUnavailable, "openai_not_configured", err.Error(), nil)
+		s.problem(w, http.StatusServiceUnavailable, "openai_not_configured",
+			"Функции с ИИ сейчас недоступны. Попробуйте позже.", nil)
 	case errors.Is(err, app.ErrResearchNotConfigured):
-		s.problem(w, http.StatusServiceUnavailable, "openai_research_not_configured", err.Error(), nil)
+		s.problem(w, http.StatusServiceUnavailable, "openai_research_not_configured",
+			"Исследование с ИИ сейчас недоступно. Попробуйте позже.", nil)
 	case errors.Is(err, app.ErrConflict):
-		s.problem(w, http.StatusConflict, "state_conflict", err.Error(), nil)
+		s.problem(w, http.StatusConflict, "state_conflict",
+			"Данные изменились во время операции. Обновите страницу и попробуйте ещё раз.", nil)
 	case errors.Is(err, context.Canceled):
-		s.problem(w, 499, "request_canceled", "Request was canceled", nil)
+		s.problem(w, 499, "request_canceled", "Операция была отменена.", nil)
 	case errors.Is(err, context.DeadlineExceeded):
-		s.problem(w, http.StatusGatewayTimeout, "upstream_timeout", "An upstream request timed out", nil)
+		s.problem(w, http.StatusGatewayTimeout, "upstream_timeout",
+			"Сервис не ответил вовремя. Попробуйте ещё раз.", nil)
 	default:
 		var maxErr *maxclient.Error
 		var openAIErr *openaiimg.Error
 		var researchErr *openairesearch.Error
 		var channelErr *app.ChannelAccessError
 		if errors.As(err, &channelErr) {
-			s.problem(w, http.StatusUnprocessableEntity, "max_channel_access", channelErr.Error(), channelErr.Diagnostics)
+			s.problem(w, http.StatusUnprocessableEntity, "max_channel_access",
+				"Помощнику MaxPosty не хватает прав в канале. Проверьте его права администратора и повторите операцию.",
+				channelErr.Diagnostics)
 			return
 		}
 		if errors.As(err, &maxErr) {
-			details := map[string]any{"upstream_status": maxErr.StatusCode, "request_id": maxErr.RequestID}
 			if maxErr.StatusCode == http.StatusBadRequest &&
 				(maxErr.Code == "errors.send-message.channel-notify" || maxErr.Message == "errors.send-message.channel-notify") {
+				s.logger.Warn("MAX channel notification request failed", "status", maxErr.StatusCode,
+					"code", maxErr.Code, "request_id", maxErr.RequestID, "error", maxErr.Message)
 				s.problem(w, http.StatusUnprocessableEntity, "max_channel_notify_unsupported",
-					"MAX currently requires subscriber notifications for channel posts", details)
+					"MAX требует уведомлять подписчиков о новых публикациях. Уведомления включены автоматически — повторите отправку.", nil)
 				return
 			}
-			s.problem(w, http.StatusBadGateway, "max_api_error", maxErr.Message, details)
+			s.logger.Warn("MAX request failed", "status", maxErr.StatusCode,
+				"code", maxErr.Code, "request_id", maxErr.RequestID, "error", maxErr.Message)
+			s.problem(w, http.StatusBadGateway, "max_api_error",
+				"MAX не смог выполнить операцию. Попробуйте ещё раз.", nil)
 			return
 		}
 		if errors.As(err, &openAIErr) {
-			details := map[string]any{"upstream_status": openAIErr.StatusCode, "request_id": openAIErr.RequestID}
-			s.problem(w, http.StatusBadGateway, "openai_api_error", openAIErr.Message, details)
+			s.logger.Warn("OpenAI image request failed", "status", openAIErr.StatusCode,
+				"request_id", openAIErr.RequestID, "error", openAIErr.Message)
+			s.problem(w, http.StatusBadGateway, "openai_api_error",
+				"Функция с ИИ сейчас недоступна. Попробуйте позже.", nil)
 			return
 		}
 		if errors.As(err, &researchErr) {
-			details := map[string]any{"upstream_status": researchErr.StatusCode, "request_id": researchErr.RequestID}
-			s.problem(w, http.StatusBadGateway, "openai_research_error", researchErr.Message, details)
+			s.logger.Warn("OpenAI research request failed", "status", researchErr.StatusCode,
+				"request_id", researchErr.RequestID, "error", researchErr.Message)
+			s.problem(w, http.StatusBadGateway, "openai_research_error",
+				"Исследование с ИИ сейчас недоступно. Попробуйте позже.", nil)
 			return
 		}
 		if isValidationError(err) {
-			s.problem(w, http.StatusBadRequest, "validation_error", err.Error(), nil)
+			s.logger.Info("request validation failed", "error", err)
+			s.problem(w, http.StatusBadRequest, "validation_error",
+				"Проверьте заполнение полей и попробуйте ещё раз.", nil)
 			return
 		}
 		s.logger.Error("request failed", "error", err)
-		s.problem(w, http.StatusInternalServerError, "internal_error", "Internal server error", nil)
+		s.problem(w, http.StatusInternalServerError, "internal_error",
+			"Не удалось выполнить операцию. Попробуйте ещё раз.", nil)
+	}
+}
+
+func storeConflictMessage(err error) string {
+	detail := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(detail, "post changed in another session"):
+		return "Публикация была обновлена в другой вкладке. Обновите данные и повторите сохранение."
+	case strings.Contains(detail, "linked post"):
+		return "Сначала удалите или перенесите публикации, связанные с этим каналом."
+	default:
+		return "Данные изменились во время операции. Обновите страницу и попробуйте ещё раз."
 	}
 }
 

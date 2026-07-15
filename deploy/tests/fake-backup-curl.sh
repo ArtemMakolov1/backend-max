@@ -51,6 +51,17 @@ respond() {
   fi
 }
 
+write_timing() {
+  local connect_time=$1
+  local appconnect_time=$2
+  [[ -z "$write_out" ]] && return 0
+  [[ "$write_out" == '%{time_connect}\t%{time_appconnect}' ]] || {
+    echo "Unexpected fake curl write-out format: $write_out" >&2
+    exit 2
+  }
+  printf '%s\t%s' "$connect_time" "$appconnect_time"
+}
+
 mkdir -p "$state"
 if [[ "$method" == POST && "$url" == */releases ]]; then
   create_calls=0
@@ -60,13 +71,19 @@ fi
 if [[ ${TEST_CONNECT_FAILURE_ONCE:-false} == true && ! -e "$state/connect-failure-injected" ]]; then
   : >"$state/connect-failure-injected"
   [[ -z "$output" ]] || : >"$output"
-  [[ -z "$write_out" ]] || printf '0.000000'
+  write_timing 0.000000 0.000000
+  exit 28
+fi
+if [[ ${TEST_TLS_HANDSHAKE_TIMEOUT_ONCE:-false} == true && ! -e "$state/tls-handshake-timeout-injected" ]]; then
+  : >"$state/tls-handshake-timeout-injected"
+  [[ -z "$output" ]] || : >"$output"
+  write_timing 0.010000 0.000000
   exit 28
 fi
 if [[ ${TEST_ESTABLISHED_TIMEOUT_ONCE:-false} == true && ! -e "$state/established-timeout-injected" ]]; then
   : >"$state/established-timeout-injected"
   [[ -z "$output" ]] || : >"$output"
-  [[ -z "$write_out" ]] || printf '0.010000'
+  write_timing 0.010000 0.020000
   exit 28
 fi
 
@@ -104,10 +121,4 @@ else
   exit 2
 fi
 
-if [[ -n "$write_out" ]]; then
-  [[ "$write_out" == '%{time_connect}' ]] || {
-    echo "Unexpected fake curl write-out format: $write_out" >&2
-    exit 2
-  }
-  printf '0.010000'
-fi
+write_timing 0.010000 0.020000

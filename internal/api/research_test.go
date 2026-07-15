@@ -137,7 +137,7 @@ func TestResearchGenerateReportsUnavailableConfigurationAndUpstreamFailure(t *te
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/v1/research/generate", strings.NewReader(validBody)))
 		assertProblemCode(t, response, http.StatusBadGateway, "openai_research_error")
-		if strings.Contains(response.Body.String(), "rate_limit") || !strings.Contains(response.Body.String(), "req-123") {
+		if strings.Contains(response.Body.String(), "rate_limit") || strings.Contains(response.Body.String(), "req-123") {
 			t.Fatalf("upstream problem body = %s", response.Body.String())
 		}
 	})
