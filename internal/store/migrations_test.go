@@ -52,10 +52,17 @@ func TestSanitizePublicationErrorsMigrationRemovesProviderDetails(t *testing.T) 
 	if len(migrations) == 0 {
 		t.Fatal("no embedded migrations loaded")
 	}
-	if migrations[len(migrations)-1].version != "012_sanitize_publication_errors.sql" {
-		t.Fatalf("last migration = %q, want 012_sanitize_publication_errors.sql", migrations[len(migrations)-1].version)
+	sanitizeIndex := -1
+	for index, migration := range migrations {
+		if migration.version == "012_sanitize_publication_errors.sql" {
+			sanitizeIndex = index
+			break
+		}
 	}
-	if err := runMigrationSet(ctx, testURL, migrations[:len(migrations)-1]); err != nil {
+	if sanitizeIndex <= 0 {
+		t.Fatalf("012_sanitize_publication_errors.sql not found in embedded migrations")
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:sanitizeIndex]); err != nil {
 		t.Fatalf("apply prerequisite migrations: %v", err)
 	}
 
@@ -76,7 +83,7 @@ VALUES ('owner', 'Legacy post', 'Body', $1, $2, $2)`, message, now); err != nil 
 		}
 	}
 
-	if err := runMigrationSet(ctx, testURL, migrations); err != nil {
+	if err := runMigrationSet(ctx, testURL, migrations[:sanitizeIndex+1]); err != nil {
 		t.Fatalf("apply sanitizing migration: %v", err)
 	}
 	rows, err := db.QueryContext(ctx, `SELECT last_error FROM posts ORDER BY id`)
@@ -100,6 +107,109 @@ VALUES ('owner', 'Legacy post', 'Body', $1, $2, $2)`, message, now); err != nil 
 	}
 	if count != len(legacyErrors) {
 		t.Fatalf("sanitized rows = %d, want %d", count, len(legacyErrors))
+	}
+}
+
+func TestS3MediaCutoverMigrationClearsLegacyLinksAndPreservesPost(t *testing.T) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cutoverIndex := -1
+	for index, migration := range migrations {
+		if migration.version == "013_s3_media_cutover.sql" {
+			cutoverIndex = index
+			break
+		}
+	}
+	if cutoverIndex <= 0 {
+		t.Fatal("013_s3_media_cutover.sql not found in embedded migrations")
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:cutoverIndex]); err != nil {
+		t.Fatalf("apply prerequisite migrations: %v", err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO users(id, display_name, created_at, updated_at) VALUES ('owner', 'Owner', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	var postID int64
+	if err := db.QueryRowContext(ctx, `
+INSERT INTO posts(
+	owner_id, title, content, format, status,
+	image_url, image_path, image_prompt,
+	notify, disable_link_preview, link_buttons,
+	max_message_id, max_message_url, max_views, max_is_pinned,
+	created_at, updated_at
+)
+VALUES (
+	'owner', 'Preserved title', 'Preserved body', 'html', 'published',
+	'/media/legacy.png', 'legacy/owner/image.png', 'Preserved image prompt',
+	TRUE, TRUE, '[{"text":"Open","url":"https://example.com"}]'::jsonb,
+	'max-message-id', 'https://max.ru/channel/message', 42, TRUE,
+	$1, $1
+)
+RETURNING id`, now).Scan(&postID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO media_assets(owner_id, filename, created_at)
+VALUES ('owner', 'legacy.png', $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runMigrationSet(ctx, testURL, migrations[:cutoverIndex+1]); err != nil {
+		t.Fatalf("apply S3 media cutover migration: %v", err)
+	}
+
+	var (
+		ownerID, title, content, format, status string
+		imageURL, imagePath, imagePrompt        string
+		maxMessageID, maxMessageURL             string
+		notify, disableLinkPreview              bool
+		linkButtonsPreserved, maxIsPinned       bool
+		maxViews                                int64
+		createdAt, updatedAt                    time.Time
+	)
+	if err := db.QueryRowContext(ctx, `
+SELECT owner_id, title, content, format, status,
+       image_url, image_path, image_prompt,
+       notify, disable_link_preview,
+       link_buttons = '[{"text":"Open","url":"https://example.com"}]'::jsonb,
+       max_message_id, max_message_url, max_views, max_is_pinned,
+       created_at, updated_at
+FROM posts
+WHERE id = $1`, postID).Scan(
+		&ownerID, &title, &content, &format, &status,
+		&imageURL, &imagePath, &imagePrompt,
+		&notify, &disableLinkPreview, &linkButtonsPreserved,
+		&maxMessageID, &maxMessageURL, &maxViews, &maxIsPinned,
+		&createdAt, &updatedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if imageURL != "" || imagePath != "" {
+		t.Fatalf("legacy image references after cutover: image_url=%q image_path=%q", imageURL, imagePath)
+	}
+	if ownerID != "owner" || title != "Preserved title" || content != "Preserved body" ||
+		format != "html" || status != "published" || imagePrompt != "Preserved image prompt" ||
+		!notify || !disableLinkPreview || !linkButtonsPreserved ||
+		maxMessageID != "max-message-id" || maxMessageURL != "https://max.ru/channel/message" ||
+		maxViews != 42 || !maxIsPinned || !createdAt.Equal(now) || !updatedAt.Equal(now) {
+		t.Fatalf("post data changed during cutover: owner=%q title=%q content=%q format=%q status=%q prompt=%q notify=%v disable_preview=%v buttons_preserved=%v max_id=%q max_url=%q views=%d pinned=%v created_at=%v updated_at=%v",
+			ownerID, title, content, format, status, imagePrompt, notify, disableLinkPreview, linkButtonsPreserved,
+			maxMessageID, maxMessageURL, maxViews, maxIsPinned, createdAt, updatedAt)
+	}
+
+	var mediaAssetCount int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM media_assets WHERE owner_id = 'owner'`).Scan(&mediaAssetCount); err != nil {
+		t.Fatal(err)
+	}
+	if mediaAssetCount != 1 {
+		t.Fatalf("legacy media assets for rollback compatibility = %d, want 1", mediaAssetCount)
 	}
 }
 
@@ -141,7 +251,7 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "013_future_additive.sql"
+	const futureVersion = "014_future_additive.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {

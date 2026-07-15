@@ -21,7 +21,15 @@ required_secret_names=(
   GRAFANA_SECRET_KEY
 )
 if [[ "$deploy_stage" == "production" ]]; then
-  required_secret_names+=(YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET)
+  required_secret_names+=(
+    YANDEX_CLIENT_ID
+    YANDEX_CLIENT_SECRET
+    MAX_BOT_TOKEN
+    MAX_WEBHOOK_SECRET
+    S3_HOST
+    S3_ACCESS_KEY
+    S3_SECRET_KEY
+  )
 fi
 for name in "${required_secret_names[@]}"; do
   if [[ -z "${!name:-}" ]]; then
@@ -47,6 +55,11 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_observability_admins=''
   rendered_bot_token=''
   rendered_webhook_secret=''
+  rendered_s3_host=''
+  rendered_s3_access_key=''
+  rendered_s3_secret_key=''
+  rendered_s3_bucket=''
+  rendered_s3_region=''
   rendered_openai_key=''
 else
   public_base_url=https://maxposty.ru
@@ -63,6 +76,11 @@ else
   fi
   rendered_bot_token=$MAX_BOT_TOKEN
   rendered_webhook_secret=$MAX_WEBHOOK_SECRET
+  rendered_s3_host=$S3_HOST
+  rendered_s3_access_key=$S3_ACCESS_KEY
+  rendered_s3_secret_key=$S3_SECRET_KEY
+  rendered_s3_bucket=${S3_BUCKET:-}
+  rendered_s3_region=${S3_REGION:-}
   rendered_openai_key=${OPENAI_API_KEY:-}
 fi
 
@@ -97,6 +115,11 @@ fi
   printf 'MAX_WEBHOOK_SECRET=%s\n' "$rendered_webhook_secret"
   printf 'MAX_WEBHOOK_URL=https://maxposty.ru/api/v1/webhooks/max\n'
   printf 'MAX_CA_CERT_FILE=%s\n' "${MAX_CA_CERT_FILE:-}"
+  printf 'S3_HOST=%s\n' "$rendered_s3_host"
+  printf 'S3_ACCESS_KEY=%s\n' "$rendered_s3_access_key"
+  printf 'S3_SECRET_KEY=%s\n' "$rendered_s3_secret_key"
+  printf 'S3_BUCKET=%s\n' "$rendered_s3_bucket"
+  printf 'S3_REGION=%s\n' "$rendered_s3_region"
   printf 'OPENAI_API_KEY=%s\n' "$rendered_openai_key"
   printf 'OPENAI_API_BASE_URL=https://api.openai.com\n'
   printf 'OPENAI_IMAGE_MODEL=%s\n' "${OPENAI_IMAGE_MODEL:-gpt-image-2}"

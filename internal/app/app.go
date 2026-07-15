@@ -8,8 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -889,7 +887,7 @@ func (a *App) GenerateImage(ctx context.Context, request openaiimg.GenerateReque
 	if err != nil {
 		return media.File{}, err
 	}
-	return a.media.Save("openai.png", bytes.NewReader(result.Bytes))
+	return a.media.Save(ctx, "openai.png", bytes.NewReader(result.Bytes))
 }
 
 func (a *App) GenerateResearch(ctx context.Context, request openairesearch.Request) (openairesearch.Result, error) {
@@ -942,7 +940,7 @@ func (a *App) SavePostImage(ctx context.Context, postID int64, filename string, 
 	if post.Status == store.PostStatusPublishing {
 		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
 	}
-	file, err := a.media.Save(filename, reader)
+	file, err := a.media.Save(ctx, filename, reader)
 	if err != nil {
 		return store.Post{}, err
 	}
@@ -1721,20 +1719,20 @@ func (a *App) imageTokens(ctx context.Context, post store.Post) ([]string, error
 	}
 	imagePath := post.ImagePath
 	if imagePath == "" {
-		resolved, err := a.media.ResolveURL(post.ImageURL)
+		resolved, err := a.media.ResolveURL(ctx, post.ImageURL)
 		if err != nil {
 			return nil, err
 		}
 		imagePath = resolved
 	}
-	file, err := os.Open(imagePath)
+	object, err := a.media.Open(ctx, imagePath)
 	if err != nil {
 		return nil, fmt.Errorf("open post image: %w", err)
 	}
 	defer func() {
-		_ = file.Close()
+		_ = object.Body.Close()
 	}()
-	upload, err := a.max.UploadImage(ctx, filepath.Base(imagePath), file)
+	upload, err := a.max.UploadImage(ctx, object.Filename, object.Body)
 	if err != nil {
 		return nil, err
 	}

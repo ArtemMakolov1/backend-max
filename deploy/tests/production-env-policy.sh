@@ -20,6 +20,9 @@ render_production() {
     OBSERVABILITY_ADMIN_USERS=makolov99 \
     MAX_BOT_TOKEN=max-bot-token \
     MAX_WEBHOOK_SECRET=0123456789abcdef0123456789abcdef \
+    S3_HOST=https://s3.example.test \
+    S3_ACCESS_KEY=test-access-key \
+    S3_SECRET_KEY=test-secret-key+/= \
     OPENAI_API_KEY= \
     "$@" \
     "$repo_root/deploy/render-production-env.sh" "$output"
@@ -30,16 +33,47 @@ render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
 grep -Fx 'OPENAI_API_KEY=' "$production_env" >/dev/null
 grep -Fx 'GRAFANA_ROOT_URL=https://maxposty.ru/monitoring/' "$production_env" >/dev/null
+grep -Fx 'S3_HOST=https://s3.example.test' "$production_env" >/dev/null
+grep -Fx 'S3_BUCKET=' "$production_env" >/dev/null
+grep -Fx 'S3_REGION=' "$production_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$production_env"
+
+configured_s3_env="$sandbox/configured-s3.env"
+render_production "$configured_s3_env" S3_BUCKET=media.maxposty.ru S3_REGION=ru-1
+grep -Fx 'S3_BUCKET=media.maxposty.ru' "$configured_s3_env" >/dev/null
+grep -Fx 'S3_REGION=ru-1' "$configured_s3_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_s3_env"
 
 for required_secret in \
   POSTGRES_MONITOR_PASSWORD GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY \
-  YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET; do
+  YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET \
+  S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
   if render_production "$sandbox/missing-$required_secret.env" "$required_secret=" >/dev/null 2>&1; then
     echo "Production render accepted an empty $required_secret" >&2
     exit 1
   fi
 done
+
+awk -F= '$1 == "S3_HOST" { print "S3_HOST=http://s3.example.test"; next } { print }' \
+  "$production_env" >"$sandbox/insecure-s3-host.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/insecure-s3-host.env" >/dev/null 2>&1; then
+  echo "Production validation accepted an insecure S3_HOST" >&2
+  exit 1
+fi
+
+awk -F= '$1 == "S3_BUCKET" { print "S3_BUCKET=Invalid_Bucket"; next } { print }' \
+  "$configured_s3_env" >"$sandbox/invalid-s3-bucket.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-s3-bucket.env" >/dev/null 2>&1; then
+  echo "Production validation accepted an invalid S3_BUCKET" >&2
+  exit 1
+fi
+
+awk -F= '$1 == "S3_REGION" { print "S3_REGION=invalid region"; next } { print }' \
+  "$configured_s3_env" >"$sandbox/invalid-s3-region.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-s3-region.env" >/dev/null 2>&1; then
+  echo "Production validation accepted an invalid S3_REGION" >&2
+  exit 1
+fi
 
 if render_production "$sandbox/missing-observability-admins.env" OBSERVABILITY_ADMIN_USERS= >/dev/null 2>&1; then
   echo "Production render accepted empty OBSERVABILITY_ADMIN_USERS" >&2
@@ -78,10 +112,15 @@ env \
   YANDEX_CLIENT_ID=must-not-leak \
   OBSERVABILITY_ADMIN_USERS=must-not-leak \
   MAX_BOT_TOKEN=must-not-leak \
+  S3_HOST=must-not-leak \
+  S3_ACCESS_KEY=must-not-leak \
+  S3_SECRET_KEY=must-not-leak \
+  S3_BUCKET=must-not-leak \
+  S3_REGION=must-not-leak \
   OPENAI_API_KEY=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN OPENAI_API_KEY; do
+for integration_key in YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

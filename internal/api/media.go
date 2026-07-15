@@ -99,7 +99,7 @@ func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, post
 	defer func() {
 		_ = upload.Close()
 	}()
-	file, err := s.app.Media().Save(fileHeader.Filename, upload)
+	file, err := s.app.Media().Save(r.Context(), fileHeader.Filename, upload)
 	if err != nil {
 		return store.Post{}, media.File{}, err
 	}
@@ -141,26 +141,34 @@ func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusNotFound, "not_found", "Media file was not found", nil)
 		return
 	}
-	file, info, err := s.app.Media().Open(filename)
+	object, err := s.app.Media().Open(r.Context(), filename)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			s.problem(w, http.StatusNotFound, "not_found", "Media file was not found", nil)
 			return
 		}
-		s.problem(w, http.StatusBadRequest, "invalid_media_path", err.Error(), nil)
+		s.logger.Error("could not load private media", "filename", filename, "error", err)
+		s.problem(w, http.StatusInternalServerError, "internal_error", "Could not load image", nil)
 		return
 	}
 	defer func() {
-		_ = file.Close()
+		_ = object.Body.Close()
 	}()
-	header := make([]byte, 512)
-	n, _ := io.ReadFull(file, header)
-	_, _ = file.Seek(0, io.SeekStart)
-	w.Header().Set("Content-Type", http.DetectContentType(header[:n]))
+	mimeType := strings.TrimSpace(object.MIMEType)
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", mimeType)
+	if object.Size >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(object.Size, 10))
+	}
 	// The URL is tenant-scoped by the session, so it must not survive logout or
 	// be replayed from a browser/CDN cache under another account.
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, object.Body); err != nil {
+		s.logger.Warn("private media response interrupted", "filename", filename, "error", err)
+	}
 }

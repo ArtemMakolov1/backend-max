@@ -583,7 +583,7 @@ func (s *Server) resolveImageURL(ctx context.Context, userID, imageURL string) (
 	if !owned {
 		return "", store.ErrNotFound
 	}
-	return s.app.Media().ResolveURL(imageURL)
+	return s.app.Media().ResolveURL(ctx, imageURL)
 }
 
 func validatePostFields(title, content, format string) error {

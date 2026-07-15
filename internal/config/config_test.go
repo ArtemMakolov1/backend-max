@@ -133,6 +133,44 @@ func TestLoadAllowsOAuthAndMAXWithoutOpenAI(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsCompleteS3StorageConfiguration(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("S3_HOST", "https://s3-nl.hostkey.com")
+	t.Setenv("S3_ACCESS_KEY", "access-key")
+	t.Setenv("S3_SECRET_KEY", "secret-key")
+	t.Setenv("S3_BUCKET", "maxposty-media")
+	t.Setenv("S3_REGION", "nl")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.S3Enabled() || cfg.S3Bucket != "maxposty-media" || cfg.S3Region != "nl" {
+		t.Fatalf("S3 config was not preserved: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsPartialS3AndS3InBootstrap(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("S3_HOST", "https://s3-nl.hostkey.com")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "configured together") {
+		t.Fatalf("partial S3 error = %v", err)
+	}
+
+	clearAuthEnv(t)
+	t.Setenv("PUBLIC_BASE_URL", "http://178.159.94.83")
+	t.Setenv("FRONTEND_ORIGIN", "http://178.159.94.83")
+	t.Setenv("AUTH_BOOTSTRAP_MODE", "true")
+	t.Setenv("S3_HOST", "https://s3-nl.hostkey.com")
+	t.Setenv("S3_ACCESS_KEY", "access-key")
+	t.Setenv("S3_SECRET_KEY", "secret-key")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "requires S3 storage to be disabled") {
+		t.Fatalf("bootstrap S3 error = %v", err)
+	}
+}
+
 func TestLoadUsesSafeAIQuotaDefaultsAndAcceptsBoundedOverrides(t *testing.T) {
 	clearAuthEnv(t)
 	setValidLocalYandexAuth(t)
@@ -308,6 +346,7 @@ func clearAuthEnv(t *testing.T) {
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
 		"OPENAI_API_KEY", "OPENAI_API_BASE_URL",
+		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
 	} {
 		t.Setenv(name, "")
 	}

@@ -37,7 +37,7 @@ func TestTenantMediaIsNeverPubliclyCached(t *testing.T) {
 	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
 		t.Fatal(err)
 	}
-	file, err := mediaStore.Save("private.png", bytes.NewReader(encoded.Bytes()))
+	file, err := mediaStore.Save(ctx, "private.png", bytes.NewReader(encoded.Bytes()))
 	if err != nil {
 		t.Fatal(err)
 	}

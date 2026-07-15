@@ -32,7 +32,8 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     PGBOUNCER_DEFAULT_POOL_SIZE|PGBOUNCER_MIN_POOL_SIZE|PGBOUNCER_RESERVE_POOL_SIZE|PGBOUNCER_MAX_CLIENT_CONN|\
     PUBLIC_BASE_URL|FRONTEND_ORIGIN|GRAFANA_ROOT_URL|GRAFANA_ADMIN_PASSWORD|GRAFANA_SECRET_KEY|AUTH_BOOTSTRAP_MODE|YANDEX_CLIENT_ID|YANDEX_CLIENT_SECRET|YANDEX_REDIRECT_URI|YANDEX_ALLOWED_USERS|OBSERVABILITY_ADMIN_USERS|\
     AUTH_SESSION_TTL|OAUTH_TRUST_X_REAL_IP|OAUTH_RATE_LIMIT_AT_EDGE|MAX_API_BASE_URL|MAX_BOT_TOKEN|\
-    MAX_WEBHOOK_SECRET|MAX_WEBHOOK_URL|MAX_CA_CERT_FILE|OPENAI_API_KEY|OPENAI_API_BASE_URL|OPENAI_IMAGE_MODEL|\
+    MAX_WEBHOOK_SECRET|MAX_WEBHOOK_URL|MAX_CA_CERT_FILE|S3_HOST|S3_ACCESS_KEY|S3_SECRET_KEY|S3_BUCKET|S3_REGION|\
+    OPENAI_API_KEY|OPENAI_API_BASE_URL|OPENAI_IMAGE_MODEL|\
     OPENAI_RESEARCH_MODEL|AI_GLOBAL_MAX_CONCURRENT|AI_USER_MAX_CONCURRENT|AI_IMAGE_PER_MINUTE|AI_IMAGE_PER_DAY|\
     AI_RESEARCH_PER_MINUTE|AI_RESEARCH_PER_DAY|AI_LEASE_TTL|SCHEDULER_INTERVAL|BACKUP_RETENTION_DAYS)
       ;;
@@ -59,7 +60,8 @@ required_keys=(
   PGBOUNCER_DEFAULT_POOL_SIZE PGBOUNCER_MIN_POOL_SIZE PGBOUNCER_RESERVE_POOL_SIZE PGBOUNCER_MAX_CLIENT_CONN
   PUBLIC_BASE_URL FRONTEND_ORIGIN GRAFANA_ROOT_URL GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY AUTH_BOOTSTRAP_MODE YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI OBSERVABILITY_ADMIN_USERS
   AUTH_SESSION_TTL OAUTH_TRUST_X_REAL_IP OAUTH_RATE_LIMIT_AT_EDGE MAX_API_BASE_URL MAX_BOT_TOKEN
-  MAX_WEBHOOK_SECRET MAX_WEBHOOK_URL MAX_CA_CERT_FILE OPENAI_API_KEY OPENAI_API_BASE_URL OPENAI_IMAGE_MODEL
+  MAX_WEBHOOK_SECRET MAX_WEBHOOK_URL MAX_CA_CERT_FILE S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION
+  OPENAI_API_KEY OPENAI_API_BASE_URL OPENAI_IMAGE_MODEL
   OPENAI_RESEARCH_MODEL AI_GLOBAL_MAX_CONCURRENT AI_USER_MAX_CONCURRENT AI_IMAGE_PER_MINUTE AI_IMAGE_PER_DAY
   AI_RESEARCH_PER_MINUTE AI_RESEARCH_PER_DAY AI_LEASE_TTL SCHEDULER_INTERVAL BACKUP_RETENTION_DAYS
 )
@@ -128,6 +130,47 @@ if [[ -n "$value" && (${#value} -lt 32 || ${#value} -gt 256 || ! "$value" =~ ^[A
   exit 1
 fi
 
+value=$(env_value S3_HOST)
+if [[ -n "$value" ]]; then
+  case "$value" in
+    https://*) endpoint=${value#https://} ;;
+    *://*)
+      echo "S3_HOST must use HTTPS when a URL scheme is provided" >&2
+      exit 1
+      ;;
+    *) endpoint=$value ;;
+  esac
+  endpoint=${endpoint%/}
+  if [[ ! "$endpoint" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[1-9][0-9]{0,4})?$ ]]; then
+    echo "S3_HOST must be an HTTPS S3 endpoint without path, query or credentials" >&2
+    exit 1
+  fi
+fi
+
+for key in S3_ACCESS_KEY S3_SECRET_KEY; do
+  value=$(env_value "$key")
+  if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    echo "$key contains unsupported characters" >&2
+    exit 1
+  fi
+done
+
+value=$(env_value S3_BUCKET)
+if [[ -n "$value" ]]; then
+  if [[ ! "$value" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] ||
+     [[ "$value" == *".."* || "$value" == *".-"* || "$value" == *"-."* ]] ||
+     [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "S3_BUCKET must be empty or a valid HOSTKEY bucket name" >&2
+    exit 1
+  fi
+fi
+
+value=$(env_value S3_REGION)
+if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; then
+  echo "S3_REGION must be empty or a valid S3 region name" >&2
+  exit 1
+fi
+
 expect_exact() {
   local key=$1
   local expected=$2
@@ -148,7 +191,7 @@ case "$bootstrap_mode" in
     expect_exact PUBLIC_BASE_URL "http://178.159.94.83"
     expect_exact FRONTEND_ORIGIN "http://178.159.94.83"
     expect_exact GRAFANA_ROOT_URL "http://178.159.94.83/monitoring/"
-    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN MAX_WEBHOOK_SECRET OPENAI_API_KEY; do
+    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY; do
       if [[ -n "$(env_value "$key")" ]]; then
         echo "$key must be empty in fail-closed bootstrap mode" >&2
         exit 1
@@ -160,7 +203,7 @@ case "$bootstrap_mode" in
     expect_exact FRONTEND_ORIGIN "https://maxposty.ru"
     expect_exact GRAFANA_ROOT_URL "https://maxposty.ru/monitoring/"
     expect_exact YANDEX_REDIRECT_URI "https://maxposty.ru/api/v1/auth/yandex/callback"
-    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET; do
+    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
       if [[ -z "$(env_value "$key")" ]]; then
         echo "$key must not be empty in production mode" >&2
         exit 1

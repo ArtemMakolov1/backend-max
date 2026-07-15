@@ -1,12 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"image"
+	"image/png"
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1205,15 +1207,12 @@ func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	imagePath := filepath.Join(t.TempDir(), "post.png")
-	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	imageFile := saveTestImage(t, application, "post.png")
 	post, err := storage.CreatePost(context.Background(), store.Post{
 		Title: "Buttons", Content: "Body", Format: store.FormatMarkdown, ChannelID: &channel.ID,
 		// Simulate a legacy draft saved before MAX stopped accepting silent
 		// channel publications. The application must omit the unsupported field.
-		ImageURL: "http://localhost:8080/media/post.png", ImagePath: imagePath, Notify: false,
+		ImageURL: imageFile.URL, ImagePath: imageFile.Path, Notify: false,
 		LinkButtons: []store.LinkButton{
 			{Text: "  Сайт ", URL: " https://example.com "},
 			{Text: "Каталог", URL: "https://example.com/catalog"},
@@ -1284,12 +1283,8 @@ func TestUpdatePublishedPostAddsImageWithoutReplacingPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	imagePath := filepath.Join(t.TempDir(), "added.png")
-	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	imageURL := "http://localhost:8080/media/added.png"
-	if post, err = storage.UpdatePost(ctx, post.ID, store.PostChanges{ImageURL: &imageURL, ImagePath: &imagePath}); err != nil {
+	imageFile := saveTestImage(t, application, "added.png")
+	if post, err = storage.UpdatePost(ctx, post.ID, store.PostChanges{ImageURL: &imageFile.URL, ImagePath: &imageFile.Path}); err != nil {
 		t.Fatal(err)
 	}
 	post, err = application.UpdatePublishedPost(ctx, post.ID)
@@ -1305,6 +1300,19 @@ func TestUpdatePublishedPostAddsImageWithoutReplacingPublication(t *testing.T) {
 		!post.PublishedAt.Equal(publishedAt) {
 		t.Fatalf("image update replaced publication history: %#v", post)
 	}
+}
+
+func saveTestImage(t *testing.T, application *App, name string) media.File {
+	t.Helper()
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	file, err := application.media.Save(context.Background(), name, bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file
 }
 
 func TestScheduleRejectsIncompleteLinkButtons(t *testing.T) {

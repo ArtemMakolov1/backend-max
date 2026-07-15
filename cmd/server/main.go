@@ -61,11 +61,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	mediaStore, err := media.New(cfg.MediaDir, cfg.PublicBaseURL)
+	var mediaStore *media.Store
+	mediaDriver := "local"
+	if cfg.S3Enabled() {
+		mediaDriver = "s3"
+		mediaStore, err = media.NewS3(rootCtx, media.S3Config{
+			Endpoint: cfg.S3Host, Region: cfg.S3Region,
+			KeyID: cfg.S3AccessKey, SecretKey: cfg.S3SecretKey, Bucket: cfg.S3Bucket,
+		}, cfg.PublicBaseURL)
+	} else {
+		mediaStore, err = media.New(cfg.MediaDir, cfg.PublicBaseURL)
+	}
 	if err != nil {
 		logger.Error("could not initialize media store", "error", err)
 		os.Exit(1)
 	}
+	logger.Info("media store initialized", "driver", mediaDriver)
 
 	var maxAPI app.MAXClient
 	if cfg.MAXBotToken != "" {

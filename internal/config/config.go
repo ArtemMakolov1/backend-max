@@ -49,6 +49,11 @@ type Config struct {
 	MediaDir             string
 	PublicBaseURL        string
 	FrontendOrigin       string
+	S3Host               string
+	S3AccessKey          string
+	S3SecretKey          string
+	S3Bucket             string
+	S3Region             string
 	MAXAPIBaseURL        string
 	MAXBotToken          string
 	MAXWebhookSecret     string
@@ -139,6 +144,11 @@ func Load() (Config, error) {
 		MediaDir:             env("MEDIA_DIR", defaultMediaDir),
 		PublicBaseURL:        strings.TrimRight(env("PUBLIC_BASE_URL", defaultPublicBaseURL), "/"),
 		FrontendOrigin:       strings.TrimRight(env("FRONTEND_ORIGIN", defaultFrontendOrigin), "/"),
+		S3Host:               strings.TrimSpace(os.Getenv("S3_HOST")),
+		S3AccessKey:          strings.TrimSpace(os.Getenv("S3_ACCESS_KEY")),
+		S3SecretKey:          strings.TrimSpace(os.Getenv("S3_SECRET_KEY")),
+		S3Bucket:             strings.TrimSpace(os.Getenv("S3_BUCKET")),
+		S3Region:             strings.TrimSpace(os.Getenv("S3_REGION")),
 		MAXAPIBaseURL:        env("MAX_API_BASE_URL", defaultMAXAPIBaseURL),
 		MAXBotToken:          strings.TrimSpace(os.Getenv("MAX_BOT_TOKEN")),
 		MAXWebhookSecret:     strings.TrimSpace(os.Getenv("MAX_WEBHOOK_SECRET")),
@@ -191,12 +201,28 @@ func Load() (Config, error) {
 			oauthParts++
 		}
 	}
+	s3Values := []string{cfg.S3Host, cfg.S3AccessKey, cfg.S3SecretKey}
+	s3Parts := 0
+	for _, value := range s3Values {
+		if value != "" {
+			s3Parts++
+		}
+	}
+	if s3Parts != 0 && s3Parts != len(s3Values) {
+		return Config{}, fmt.Errorf("S3_HOST, S3_ACCESS_KEY and S3_SECRET_KEY must be configured together")
+	}
+	if (cfg.S3Bucket != "" || cfg.S3Region != "") && s3Parts == 0 {
+		return Config{}, fmt.Errorf("S3_BUCKET and S3_REGION require S3 credentials")
+	}
 	if cfg.AuthBootstrapMode {
 		if oauthParts != 0 || len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
 		}
 		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX and OpenAI integrations to be disabled")
+		}
+		if s3Parts != 0 || cfg.S3Bucket != "" || cfg.S3Region != "" {
+			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires S3 storage to be disabled")
 		}
 		if err := validateBootstrapOrigins(cfg.PublicBaseURL, frontendURL); err != nil {
 			return Config{}, err
@@ -229,6 +255,10 @@ func Load() (Config, error) {
 
 func (c Config) YandexAuthEnabled() bool {
 	return c.YandexClientID != "" && c.YandexClientSecret != "" && c.YandexRedirectURI != ""
+}
+
+func (c Config) S3Enabled() bool {
+	return c.S3Host != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
 }
 
 func validateYandexRedirectURI(raw string) error {

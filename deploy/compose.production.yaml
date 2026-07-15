@@ -129,6 +129,11 @@ services:
       PORT: "8080"
       DATABASE_URL: postgresql://${POSTGRES_APP_USER}:${POSTGRES_APP_PASSWORD}@pgbouncer:6432/${POSTGRES_DB}?sslmode=disable
       MEDIA_DIR: /app/media
+      S3_HOST: ${S3_HOST}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_REGION: ${S3_REGION}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
       AUTH_BOOTSTRAP_MODE: ${AUTH_BOOTSTRAP_MODE}
@@ -162,7 +167,7 @@ services:
       - media-data:/app/media
       - ../certs:/app/certs:ro
     tmpfs:
-      - /tmp:size=64m,mode=1777
+      - /tmp:size=256m,mode=1777
     read_only: true
     pids_limit: 256
     cap_drop:
