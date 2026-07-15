@@ -226,6 +226,16 @@ linked_at=CASE WHEN max_identity_links.max_user_id=excluded.max_user_id THEN max
 updated_at=excluded.updated_at`, attempt.UserID, maxUserID, now.UTC()); err != nil {
 		return MAXIdentityLinkAttempt{}, fmt.Errorf("persist MAX identity link: %w", err)
 	}
+	identityResult, err := tx.ExecContext(ctx, `INSERT INTO auth_identities(provider, subject, owner_id, created_at, updated_at)
+VALUES ('max',$1,$2,$3,$3)
+ON CONFLICT(provider, subject) DO UPDATE SET updated_at=excluded.updated_at
+WHERE auth_identities.owner_id=excluded.owner_id`, maxUserID, attempt.UserID, now.UTC())
+	if err != nil {
+		return MAXIdentityLinkAttempt{}, fmt.Errorf("persist MAX auth identity: %w", err)
+	}
+	if affected, _ := identityResult.RowsAffected(); affected == 0 {
+		return MAXIdentityLinkAttempt{}, fmt.Errorf("%w: MAX auth identity belongs to another account", ErrConflict)
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE max_identity_link_attempts SET status='linked', error_code='', updated_at=$1 WHERE id=$2`, now.UTC(), attempt.ID); err != nil {
 		return MAXIdentityLinkAttempt{}, err
 	}

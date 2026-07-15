@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	authSessionColumns   = `token_hash, yandex_user_id, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at`
+	authSessionColumns   = `token_hash, yandex_user_id, COALESCE(provider, 'yandex'), login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at`
 	oauthStateColumns    = `state_hash, pkce_verifier, return_to, terms_version, personal_data_version, consent_at, created_at, expires_at`
 	maxActiveOAuthStates = 1024
 )
@@ -20,8 +20,17 @@ const (
 // versioned consent evidence, and creates the browser session. A callback can
 // therefore never expose an authenticated session without its audit evidence.
 func (s *Store) CreateAuthenticatedSession(ctx context.Context, user User, consents []Consent, session AuthSession) error {
-	if strings.TrimSpace(user.ID) == "" || user.ID != session.YandexUserID {
+	ownerID := authSessionOwnerID(session)
+	provider := authSessionProvider(session)
+	providerSubject := strings.TrimSpace(session.ProviderSubject)
+	if providerSubject == "" {
+		providerSubject = ownerID
+	}
+	if strings.TrimSpace(user.ID) == "" || user.ID != ownerID {
 		return errors.New("session user id must match the local user")
+	}
+	if err := validateAuthProvider(provider); err != nil {
+		return err
 	}
 	if err := validateSHA256Hex("token hash", session.TokenHash); err != nil {
 		return err
@@ -46,6 +55,13 @@ display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_
 		user.ID, user.Login, user.Email, user.DisplayName, user.AvatarURL, now); err != nil {
 		return fmt.Errorf("upsert authenticated user: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO auth_identities(provider, subject, owner_id, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $4)
+ON CONFLICT(provider, subject) DO UPDATE SET updated_at=excluded.updated_at
+WHERE auth_identities.owner_id=excluded.owner_id`, provider, providerSubject, ownerID, now); err != nil {
+		return fmt.Errorf("upsert authenticated identity: %w", err)
+	}
 	for _, consent := range consents {
 		if consent.Document != "terms" && consent.Document != "personal_data" {
 			return fmt.Errorf("unsupported consent document %q", consent.Document)
@@ -65,8 +81,8 @@ ON CONFLICT(owner_id, document, version) DO NOTHING`, user.ID, consent.Document,
 		return fmt.Errorf("delete expired auth sessions: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, session.TokenHash, session.YandexUserID,
+INSERT INTO auth_sessions(token_hash, yandex_user_id, provider, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, session.TokenHash, ownerID, provider,
 		session.Login, session.Email, session.DisplayName, session.AvatarURL, session.AllowlistIdentity, now, session.ExpiresAt.UTC()); err != nil {
 		return fmt.Errorf("create auth session: %w", err)
 	}
@@ -118,8 +134,17 @@ func (s *Store) CreateAuthSession(ctx context.Context, session AuthSession) erro
 	if err := validateSHA256Hex("token hash", session.TokenHash); err != nil {
 		return err
 	}
-	if session.YandexUserID == "" {
-		return errors.New("yandex user id is required")
+	ownerID := authSessionOwnerID(session)
+	provider := authSessionProvider(session)
+	providerSubject := strings.TrimSpace(session.ProviderSubject)
+	if providerSubject == "" {
+		providerSubject = ownerID
+	}
+	if ownerID == "" {
+		return errors.New("session owner id is required")
+	}
+	if err := validateAuthProvider(provider); err != nil {
+		return err
 	}
 	if err := validateLifetime(session.CreatedAt, session.ExpiresAt); err != nil {
 		return fmt.Errorf("auth session: %w", err)
@@ -134,18 +159,25 @@ func (s *Store) CreateAuthSession(ctx context.Context, session AuthSession) erro
 INSERT INTO users(id, login, email, display_name, avatar_url, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6, $6)
 ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
-display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_at = excluded.updated_at`, session.YandexUserID,
+	display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_at = excluded.updated_at`, ownerID,
 		session.Login, session.Email, session.DisplayName, session.AvatarURL, session.CreatedAt.UTC()); err != nil {
 		return fmt.Errorf("upsert auth session user: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO auth_identities(provider, subject, owner_id, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$4)
+ON CONFLICT(provider, subject) DO UPDATE SET updated_at=excluded.updated_at
+WHERE auth_identities.owner_id=excluded.owner_id`, provider, providerSubject, ownerID, session.CreatedAt.UTC()); err != nil {
+		return fmt.Errorf("upsert auth session identity: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx, bindSQL(`DELETE FROM auth_sessions WHERE expires_at <= ?`), session.CreatedAt.UTC()); err != nil {
 		return fmt.Errorf("delete expired auth sessions: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
-INSERT INTO auth_sessions(token_hash, yandex_user_id, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		session.TokenHash, session.YandexUserID, session.Login, session.Email, session.DisplayName,
+INSERT INTO auth_sessions(token_hash, yandex_user_id, provider, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		session.TokenHash, ownerID, provider, session.Login, session.Email, session.DisplayName,
 		session.AvatarURL, session.AllowlistIdentity, session.CreatedAt.UTC(), session.ExpiresAt.UTC()); err != nil {
 		return fmt.Errorf("create auth session: %w", err)
 	}
@@ -265,7 +297,7 @@ func (s *Store) ConsumeOAuthState(ctx context.Context, stateHash string, now tim
 
 func scanAuthSession(row scanner) (AuthSession, error) {
 	var session AuthSession
-	if err := row.Scan(&session.TokenHash, &session.YandexUserID, &session.Login, &session.Email,
+	if err := row.Scan(&session.TokenHash, &session.OwnerID, &session.Provider, &session.Login, &session.Email,
 		&session.DisplayName, &session.AvatarURL, &session.AllowlistIdentity, &session.CreatedAt, &session.ExpiresAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AuthSession{}, ErrNotFound
@@ -273,9 +305,32 @@ func scanAuthSession(row scanner) (AuthSession, error) {
 		return AuthSession{}, fmt.Errorf("scan auth session: %w", err)
 	}
 
+	session.YandexUserID = session.OwnerID
 	session.CreatedAt = session.CreatedAt.UTC()
 	session.ExpiresAt = session.ExpiresAt.UTC()
 	return session, nil
+}
+
+func authSessionOwnerID(session AuthSession) string {
+	if ownerID := strings.TrimSpace(session.OwnerID); ownerID != "" {
+		return ownerID
+	}
+	return strings.TrimSpace(session.YandexUserID)
+}
+
+func authSessionProvider(session AuthSession) string {
+	provider := strings.ToLower(strings.TrimSpace(session.Provider))
+	if provider == "" {
+		return "yandex"
+	}
+	return provider
+}
+
+func validateAuthProvider(provider string) error {
+	if provider != "yandex" && provider != "max" {
+		return errors.New("auth provider must be yandex or max")
+	}
+	return nil
 }
 
 func scanOAuthState(row scanner) (OAuthState, error) {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"maxpilot/backend/internal/app"
+	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/store"
 )
 
@@ -73,6 +74,24 @@ func (s *Server) testMAXIntegration(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type maxWebhookUser struct {
+	UserID        json.RawMessage `json:"user_id"`
+	FirstName     string          `json:"first_name,omitempty"`
+	LastName      string          `json:"last_name,omitempty"`
+	Username      string          `json:"username,omitempty"`
+	AvatarURL     string          `json:"avatar_url,omitempty"`
+	FullAvatarURL string          `json:"full_avatar_url,omitempty"`
+}
+
+type maxWebhookAttachment struct {
+	Type    string `json:"type"`
+	Payload struct {
+		VCFInfo string          `json:"vcf_info"`
+		Hash    string          `json:"hash"`
+		MAXInfo *maxWebhookUser `json:"max_info,omitempty"`
+	} `json:"payload"`
+}
+
 type maxUpdate struct {
 	UpdateType string          `json:"update_type"`
 	Timestamp  int64           `json:"timestamp"`
@@ -82,24 +101,27 @@ type maxUpdate struct {
 	Chat       *struct {
 		Title string `json:"title"`
 	} `json:"chat,omitempty"`
-	Payload string `json:"payload,omitempty"`
-	User    *struct {
-		UserID json.RawMessage `json:"user_id"`
-	} `json:"user,omitempty"`
+	Payload  string          `json:"payload,omitempty"`
+	User     *maxWebhookUser `json:"user,omitempty"`
 	Callback *struct {
-		CallbackID string `json:"callback_id"`
-		Payload    string `json:"payload"`
-		User       *struct {
-			UserID json.RawMessage `json:"user_id"`
-		} `json:"user,omitempty"`
+		CallbackID string          `json:"callback_id"`
+		Payload    string          `json:"payload"`
+		User       *maxWebhookUser `json:"user,omitempty"`
 	} `json:"callback,omitempty"`
 	Message *struct {
+		Sender    *maxWebhookUser `json:"sender,omitempty"`
 		Recipient struct {
 			ChatID   json.RawMessage `json:"chat_id"`
 			ChatType string          `json:"chat_type"`
 		} `json:"recipient"`
+		Body struct {
+			MID         string                 `json:"mid"`
+			Attachments []maxWebhookAttachment `json:"attachments,omitempty"`
+		} `json:"body"`
 	} `json:"message,omitempty"`
 }
+
+const maxAuthConfirmPayloadPrefix = "auth_contact_confirm_"
 
 func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
 	if s.webhookSecret == "" {
@@ -175,6 +197,10 @@ func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMessageCreated(w http.ResponseWriter, r *http.Request, update maxUpdate) {
+	if update.Message != nil && update.Message.Recipient.ChatType == "dialog" {
+		s.handleMAXAuthContactMessage(w, r, update)
+		return
+	}
 	// Unlike bot lifecycle updates, message_created carries the chat identity
 	// inside message.recipient. Trust the authenticated MAX recipient type, not
 	// optional top-level compatibility fields, so dialogs and group chats never
@@ -226,6 +252,10 @@ func (s *Server) handleBotStarted(w http.ResponseWriter, r *http.Request, update
 		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
 		return
 	}
+	if strings.HasPrefix(update.Payload, "auth_") {
+		s.handleMAXAuthBotStarted(w, r, update, maxUserID, strings.TrimPrefix(update.Payload, "auth_"))
+		return
+	}
 	if strings.HasPrefix(update.Payload, "link_") {
 		s.handleMAXIdentityBotStarted(w, r, maxUserID, strings.TrimPrefix(update.Payload, "link_"))
 		return
@@ -275,6 +305,118 @@ func (s *Server) handleBotStarted(w http.ResponseWriter, r *http.Request, update
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+func (s *Server) handleMAXAuthBotStarted(w http.ResponseWriter, r *http.Request, update maxUpdate, maxUserID, deepToken string) {
+	if len(deepToken) < 32 || len(deepToken) > 96 {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	eventAt, valid := maxEventTime(update.Timestamp, s.now().UTC())
+	if !valid {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	now := s.now().UTC()
+	attempt, first, err := s.app.Store().StartMAXAuthContact(r.Context(), sha256Hex(deepToken), maxUserID, eventAt, now)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		s.writeError(w, err)
+		return
+	}
+	if first {
+		ctx, cancel := contextWithTimeout(r, 8*time.Second)
+		err = s.app.SendMAXAuthContactRequest(ctx, maxUserID, attempt.ComparisonCode,
+			maxAuthConfirmPayloadPrefix+deepToken)
+		cancel()
+		if err != nil {
+			_ = s.app.Store().ResetMAXAuthContactStart(r.Context(), attempt.ID, maxUserID, now)
+			s.writeError(w, err)
+			return
+		}
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleMAXAuthContactMessage(w http.ResponseWriter, r *http.Request, update maxUpdate) {
+	if update.Message == nil || update.Message.Sender == nil || strings.TrimSpace(update.Message.Body.MID) == "" {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	maxUserID, err := webhookUserID(update.Message.Sender)
+	if err != nil {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	var contact *maxWebhookAttachment
+	for index := range update.Message.Body.Attachments {
+		attachment := &update.Message.Body.Attachments[index]
+		if attachment.Type != "contact" {
+			continue
+		}
+		if contact != nil {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		contact = attachment
+	}
+	if contact == nil || contact.Payload.MAXInfo == nil || contact.Payload.Hash == "" || contact.Payload.VCFInfo == "" {
+		// Manually shared/forwarded contacts deliberately have no hash and are
+		// never accepted as authentication proof.
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	contactMAXUserID, err := webhookUserID(contact.Payload.MAXInfo)
+	if err != nil || contactMAXUserID != maxUserID || !s.app.VerifyMAXAuthContact(contact.Payload.VCFInfo, contact.Payload.Hash) {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	// Validate and normalize transiently, then discard. Neither the number nor
+	// its source vCard/hash is passed to storage or logging.
+	if _, ok := maxclient.NormalizeVerifiedContactPhone(contact.Payload.VCFInfo); !ok {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	eventAt, valid := maxEventTime(update.Timestamp, s.now().UTC())
+	if !valid {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	profile := store.MAXAuthProfile{
+		MAXUserID: maxUserID,
+		FirstName: safeMAXProfileValue(contact.Payload.MAXInfo.FirstName),
+		LastName:  safeMAXProfileValue(contact.Payload.MAXInfo.LastName),
+		Username:  safeMAXProfileValue(contact.Payload.MAXInfo.Username),
+		AvatarURL: maxclient.SafeAssetURL(firstNonEmpty(contact.Payload.MAXInfo.FullAvatarURL, contact.Payload.MAXInfo.AvatarURL)),
+	}
+	_, _, err = s.app.Store().RecordMAXAuthContact(r.Context(), maxUserID, update.Message.Body.MID,
+		eventAt, s.now().UTC(), profile)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func safeMAXProfileValue(value string) string {
+	value = strings.Map(func(char rune) rune {
+		if char < 0x20 || char == 0x7f {
+			return -1
+		}
+		return char
+	}, strings.TrimSpace(value))
+	runes := []rune(value)
+	if len(runes) > 255 {
+		value = string(runes[:255])
+	}
+	return value
+}
+
 func (s *Server) handleMessageCallback(w http.ResponseWriter, r *http.Request, update maxUpdate) {
 	if update.Callback == nil {
 		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
@@ -286,6 +428,10 @@ func (s *Server) handleMessageCallback(w http.ResponseWriter, r *http.Request, u
 		return
 	}
 	payload := update.Callback.Payload
+	if strings.HasPrefix(payload, maxAuthConfirmPayloadPrefix) {
+		s.handleMAXAuthContactCallback(w, r, update, maxUserID)
+		return
+	}
 	if strings.HasPrefix(payload, "link_confirm_") || strings.HasPrefix(payload, "link_cancel_") {
 		s.handleMAXIdentityCallback(w, r, update, maxUserID)
 		return
@@ -352,6 +498,59 @@ func (s *Server) handleMessageCallback(w http.ResponseWriter, r *http.Request, u
 			s.logger.Warn("could not answer MAX callback", "error", answerErr)
 		}
 		cancel()
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleMAXAuthContactCallback(w http.ResponseWriter, r *http.Request, update maxUpdate, maxUserID string) {
+	token := strings.TrimPrefix(update.Callback.Payload, maxAuthConfirmPayloadPrefix)
+	if len(token) < 32 || len(token) > 96 || strings.TrimSpace(update.Callback.CallbackID) == "" {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	now := s.now().UTC()
+	eventAt, valid := maxEventTime(update.Timestamp, now)
+	if !valid {
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+		return
+	}
+	attempt, _, err := s.app.Store().ConfirmMAXAuthContact(r.Context(), sha256Hex(token), maxUserID, eventAt, now)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			ctx, cancel := contextWithTimeout(r, 5*time.Second)
+			answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID,
+				"Запрос входа устарел. Начните вход заново на сайте MaxPosty.",
+				"⏱ Этот запрос входа больше не действует.\n\nНачните новый вход на сайте MaxPosty.")
+			cancel()
+			if answerErr != nil {
+				s.logger.Warn("could not answer expired MAX auth callback", "error", answerErr)
+			}
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		s.writeError(w, err)
+		return
+	}
+	if attempt.Status != store.MAXAuthAttemptVerified {
+		// Keep the keyboard: the user can share the signed contact and retry this
+		// exact callback without restarting the browser flow.
+		ctx, cancel := contextWithTimeout(r, 5*time.Second)
+		answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID,
+			"Сначала нажмите «1. Поделиться контактом», затем повторите подтверждение.", "")
+		cancel()
+		if answerErr != nil {
+			s.logger.Warn("could not answer early MAX auth callback", "error", answerErr)
+		}
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "awaiting_contact": true})
+		return
+	}
+	ctx, cancel := contextWithTimeout(r, 5*time.Second)
+	answerErr := s.app.AnswerMAXCallback(ctx, update.Callback.CallbackID,
+		"Вход подтверждён. Вернитесь в MaxPosty.",
+		"✅ Вход подтверждён.\n\nВернитесь в открытое окно MaxPosty — вход завершится автоматически.")
+	cancel()
+	if answerErr != nil {
+		s.logger.Warn("could not answer MAX auth callback", "error", answerErr)
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -443,9 +642,7 @@ func (s *Server) handleMAXIdentityCallback(w http.ResponseWriter, r *http.Reques
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func webhookUserID(user *struct {
-	UserID json.RawMessage `json:"user_id"`
-}) (string, error) {
+func webhookUserID(user *maxWebhookUser) (string, error) {
 	if user == nil {
 		return "", errors.New("MAX user is missing")
 	}

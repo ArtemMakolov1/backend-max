@@ -138,11 +138,16 @@ type PostChanges struct {
 	ScheduledAt        **time.Time
 }
 
-// AuthSession is a server-side Yandex OAuth session. TokenHash contains the
+// AuthSession is a provider-neutral server-side login session. TokenHash contains the
 // SHA-256 hex digest of the opaque browser token; the token itself must never
 // be persisted.
 type AuthSession struct {
-	TokenHash         string
+	TokenHash       string
+	OwnerID         string
+	Provider        string
+	ProviderSubject string
+	// YandexUserID is kept as a source-compatibility alias for older callers.
+	// New code must use OwnerID; it is populated when sessions are read.
 	YandexUserID      string
 	Login             string
 	Email             string
@@ -151,6 +156,51 @@ type AuthSession struct {
 	AllowlistIdentity string
 	CreatedAt         time.Time
 	ExpiresAt         time.Time
+}
+
+const (
+	MAXAuthAttemptPending         = "pending"
+	MAXAuthAttemptAwaitingContact = "awaiting_contact"
+	MAXAuthAttemptVerified        = "verified"
+	MAXAuthAttemptAuthenticated   = "authenticated"
+	MAXAuthAttemptCancelled       = "canceled"
+	MAXAuthAttemptFailed          = "failed"
+	MAXAuthAttemptExpired         = "expired"
+)
+
+// MAXAuthAttempt is a browser-bound device-flow attempt. Both browser and
+// deep-link secrets are persisted only as SHA-256 hashes.
+type MAXAuthAttempt struct {
+	ID                  string
+	BrowserTokenHash    string
+	DeepTokenHash       string
+	ReturnTo            string
+	ComparisonCode      string
+	Status              string
+	MAXUserID           string
+	TermsVersion        string
+	PersonalDataVersion string
+	ConsentAt           time.Time
+	ContactMessageID    string
+	ContactEventAt      *time.Time
+	ErrorCode           string
+	CreatedAt           time.Time
+	ExpiresAt           time.Time
+	AuthenticatedAt     *time.Time
+	UpdatedAt           time.Time
+}
+
+// MAXAuthProfile contains only the signed MAX identity data needed by the
+// application. The verified phone number, vCard and contact hash are never
+// stored.
+type MAXAuthProfile struct {
+	MAXUserID         string
+	FirstName         string
+	LastName          string
+	Username          string
+	AvatarURL         string
+	ContactVerifiedAt time.Time
+	UpdatedAt         time.Time
 }
 
 // User is the local account attached to a Yandex identity. ID is the stable

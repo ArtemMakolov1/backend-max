@@ -440,6 +440,11 @@ type maxIdentityConfirmationSender interface {
 	SendIdentityLinkConfirmation(context.Context, string, string, string, string, string) error
 }
 
+type maxAuthContactClient interface {
+	SendAuthContactRequest(context.Context, string, string, string) error
+	VerifyContactHMAC(string, string) bool
+}
+
 func (a *App) SendMAXIdentityLinkConfirmation(ctx context.Context, maxUserID, requesterLabel, comparisonCode, confirmPayload, cancelPayload string) error {
 	if a.max == nil {
 		return ErrMAXNotConfigured
@@ -449,6 +454,25 @@ func (a *App) SendMAXIdentityLinkConfirmation(ctx context.Context, maxUserID, re
 	}
 	// Compatibility for alternative clients implementing the older interface.
 	return a.max.SendClaimConfirmation(ctx, maxUserID, "профиль MAX", "", requesterLabel, comparisonCode, confirmPayload, cancelPayload)
+}
+
+func (a *App) SendMAXAuthContactRequest(ctx context.Context, maxUserID, comparisonCode, confirmPayload string) error {
+	if a.max == nil {
+		return ErrMAXNotConfigured
+	}
+	client, ok := a.max.(maxAuthContactClient)
+	if !ok {
+		return ErrMAXNotConfigured
+	}
+	return client.SendAuthContactRequest(ctx, maxUserID, comparisonCode, confirmPayload)
+}
+
+func (a *App) VerifyMAXAuthContact(vcfInfo, proof string) bool {
+	if a.max == nil {
+		return false
+	}
+	client, ok := a.max.(maxAuthContactClient)
+	return ok && client.VerifyContactHMAC(vcfInfo, proof)
 }
 
 func (a *App) ConnectDiscoverableChannelForUser(ctx context.Context, userID, maxChatID string) (ChannelCheck, error) {
@@ -1045,6 +1069,9 @@ func (a *App) runSchedulerCycle(ctx context.Context, now time.Time) {
 	a.publishDueAt(ctx, now)
 	a.syncDueMAXStats(ctx, now)
 	a.syncDueChannelParticipantStats(ctx, now)
+	if err := a.store.PurgeExpiredMAXAuthAttempts(ctx, now.UTC()); err != nil {
+		a.logger.Error("scheduler could not purge expired MAX auth attempts", "error", err)
+	}
 }
 
 func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {

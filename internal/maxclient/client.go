@@ -432,6 +432,36 @@ func (c *Client) SendIdentityLinkConfirmation(ctx context.Context, userID, reque
 	return c.doJSON(ctx, http.MethodPost, "/messages", url.Values{"user_id": {userID}}, body, nil)
 }
 
+// SendAuthContactRequest asks the MAX account that opened the one-time deep
+// link to provide two independent proofs: its signed contact and a callback
+// carrying the secret of this exact browser attempt.
+func (c *Client) SendAuthContactRequest(ctx context.Context, userID, comparisonCode, confirmPayload string) error {
+	if !numericID(userID) {
+		return errors.New("send auth contact request: MAX user ID must be numeric")
+	}
+	if len(comparisonCode) != 6 {
+		return errors.New("send auth contact request: six-digit comparison code is required")
+	}
+	if strings.TrimSpace(confirmPayload) == "" || utf8.RuneCountInString(confirmPayload) > 128 {
+		return errors.New("send auth contact request: valid confirmation payload is required")
+	}
+	body := struct {
+		Text        string `json:"text"`
+		Attachments []any  `json:"attachments"`
+	}{
+		Text: "Вход в MaxPosty\n\nКод проверки: " + comparisonCode +
+			"\nУбедитесь, что такой же код показан на сайте. Затем выполните оба шага по порядку:",
+		Attachments: []any{map[string]any{
+			"type": "inline_keyboard",
+			"payload": map[string]any{"buttons": [][]map[string]string{
+				{{"type": "request_contact", "text": "1. Поделиться контактом"}},
+				{{"type": "callback", "text": "2. Подтвердить вход", "payload": confirmPayload}},
+			}},
+		}},
+	}
+	return c.doJSON(ctx, http.MethodPost, "/messages", url.Values{"user_id": {userID}}, body, nil)
+}
+
 type callbackAnswerMessage struct {
 	Text        string `json:"text"`
 	Attachments []any  `json:"attachments"`

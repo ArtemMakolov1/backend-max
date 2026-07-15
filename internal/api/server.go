@@ -131,6 +131,9 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/auth/session", s.authSession)
 		r.Post("/auth/yandex/start", s.startYandexAuth)
 		r.Get("/auth/yandex/callback", s.finishYandexAuth)
+		r.Post("/auth/max/start", s.startMAXAuth)
+		r.Post("/auth/max/{request_id}/complete", s.completeMAXAuth)
+		r.Delete("/auth/max/{request_id}", s.cancelMAXAuth)
 		r.Post("/auth/logout", s.logout)
 		r.Get("/observability/auth", s.observabilityAuth)
 
@@ -236,9 +239,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 func (s *Server) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal, ok := s.authenticate(r)
-		if !ok || principal.Method != "yandex" || principal.User == nil || principal.User.ID == "" {
+		if !ok || (principal.Method != "yandex" && principal.Method != "max") || principal.User == nil || principal.User.ID == "" {
 			w.Header().Set("Cache-Control", "no-store")
-			s.problem(w, http.StatusUnauthorized, "authentication_required", "A valid Yandex session is required", nil)
+			s.problem(w, http.StatusUnauthorized, "authentication_required", "A valid sign-in session is required", nil)
 			return
 		}
 		ctx := context.WithValue(r.Context(), principalContextKey{}, principal)

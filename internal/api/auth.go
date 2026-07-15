@@ -25,8 +25,8 @@ const (
 	sessionCookieName   = "maxstudio_session"
 	stateCookieName     = "maxstudio_oauth_state"
 	oauthStateTTL       = 10 * time.Minute
-	termsVersion        = "2026-07-14"
-	personalDataVersion = "2026-07-14"
+	termsVersion        = "2026-07-15"
+	personalDataVersion = "2026-07-15"
 )
 
 type authUser struct {
@@ -65,28 +65,37 @@ func (s *Server) authRequired() bool {
 }
 
 func (s *Server) authenticate(r *http.Request) (authPrincipal, bool) {
-	if s.yandexClient != nil {
-		if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
-			tokenHash := sha256Hex(cookie.Value)
-			session, err := s.app.Store().GetAuthSession(r.Context(), tokenHash, s.now().UTC())
-			if err == nil {
-				if len(s.yandexAllowed) > 0 {
-					if _, allowed := s.yandexAllowed[strings.ToLower(strings.TrimSpace(session.AllowlistIdentity))]; !allowed {
-						if deleteErr := s.app.Store().DeleteAuthSession(r.Context(), tokenHash); deleteErr != nil {
-							s.logger.Warn("revoked auth session cleanup failed", "error", deleteErr)
-						}
-						return authPrincipal{}, false
+	if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+		tokenHash := sha256Hex(cookie.Value)
+		session, err := s.app.Store().GetAuthSession(r.Context(), tokenHash, s.now().UTC())
+		if err == nil {
+			method := strings.ToLower(strings.TrimSpace(session.Provider))
+			if method == "" {
+				method = "yandex"
+			}
+			if method != "yandex" && method != "max" {
+				return authPrincipal{}, false
+			}
+			if method == "yandex" && len(s.yandexAllowed) > 0 {
+				if _, allowed := s.yandexAllowed[strings.ToLower(strings.TrimSpace(session.AllowlistIdentity))]; !allowed {
+					if deleteErr := s.app.Store().DeleteAuthSession(r.Context(), tokenHash); deleteErr != nil {
+						s.logger.Warn("revoked auth session cleanup failed", "error", deleteErr)
 					}
+					return authPrincipal{}, false
 				}
-				expiresAt := session.ExpiresAt
-				return authPrincipal{Method: "yandex", ExpiresAt: &expiresAt, User: &authUser{
-					ID: session.YandexUserID, Provider: "yandex", Login: session.Login,
-					DisplayName: firstNonEmpty(session.DisplayName, session.Login, "Пользователь Яндекса"), AvatarURL: session.AvatarURL,
-				}}, true
 			}
-			if !errors.Is(err, store.ErrNotFound) {
-				s.logger.Warn("auth session lookup failed", "error", err)
+			expiresAt := session.ExpiresAt
+			fallbackName := "Пользователь MAX"
+			if method == "yandex" {
+				fallbackName = "Пользователь Яндекса"
 			}
+			return authPrincipal{Method: method, ExpiresAt: &expiresAt, User: &authUser{
+				ID: session.OwnerID, Provider: method, Login: session.Login,
+				DisplayName: firstNonEmpty(session.DisplayName, session.Login, fallbackName), AvatarURL: session.AvatarURL,
+			}}, true
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			s.logger.Warn("auth session lookup failed", "error", err)
 		}
 	}
 	return authPrincipal{}, false
@@ -95,7 +104,7 @@ func (s *Server) authenticate(r *http.Request) (authPrincipal, bool) {
 func (s *Server) authenticationStatus(r *http.Request) authStatusPayload {
 	principal, authenticated := s.authenticate(r)
 	observabilityAccess := false
-	if authenticated {
+	if authenticated && principal.Method == "yandex" {
 		_, observabilityAccess = s.observabilityIdentity(principal.User)
 	}
 	if !authenticated {
@@ -103,7 +112,7 @@ func (s *Server) authenticationStatus(r *http.Request) authStatusPayload {
 	}
 	return authStatusPayload{
 		Required: s.authRequired(), Authenticated: authenticated,
-		Methods: map[string]bool{"yandex": s.yandexClient != nil},
+		Methods: map[string]bool{"yandex": s.yandexClient != nil, "max": s.app.MAXConfigured()},
 		Method:  principal.Method, User: principal.User, SessionExpiresAt: principal.ExpiresAt,
 		DocumentVersions:    map[string]string{"terms": termsVersion, "personal_data": personalDataVersion},
 		ObservabilityAccess: observabilityAccess,
@@ -249,7 +258,7 @@ func (s *Server) finishYandexAuth(w http.ResponseWriter, r *http.Request) {
 		{Document: "terms", Version: state.TermsVersion, AcceptedAt: state.ConsentAt, Source: "yandex_oauth"},
 		{Document: "personal_data", Version: state.PersonalDataVersion, AcceptedAt: state.ConsentAt, Source: "yandex_oauth"},
 	}, store.AuthSession{
-		TokenHash: sha256Hex(sessionToken), YandexUserID: yandexUserID,
+		TokenHash: sha256Hex(sessionToken), OwnerID: yandexUserID, Provider: "yandex", ProviderSubject: yandexUserID,
 		Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName, AvatarURL: avatarURL,
 		AllowlistIdentity: allowlistIdentity,
 		CreatedAt:         now, ExpiresAt: now.Add(s.sessionTTL),
