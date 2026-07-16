@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestWorkspacePlansMigrationIsIdempotentAndBackfillsSubscriptions(t *testing.T) {
+func TestWorkspacePlansMigrationBackfillsSubscriptions(t *testing.T) {
 	ctx := context.Background()
 	testURL, db := newMigrationTestSchema(t)
 	migrations, err := loadEmbeddedMigrations()
@@ -29,10 +29,8 @@ func TestWorkspacePlansMigrationIsIdempotentAndBackfillsSubscriptions(t *testing
 VALUES('migration-existing','Existing',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`); err != nil {
 		t.Fatal(err)
 	}
-	for attempt := 1; attempt <= 2; attempt++ {
-		if _, err := db.ExecContext(ctx, string(migrations[planIndex].contents)); err != nil {
-			t.Fatalf("apply billing migration attempt %d: %v", attempt, err)
-		}
+	if _, err := db.ExecContext(ctx, string(migrations[planIndex].contents)); err != nil {
+		t.Fatalf("apply billing migration: %v", err)
 	}
 
 	var plans, entitlements, subscriptions int

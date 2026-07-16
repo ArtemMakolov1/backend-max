@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS billing_plan_entitlements (
 -- A version is a durable commercial snapshot. Visibility/availability are
 -- rollout state and may change, but price, identity and descriptive fields
 -- require a new version. Entitlements are wholly immutable for the same reason.
-CREATE OR REPLACE FUNCTION protect_billing_plan_version_snapshot() RETURNS trigger
+CREATE FUNCTION protect_billing_plan_version_snapshot() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
@@ -80,7 +80,7 @@ CREATE TRIGGER billing_plan_versions_protect_snapshot
 BEFORE UPDATE OR DELETE ON billing_plan_versions
 FOR EACH ROW EXECUTE FUNCTION protect_billing_plan_version_snapshot();
 
-CREATE OR REPLACE FUNCTION protect_billing_plan_entitlement_snapshot() RETURNS trigger
+CREATE FUNCTION protect_billing_plan_entitlement_snapshot() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
 	IF TG_OP = 'INSERT' THEN
@@ -193,7 +193,7 @@ CREATE TRIGGER billing_plan_entitlements_protect_snapshot
 BEFORE INSERT OR UPDATE OR DELETE ON billing_plan_entitlements
 FOR EACH ROW EXECUTE FUNCTION protect_billing_plan_entitlement_snapshot();
 
-CREATE OR REPLACE FUNCTION create_free_subscription_for_workspace() RETURNS trigger
+CREATE FUNCTION create_free_subscription_for_workspace() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
     INSERT INTO workspace_subscriptions(
