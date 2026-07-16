@@ -114,6 +114,25 @@ grep -F "url: 'https://alerts.example.test/private-receiver'" "$production_alert
 grep -F 'send_resolved: true' "$production_alertmanager" >/dev/null
 [[ $(stat -c '%a' "$production_alertmanager" 2>/dev/null || stat -f '%Lp' "$production_alertmanager") == 600 ]]
 
+# The overridden `sh -ec` entrypoint must receive the initializer as one argv
+# element. A scalar Compose command is tokenized and silently turns `mkdir`
+# into a zero-argument script on the production Docker/Compose versions.
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+  runtime_command_length=$(
+    BACKEND_IMAGE=ghcr.io/example/maxposty@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+      docker compose \
+        --project-directory "$repo_root" \
+        --env-file "$production_env" \
+        --file "$compose_file" \
+        config --format json |
+      jq -r '.services["runtime-storage-init"].command | length'
+  )
+  [[ "$runtime_command_length" == 1 ]] || {
+    echo "runtime-storage-init command must remain a single shell script argument" >&2
+    exit 1
+  }
+fi
+
 without_alerts_env="$sandbox/without-alerts.env"
 env \
   DEPLOY_STAGE=production \

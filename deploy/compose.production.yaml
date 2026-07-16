@@ -12,13 +12,18 @@ services:
     restart: "no"
     user: "0:0"
     entrypoint: ["/bin/sh", "-ec"]
-    command: >-
-      mkdir -p /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups /alertmanager-config &&
-      chown -R postgres:postgres /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups &&
-      chmod 0700 /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups &&
-      cp /source/alertmanager.yml /alertmanager-config/alertmanager.yml &&
-      chown 65534:65534 /alertmanager-config/alertmanager.yml &&
-      chmod 0400 /alertmanager-config/alertmanager.yml
+    # Compose otherwise tokenizes a scalar command before passing it to the
+    # overridden `sh -ec` entrypoint. Keep the complete script in one argv
+    # element so `mkdir` does not become the script with the remaining tokens
+    # incorrectly assigned to shell positional parameters.
+    command:
+      - >-
+        mkdir -p /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups /alertmanager-config &&
+        chown -R postgres:postgres /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups &&
+        chmod 0700 /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups &&
+        cp /source/alertmanager.yml /alertmanager-config/alertmanager.yml &&
+        chown 65534:65534 /alertmanager-config/alertmanager.yml &&
+        chmod 0400 /alertmanager-config/alertmanager.yml
     volumes:
       - postgres-wal-archive:/var/lib/postgresql/wal-archive
       - postgres-base-backups:/var/lib/postgresql/base-backups

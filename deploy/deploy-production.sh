@@ -533,7 +533,11 @@ if [[ -n "$current_dir" ]]; then
   compose "$current_dir" "$current_env" "$current_release" stop backend
 fi
 
-compose "$release_dir" "$next_env" "$next_release" up -d postgres
+if ! compose "$release_dir" "$next_env" "$next_release" up -d postgres; then
+  compose "$release_dir" "$next_env" "$next_release" logs --tail=120 --no-color runtime-storage-init postgres >&2 || true
+  echo "PostgreSQL startup prerequisites failed" >&2
+  exit 1
+fi
 if ! wait_for_health "$release_dir" "$next_env" "$next_release" postgres 40; then
   compose "$release_dir" "$next_env" "$next_release" logs --tail=120 --no-color postgres >&2 || true
   echo "PostgreSQL did not become healthy" >&2
