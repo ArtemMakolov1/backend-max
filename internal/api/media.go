@@ -56,6 +56,11 @@ func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, post
 	if err != nil {
 		return store.Post{}, media.File{}, err
 	}
+	releaseUpload, acquired := s.mediaUploads.tryAcquire(userID)
+	if !acquired {
+		return store.Post{}, media.File{}, errMediaUploadRateLimited
+	}
+	defer releaseUpload()
 	// Route and query post IDs are known before multipart parsing. Authorize
 	// them first so a foreign resource consistently looks absent regardless of
 	// whether the request body is valid.
@@ -99,11 +104,8 @@ func (s *Server) saveMultipartImage(w http.ResponseWriter, r *http.Request, post
 	defer func() {
 		_ = upload.Close()
 	}()
-	file, err := s.app.Media().Save(r.Context(), fileHeader.Filename, upload)
+	file, err := s.app.SaveMediaForUser(r.Context(), userID, fileHeader.Filename, upload)
 	if err != nil {
-		return store.Post{}, media.File{}, err
-	}
-	if err := s.app.Store().RegisterMedia(r.Context(), userID, file.Filename, s.now().UTC()); err != nil {
 		return store.Post{}, media.File{}, err
 	}
 	if postID == nil {

@@ -133,6 +133,38 @@ func TestWriteErrorDoesNotExposeUpstreamOrConflictDetails(t *testing.T) {
 	}
 }
 
+func TestWriteErrorTranslatesMediaQuotaFailures(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{err: store.ErrMediaQuotaExceeded, wantStatus: http.StatusRequestEntityTooLarge, wantCode: "media_quota_exceeded"},
+		{err: store.ErrMediaUploadBusy, wantStatus: http.StatusConflict, wantCode: "media_upload_in_progress"},
+	}
+	for _, test := range tests {
+		response := httptest.NewRecorder()
+		server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		server.writeError(response, test.err)
+		if response.Code != test.wantStatus {
+			t.Fatalf("status=%d, want %d: %s", response.Code, test.wantStatus, response.Body.String())
+		}
+		var payload struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Error.Code != test.wantCode || payload.Error.Message == "" || strings.Contains(payload.Error.Message, "quota") {
+			t.Fatalf("payload=%#v", payload.Error)
+		}
+	}
+}
+
 func TestMetricsEndpointAllowsOnlyDirectPrivateScrapers(t *testing.T) {
 	t.Parallel()
 

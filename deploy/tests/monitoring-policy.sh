@@ -14,6 +14,7 @@ fi
 
 for image in \
   'prom/prometheus:v3.13.1@sha256:' \
+  'prom/alertmanager:v0.33.1@sha256:' \
   'grafana/grafana:nightly-slim@sha256:' \
   'ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.5.1@sha256:' \
   'ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.5.1@sha256:' \
@@ -47,7 +48,12 @@ grep -F '127.0.0.1:${GRAFANA_PORT:-3000}:3000' "$local_compose" >/dev/null
 grep -F "grep -Eq '^pg_up 1" "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F "grep -Eq '^pgbouncer_up 1" "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F 'wait_for_prometheus_target' "$repo_root/deploy/deploy-production.sh" >/dev/null
+grep -F 'wait_for_prometheus_alertmanager' "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F 'wait_for_grafana_provisioning' "$repo_root/deploy/deploy-production.sh" >/dev/null
+grep -F -- '--collector.textfile.directory=/var/lib/node-exporter/textfile' "$production_compose" >/dev/null
+grep -F '/opt/maxposty/backend/runtime/metrics:/var/lib/node-exporter/textfile:ro' "$production_compose" >/dev/null
+grep -F 'alertmanagers:' "$repo_root/monitoring/prometheus/prometheus.yml" >/dev/null
+grep -F 'alertmanager:9093' "$repo_root/monitoring/prometheus/prometheus.yml" >/dev/null
 
 for compose_file in "$production_compose" "$local_compose"; do
   grep -F -- '--collector.stat_statements.include_query' "$compose_file" >/dev/null
@@ -81,7 +87,7 @@ jq -e '
   )
 ' "$infrastructure_dashboard" >/dev/null
 
-for service in postgres-exporter pgbouncer-exporter prometheus grafana; do
+for service in postgres-exporter pgbouncer-exporter alertmanager prometheus grafana; do
   service_block=$(awk -v service="$service" '
     $0 == "  " service ":" { inside=1; next }
     inside && $0 ~ /^  [a-zA-Z0-9_-]+:$/ { exit }
@@ -113,6 +119,13 @@ done
 
 grep -F 'pg_long_running_transactions_oldest_timestamp_seconds' \
   "$repo_root/monitoring/prometheus/rules/maxposty-alerts.yml" >/dev/null
+for metric in \
+  maxposty_backup_last_attempt_success \
+  maxposty_backup_restore_verification_last_success_timestamp_seconds \
+  maxposty_pitr_base_backup_last_success_timestamp_seconds \
+  maxposty_postgresql_wal_archive_failed_total; do
+  grep -F "$metric" "$repo_root/monitoring/prometheus/rules/maxposty-alerts.yml" >/dev/null
+done
 
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   docker run --rm \

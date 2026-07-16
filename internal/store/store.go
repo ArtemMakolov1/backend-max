@@ -25,6 +25,8 @@ var (
 	ErrChannelOwned       = errors.New("channel is already connected to another account")
 	ErrScheduleNotDue     = errors.New("scheduled post is not due")
 	ErrMigrationIntegrity = errors.New("migration integrity check failed")
+	ErrMediaQuotaExceeded = errors.New("media storage quota exceeded")
+	ErrMediaUploadBusy    = errors.New("media upload is already in progress")
 )
 
 type Store struct {
@@ -50,7 +52,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "013_s3_media_cutover.sql"
+const RequiredSchemaVersion = "014_media_quota_and_gc.sql"
 
 type schemaMigration struct {
 	version        string

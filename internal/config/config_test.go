@@ -151,6 +151,54 @@ func TestLoadAcceptsCompleteS3StorageConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadUsesBoundedMediaQuotaAndCleanupDefaults(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MediaUserMaxFiles != 500 || cfg.MediaUserMaxBytes != 1<<30 ||
+		cfg.MediaOrphanGrace != 24*time.Hour || cfg.MediaCleanupInterval != 15*time.Minute || cfg.MediaCleanupBatch != 50 {
+		t.Fatalf("unexpected media defaults: %#v", cfg)
+	}
+
+	t.Setenv("MEDIA_USER_MAX_FILES", "42")
+	t.Setenv("MEDIA_USER_MAX_BYTES", "10485760")
+	t.Setenv("MEDIA_ORPHAN_GRACE_PERIOD", "2h")
+	t.Setenv("MEDIA_CLEANUP_INTERVAL", "5m")
+	t.Setenv("MEDIA_CLEANUP_BATCH_SIZE", "25")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MediaUserMaxFiles != 42 || cfg.MediaUserMaxBytes != 10<<20 ||
+		cfg.MediaOrphanGrace != 2*time.Hour || cfg.MediaCleanupInterval != 5*time.Minute || cfg.MediaCleanupBatch != 25 {
+		t.Fatalf("media overrides were not loaded: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsUnsafeMediaQuotaAndCleanupValues(t *testing.T) {
+	tests := map[string]string{
+		"MEDIA_USER_MAX_FILES":      "0",
+		"MEDIA_USER_MAX_BYTES":      "1125899906842625",
+		"MEDIA_ORPHAN_GRACE_PERIOD": "59m",
+		"MEDIA_CLEANUP_INTERVAL":    "25h",
+		"MEDIA_CLEANUP_BATCH_SIZE":  "1001",
+	}
+	for name, value := range tests {
+		name, value := name, value
+		t.Run(name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv(name, value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("Load() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsPartialS3AndS3InBootstrap(t *testing.T) {
 	clearAuthEnv(t)
 	setValidLocalYandexAuth(t)
@@ -347,6 +395,7 @@ func clearAuthEnv(t *testing.T) {
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
 		"OPENAI_API_KEY", "OPENAI_API_BASE_URL",
 		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
+		"MEDIA_USER_MAX_FILES", "MEDIA_USER_MAX_BYTES", "MEDIA_ORPHAN_GRACE_PERIOD", "MEDIA_CLEANUP_INTERVAL", "MEDIA_CLEANUP_BATCH_SIZE",
 	} {
 		t.Setenv(name, "")
 	}

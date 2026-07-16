@@ -122,6 +122,16 @@ services:
       # exposed to this container; only the one-shot migrate service receives it.
       DATABASE_URL: "postgresql://${POSTGRES_APP_USER:-maxstudio_app}:${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}@pgbouncer:6432/${POSTGRES_DB:-maxstudio}?sslmode=disable"
       MEDIA_DIR: /app/media
+      S3_HOST: ${S3_HOST:-}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      MEDIA_USER_MAX_FILES: ${MEDIA_USER_MAX_FILES:-500}
+      MEDIA_USER_MAX_BYTES: ${MEDIA_USER_MAX_BYTES:-1073741824}
+      MEDIA_ORPHAN_GRACE_PERIOD: ${MEDIA_ORPHAN_GRACE_PERIOD:-24h}
+      MEDIA_CLEANUP_INTERVAL: ${MEDIA_CLEANUP_INTERVAL:-15m}
+      MEDIA_CLEANUP_BATCH_SIZE: ${MEDIA_CLEANUP_BATCH_SIZE:-50}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:4321}
       OAUTH_TRUST_X_REAL_IP: ${OAUTH_TRUST_X_REAL_IP:-false}

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -506,12 +505,8 @@ func (s *Server) generateImage(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	file, err := s.app.GenerateImage(ctx, request)
+	file, err := s.app.GenerateImageForUser(ctx, userID, request)
 	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	if err := s.app.Store().RegisterMedia(r.Context(), userID, file.Filename, s.now().UTC()); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -553,17 +548,10 @@ func (s *Server) generatePostImage(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	post, err := s.app.GeneratePostImage(ctx, id, request)
+	post, err := s.app.GeneratePostImage(ctx, userID, id, request)
 	if err != nil {
 		s.writeError(w, err)
 		return
-	}
-	if post.ImageURL != "" {
-		filename := path.Base(post.ImageURL)
-		if err := s.app.Store().RegisterMedia(r.Context(), userID, filename, s.now().UTC()); err != nil {
-			s.writeError(w, err)
-			return
-		}
 	}
 	s.writeJSON(w, http.StatusOK, post)
 }

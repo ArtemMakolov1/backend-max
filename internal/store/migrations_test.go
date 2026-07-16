@@ -213,6 +213,54 @@ WHERE id = $1`, postID).Scan(
 	}
 }
 
+func TestMediaQuotaMigrationPreservesLegacyOwnershipForAdditiveRollout(t *testing.T) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	quotaIndex := -1
+	for index, migration := range migrations {
+		if migration.version == "014_media_quota_and_gc.sql" {
+			quotaIndex = index
+			break
+		}
+	}
+	if quotaIndex <= 0 {
+		t.Fatal("014_media_quota_and_gc.sql not found in embedded migrations")
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:quotaIndex]); err != nil {
+		t.Fatalf("apply prerequisite migrations: %v", err)
+	}
+
+	now := time.Now().UTC()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO users(id, display_name, created_at, updated_at) VALUES ('owner', 'Owner', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO media_assets(owner_id, filename, created_at) VALUES ('owner', 'legacy-local.png', $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:quotaIndex+1]); err != nil {
+		t.Fatalf("apply media quota migration: %v", err)
+	}
+
+	var assets int
+	var sizeBytes int64
+	var state string
+	if err := db.QueryRowContext(ctx, `SELECT count(*), max(size_bytes), max(state) FROM media_assets`).Scan(&assets, &sizeBytes, &state); err != nil {
+		t.Fatal(err)
+	}
+	if assets != 1 || sizeBytes != 0 || state != "ready" {
+		t.Fatalf("legacy media ownership after additive rollout = (%d, %d, %q), want (1, 0, ready)", assets, sizeBytes, state)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO media_usage(owner_id, asset_count, total_bytes) VALUES ('owner', 0, 0)`); err != nil {
+		t.Fatalf("media_usage is not available: %v", err)
+	}
+}
+
 func TestMigrationIntegrityFailsClosedAtRuntimeAndMigrator(t *testing.T) {
 	ctx := context.Background()
 	testURL, db := newMigrationTestSchema(t)
@@ -251,7 +299,7 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "014_future_additive.sql"
+	const futureVersion = "015_future_additive.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {

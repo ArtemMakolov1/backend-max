@@ -146,6 +146,8 @@ func (m *recordingMetrics) ObserveSchedulerCycle(time.Duration, time.Time) {
 
 func (m *recordingMetrics) AddRecoveredPublications(int64) {}
 
+func (m *recordingMetrics) ObserveMediaOperation(string, string) {}
+
 func (f *fakeMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 	return maxclient.BotInfo{UserID: 1, Username: "studio_bot", IsBot: true}, nil
 }

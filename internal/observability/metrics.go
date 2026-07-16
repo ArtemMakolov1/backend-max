@@ -42,6 +42,7 @@ type Metrics struct {
 	schedulerLastRun   prometheus.Gauge
 	schedulerInterval  prometheus.Gauge
 	recoveredPosts     prometheus.Counter
+	mediaOperations    *prometheus.CounterVec
 
 	slowQueryThreshold time.Duration
 }
@@ -127,6 +128,10 @@ func NewWithRegistry(registry *prometheus.Registry) *Metrics {
 			Namespace: "maxposty", Name: "scheduler_recovered_publications_total",
 			Help: "Total interrupted publishing records recovered by the scheduler.",
 		}),
+		mediaOperations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "maxposty", Name: "media_operations_total",
+			Help: "Total private media operations by bounded operation and outcome.",
+		}, []string{"operation", "outcome"}),
 		slowQueryThreshold: defaultSlowQueryThreshold,
 	}
 	registry.MustRegister(
@@ -135,7 +140,7 @@ func NewWithRegistry(registry *prometheus.Registry) *Metrics {
 		m.dbDuration, m.dbErrors, m.dbSlow,
 		m.publicationTotal, m.publicationTime,
 		m.schedulerJobs, m.schedulerDue, m.schedulerCycles, m.schedulerCycleTime,
-		m.schedulerLastRun, m.schedulerInterval, m.recoveredPosts,
+		m.schedulerLastRun, m.schedulerInterval, m.recoveredPosts, m.mediaOperations,
 	)
 	m.handler = promhttp.HandlerFor(registry, promhttp.HandlerOpts{EnableOpenMetrics: true})
 	return m
@@ -207,6 +212,20 @@ func (m *Metrics) AddRecoveredPublications(count int64) {
 	if count > 0 {
 		m.recoveredPosts.Add(float64(count))
 	}
+}
+
+func (m *Metrics) ObserveMediaOperation(operation, outcome string) {
+	switch operation {
+	case "upload", "cleanup":
+	default:
+		operation = "other"
+	}
+	switch outcome {
+	case "success", "error", "quota_exceeded", "busy":
+	default:
+		outcome = "other"
+	}
+	m.mediaOperations.WithLabelValues(operation, outcome).Inc()
 }
 
 // RegisterDBPoolStats adds a collector backed by database/sql's concurrency

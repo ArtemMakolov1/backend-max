@@ -20,6 +20,11 @@ const (
 	defaultHost                = "127.0.0.1"
 	defaultPort                = "8080"
 	defaultMediaDir            = "./media"
+	defaultMediaUserMaxFiles   = int64(500)
+	defaultMediaUserMaxBytes   = int64(1 << 30)
+	defaultMediaOrphanGrace    = 24 * time.Hour
+	defaultMediaCleanupPeriod  = 15 * time.Minute
+	defaultMediaCleanupBatch   = 50
 	defaultPublicBaseURL       = "http://localhost:8080"
 	defaultFrontendOrigin      = "http://localhost:4321"
 	defaultMAXAPIBaseURL       = "https://platform-api2.max.ru"
@@ -39,6 +44,8 @@ const (
 	maxAIConfiguredPerMinute   = 10_000
 	maxAIConfiguredPerDay      = 1_000_000
 	maxAIConfiguredLeaseTTL    = 24 * time.Hour
+	maxMediaUserFiles          = int64(100_000)
+	maxMediaUserBytes          = int64(1 << 50)
 	aiHandlerTimeout           = 3 * time.Minute
 )
 
@@ -47,6 +54,11 @@ type Config struct {
 	Port                 string
 	DatabaseURL          string
 	MediaDir             string
+	MediaUserMaxFiles    int64
+	MediaUserMaxBytes    int64
+	MediaOrphanGrace     time.Duration
+	MediaCleanupInterval time.Duration
+	MediaCleanupBatch    int
 	PublicBaseURL        string
 	FrontendOrigin       string
 	S3Host               string
@@ -82,6 +94,28 @@ type Config struct {
 }
 
 func Load() (Config, error) {
+	mediaMaxFiles, err := boundedPositiveInt64Env("MEDIA_USER_MAX_FILES", defaultMediaUserMaxFiles, maxMediaUserFiles)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaMaxBytes, err := boundedPositiveInt64Env("MEDIA_USER_MAX_BYTES", defaultMediaUserMaxBytes, maxMediaUserBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaOrphanGraceText := env("MEDIA_ORPHAN_GRACE_PERIOD", defaultMediaOrphanGrace.String())
+	mediaOrphanGrace, err := time.ParseDuration(mediaOrphanGraceText)
+	if err != nil || mediaOrphanGrace < time.Hour || mediaOrphanGrace > 30*24*time.Hour {
+		return Config{}, fmt.Errorf("MEDIA_ORPHAN_GRACE_PERIOD must be between 1h and 720h: %q", mediaOrphanGraceText)
+	}
+	mediaCleanupIntervalText := env("MEDIA_CLEANUP_INTERVAL", defaultMediaCleanupPeriod.String())
+	mediaCleanupInterval, err := time.ParseDuration(mediaCleanupIntervalText)
+	if err != nil || mediaCleanupInterval < time.Minute || mediaCleanupInterval > 24*time.Hour {
+		return Config{}, fmt.Errorf("MEDIA_CLEANUP_INTERVAL must be between 1m and 24h: %q", mediaCleanupIntervalText)
+	}
+	mediaCleanupBatch, err := boundedPositiveIntEnv("MEDIA_CLEANUP_BATCH_SIZE", defaultMediaCleanupBatch, 1_000)
+	if err != nil {
+		return Config{}, err
+	}
 	intervalText := env("SCHEDULER_INTERVAL", defaultSchedulerInterval.String())
 	interval, err := time.ParseDuration(intervalText)
 	if err != nil || interval <= 0 {
@@ -142,6 +176,11 @@ func Load() (Config, error) {
 		Port:                 env("PORT", defaultPort),
 		DatabaseURL:          strings.TrimSpace(os.Getenv("DATABASE_URL")),
 		MediaDir:             env("MEDIA_DIR", defaultMediaDir),
+		MediaUserMaxFiles:    mediaMaxFiles,
+		MediaUserMaxBytes:    mediaMaxBytes,
+		MediaOrphanGrace:     mediaOrphanGrace,
+		MediaCleanupInterval: mediaCleanupInterval,
+		MediaCleanupBatch:    mediaCleanupBatch,
 		PublicBaseURL:        strings.TrimRight(env("PUBLIC_BASE_URL", defaultPublicBaseURL), "/"),
 		FrontendOrigin:       strings.TrimRight(env("FRONTEND_ORIGIN", defaultFrontendOrigin), "/"),
 		S3Host:               strings.TrimSpace(os.Getenv("S3_HOST")),
@@ -352,6 +391,15 @@ func splitNormalizedCSV(value string) []string {
 func boundedPositiveIntEnv(name string, fallback, maximum int) (int, error) {
 	raw := env(name, strconv.Itoa(fallback))
 	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d: %q", name, maximum, raw)
+	}
+	return value, nil
+}
+
+func boundedPositiveInt64Env(name string, fallback, maximum int64) (int64, error) {
+	raw := env(name, strconv.FormatInt(fallback, 10))
+	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value <= 0 || value > maximum {
 		return 0, fmt.Errorf("%s must be an integer between 1 and %d: %q", name, maximum, raw)
 	}

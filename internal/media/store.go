@@ -56,6 +56,7 @@ type backend interface {
 	Put(context.Context, string, string, int64, io.Reader) error
 	Head(context.Context, string) (objectInfo, error)
 	Open(context.Context, string) (Object, error)
+	Delete(context.Context, string) error
 }
 
 type Store struct {
@@ -96,17 +97,76 @@ func newStore(storage backend, publicBaseURL string) (*Store, error) {
 	}, nil
 }
 
+// Upload is a validated temporary image. Call Store only after the database
+// has atomically reserved the tenant's quota, then always Close it.
+type Upload struct {
+	store    *Store
+	file     File
+	tempPath string
+}
+
+func (u *Upload) File() File { return u.file }
+
+func (u *Upload) Store(ctx context.Context) error {
+	if u == nil || u.store == nil || u.tempPath == "" {
+		return errors.New("media upload is closed")
+	}
+	// #nosec G703 -- tempPath is returned by os.CreateTemp and never includes user input.
+	payload, err := os.Open(u.tempPath)
+	if err != nil {
+		return fmt.Errorf("open validated image: %w", err)
+	}
+	putErr := u.store.backend.Put(ctx, u.file.Filename, u.file.MIMEType, u.file.Size, payload)
+	closeErr := payload.Close()
+	if putErr != nil {
+		if closeErr != nil {
+			putErr = errors.Join(putErr, fmt.Errorf("close validated image: %w", closeErr))
+		}
+		return fmt.Errorf("store media: %w", putErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close validated image: %w", closeErr)
+	}
+	return nil
+}
+
+func (u *Upload) Close() error {
+	if u == nil || u.tempPath == "" {
+		return nil
+	}
+	name := u.tempPath
+	u.tempPath = ""
+	return os.Remove(name)
+}
+
 func (s *Store) Save(ctx context.Context, originalName string, reader io.Reader) (File, error) {
+	upload, err := s.Prepare(originalName, reader)
+	if err != nil {
+		return File{}, err
+	}
+	defer func() { _ = upload.Close() }()
+	if err := upload.Store(ctx); err != nil {
+		return File{}, err
+	}
+	return upload.File(), nil
+}
+
+// Prepare validates and hashes an image without mutating the backing store.
+// This split lets the application reserve per-tenant quota before S3 upload.
+func (s *Store) Prepare(originalName string, reader io.Reader) (*Upload, error) {
 	if reader == nil {
-		return File{}, errors.New("image reader is required")
+		return nil, errors.New("image reader is required")
 	}
 	tmp, err := os.CreateTemp("", ".maxposty-upload-*")
 	if err != nil {
-		return File{}, fmt.Errorf("create media temp file: %w", err)
+		return nil, fmt.Errorf("create media temp file: %w", err)
 	}
 	tmpName := tmp.Name()
+	keepTemp := false
 	defer func() {
-		_ = os.Remove(tmpName)
+		if !keepTemp {
+			_ = os.Remove(tmpName)
+		}
 	}()
 
 	hash := sha256.New()
@@ -117,22 +177,22 @@ func (s *Store) Save(ctx context.Context, originalName string, reader io.Reader)
 		if closeErr != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("close image: %w", closeErr))
 		}
-		return File{}, resultErr
+		return nil, resultErr
 	}
 	if closeErr != nil {
-		return File{}, fmt.Errorf("close image: %w", closeErr)
+		return nil, fmt.Errorf("close image: %w", closeErr)
 	}
 	if written == 0 {
-		return File{}, errors.New("image is empty")
+		return nil, errors.New("image is empty")
 	}
 	if written > s.maxImageBytes {
-		return File{}, fmt.Errorf("image exceeds %d bytes", s.maxImageBytes)
+		return nil, fmt.Errorf("image exceeds %d bytes", s.maxImageBytes)
 	}
 
 	// #nosec G703 -- tmpName is returned by os.CreateTemp and never includes user input.
 	inspection, err := os.Open(tmpName)
 	if err != nil {
-		return File{}, fmt.Errorf("inspect image: %w", err)
+		return nil, fmt.Errorf("inspect image: %w", err)
 	}
 	header := make([]byte, 512)
 	headerN, readErr := io.ReadFull(inspection, header)
@@ -141,12 +201,12 @@ func (s *Store) Save(ctx context.Context, originalName string, reader io.Reader)
 		if closeErr := inspection.Close(); closeErr != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("close image inspection file: %w", closeErr))
 		}
-		return File{}, resultErr
+		return nil, resultErr
 	}
 	mimeType := http.DetectContentType(header[:headerN])
 	if _, err := inspection.Seek(0, io.SeekStart); err != nil {
 		_ = inspection.Close()
-		return File{}, fmt.Errorf("rewind image inspection file: %w", err)
+		return nil, fmt.Errorf("rewind image inspection file: %w", err)
 	}
 	config, _, decodeErr := image.DecodeConfig(inspection)
 	inspectionCloseErr := inspection.Close()
@@ -155,42 +215,27 @@ func (s *Store) Save(ctx context.Context, originalName string, reader io.Reader)
 		if inspectionCloseErr != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("close image inspection file: %w", inspectionCloseErr))
 		}
-		return File{}, resultErr
+		return nil, resultErr
 	}
 	if inspectionCloseErr != nil {
-		return File{}, fmt.Errorf("close image inspection file: %w", inspectionCloseErr)
+		return nil, fmt.Errorf("close image inspection file: %w", inspectionCloseErr)
 	}
 	if config.Width <= 0 || config.Height <= 0 || config.Width > s.maxImageEdge || config.Height > s.maxImageEdge {
-		return File{}, fmt.Errorf("image dimensions must be between 1 and %d pixels per edge", s.maxImageEdge)
+		return nil, fmt.Errorf("image dimensions must be between 1 and %d pixels per edge", s.maxImageEdge)
 	}
 
 	ext, ok := extensionForMIME(mimeType)
 	if !ok {
-		return File{}, fmt.Errorf("unsupported image type %q; use PNG, JPEG or GIF", mimeType)
+		return nil, fmt.Errorf("unsupported image type %q; use PNG, JPEG or GIF", mimeType)
 	}
 	filename := hex.EncodeToString(hash.Sum(nil)) + ext
-	// #nosec G703 -- tmpName is a trusted temporary file created above.
-	payload, err := os.Open(tmpName)
-	if err != nil {
-		return File{}, fmt.Errorf("open validated image: %w", err)
-	}
-	putErr := s.backend.Put(ctx, filename, mimeType, written, payload)
-	payloadCloseErr := payload.Close()
-	if putErr != nil {
-		if payloadCloseErr != nil {
-			putErr = errors.Join(putErr, fmt.Errorf("close validated image: %w", payloadCloseErr))
-		}
-		return File{}, fmt.Errorf("store media: %w", putErr)
-	}
-	if payloadCloseErr != nil {
-		return File{}, fmt.Errorf("close validated image: %w", payloadCloseErr)
-	}
-
 	_ = originalName // Persisted names are content-addressed to prevent path traversal.
-	return File{
+	file := File{
 		URL: s.URL(filename), Filename: filename, Path: filename, MIMEType: mimeType,
 		Size: written, Width: config.Width, Height: config.Height,
-	}, nil
+	}
+	keepTemp = true
+	return &Upload{store: s, file: file, tempPath: tmpName}, nil
 }
 
 func (s *Store) URL(filename string) string {
@@ -240,6 +285,18 @@ func (s *Store) Open(ctx context.Context, filename string) (Object, error) {
 		return Object{}, errors.New("invalid media filename")
 	}
 	return s.backend.Open(ctx, decoded)
+}
+
+// Delete removes a content-addressed object. Missing objects are successful so
+// the garbage collector can safely retry after crashes.
+func (s *Store) Delete(ctx context.Context, filename string) error {
+	if !validFilename(filename) {
+		return errors.New("invalid media filename")
+	}
+	if err := s.backend.Delete(ctx, filename); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func validFilename(filename string) bool {
@@ -318,6 +375,17 @@ func (b *localBackend) Open(_ context.Context, key string) (Object, error) {
 		Body: file, Filename: key, MIMEType: mime.TypeByExtension(filepath.Ext(key)),
 		Size: info.Size(), LastModified: info.ModTime(),
 	}, nil
+}
+
+func (b *localBackend) Delete(_ context.Context, key string) error {
+	if !validFilename(key) {
+		return errors.New("invalid media filename")
+	}
+	err := os.Remove(filepath.Join(b.dir, key))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func extensionForMIME(mimeType string) (string, bool) {

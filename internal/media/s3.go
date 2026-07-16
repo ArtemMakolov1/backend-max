@@ -274,6 +274,20 @@ func (b *s3Backend) Open(ctx context.Context, key string) (Object, error) {
 	}, nil
 }
 
+func (b *s3Backend) Delete(ctx context.Context, key string) error {
+	if !validFilename(key) {
+		return errors.New("invalid media filename")
+	}
+	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key)})
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete S3 object: %w", err)
+	}
+	return nil
+}
+
 func isS3NotFound(err error) bool {
 	var noSuchKey *types.NoSuchKey
 	var notFound *types.NotFound

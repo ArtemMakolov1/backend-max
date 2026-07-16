@@ -57,6 +57,7 @@ type Server struct {
 	secureCookies       bool
 	oauthStartLimiter   *keyedWindowLimiter
 	aiLimiter           *aiRequestLimiter
+	mediaUploads        *mediaUploadGate
 	trustXRealIP        bool
 	now                 func() time.Time
 	metrics             *observability.Metrics
@@ -78,6 +79,7 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		frontendOrigin: strings.TrimRight(frontendOrigin, "/"), webhookSecret: webhookSecret,
 		sessionTTL:        12 * time.Hour,
 		oauthStartLimiter: newKeyedWindowLimiter(12, 600, time.Minute, 4096), now: time.Now,
+		mediaUploads:        newMediaUploadGate(8),
 		observabilityAdmins: make(map[string]struct{}), activityUsers: make(map[string]struct{}),
 	}
 	if len(authOptions) != 0 {
@@ -445,6 +447,17 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, errMediaUploadRateLimited):
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		s.problem(w, http.StatusTooManyRequests, "media_upload_busy",
+			"Другая загрузка изображения ещё выполняется. Повторите через несколько секунд.", nil)
+	case errors.Is(err, store.ErrMediaQuotaExceeded):
+		s.problem(w, http.StatusRequestEntityTooLarge, "media_quota_exceeded",
+			"Хранилище изображений заполнено. Удалите ненужные черновики с изображениями и попробуйте ещё раз.", nil)
+	case errors.Is(err, store.ErrMediaUploadBusy):
+		s.problem(w, http.StatusConflict, "media_upload_in_progress",
+			"Это изображение уже загружается. Подождите несколько секунд и попробуйте ещё раз.", nil)
 	case errors.Is(err, store.ErrNotFound):
 		s.problem(w, http.StatusNotFound, "not_found", "Запрошенные данные не найдены.", nil)
 	case errors.Is(err, store.ErrConflict):

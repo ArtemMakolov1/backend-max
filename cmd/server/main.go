@@ -111,6 +111,14 @@ func main() {
 	}
 
 	application := app.NewWithMetrics(storage, mediaStore, maxAPI, openAI, research, logger, metrics)
+	if err := application.ConfigureMediaPolicy(app.MediaPolicy{
+		MaxFiles: cfg.MediaUserMaxFiles, MaxBytes: cfg.MediaUserMaxBytes,
+		OrphanGrace: cfg.MediaOrphanGrace, CleanupInterval: cfg.MediaCleanupInterval,
+		CleanupBatch: cfg.MediaCleanupBatch,
+	}); err != nil {
+		logger.Error("could not configure media policy", "error", err)
+		os.Exit(1)
+	}
 	var yandexOAuth api.YandexOAuthClient
 	if cfg.YandexAuthEnabled() {
 		client, err := yandexauth.New(cfg.YandexClientID, cfg.YandexClientSecret, nil)
@@ -147,9 +155,7 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	if maxAPI != nil {
-		go application.RunScheduler(rootCtx, cfg.SchedulerInterval)
-	}
+	go application.RunScheduler(rootCtx, cfg.SchedulerInterval)
 
 	serverErr := make(chan error, 1)
 	go func() {

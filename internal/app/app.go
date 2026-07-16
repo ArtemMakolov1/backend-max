@@ -39,6 +39,11 @@ const (
 	discoverableOwnedRefreshLimit   = 8
 	discoverableUnknownRefreshLimit = 2
 	incompleteObservedChatWindow    = 7 * 24 * time.Hour
+	defaultMediaMaxFiles            = int64(500)
+	defaultMediaMaxBytes            = int64(1 << 30)
+	defaultMediaOrphanGrace         = 24 * time.Hour
+	defaultMediaCleanupInterval     = 15 * time.Minute
+	defaultMediaCleanupBatch        = 50
 )
 
 type MAXClient interface {
@@ -143,6 +148,7 @@ type Metrics interface {
 	SetSchedulerDue(job string, count int)
 	ObserveSchedulerCycle(elapsed time.Duration, completedAt time.Time)
 	AddRecoveredPublications(count int64)
+	ObserveMediaOperation(operation, outcome string)
 }
 
 type noopMetrics struct{}
@@ -152,6 +158,15 @@ func (noopMetrics) ObserveSchedulerJob(string, string)                        {}
 func (noopMetrics) SetSchedulerDue(string, int)                               {}
 func (noopMetrics) ObserveSchedulerCycle(time.Duration, time.Time)            {}
 func (noopMetrics) AddRecoveredPublications(int64)                            {}
+func (noopMetrics) ObserveMediaOperation(string, string)                      {}
+
+type MediaPolicy struct {
+	MaxFiles        int64
+	MaxBytes        int64
+	OrphanGrace     time.Duration
+	CleanupInterval time.Duration
+	CleanupBatch    int
+}
 
 type discoverableRefreshState struct {
 	inFlight bool
@@ -174,6 +189,9 @@ type App struct {
 	discoverableRefreshMu        sync.Mutex
 	discoverableRefreshes        map[string]discoverableRefreshState
 	discoverableRefreshLastSweep time.Time
+	mediaPolicy                  MediaPolicy
+	mediaCleanupMu               sync.Mutex
+	lastMediaCleanup             time.Time
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {
@@ -191,7 +209,24 @@ func NewWithMetrics(storage *store.Store, mediaStore *media.Store, max MAXClient
 		store: storage, media: mediaStore, max: max, images: images, research: research,
 		logger: logger, metrics: metrics, now: time.Now,
 		discoverableRefreshes: make(map[string]discoverableRefreshState),
+		mediaPolicy: MediaPolicy{
+			MaxFiles: defaultMediaMaxFiles, MaxBytes: defaultMediaMaxBytes,
+			OrphanGrace: defaultMediaOrphanGrace, CleanupInterval: defaultMediaCleanupInterval,
+			CleanupBatch: defaultMediaCleanupBatch,
+		},
 	}
+}
+
+func (a *App) ConfigureMediaPolicy(policy MediaPolicy) error {
+	if policy.MaxFiles <= 0 || policy.MaxBytes <= 0 || policy.OrphanGrace <= 0 ||
+		policy.CleanupInterval <= 0 || policy.CleanupBatch <= 0 {
+		return errors.New("media policy values must be positive")
+	}
+	a.mediaCleanupMu.Lock()
+	a.mediaPolicy = policy
+	a.lastMediaCleanup = time.Time{}
+	a.mediaCleanupMu.Unlock()
+	return nil
 }
 
 func (a *App) Store() *store.Store { return a.store }
@@ -879,7 +914,7 @@ func (a *App) TestChannelForUser(ctx context.Context, userID string, channelID i
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
 
-func (a *App) GenerateImage(ctx context.Context, request openaiimg.GenerateRequest) (media.File, error) {
+func (a *App) GenerateImageForUser(ctx context.Context, userID string, request openaiimg.GenerateRequest) (media.File, error) {
 	if a.images == nil {
 		return media.File{}, ErrOpenAINotConfigured
 	}
@@ -887,7 +922,50 @@ func (a *App) GenerateImage(ctx context.Context, request openaiimg.GenerateReque
 	if err != nil {
 		return media.File{}, err
 	}
-	return a.media.Save(ctx, "openai.png", bytes.NewReader(result.Bytes))
+	return a.SaveMediaForUser(ctx, userID, "openai.png", bytes.NewReader(result.Bytes))
+}
+
+// SaveMediaForUser reserves quota in PostgreSQL before writing the private S3
+// object. A failed write releases the reservation; stale reservations are also
+// reclaimed by the periodic orphan job after the configured grace period.
+func (a *App) SaveMediaForUser(ctx context.Context, userID, filename string, reader io.Reader) (result media.File, resultErr error) {
+	defer func() { a.metrics.ObserveMediaOperation("upload", metricOutcome(resultErr)) }()
+	upload, err := a.media.Prepare(filename, reader)
+	if err != nil {
+		return media.File{}, err
+	}
+	defer func() { _ = upload.Close() }()
+	file := upload.File()
+	policy := a.currentMediaPolicy()
+	reservation, err := a.store.ReserveMedia(ctx, userID, file.Filename, file.Size, store.MediaLimits{
+		MaxFiles: policy.MaxFiles, MaxBytes: policy.MaxBytes,
+	}, a.now().UTC())
+	if err != nil {
+		return media.File{}, err
+	}
+	if err := upload.Store(ctx); err != nil {
+		a.releaseMediaReservation(reservation)
+		return media.File{}, err
+	}
+	if err := a.store.CompleteMediaReservation(ctx, reservation, a.now().UTC()); err != nil {
+		a.releaseMediaReservation(reservation)
+		return media.File{}, err
+	}
+	return file, nil
+}
+
+func (a *App) releaseMediaReservation(reservation store.MediaReservation) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.store.ReleaseMediaReservation(ctx, reservation, a.now().UTC()); err != nil {
+		a.logger.Error("could not release failed media reservation", "error", err)
+	}
+}
+
+func (a *App) currentMediaPolicy() MediaPolicy {
+	a.mediaCleanupMu.Lock()
+	defer a.mediaCleanupMu.Unlock()
+	return a.mediaPolicy
 }
 
 func (a *App) GenerateResearch(ctx context.Context, request openairesearch.Request) (openairesearch.Result, error) {
@@ -911,8 +989,8 @@ func (a *App) FormatPostContent(ctx context.Context, request openairesearch.Form
 	return formatter.FormatContent(ctx, request)
 }
 
-func (a *App) GeneratePostImage(ctx context.Context, postID int64, request openaiimg.GenerateRequest) (store.Post, error) {
-	post, err := a.store.GetPost(ctx, postID)
+func (a *App) GeneratePostImage(ctx context.Context, userID string, postID int64, request openaiimg.GenerateRequest) (store.Post, error) {
+	post, err := a.store.GetPostForUser(ctx, userID, postID)
 	if err != nil {
 		return store.Post{}, err
 	}
@@ -922,7 +1000,7 @@ func (a *App) GeneratePostImage(ctx context.Context, postID int64, request opena
 	if strings.TrimSpace(request.Prompt) == "" {
 		request.Prompt = post.ImagePrompt
 	}
-	file, err := a.GenerateImage(ctx, request)
+	file, err := a.GenerateImageForUser(ctx, userID, request)
 	if err != nil {
 		return store.Post{}, err
 	}
@@ -940,7 +1018,7 @@ func (a *App) SavePostImage(ctx context.Context, postID int64, filename string, 
 	if post.Status == store.PostStatusPublishing {
 		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
 	}
-	file, err := a.media.Save(ctx, filename, reader)
+	file, err := a.SaveMediaForUser(ctx, post.UserID, filename, reader)
 	if err != nil {
 		return store.Post{}, err
 	}
@@ -1326,10 +1404,16 @@ func isStoredMAXPublicationMissing(post store.Post) bool {
 }
 
 func metricOutcome(err error) string {
-	if err != nil {
+	switch {
+	case err == nil:
+		return "success"
+	case errors.Is(err, store.ErrMediaQuotaExceeded):
+		return "quota_exceeded"
+	case errors.Is(err, store.ErrMediaUploadBusy):
+		return "busy"
+	default:
 		return "error"
 	}
-	return "success"
 }
 
 func validateMAXMessageChannel(message maxclient.Message, chatID string) error {
@@ -1362,11 +1446,42 @@ func (a *App) runSchedulerCycle(ctx context.Context, now time.Time) {
 	defer func() {
 		a.metrics.ObserveSchedulerCycle(time.Since(startedAt), a.now().UTC())
 	}()
-	a.publishDueAt(ctx, now)
-	a.syncDueMAXStats(ctx, now)
-	a.syncDueChannelParticipantStats(ctx, now)
+	if a.max != nil {
+		a.publishDueAt(ctx, now)
+		a.syncDueMAXStats(ctx, now)
+		a.syncDueChannelParticipantStats(ctx, now)
+	}
+	a.cleanupDueMedia(ctx, now)
 	if err := a.store.PurgeExpiredMAXAuthAttempts(ctx, now.UTC()); err != nil {
 		a.logger.Error("scheduler could not purge expired MAX auth attempts", "error", err)
+	}
+}
+
+func (a *App) cleanupDueMedia(ctx context.Context, now time.Time) {
+	a.mediaCleanupMu.Lock()
+	policy := a.mediaPolicy
+	if !a.lastMediaCleanup.IsZero() && now.Before(a.lastMediaCleanup.Add(policy.CleanupInterval)) {
+		a.mediaCleanupMu.Unlock()
+		return
+	}
+	a.lastMediaCleanup = now
+	a.mediaCleanupMu.Unlock()
+
+	cleanupCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	result, err := a.store.CleanupOrphanMedia(cleanupCtx, now.Add(-policy.OrphanGrace), policy.CleanupBatch, a.media.Delete)
+	if err != nil {
+		a.metrics.ObserveSchedulerJob("media_cleanup", "error")
+		a.metrics.ObserveMediaOperation("cleanup", "error")
+		a.logger.Error("scheduler could not clean orphan media", "error", err)
+		return
+	}
+	a.metrics.ObserveSchedulerJob("media_cleanup", "success")
+	a.metrics.SetSchedulerDue("media_cleanup", int(result.AssetsRemoved+result.ObjectsDeleted))
+	a.metrics.ObserveMediaOperation("cleanup", "success")
+	if result.AssetsRemoved > 0 || result.ObjectsDeleted > 0 {
+		a.logger.Info("orphan media cleanup completed", "assets_removed", result.AssetsRemoved,
+			"objects_deleted", result.ObjectsDeleted, "bytes_released", result.BytesReleased)
 	}
 }
 

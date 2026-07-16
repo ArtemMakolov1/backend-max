@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -352,27 +351,4 @@ func scanChannelClaim(row scanner) (ChannelClaim, error) {
 	}
 	claim.CreatedAt, claim.ExpiresAt, claim.UpdatedAt = claim.CreatedAt.UTC(), claim.ExpiresAt.UTC(), claim.UpdatedAt.UTC()
 	return claim, nil
-}
-
-func (s *Store) RegisterMedia(ctx context.Context, userID, filename string, now time.Time) error {
-	filename = filepath.Base(strings.TrimSpace(filename))
-	if userID == "" || filename == "" || strings.ContainsAny(filename, `/\\`) {
-		return errors.New("valid user id and media filename are required")
-	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO media_assets(owner_id, filename, created_at) VALUES (?,?,?)
-ON CONFLICT(owner_id, filename) DO NOTHING`, userID, filename, now.UTC())
-	if err != nil {
-		return fmt.Errorf("register media ownership: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) UserOwnsMedia(ctx context.Context, userID, filename string) (bool, error) {
-	var owned bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM media_assets WHERE owner_id=? AND filename=?)`,
-		userID, filename).Scan(&owned)
-	if err != nil {
-		return false, fmt.Errorf("check media ownership: %w", err)
-	}
-	return owned, nil
 }

@@ -37,6 +37,8 @@ fi
 next_env="$release_dir/.env.production.next"
 next_release="$release_dir/.release.next"
 validator="$release_dir/deploy/validate-production-env.sh"
+alertmanager_renderer="$release_dir/deploy/render-alertmanager-config.sh"
+alertmanager_config="$release_dir/.alertmanager.yml"
 current_link="$installation_dir/current"
 current_dir=''
 current_env=''
@@ -216,12 +218,29 @@ wait_for_prometheus_target() {
     postgres) encoded_job=postgres ;;
     pgbouncer) encoded_job=pgbouncer ;;
     node) encoded_job=node ;;
+    alertmanager) encoded_job=alertmanager ;;
     *) return 2 ;;
   esac
   for ((attempt = 1; attempt <= 20; attempt++)); do
     response=$(compose "$bundle_dir" "$environment_file" "$release_file" exec -T prometheus \
       wget -q -O - "http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22${encoded_job}%22%7D" 2>/dev/null || true)
     if grep -Eq '"value":\[[^]]*,"1"\]' <<<"$response"; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+wait_for_prometheus_alertmanager() {
+  local bundle_dir=$1
+  local environment_file=$2
+  local release_file=$3
+  local response
+  for ((attempt = 1; attempt <= 20; attempt++)); do
+    response=$(compose "$bundle_dir" "$environment_file" "$release_file" exec -T prometheus \
+      wget -q -O - http://127.0.0.1:9090/api/v1/alertmanagers 2>/dev/null || true)
+    if grep -Fq 'http://alertmanager:9093/api/v2/alerts' <<<"$response"; then
       return 0
     fi
     sleep 3
@@ -269,6 +288,11 @@ has_monitoring_stack() {
   grep -q '^  prometheus:$' "$bundle_dir/deploy/compose.production.yaml"
 }
 
+has_alertmanager_stack() {
+  local bundle_dir=$1
+  grep -q '^  alertmanager:$' "$bundle_dir/deploy/compose.production.yaml"
+}
+
 start_monitoring() {
   local bundle_dir=$1
   local environment_file=$2
@@ -304,6 +328,18 @@ start_monitoring() {
     return 1
   fi
 
+  if has_alertmanager_stack "$bundle_dir"; then
+    if ! compose "$bundle_dir" "$environment_file" "$release_file" up -d --no-deps --force-recreate alertmanager; then
+      echo "Alertmanager could not be recreated" >&2
+      return 1
+    fi
+    if ! wait_for_health "$bundle_dir" "$environment_file" "$release_file" alertmanager 30; then
+      compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color alertmanager >&2 || true
+      echo "Alertmanager did not become healthy" >&2
+      return 1
+    fi
+  fi
+
   if ! compose "$bundle_dir" "$environment_file" "$release_file" up -d --no-deps --force-recreate prometheus; then
     echo "Prometheus could not be recreated" >&2
     return 1
@@ -320,6 +356,18 @@ start_monitoring() {
       return 1
     fi
   done
+  if has_alertmanager_stack "$bundle_dir"; then
+    if ! wait_for_prometheus_target "$bundle_dir" "$environment_file" "$release_file" alertmanager; then
+      compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color prometheus >&2 || true
+      echo "Prometheus target is missing or down: alertmanager" >&2
+      return 1
+    fi
+    if ! wait_for_prometheus_alertmanager "$bundle_dir" "$environment_file" "$release_file"; then
+      compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color prometheus >&2 || true
+      echo "Prometheus has not activated the internal Alertmanager endpoint" >&2
+      return 1
+    fi
+  fi
 
   if ! compose "$bundle_dir" "$environment_file" "$release_file" up -d --no-deps --force-recreate grafana; then
     echo "Grafana could not be recreated" >&2
@@ -354,7 +402,16 @@ restore_previous_release() {
   if [[ -n "$current_dir" && ("$stack_mutated" == "true" || "$writes_frozen" == "true") ]]; then
     echo "Deployment failed; restoring the previous versioned backend bundle" >&2
     if has_monitoring_stack "$release_dir"; then
-      compose "$release_dir" "$next_env" "$next_release" stop grafana prometheus postgres-exporter pgbouncer-exporter node-exporter >/dev/null 2>&1 || true
+      compose "$release_dir" "$next_env" "$next_release" stop grafana prometheus alertmanager postgres-exporter pgbouncer-exporter node-exporter >/dev/null 2>&1 || true
+    fi
+    # Restore the accepted release's private Alertmanager configuration before
+    # its monitoring containers are recreated. This also makes secret rotation
+    # rollback deterministic instead of leaving the rejected config in the
+    # shared volume.
+    if has_alertmanager_stack "$current_dir"; then
+      if ! compose "$current_dir" "$current_env" "$current_release" up --no-deps --force-recreate runtime-storage-init; then
+        restore_failed=true
+      fi
     fi
     if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate postgres; then
       restore_failed=true
@@ -392,15 +449,17 @@ restore_previous_release() {
   # after the previous stack or initial-deploy containers have been handled.
   rm -f "$next_env" "$next_release"
   if [[ "$current_dir" != "$release_dir" ]]; then
-    rm -f "$release_dir/.env.production" "$release_dir/.release"
+    rm -f "$release_dir/.env.production" "$release_dir/.release" "$alertmanager_config"
   fi
   return "$exit_status"
 }
 trap restore_previous_release EXIT
 
+install -d -m 755 "$installation_dir/runtime" "$installation_dir/runtime/metrics"
+"$alertmanager_renderer" "$next_env" "$alertmanager_config"
 compose "$release_dir" "$next_env" "$next_release" config >/dev/null
 compose "$release_dir" "$next_env" "$next_release" pull \
-  backend migrate postgres pgbouncer postgres-exporter pgbouncer-exporter node-exporter prometheus grafana
+  backend migrate runtime-storage-init postgres pgbouncer postgres-exporter pgbouncer-exporter node-exporter alertmanager prometheus grafana
 
 stack_mutated=true
 

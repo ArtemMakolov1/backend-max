@@ -7,6 +7,37 @@ x-logging: &default-logging
     max-file: "5"
 
 services:
+  runtime-storage-init:
+    image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+    restart: "no"
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: >-
+      mkdir -p /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups /alertmanager-config &&
+      chown -R postgres:postgres /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups &&
+      chmod 0700 /var/lib/postgresql/wal-archive /var/lib/postgresql/base-backups &&
+      cp /source/alertmanager.yml /alertmanager-config/alertmanager.yml &&
+      chown 65534:65534 /alertmanager-config/alertmanager.yml &&
+      chmod 0400 /alertmanager-config/alertmanager.yml
+    volumes:
+      - postgres-wal-archive:/var/lib/postgresql/wal-archive
+      - postgres-base-backups:/var/lib/postgresql/base-backups
+      - alertmanager-config:/alertmanager-config
+      - ../.alertmanager.yml:/source/alertmanager.yml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    network_mode: none
+
   postgres:
     image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     restart: unless-stopped
@@ -37,10 +68,22 @@ services:
       - compute_query_id=on
       - -c
       - track_io_timing=on
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=300s
+      - -c
+      - archive_command=test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f
     expose:
       - "5432"
     volumes:
       - postgres-data:/var/lib/postgresql
+      - postgres-wal-archive:/var/lib/postgresql/wal-archive
+      - postgres-base-backups:/var/lib/postgresql/base-backups
       - ../docker/postgres/init-app-role.sh:/docker-entrypoint-initdb.d/10-app-role.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
@@ -53,6 +96,9 @@ services:
     shm_size: 128mb
     stop_grace_period: 30s
     logging: *default-logging
+    depends_on:
+      runtime-storage-init:
+        condition: service_completed_successfully
     networks:
       - database
 
@@ -134,6 +180,11 @@ services:
       S3_SECRET_KEY: ${S3_SECRET_KEY}
       S3_BUCKET: ${S3_BUCKET}
       S3_REGION: ${S3_REGION}
+      MEDIA_USER_MAX_FILES: ${MEDIA_USER_MAX_FILES}
+      MEDIA_USER_MAX_BYTES: ${MEDIA_USER_MAX_BYTES}
+      MEDIA_ORPHAN_GRACE_PERIOD: ${MEDIA_ORPHAN_GRACE_PERIOD}
+      MEDIA_CLEANUP_INTERVAL: ${MEDIA_CLEANUP_INTERVAL}
+      MEDIA_CLEANUP_BATCH_SIZE: ${MEDIA_CLEANUP_BATCH_SIZE}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN}
       AUTH_BOOTSTRAP_MODE: ${AUTH_BOOTSTRAP_MODE}
@@ -301,12 +352,14 @@ services:
       - --path.rootfs=/rootfs
       - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/containers/storage/.+)($|/)
       - --collector.netdev.device-exclude=^(veth.*|docker.*|br-.*)$
+      - --collector.textfile.directory=/var/lib/node-exporter/textfile
     expose:
       - "9100"
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
       - /:/rootfs:ro,rslave
+      - /opt/maxposty/backend/runtime/metrics:/var/lib/node-exporter/textfile:ro
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -321,6 +374,40 @@ services:
       timeout: 5s
       retries: 8
       start_period: 5s
+    logging: *default-logging
+    networks:
+      - monitoring
+
+  alertmanager:
+    image: prom/alertmanager:v0.33.1@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --data.retention=120h
+      - --log.level=warn
+    expose:
+      - "9093"
+    volumes:
+      - alertmanager-config:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      runtime-storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
     logging: *default-logging
     networks:
       - monitoring
@@ -360,6 +447,8 @@ services:
       pgbouncer-exporter:
         condition: service_healthy
       node-exporter:
+        condition: service_healthy
+      alertmanager:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9090/-/ready"]
@@ -472,8 +561,12 @@ services:
 
 volumes:
   postgres-data:
+  postgres-wal-archive:
+  postgres-base-backups:
   media-data:
   prometheus-data:
+  alertmanager-data:
+  alertmanager-config:
   grafana-data:
 
 networks:

@@ -2,7 +2,7 @@ groups:
   - name: maxposty-targets
     rules:
       - alert: MaxPostyTargetDown
-        expr: up{job=~"maxposty-backend|postgres|pgbouncer|node"} == 0
+        expr: up{job=~"maxposty-backend|postgres|pgbouncer|node|alertmanager"} == 0
         for: 2m
         labels:
           severity: critical
@@ -218,3 +218,67 @@ groups:
         annotations:
           summary: "На VPS мало доступной памяти"
           description: "Доступно меньше 10% оперативной памяти в течение 10 минут."
+
+  - name: maxposty-backup-and-pitr
+    rules:
+      - alert: MaxPostyScheduledBackupFailed
+        expr: maxposty_backup_last_attempt_success == 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Последний резервный снимок завершился ошибкой"
+          description: "Ежедневный backup job не завершил проверку восстановления, шифрование или внешнюю публикацию."
+
+      - alert: MaxPostyVerifiedBackupStale
+        expr: |
+          absent(maxposty_backup_last_success_timestamp_seconds)
+          or (time() - maxposty_backup_last_success_timestamp_seconds > 108000)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Нет свежей проверенной резервной копии"
+          description: "Последняя полностью проверенная и зашифрованная копия старше 30 часов или метрика отсутствует."
+
+      - alert: MaxPostyRestoreVerificationStale
+        expr: |
+          absent(maxposty_backup_restore_verification_last_success_timestamp_seconds)
+          or (time() - maxposty_backup_restore_verification_last_success_timestamp_seconds > 108000)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Давно не проверялось восстановление PostgreSQL"
+          description: "Дамп не разворачивался во временную базу более 30 часов или метрика проверки отсутствует."
+
+      - alert: MaxPostyPITRBaseBackupStale
+        expr: |
+          absent(maxposty_pitr_base_backup_last_success_timestamp_seconds)
+          or (time() - maxposty_pitr_base_backup_last_success_timestamp_seconds > 108000)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Физическая база PITR устарела"
+          description: "Последний pg_verifybackup-валидированный base backup старше 30 часов или метрика отсутствует."
+
+      - alert: MaxPostyWALArchiveFailures
+        expr: increase(maxposty_postgresql_wal_archive_failed_total[30m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL не смог архивировать WAL"
+          description: "pg_stat_archiver зарегистрировал новые ошибки архивирования WAL за последние 30 минут."
+
+      - alert: MaxPostyWALArchiveStale
+        expr: |
+          absent(maxposty_postgresql_wal_archive_last_success_timestamp_seconds)
+          or (time() - maxposty_postgresql_wal_archive_last_success_timestamp_seconds > 108000)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Нет свежего подтверждения архивации WAL"
+          description: "Последний подтверждённый WAL-сегмент старше 30 часов или метрика отсутствует."

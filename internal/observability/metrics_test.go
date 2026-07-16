@@ -125,6 +125,27 @@ func TestSchedulerIntervalMetric(t *testing.T) {
 	}
 }
 
+func TestMediaMetricsHaveBoundedLabels(t *testing.T) {
+	t.Parallel()
+	metrics := New()
+	metrics.ObserveMediaOperation("upload", "quota_exceeded")
+	metrics.ObserveMediaOperation("attacker-operation", "attacker-outcome")
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, expected := range []string{
+		`maxposty_media_operations_total{operation="upload",outcome="quota_exceeded"} 1`,
+		`maxposty_media_operations_total{operation="other",outcome="other"} 1`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("metrics output does not contain %q", expected)
+		}
+	}
+	if strings.Contains(body, "attacker-operation") || strings.Contains(body, "attacker-outcome") {
+		t.Fatalf("unbounded media labels leaked into metrics: %s", body)
+	}
+}
+
 func TestProductAnalyticsCollectorCachesAndPreservesLastSuccess(t *testing.T) {
 	t.Parallel()
 
