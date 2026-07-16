@@ -112,7 +112,7 @@ production_alertmanager="$sandbox/alertmanager.yml"
 "$renderer" "$production_env" "$production_alertmanager"
 grep -F "url: 'https://alerts.example.test/private-receiver'" "$production_alertmanager" >/dev/null
 grep -F 'send_resolved: true' "$production_alertmanager" >/dev/null
-[[ $(stat -f '%Lp' "$production_alertmanager" 2>/dev/null || stat -c '%a' "$production_alertmanager") == 600 ]]
+[[ $(stat -c '%a' "$production_alertmanager" 2>/dev/null || stat -f '%Lp' "$production_alertmanager") == 600 ]]
 
 without_alerts_env="$sandbox/without-alerts.env"
 env \
