@@ -1,14 +1,23 @@
 -- Legacy files were stored on the retired server volume and cannot be copied
 -- into the private S3 bucket reliably. Migration 013 already removed every
--- legacy image reference from posts. Keep the ownership rows during the
--- additive rollout so a previously accepted backend can still start; the
--- bounded orphan worker removes them after the grace period.
+-- legacy image reference from posts. Quarantine the pre-existing ownership
+-- rows as expired reservations so they can never be mistaken for quota-paid
+-- S3 objects. The bounded orphan worker removes them immediately after the
+-- new backend starts; a same-name upload is allowed only after that cleanup.
 
 ALTER TABLE media_assets
     ADD COLUMN size_bytes BIGINT DEFAULT 0 CHECK (size_bytes IS DISTINCT FROM NULL AND size_bytes >= 0),
     ADD COLUMN state TEXT DEFAULT 'ready' CHECK (state IS DISTINCT FROM NULL AND state IN ('pending', 'ready')),
     ADD COLUMN reservation_token TEXT DEFAULT '' CHECK (reservation_token IS DISTINCT FROM NULL),
     ADD COLUMN updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP CHECK (updated_at IS DISTINCT FROM NULL);
+
+UPDATE media_assets
+SET state = 'pending',
+    reservation_token = 'legacy-local-cutover',
+    updated_at = TIMESTAMPTZ '1970-01-01 00:00:00+00'
+WHERE state = 'ready'
+  AND size_bytes = 0
+  AND reservation_token = '';
 
 CREATE INDEX idx_media_assets_state_updated
     ON media_assets(state, updated_at, owner_id, filename);

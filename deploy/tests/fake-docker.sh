@@ -86,6 +86,11 @@ if [[ "$*" == *" exec -T prometheus "*"/api/v1/query"* ]]; then
   exit 0
 fi
 
+if [[ "$*" == *" exec -T prometheus "*"/api/v1/alertmanagers"* ]]; then
+  printf '{"status":"success","data":{"activeAlertmanagers":[{"url":"http://alertmanager:9093/api/v2/alerts"}]}}\n'
+  exit 0
+fi
+
 if [[ "$*" == *" exec -T grafana "*"/monitoring/api/datasources/uid/maxposty-prometheus"* ]]; then
   printf '{"uid":"maxposty-prometheus"}\n'
   exit 0

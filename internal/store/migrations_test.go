@@ -213,7 +213,7 @@ WHERE id = $1`, postID).Scan(
 	}
 }
 
-func TestMediaQuotaMigrationPreservesLegacyOwnershipForAdditiveRollout(t *testing.T) {
+func TestMediaQuotaMigrationQuarantinesLegacyOwnershipUntilCleanup(t *testing.T) {
 	ctx := context.Background()
 	testURL, db := newMigrationTestSchema(t)
 	migrations, err := loadEmbeddedMigrations()
@@ -249,15 +249,45 @@ func TestMediaQuotaMigrationPreservesLegacyOwnershipForAdditiveRollout(t *testin
 
 	var assets int
 	var sizeBytes int64
-	var state string
-	if err := db.QueryRowContext(ctx, `SELECT count(*), max(size_bytes), max(state) FROM media_assets`).Scan(&assets, &sizeBytes, &state); err != nil {
+	var state, reservationToken string
+	var updatedAt time.Time
+	if err := db.QueryRowContext(ctx, `SELECT count(*), max(size_bytes), max(state), max(reservation_token), max(updated_at) FROM media_assets`).Scan(
+		&assets, &sizeBytes, &state, &reservationToken, &updatedAt,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if assets != 1 || sizeBytes != 0 || state != "ready" {
-		t.Fatalf("legacy media ownership after additive rollout = (%d, %d, %q), want (1, 0, ready)", assets, sizeBytes, state)
+	if assets != 1 || sizeBytes != 0 || state != "pending" || reservationToken != "legacy-local-cutover" || !updatedAt.Before(time.Unix(1, 0).UTC()) {
+		t.Fatalf("quarantined legacy media = (%d, %d, %q, %q, %v), want stale pending cutover reservation",
+			assets, sizeBytes, state, reservationToken, updatedAt)
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO media_usage(owner_id, asset_count, total_bytes) VALUES ('owner', 0, 0)`); err != nil {
-		t.Fatalf("media_usage is not available: %v", err)
+	storage := &Store{db: &postgresDB{DB: db}}
+	limits := MediaLimits{MaxFiles: 10, MaxBytes: 1 << 20}
+	if _, err := storage.ReserveMedia(ctx, "owner", "legacy-local.png", 123, limits, now); !errors.Is(err, ErrMediaUploadBusy) {
+		t.Fatalf("reserve quarantined legacy media error = %v, want ErrMediaUploadBusy", err)
+	}
+	cleanup, err := storage.CleanupOrphanMedia(ctx, now, 10, func(context.Context, string) error { return nil })
+	if err != nil {
+		t.Fatalf("clean quarantined legacy media: %v", err)
+	}
+	if cleanup.AssetsRemoved != 1 || cleanup.ObjectsDeleted != 1 {
+		t.Fatalf("legacy cleanup = %+v, want one ownership and object removal", cleanup)
+	}
+	reservation, err := storage.ReserveMedia(ctx, "owner", "legacy-local.png", 123, limits, now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("reserve cleaned filename with quota: %v", err)
+	}
+	if reservation.Existing {
+		t.Fatal("cleaned legacy filename bypassed quota as an existing object")
+	}
+	if err := storage.CompleteMediaReservation(ctx, reservation, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("complete replacement media: %v", err)
+	}
+	var usedFiles, usedBytes int64
+	if err := db.QueryRowContext(ctx, `SELECT asset_count, total_bytes FROM media_usage WHERE owner_id='owner'`).Scan(&usedFiles, &usedBytes); err != nil {
+		t.Fatalf("read replacement quota: %v", err)
+	}
+	if usedFiles != 1 || usedBytes != 123 {
+		t.Fatalf("replacement quota = (%d files, %d bytes), want (1, 123)", usedFiles, usedBytes)
 	}
 }
 

@@ -389,6 +389,34 @@ backup_temporary=''
 media_temporary=''
 stack_mutated=false
 writes_frozen=false
+schema_advanced=false
+new_backend_healthy=false
+release_activated=false
+
+activate_release_bundle() {
+  if [[ "$release_activated" == "true" ]]; then
+    return 0
+  fi
+  if [[ -f "$next_env" ]]; then
+    mv -f "$next_env" "$release_dir/.env.production"
+  elif [[ ! -f "$release_dir/.env.production" ]]; then
+    echo "Release activation is missing its production environment" >&2
+    return 1
+  fi
+  if [[ -f "$next_release" ]]; then
+    mv -f "$next_release" "$release_dir/.release"
+  elif [[ ! -f "$release_dir/.release" ]]; then
+    echo "Release activation is missing its immutable image metadata" >&2
+    return 1
+  fi
+  chmod 600 "$release_dir/.env.production" "$release_dir/.release"
+  local temporary_link="$installation_dir/.current-${release_id}"
+  rm -f "$temporary_link"
+  ln -s "$release_dir" "$temporary_link"
+  mv -Tf "$temporary_link" "$current_link"
+  release_activated=true
+}
+
 restore_previous_release() {
   local exit_status=$?
   local restore_failed=false
@@ -400,56 +428,90 @@ restore_previous_release() {
 
   set +e
   if [[ -n "$current_dir" && ("$stack_mutated" == "true" || "$writes_frozen" == "true") ]]; then
-    echo "Deployment failed; restoring the previous versioned backend bundle" >&2
     if has_monitoring_stack "$release_dir"; then
       compose "$release_dir" "$next_env" "$next_release" stop grafana prometheus alertmanager postgres-exporter pgbouncer-exporter node-exporter >/dev/null 2>&1 || true
     fi
-    # Restore the accepted release's private Alertmanager configuration before
-    # its monitoring containers are recreated. This also makes secret rotation
-    # rollback deterministic instead of leaving the rejected config in the
-    # shared volume.
-    if has_alertmanager_stack "$current_dir"; then
-      if ! compose "$current_dir" "$current_env" "$current_release" up --no-deps --force-recreate runtime-storage-init; then
+
+    if [[ "$schema_advanced" == "true" ]]; then
+      echo "Deployment failed after schema advancement; refusing to start the retired backend against the new schema" >&2
+      if [[ "$new_backend_healthy" == "true" ]]; then
+        # The application has already passed its health gate. Keep it and the
+        # new S3/schema semantics active, then fall back only the monitoring
+        # services. This is a roll-forward application recovery, not rollback.
+        if ! activate_release_bundle; then
+          restore_failed=true
+        fi
+        if has_monitoring_stack "$current_dir"; then
+          if ! start_monitoring "$current_dir" "$current_env" "$current_release"; then
+            restore_failed=true
+          fi
+        fi
+        if [[ "$restore_failed" == "true" ]]; then
+          echo "The new backend remains required, but monitoring or release activation needs manual recovery" >&2
+        else
+          echo "The healthy new backend remains active; previous monitoring was restored for operator recovery" >&2
+        fi
+      else
+        # Migrations are applied transaction-by-transaction. Even when the
+        # migrator exits non-zero, an earlier cutover migration may already be
+        # committed, so starting the old local-media binary is never safe.
+        compose "$release_dir" "$next_env" "$next_release" stop backend >/dev/null 2>&1 || true
+        echo "Backend is fail-closed; complete a roll-forward deployment from the preserved staged bundle" >&2
+      fi
+    else
+      echo "Deployment failed before schema advancement; restoring the previous versioned backend bundle" >&2
+      # Restore the accepted release's private Alertmanager configuration before
+      # its monitoring containers are recreated. This also makes secret rotation
+      # rollback deterministic instead of leaving the rejected config in the
+      # shared volume.
+      if has_alertmanager_stack "$current_dir"; then
+        if ! compose "$current_dir" "$current_env" "$current_release" up --no-deps --force-recreate runtime-storage-init; then
+          restore_failed=true
+        fi
+      fi
+      if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate postgres; then
+        restore_failed=true
+      elif ! wait_for_health "$current_dir" "$current_env" "$current_release" postgres 40; then
         restore_failed=true
       fi
-    fi
-    if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate postgres; then
-      restore_failed=true
-    elif ! wait_for_health "$current_dir" "$current_env" "$current_release" postgres 40; then
-      restore_failed=true
-    fi
-    if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate pgbouncer; then
-      restore_failed=true
-    elif ! wait_for_health "$current_dir" "$current_env" "$current_release" pgbouncer 30; then
-      restore_failed=true
-    fi
-    # Always attempt to start the previous backend, even if an infrastructure
-    # dependency needs manual recovery, so the trap never deliberately leaves
-    # the accepted application container in a stopped state.
-    if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate backend; then
-      restore_failed=true
-    fi
-    if ! wait_for_health "$current_dir" "$current_env" "$current_release" backend 40; then
-      restore_failed=true
-    fi
-    if has_monitoring_stack "$current_dir"; then
-      if ! start_monitoring "$current_dir" "$current_env" "$current_release"; then
+      if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate pgbouncer; then
+        restore_failed=true
+      elif ! wait_for_health "$current_dir" "$current_env" "$current_release" pgbouncer 30; then
         restore_failed=true
       fi
-    fi
-    if [[ "$restore_failed" == "true" ]]; then
-      echo "Previous bundle did not recover fully; manual recovery is required" >&2
+      # The previous backend is safe only because no migration has started.
+      if ! compose "$current_dir" "$current_env" "$current_release" up -d --no-deps --force-recreate backend; then
+        restore_failed=true
+      fi
+      if ! wait_for_health "$current_dir" "$current_env" "$current_release" backend 40; then
+        restore_failed=true
+      fi
+      if has_monitoring_stack "$current_dir"; then
+        if ! start_monitoring "$current_dir" "$current_env" "$current_release"; then
+          restore_failed=true
+        fi
+      fi
+      if [[ "$restore_failed" == "true" ]]; then
+        echo "Previous bundle did not recover fully; manual recovery is required" >&2
+      fi
     fi
   elif [[ -z "$current_dir" && "$stack_mutated" == "true" ]]; then
-    echo "Initial deployment failed; removing unaccepted containers while preserving data volumes" >&2
-    compose "$release_dir" "$next_env" "$next_release" down --remove-orphans >/dev/null 2>&1 || true
+    if [[ "$schema_advanced" == "true" ]]; then
+      echo "Initial deployment failed after schema advancement; preserving the staged bundle for roll-forward recovery" >&2
+      compose "$release_dir" "$next_env" "$next_release" stop backend grafana prometheus alertmanager postgres-exporter pgbouncer-exporter node-exporter >/dev/null 2>&1 || true
+    else
+      echo "Initial deployment failed; removing unaccepted containers while preserving data volumes" >&2
+      compose "$release_dir" "$next_env" "$next_release" down --remove-orphans >/dev/null 2>&1 || true
+    fi
   fi
 
-  # Rollback commands above still need the staged files, so clean them only
-  # after the previous stack or initial-deploy containers have been handled.
-  rm -f "$next_env" "$next_release"
-  if [[ "$current_dir" != "$release_dir" ]]; then
-    rm -f "$release_dir/.env.production" "$release_dir/.release" "$alertmanager_config"
+  # Once migration starts, staged metadata is the recovery input for the only
+  # safe direction: roll-forward. Before that point it is safe to discard.
+  if [[ "$schema_advanced" != "true" || "$new_backend_healthy" == "true" ]]; then
+    rm -f "$next_env" "$next_release"
+    if [[ "$release_activated" != "true" && "$current_dir" != "$release_dir" ]]; then
+      rm -f "$release_dir/.env.production" "$release_dir/.release" "$alertmanager_config"
+    fi
   fi
   return "$exit_status"
 }
@@ -559,27 +621,23 @@ retention_days=$(env_value "$next_env" BACKUP_RETENTION_DAYS)
 find "$backup_dir" -type f \( -name 'postgres-*.dump' -o -name 'media-*.tar.gz' -o -name 'backup-*.sha256' \) \
   -mtime "+$retention_days" -delete
 
+schema_advanced=true
 compose "$release_dir" "$next_env" "$next_release" run --rm --no-deps migrate
 compose "$release_dir" "$next_env" "$next_release" up -d --no-deps --force-recreate backend
 
 if ! wait_for_health "$release_dir" "$next_env" "$next_release" backend 40; then
   compose "$release_dir" "$next_env" "$next_release" logs --tail=120 --no-color backend >&2 || true
-  echo "New backend did not become healthy; database remains on the additive schema and the previous bundle will be restored" >&2
+  echo "New backend did not become healthy after schema advancement; automatic backend rollback is disabled" >&2
   exit 1
 fi
+new_backend_healthy=true
 
 if ! start_monitoring "$release_dir" "$next_env" "$next_release"; then
-  echo "The monitoring stack did not become healthy; the previous release will be restored" >&2
+  echo "The monitoring stack did not become healthy; the new backend will remain active and monitoring will fall back" >&2
   exit 1
 fi
 
-mv -f "$next_env" "$release_dir/.env.production"
-mv -f "$next_release" "$release_dir/.release"
-chmod 600 "$release_dir/.env.production" "$release_dir/.release"
-temporary_link="$installation_dir/.current-${release_id}"
-rm -f "$temporary_link"
-ln -s "$release_dir" "$temporary_link"
-mv -Tf "$temporary_link" "$current_link"
+activate_release_bundle
 
 trap - EXIT
 echo "Backend deployment is healthy at immutable digest: $image"
