@@ -408,6 +408,7 @@ RETURNING id,name,channel_id,version`, now, workspaceID, exceptID)
 	if err != nil {
 		return mapWorkspaceWriteError("clear channel template default", err)
 	}
+	defer func() { _ = rows.Close() }()
 	type clearedTemplate struct {
 		id, version int64
 		name        string

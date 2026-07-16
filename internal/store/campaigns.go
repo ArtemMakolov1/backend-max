@@ -659,6 +659,7 @@ FROM campaign_variants WHERE workspace_id=$1 AND campaign_id=$2 ORDER BY id`, wo
 	if err != nil {
 		return Campaign{}, err
 	}
+	defer func() { _ = rows.Close() }()
 	type materializeRow struct {
 		id, title, content, format string
 		channelID                  int64

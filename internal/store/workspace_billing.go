@@ -420,6 +420,7 @@ WHERE workspace_id=$1 AND period_start=$2`, workspaceID, periodStart)
 	if err != nil {
 		return nil, fmt.Errorf("read workspace monthly usage: %w", err)
 	}
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var metric string
 		var quantity int64

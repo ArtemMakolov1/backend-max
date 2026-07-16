@@ -638,6 +638,7 @@ func notifyRolesTx(ctx context.Context, tx *sql.Tx, workspaceID, excludedUserID 
 	if err != nil {
 		return err
 	}
+	defer func() { _ = rows.Close() }()
 	type recipient struct{ userID, role string }
 	recipients := make([]recipient, 0)
 	for rows.Next() {
