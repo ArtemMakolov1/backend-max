@@ -45,7 +45,8 @@ func TestAnalyticsAPIIsPrivateBoundedAndTenantScoped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	today := utcAPIDate(time.Now())
+	now := time.Now().UTC().Truncate(time.Second)
+	today := utcAPIDate(now)
 	publishedAt := today.Add(9 * time.Hour)
 	views := int64(8)
 	post, err := storage.CreatePost(ctx, store.Post{
@@ -67,7 +68,7 @@ func TestAnalyticsAPIIsPrivateBoundedAndTenantScoped(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	application := app.New(storage, mediaStore, nil, nil, nil, logger)
 	server := New(application, logger, "http://localhost:4321", "", AuthOptions{YandexClient: &fakeYandexOAuth{}})
-	server.now = func() time.Time { return today.Add(12 * time.Hour) }
+	server.now = func() time.Time { return now }
 	rawHandler := server.Handler()
 	handler := withTestSession(t, storage, rawHandler, "analytics-api-owner")
 	from := today.AddDate(0, 0, -2).Format(time.DateOnly)
