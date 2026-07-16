@@ -31,6 +31,11 @@ if grep -Eq 'ssh[^\n]*(BACKUP_TOKEN|github\.token)' "$backup_workflow"; then
 fi
 grep -F 'flock -w 300' "$backup_script" >/dev/null
 grep -F 'current_dir" != "$release_dir' "$backup_script" >/dev/null
+grep -F 'pg_dump --format=custom' "$deploy_script" >/dev/null
+if grep -F 'media-backup' "$deploy_script" >/dev/null; then
+  echo "Production deploy must not synchronously archive media" >&2
+  exit 1
+fi
 for signal_script in "$backup_script" "$backup_hook"; do
   grep -F 'trap cleanup EXIT' "$signal_script" >/dev/null
   grep -F "trap 'exit 130' INT" "$signal_script" >/dev/null

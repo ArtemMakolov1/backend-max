@@ -386,7 +386,6 @@ start_monitoring() {
 }
 
 backup_temporary=''
-media_temporary=''
 stack_mutated=false
 writes_frozen=false
 schema_advanced=false
@@ -421,7 +420,6 @@ restore_previous_release() {
   local exit_status=$?
   local restore_failed=false
   [[ -z "$backup_temporary" ]] || rm -f "$backup_temporary"
-  [[ -z "$media_temporary" ]] || rm -f "$media_temporary"
   if ((exit_status == 0)); then
     return 0
   fi
@@ -550,8 +548,10 @@ if ! wait_for_health "$release_dir" "$next_env" "$next_release" pgbouncer 30; th
   exit 1
 fi
 
-# Application writes stay frozen while the database and media volume are
-# captured, copied off-host (in production), and the additive migration runs.
+# Application writes stay frozen while a validated local database snapshot is
+# created and the additive migration runs. Media already lives in S3 and is not
+# copied during a deploy; encrypted offsite database/media backups are handled
+# by the independent scheduled backup workflow.
 
 backup_dir="$installation_dir/backups"
 mkdir -p "$backup_dir"
@@ -559,9 +559,6 @@ chmod 700 "$backup_dir"
 backup_timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup_temporary="$backup_dir/postgres-${backup_timestamp}.dump.tmp"
 backup_final="$backup_dir/postgres-${backup_timestamp}.dump"
-media_temporary="$backup_dir/media-${backup_timestamp}.tar.gz.tmp"
-media_final="$backup_dir/media-${backup_timestamp}.tar.gz"
-manifest_final="$backup_dir/backup-${backup_timestamp}.sha256"
 
 # The variables in this command are intentionally expanded inside PostgreSQL's
 # container, not by this host-side script.
@@ -579,50 +576,12 @@ if ! compose "$release_dir" "$next_env" "$next_release" exec -T postgres \
   exit 1
 fi
 
-compose "$release_dir" "$next_env" "$next_release" --profile ops run --rm --no-deps --quiet-pull -T media-backup \
-  -C /source -czf - . >"$media_temporary"
-if [[ ! -s "$media_temporary" ]]; then
-  echo "Pre-migration media backup is empty or could not be created" >&2
-  exit 1
-fi
-if ! tar -tzf "$media_temporary" >/dev/null; then
-  echo "Pre-migration media backup did not pass archive validation" >&2
-  exit 1
-fi
-
-chmod 600 "$backup_temporary" "$media_temporary"
+chmod 600 "$backup_temporary"
 mv "$backup_temporary" "$backup_final"
-mv "$media_temporary" "$media_final"
 backup_temporary=''
-media_temporary=''
-(
-  cd "$backup_dir"
-  sha256sum "$(basename "$backup_final")" "$(basename "$media_final")" >"$(basename "$manifest_final")"
-)
-chmod 600 "$manifest_final"
-
-backup_hook="$installation_dir/hooks/after-backup"
-bootstrap_mode=$(env_value "$next_env" AUTH_BOOTSTRAP_MODE)
-if [[ "$bootstrap_mode" == "false" ]]; then
-  if [[ ! -x "$backup_hook" ]]; then
-    echo "Production requires executable offsite backup hook: $backup_hook" >&2
-    exit 1
-  fi
-  snapshot_image=$image
-  snapshot_source_sha=$release_id
-  if [[ -n "$current_dir" ]]; then
-    snapshot_image=$(env_value "$current_release" BACKEND_IMAGE)
-    snapshot_source_sha=$(basename -- "$current_dir")
-  fi
-  MAXPOSTY_BACKUP_SNAPSHOT_IMAGE="$snapshot_image" \
-    MAXPOSTY_BACKUP_SNAPSHOT_SOURCE_SHA="$snapshot_source_sha" \
-    "$backup_hook" "$backup_final" "$media_final" "$manifest_final" "$image"
-else
-  echo "Bootstrap warning: encrypted offsite publication is disabled; local snapshots only" >&2
-fi
 
 retention_days=$(env_value "$next_env" BACKUP_RETENTION_DAYS)
-find "$backup_dir" -type f \( -name 'postgres-*.dump' -o -name 'media-*.tar.gz' -o -name 'backup-*.sha256' \) \
+find "$backup_dir" -type f -name 'postgres-*.dump' \
   -mtime "+$retention_days" -delete
 
 schema_advanced=true

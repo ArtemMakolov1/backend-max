@@ -166,9 +166,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      # Production publishes a verified encrypted pre-migration snapshot as an
-      # immutable Release before it is allowed to apply additive migrations.
-      contents: write
+      # Offsite backups are published by the independent scheduled backup job.
+      # A deploy only needs repository metadata and the immutable image.
+      contents: read
       packages: read
     environment:
       name: ${{ vars.DEPLOY_STAGE == 'production' && 'production' || 'bootstrap' }}
