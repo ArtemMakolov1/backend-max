@@ -1,6 +1,9 @@
 package store
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	FormatMarkdown = "markdown"
@@ -12,6 +15,19 @@ const (
 	PostStatusPublished  = "published"
 	PostStatusFailed     = "failed"
 
+	PostAttachmentImage = "image"
+	PostAttachmentVideo = "video"
+
+	AttachmentStatusUploading  = "uploading"
+	AttachmentStatusProcessing = "processing"
+	AttachmentStatusReady      = "ready"
+	AttachmentStatusFailed     = "failed"
+
+	// MAX accepts up to twelve message attachments. An inline keyboard is an
+	// attachment too, so a post with link buttons has one fewer media slot.
+	MaxPostAttachments             = 12
+	MaxPostAttachmentsWithKeyboard = 11
+
 	// MAXPublicationMissingLastError is persisted when a publication that was
 	// previously sent successfully no longer exists in MAX. Keeping a stable,
 	// user-facing marker lets API clients distinguish this recoverable state
@@ -19,6 +35,31 @@ const (
 	// status or discarding the original publication timestamp.
 	MAXPublicationMissingLastError = "Публикация удалена из MAX"
 )
+
+// PostAttachment is the public attachment DTO embedded in Post responses.
+// Storage and provider fields are deliberately hidden from JSON: storage keys
+// are implementation details and MAX upload tokens are opaque provider credentials.
+type PostAttachment struct {
+	ID               int64           `json:"id"`
+	OwnerID          string          `json:"-"`
+	PostID           int64           `json:"-"`
+	Type             string          `json:"type"`
+	Position         int             `json:"position"`
+	URL              string          `json:"url"`
+	StorageKey       string          `json:"-"`
+	ProcessingStatus string          `json:"processing_status"`
+	SizeBytes        int64           `json:"size_bytes"`
+	MIMEType         string          `json:"mime_type"`
+	Width            *int            `json:"width,omitempty"`
+	Height           *int            `json:"height,omitempty"`
+	DurationMS       *int64          `json:"duration_ms,omitempty"`
+	ProviderToken    string          `json:"-"`
+	ProviderExpires  *time.Time      `json:"-"`
+	ProviderMeta     json.RawMessage `json:"-"`
+	ErrorCode        string          `json:"-"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
+}
 
 type Channel struct {
 	ID                 int64     `json:"id"`
@@ -107,30 +148,31 @@ type DiscoverableChannelRefreshCandidates struct {
 }
 
 type Post struct {
-	ID                  int64        `json:"id"`
-	UserID              string       `json:"-"`
-	Title               string       `json:"title"`
-	Content             string       `json:"content"`
-	Format              string       `json:"format"`
-	Status              string       `json:"status"`
-	ChannelID           *int64       `json:"channel_id,omitempty"`
-	ImageURL            string       `json:"image_url,omitempty"`
-	ImagePath           string       `json:"-"`
-	ImagePrompt         string       `json:"image_prompt,omitempty"`
-	LinkButtons         []LinkButton `json:"link_buttons"`
-	Notify              bool         `json:"notify"`
-	DisableLinkPreview  bool         `json:"disable_link_preview"`
-	ScheduledAt         *time.Time   `json:"scheduled_at,omitempty"`
-	MAXMessageID        string       `json:"max_message_id,omitempty"`
-	MAXMessageURL       string       `json:"max_message_url"`
-	MAXViews            *int64       `json:"max_views"`
-	MAXStatsSyncedAt    *time.Time   `json:"max_stats_synced_at"`
-	MAXStatsAttemptedAt *time.Time   `json:"-"`
-	MAXIsPinned         bool         `json:"max_is_pinned"`
-	LastError           string       `json:"last_error,omitempty"`
-	CreatedAt           time.Time    `json:"created_at"`
-	UpdatedAt           time.Time    `json:"updated_at"`
-	PublishedAt         *time.Time   `json:"published_at,omitempty"`
+	ID                  int64            `json:"id"`
+	UserID              string           `json:"-"`
+	Title               string           `json:"title"`
+	Content             string           `json:"content"`
+	Format              string           `json:"format"`
+	Status              string           `json:"status"`
+	ChannelID           *int64           `json:"channel_id,omitempty"`
+	ImageURL            string           `json:"image_url,omitempty"`
+	ImagePath           string           `json:"-"`
+	ImagePrompt         string           `json:"image_prompt,omitempty"`
+	Attachments         []PostAttachment `json:"attachments"`
+	LinkButtons         []LinkButton     `json:"link_buttons"`
+	Notify              bool             `json:"notify"`
+	DisableLinkPreview  bool             `json:"disable_link_preview"`
+	ScheduledAt         *time.Time       `json:"scheduled_at,omitempty"`
+	MAXMessageID        string           `json:"max_message_id,omitempty"`
+	MAXMessageURL       string           `json:"max_message_url"`
+	MAXViews            *int64           `json:"max_views"`
+	MAXStatsSyncedAt    *time.Time       `json:"max_stats_synced_at"`
+	MAXStatsAttemptedAt *time.Time       `json:"-"`
+	MAXIsPinned         bool             `json:"max_is_pinned"`
+	LastError           string           `json:"last_error,omitempty"`
+	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
+	PublishedAt         *time.Time       `json:"published_at,omitempty"`
 }
 
 type PostChanges struct {

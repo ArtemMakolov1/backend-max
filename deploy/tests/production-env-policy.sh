@@ -67,7 +67,7 @@ grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=75' "$configured_media_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_media_env"
 
 for required_secret in \
-  POSTGRES_MONITOR_PASSWORD GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY ALERTMANAGER_WEBHOOK_URL \
+  POSTGRES_MONITOR_PASSWORD GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY \
   YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET \
   S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
   if render_production "$sandbox/missing-$required_secret.env" "$required_secret=" >/dev/null 2>&1; then
@@ -75,6 +75,11 @@ for required_secret in \
     exit 1
   fi
 done
+
+without_alerts_env="$sandbox/without-alerts.env"
+render_production "$without_alerts_env" ALERTMANAGER_WEBHOOK_URL=
+grep -Fx 'ALERTMANAGER_WEBHOOK_URL=' "$without_alerts_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$without_alerts_env"
 
 for invalid_alertmanager_url in \
   'http://alerts.example.test/maxposty' \

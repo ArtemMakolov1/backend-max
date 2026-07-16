@@ -197,8 +197,13 @@ func (s *Store) CleanupOrphanMedia(ctx context.Context, before time.Time, limit 
 	candidates, err := func() ([]mediaCleanupCandidate, error) {
 		rows, err := s.db.QueryContext(ctx, bindSQL(`SELECT owner_id, filename FROM media_assets ma
 WHERE ma.updated_at < ? AND (
-    ma.state='pending' OR NOT EXISTS (
-        SELECT 1 FROM posts p WHERE p.owner_id=ma.owner_id AND p.image_path=ma.filename
+    ma.state='pending' OR (
+        NOT EXISTS (
+            SELECT 1 FROM posts p WHERE p.owner_id=ma.owner_id AND p.image_path=ma.filename
+        ) AND NOT EXISTS (
+            SELECT 1 FROM post_attachments pa
+            WHERE pa.owner_id=ma.owner_id AND pa.storage_key=ma.filename
+        )
     )
 )
 ORDER BY ma.updated_at, ma.owner_id, ma.filename LIMIT ?`), before.UTC(), limit)
@@ -298,8 +303,10 @@ WHERE owner_id=? AND filename=? FOR UPDATE`), candidate.ownerID, candidate.filen
 	}
 	if state == "ready" {
 		var referenced bool
-		if err := tx.QueryRowContext(ctx, bindSQL(`SELECT EXISTS(SELECT 1 FROM posts
-WHERE owner_id=? AND image_path=?)`), candidate.ownerID, candidate.filename).Scan(&referenced); err != nil {
+		if err := tx.QueryRowContext(ctx, bindSQL(`SELECT
+EXISTS(SELECT 1 FROM posts WHERE owner_id=? AND image_path=?) OR
+EXISTS(SELECT 1 FROM post_attachments WHERE owner_id=? AND storage_key=?)`),
+			candidate.ownerID, candidate.filename, candidate.ownerID, candidate.filename).Scan(&referenced); err != nil {
 			return false, 0, err
 		}
 		if referenced {

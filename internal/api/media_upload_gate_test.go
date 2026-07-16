@@ -41,7 +41,7 @@ func (b *countedUploadBody) Read([]byte) (int, error) {
 
 func TestMediaUploadGateHasBoundedState(t *testing.T) {
 	t.Parallel()
-	gate := newMediaUploadGate(8)
+	gate := newMediaUploadGate(8, 2)
 	releases := make([]func(), 0, 8)
 	for index := 0; index < 8; index++ {
 		release, ok := gate.tryAcquire("user-" + string(rune('a'+index)))
@@ -53,25 +53,36 @@ func TestMediaUploadGateHasBoundedState(t *testing.T) {
 	if _, ok := gate.tryAcquire("overflow"); ok {
 		t.Fatal("ninth global upload acquired a slot")
 	}
+	// Free a global slot, then prove the per-user limit allows a two-file
+	// concurrent batch but not an unbounded third upload.
+	releases[len(releases)-1]()
+	releases = releases[:len(releases)-1]
+	secondUserA, ok := gate.tryAcquire("user-a")
+	if !ok {
+		t.Fatal("second concurrent upload for the same user was rejected")
+	}
 	if _, ok := gate.tryAcquire("user-a"); ok {
-		t.Fatal("second upload for the same user acquired a slot")
+		t.Fatal("third upload for the same user acquired a slot")
 	}
 	gate.mu.Lock()
 	trackedUsers := len(gate.users)
+	userAUploads := gate.users["user-a"]
 	gate.mu.Unlock()
-	if trackedUsers != cap(gate.global) {
-		t.Fatalf("tracked users = %d, want bounded capacity %d", trackedUsers, cap(gate.global))
+	if trackedUsers > cap(gate.global) || userAUploads != 2 {
+		t.Fatalf("tracked users = %d, user-a uploads = %d; want bounded state and two uploads", trackedUsers, userAUploads)
 	}
 	for _, release := range releases {
 		release()
 		release() // Release is deliberately idempotent.
 	}
+	secondUserA()
+	secondUserA()
 	if len(gate.global) != 0 {
 		t.Fatalf("global slots after release = %d, want 0", len(gate.global))
 	}
 }
 
-func TestParallelMediaUploadsAreRejectedBeforeBodyRead(t *testing.T) {
+func TestThirdParallelMediaUploadIsRejectedBeforeBodyRead(t *testing.T) {
 	ctx := context.Background()
 	storage, err := store.Open(ctx, filepath.Join(t.TempDir(), "media-upload-gate.db"))
 	if err != nil {
@@ -106,31 +117,21 @@ func TestParallelMediaUploadsAreRejectedBeforeBodyRead(t *testing.T) {
 		t.Fatal("first upload did not start reading its body")
 	}
 
-	secondBody := &countedUploadBody{}
-	secondRequest := httptest.NewRequest(http.MethodPost, "/api/v1/media", secondBody)
+	secondBlockedBody := &blockingUploadBody{started: make(chan struct{}), release: make(chan struct{})}
+	secondRequest := httptest.NewRequest(http.MethodPost, "/api/v1/media", secondBlockedBody)
 	secondRequest.Header.Set("Content-Type", "multipart/form-data; boundary=maxposty-test")
 	secondResponse := httptest.NewRecorder()
-	handler.ServeHTTP(secondResponse, secondRequest)
-	if secondResponse.Code != http.StatusTooManyRequests {
-		close(blockedBody.release)
-		t.Fatalf("parallel upload status = %d, want 429; body=%s", secondResponse.Code, secondResponse.Body.String())
-	}
-	if secondBody.reads.Load() != 0 {
-		close(blockedBody.release)
-		t.Fatalf("rejected upload body was read %d times", secondBody.reads.Load())
-	}
-	if secondResponse.Header().Get("Retry-After") != "1" ||
-		!strings.Contains(secondResponse.Body.String(), `"code":"media_upload_busy"`) {
-		close(blockedBody.release)
-		t.Fatalf("parallel upload response is not retryable/friendly: headers=%v body=%s",
-			secondResponse.Header(), secondResponse.Body.String())
-	}
-
-	close(blockedBody.release)
+	secondDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(secondResponse, secondRequest)
+		close(secondDone)
+	}()
 	select {
-	case <-firstDone:
+	case <-secondBlockedBody.started:
 	case <-time.After(5 * time.Second):
-		t.Fatal("first upload did not finish after its body was released")
+		close(blockedBody.release)
+		close(secondBlockedBody.release)
+		t.Fatal("second concurrent upload did not start reading its body")
 	}
 
 	thirdBody := &countedUploadBody{}
@@ -138,8 +139,44 @@ func TestParallelMediaUploadsAreRejectedBeforeBodyRead(t *testing.T) {
 	thirdRequest.Header.Set("Content-Type", "multipart/form-data; boundary=maxposty-test")
 	thirdResponse := httptest.NewRecorder()
 	handler.ServeHTTP(thirdResponse, thirdRequest)
-	if thirdResponse.Code == http.StatusTooManyRequests || thirdBody.reads.Load() == 0 {
+	if thirdResponse.Code != http.StatusTooManyRequests {
+		close(blockedBody.release)
+		close(secondBlockedBody.release)
+		t.Fatalf("third upload status = %d, want 429; body=%s", thirdResponse.Code, thirdResponse.Body.String())
+	}
+	if thirdBody.reads.Load() != 0 {
+		close(blockedBody.release)
+		close(secondBlockedBody.release)
+		t.Fatalf("rejected third upload body was read %d times", thirdBody.reads.Load())
+	}
+	if thirdResponse.Header().Get("Retry-After") != "1" ||
+		!strings.Contains(thirdResponse.Body.String(), `"code":"media_upload_busy"`) {
+		close(blockedBody.release)
+		close(secondBlockedBody.release)
+		t.Fatalf("third upload response is not retryable/friendly: headers=%v body=%s",
+			thirdResponse.Header(), thirdResponse.Body.String())
+	}
+
+	close(blockedBody.release)
+	close(secondBlockedBody.release)
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first upload did not finish after its body was released")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second upload did not finish after its body was released")
+	}
+
+	fourthBody := &countedUploadBody{}
+	fourthRequest := httptest.NewRequest(http.MethodPost, "/api/v1/media", fourthBody)
+	fourthRequest.Header.Set("Content-Type", "multipart/form-data; boundary=maxposty-test")
+	fourthResponse := httptest.NewRecorder()
+	handler.ServeHTTP(fourthResponse, fourthRequest)
+	if fourthResponse.Code == http.StatusTooManyRequests || fourthBody.reads.Load() == 0 {
 		t.Fatalf("upload slot was not released: status=%d reads=%d body=%s",
-			thirdResponse.Code, thirdBody.reads.Load(), thirdResponse.Body.String())
+			fourthResponse.Code, fourthBody.reads.Load(), fourthResponse.Body.String())
 	}
 }

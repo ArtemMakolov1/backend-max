@@ -8,9 +8,11 @@ import (
 )
 
 const (
-	maxLinkButtons    = 3
-	maxLinkButtonText = 128
-	maxLinkButtonURL  = 2048
+	maxLinkButtons        = 3
+	maxLinkButtonText     = 128
+	maxLinkButtonURL      = 2048
+	maxMessageAttachments = 12
+	maxMediaWithKeyboard  = 11
 )
 
 // LinkButton is rendered by MAX as a URL button below a message.
@@ -29,10 +31,24 @@ type inlineKeyboardButton struct {
 	URL  string `json:"url"`
 }
 
-func messageAttachments(imageTokens []string, buttons []LinkButton) (*[]attachment, error) {
-	attachments, err := imageAttachments(imageTokens)
+func messageAttachments(mediaTokens []MediaToken, imageTokens []string, buttons []LinkButton) (*[]attachment, error) {
+	if mediaTokens != nil && imageTokens != nil {
+		return nil, fmt.Errorf("media tokens and legacy image tokens cannot be combined")
+	}
+
+	attachments, err := mediaAttachments(mediaTokens)
+	if mediaTokens == nil {
+		attachments, err = imageAttachments(imageTokens)
+	}
 	if err != nil {
 		return nil, err
+	}
+	mediaCount := len(mediaTokens)
+	if mediaTokens == nil {
+		mediaCount = len(imageTokens)
+	}
+	if mediaCount > maxMessageAttachments {
+		return nil, fmt.Errorf("media attachments must contain no more than %d items", maxMessageAttachments)
 	}
 	if buttons == nil {
 		return attachments, nil
@@ -41,7 +57,10 @@ func messageAttachments(imageTokens []string, buttons []LinkButton) (*[]attachme
 		return nil, err
 	}
 
-	result := make([]attachment, 0, len(imageTokens)+1)
+	if len(buttons) > 0 && mediaCount > maxMediaWithKeyboard {
+		return nil, fmt.Errorf("media attachments with link buttons must contain no more than %d items", maxMediaWithKeyboard)
+	}
+	result := make([]attachment, 0, mediaCount+1)
 	if attachments != nil {
 		result = append(result, (*attachments)...)
 	}

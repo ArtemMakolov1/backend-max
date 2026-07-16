@@ -541,6 +541,114 @@ paths:
           $ref: '#/components/responses/Post'
         default:
           $ref: '#/components/responses/Problem'
+  /posts/{id}/attachments:
+    post:
+      tags: [Posts]
+      operationId: uploadPostAttachment
+      summary: Upload one image or video into the ordered post gallery
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                type:
+                  type: string
+                  enum: [image, video]
+                  description: Inferred from the filename when omitted.
+                position:
+                  type: integer
+                  minimum: 0
+                  maximum: 11
+                  description: Zero-based insertion position; appends when omitted.
+      responses:
+        '201':
+          $ref: '#/components/responses/PostAttachmentMutation'
+        default:
+          $ref: '#/components/responses/Problem'
+  /posts/{id}/attachments/{attachment_id}:
+    put:
+      tags: [Posts]
+      operationId: replacePostAttachment
+      summary: Replace one attachment while preserving its id and position
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/AttachmentId'
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                type:
+                  type: string
+                  enum: [image, video]
+                  description: Inferred from the filename when omitted.
+      responses:
+        '200':
+          $ref: '#/components/responses/PostAttachmentMutation'
+        default:
+          $ref: '#/components/responses/Problem'
+    delete:
+      tags: [Posts]
+      operationId: deletePostAttachment
+      summary: Remove one attachment and compact the remaining order
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - $ref: '#/components/parameters/AttachmentId'
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Post'
+        default:
+          $ref: '#/components/responses/Problem'
+  /posts/{id}/attachments/order:
+    patch:
+      tags: [Posts]
+      operationId: reorderPostAttachments
+      summary: Replace the complete attachment order
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [attachment_ids]
+              properties:
+                attachment_ids:
+                  type: array
+                  maxItems: 12
+                  uniqueItems: true
+                  items:
+                    type: integer
+                    format: int64
+                    minimum: 1
+      responses:
+        '200':
+          $ref: '#/components/responses/Post'
+        default:
+          $ref: '#/components/responses/Problem'
   /posts/{id}/publish:
     post:
       tags: [Posts]
@@ -767,6 +875,14 @@ components:
         type: string
         maxLength: 128
         pattern: '^[A-Za-z0-9_-]+$'
+    AttachmentId:
+      name: attachment_id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
   responses:
     Problem:
       description: Request failed
@@ -780,6 +896,18 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Post'
+    PostAttachment:
+      description: Uploaded or replaced attachment
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PostAttachment'
+    PostAttachmentMutation:
+      description: Uploaded or replaced attachment together with the latest post revision
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PostAttachmentMutation'
   schemas:
     ProblemEnvelope:
       type: object
@@ -1057,6 +1185,64 @@ components:
         url:
           type: string
           format: uri
+    PostAttachment:
+      type: object
+      required:
+        - id
+        - type
+        - position
+        - url
+        - processing_status
+        - size_bytes
+        - mime_type
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: integer
+          format: int64
+        type:
+          type: string
+          enum: [image, video]
+        position:
+          type: integer
+          minimum: 0
+          maximum: 11
+        url:
+          type: string
+        processing_status:
+          type: string
+          enum: [uploading, processing, ready, failed]
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        mime_type:
+          type: string
+        width:
+          type: [integer, 'null']
+          minimum: 1
+        height:
+          type: [integer, 'null']
+          minimum: 1
+        duration_ms:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PostAttachmentMutation:
+      type: object
+      required: [attachment, post]
+      properties:
+        attachment:
+          $ref: '#/components/schemas/PostAttachment'
+        post:
+          $ref: '#/components/schemas/Post'
     EditablePost:
       type: object
       properties:
@@ -1103,6 +1289,7 @@ components:
         - content
         - format
         - status
+        - attachments
         - link_buttons
         - notify
         - disable_link_preview
@@ -1128,6 +1315,11 @@ components:
           type: [string, 'null']
         image_prompt:
           type: [string, 'null']
+        attachments:
+          type: array
+          maxItems: 12
+          items:
+            $ref: '#/components/schemas/PostAttachment'
         link_buttons:
           type: array
           items:

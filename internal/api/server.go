@@ -79,7 +79,7 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		frontendOrigin: strings.TrimRight(frontendOrigin, "/"), webhookSecret: webhookSecret,
 		sessionTTL:        12 * time.Hour,
 		oauthStartLimiter: newKeyedWindowLimiter(12, 600, time.Minute, 4096), now: time.Now,
-		mediaUploads:        newMediaUploadGate(8),
+		mediaUploads:        newMediaUploadGate(8, 2),
 		observabilityAdmins: make(map[string]struct{}), activityUsers: make(map[string]struct{}),
 	}
 	if len(authOptions) != 0 {
@@ -165,6 +165,10 @@ func (s *Server) Handler() http.Handler {
 			r.Delete("/posts/{id}", s.deletePost)
 			r.Post("/posts/{id}/duplicate", s.duplicatePost)
 			r.Post("/posts/{id}/image", s.uploadPostImage)
+			r.Post("/posts/{id}/attachments", s.uploadPostAttachment)
+			r.Put("/posts/{id}/attachments/{attachment_id}", s.replacePostAttachment)
+			r.Patch("/posts/{id}/attachments/order", s.reorderPostAttachments)
+			r.Delete("/posts/{id}/attachments/{attachment_id}", s.deletePostAttachment)
 			r.Post("/posts/{id}/generate-image", s.generatePostImage)
 			r.Post("/posts/{id}/schedule", s.schedulePost)
 			r.Put("/posts/{id}/schedule", s.schedulePost)

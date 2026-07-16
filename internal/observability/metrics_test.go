@@ -146,6 +146,30 @@ func TestMediaMetricsHaveBoundedLabels(t *testing.T) {
 	}
 }
 
+func TestAttachmentUploadMetricsHaveBoundedLabels(t *testing.T) {
+	t.Parallel()
+	metrics := New()
+	metrics.ObserveAttachmentUpload(store.PostAttachmentVideo, "success", 2<<20, 1500*time.Millisecond)
+	metrics.ObserveAttachmentUpload("attacker-type", "attacker-outcome", 0, time.Second)
+
+	response := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, expected := range []string{
+		`maxposty_attachment_uploads_total{outcome="success",type="video"} 1`,
+		`maxposty_attachment_uploads_total{outcome="other",type="unknown"} 1`,
+		`maxposty_attachment_upload_ready_duration_seconds_count{outcome="success",type="video"} 1`,
+		`maxposty_attachment_upload_size_bytes_count{type="video"} 1`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("metrics output does not contain %q", expected)
+		}
+	}
+	if strings.Contains(body, "attacker-type") || strings.Contains(body, "attacker-outcome") {
+		t.Fatalf("unbounded attachment labels leaked into metrics: %s", body)
+	}
+}
+
 func TestProductAnalyticsCollectorCachesAndPreservesLastSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -161,6 +185,8 @@ func TestProductAnalyticsCollectorCachesAndPreservesLastSuccess(t *testing.T) {
 			DailyActiveUsers: 3, WeeklyActiveUsers: 8, MonthlyActiveUsers: 13,
 			RegisteredUsers: 21, MAXLinkedUsers: 17, ChannelConnectedUsers: 12,
 			PostCreatedUsers: 9, PostScheduledOrPublishedUsers: 7, PostPublishedUsers: 5,
+			PublishedPosts: 11, PublishedPostsWithMedia: 8, PublishedPostsWithMultiple: 4,
+			PublishedPostsWithVideo: 3, PublishedPostsWithMixedMedia: 2,
 		}, nil
 	}, time.Minute, time.Second)
 	collector.now = func() time.Time { return now }
@@ -178,6 +204,8 @@ func TestProductAnalyticsCollectorCachesAndPreservesLastSuccess(t *testing.T) {
 	first := scrape()
 	if calls.Load() != 1 || !strings.Contains(first, `maxposty_product_active_users{period="day"} 3`) ||
 		!strings.Contains(first, `maxposty_product_funnel_users{stage="published"} 5`) ||
+		!strings.Contains(first, `maxposty_product_published_posts{kind="multiple"} 4`) ||
+		!strings.Contains(first, `maxposty_product_published_posts{kind="video"} 3`) ||
 		!strings.Contains(first, "maxposty_product_analytics_last_success_timestamp_seconds 2e+09") {
 		t.Fatalf("unexpected first scrape (calls=%d): %s", calls.Load(), first)
 	}

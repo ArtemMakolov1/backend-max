@@ -260,6 +260,12 @@ func TestMediaQuotaMigrationQuarantinesLegacyOwnershipUntilCleanup(t *testing.T)
 		t.Fatalf("quarantined legacy media = (%d, %d, %q, %q, %v), want stale pending cutover reservation",
 			assets, sizeBytes, state, reservationToken, updatedAt)
 	}
+	// Runtime orphan cleanup follows the current schema and checks both the
+	// legacy posts.image_path projection and the normalized attachment rows.
+	// Finish the migration set after asserting the isolated 014 cutover state.
+	if err := runMigrationSet(ctx, testURL, migrations); err != nil {
+		t.Fatalf("apply current attachment schema: %v", err)
+	}
 	storage := &Store{db: &postgresDB{DB: db}}
 	limits := MediaLimits{MaxFiles: 10, MaxBytes: 1 << 20}
 	if _, err := storage.ReserveMedia(ctx, "owner", "legacy-local.png", 123, limits, now); !errors.Is(err, ErrMediaUploadBusy) {
@@ -329,7 +335,7 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "015_future_additive.sql"
+	const futureVersion = "016_future_additive.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {

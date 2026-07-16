@@ -52,7 +52,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "014_media_quota_and_gc.sql"
+const RequiredSchemaVersion = "015_post_attachments.sql"
 
 type schemaMigration struct {
 	version        string
@@ -849,7 +849,13 @@ func (s *Store) ListPosts(ctx context.Context, status string, channelID *int64) 
 		}
 		posts = append(posts, post)
 	}
-	return posts, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.hydratePostAttachments(ctx, posts); err != nil {
+		return nil, err
+	}
+	return posts, nil
 }
 
 func (s *Store) ListPostsForUser(ctx context.Context, userID, status string, channelID *int64) ([]Post, error) {
@@ -881,14 +887,44 @@ func (s *Store) ListPostsForUser(ctx context.Context, userID, status string, cha
 		}
 		posts = append(posts, post)
 	}
-	return posts, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.hydratePostAttachments(ctx, posts); err != nil {
+		return nil, err
+	}
+	return posts, nil
 }
 
 func (s *Store) GetPost(ctx context.Context, id int64) (Post, error) {
-	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE id = ?`, id))
+	post, err := s.getPostWithoutAttachments(ctx, id)
+	if err != nil {
+		return Post{}, err
+	}
+	posts := []Post{post}
+	if err := s.hydratePostAttachments(ctx, posts); err != nil {
+		return Post{}, err
+	}
+	return posts[0], nil
 }
 
 func (s *Store) GetPostForUser(ctx context.Context, userID string, id int64) (Post, error) {
+	post, err := s.getPostForUserWithoutAttachments(ctx, userID, id)
+	if err != nil {
+		return Post{}, err
+	}
+	posts := []Post{post}
+	if err := s.hydratePostAttachments(ctx, posts); err != nil {
+		return Post{}, err
+	}
+	return posts[0], nil
+}
+
+func (s *Store) getPostWithoutAttachments(ctx context.Context, id int64) (Post, error) {
+	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE id = ?`, id))
+}
+
+func (s *Store) getPostForUserWithoutAttachments(ctx context.Context, userID string, id int64) (Post, error) {
 	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE owner_id = ? AND id = ?`, userID, id))
 }
 
@@ -950,6 +986,9 @@ func (s *Store) updatePostSnapshot(ctx context.Context, post Post, changes PostC
 	}
 	if changes.LinkButtons != nil {
 		post.LinkButtons = normalizeLinkButtons(append([]LinkButton(nil), (*changes.LinkButtons)...))
+		if len(post.LinkButtons) > 0 && len(post.Attachments) > MaxPostAttachmentsWithKeyboard {
+			return Post{}, fmt.Errorf("link buttons require no more than %d media attachments", MaxPostAttachmentsWithKeyboard)
+		}
 	}
 	if changes.Notify != nil {
 		post.Notify = *changes.Notify
@@ -1042,20 +1081,39 @@ WHERE owner_id = ? AND id = ? AND status != ? AND max_message_id = ''`,
 }
 
 func (s *Store) DuplicatePost(ctx context.Context, id int64) (Post, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Post{}, fmt.Errorf("begin duplicate post: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	now := nowText()
 	var copyID int64
-	err := s.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, bindSQL(`
 INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 	              notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views,
 	              max_stats_synced_at, max_is_pinned, last_error, published_at, created_at, updated_at)
 SELECT owner_id, trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt, link_buttons,
 	   notify, disable_link_preview, NULL, '', '', NULL, NULL, FALSE, '', NULL, ?, ?
-FROM posts WHERE id = ? AND status != ? RETURNING id`, PostStatusDraft, now, now, id, PostStatusPublishing).Scan(&copyID)
+FROM posts WHERE id = ? AND status != ? RETURNING id`), PostStatusDraft, now, now, id, PostStatusPublishing).Scan(&copyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Post{}, s.postWriteMiss(ctx, id, "post is currently publishing")
 	}
 	if err != nil {
 		return Post{}, fmt.Errorf("duplicate post: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, bindSQL(`
+INSERT INTO post_attachments(owner_id, post_id, type, position, storage_key, processing_status, size_bytes, mime_type,
+                             width, height, duration_ms, provider_token, provider_token_expires_at, provider_meta,
+                             error_code, created_at, updated_at)
+SELECT owner_id, ?, type, position, storage_key, 'ready', size_bytes, mime_type,
+       width, height, duration_ms, '', NULL, '{}', '', ?, ?
+FROM post_attachments
+WHERE post_id = ?
+ORDER BY position, id`), copyID, now, now, id); err != nil {
+		return Post{}, fmt.Errorf("duplicate post attachments: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Post{}, fmt.Errorf("commit duplicate post: %w", err)
 	}
 	return s.GetPost(ctx, copyID)
 }
@@ -1150,6 +1208,47 @@ WHERE id = ? AND status IN (?, ?, ?)`,
 	return s.GetPost(ctx, id)
 }
 
+// ClaimPublishedForUpdate is the final compare-and-swap before an edit is
+// sent to MAX. Moving the post to publishing blocks concurrent editor and
+// attachment writes until the outbound operation is released.
+func (s *Store) ClaimPublishedForUpdate(ctx context.Context, current Post) (Post, error) {
+	if current.ID <= 0 || current.UserID == "" || current.MAXMessageID == "" {
+		return Post{}, fmt.Errorf("%w: published post snapshot is incomplete", ErrConflict)
+	}
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, bindSQL(`UPDATE posts
+SET status=?, last_error='', updated_at=?
+WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
+		PostStatusPublishing, now, current.UserID, current.ID, PostStatusPublished,
+		current.MAXMessageID, current.UpdatedAt.UTC())
+	if err != nil {
+		return Post{}, fmt.Errorf("claim published post update: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return Post{}, s.postWriteMiss(ctx, current.ID, "post changed before its MAX update; reload and retry")
+	}
+	return s.GetPostForUser(ctx, current.UserID, current.ID)
+}
+
+// ReleasePublishedUpdate returns an edit claim to its normal published state.
+// The claimed snapshot guards against releasing a different publishing
+// operation after a crash or operator intervention.
+func (s *Store) ReleasePublishedUpdate(ctx context.Context, claimed Post, lastError string) (Post, error) {
+	now := time.Now().UTC()
+	result, err := s.db.ExecContext(ctx, bindSQL(`UPDATE posts
+SET status=?, last_error=?, updated_at=?
+WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
+		PostStatusPublished, truncate(lastError, 2000), now, claimed.UserID, claimed.ID,
+		PostStatusPublishing, claimed.MAXMessageID, claimed.UpdatedAt.UTC())
+	if err != nil {
+		return Post{}, fmt.Errorf("release published post update: %w", err)
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return Post{}, s.postWriteMiss(ctx, claimed.ID, "MAX update claim changed before it could be released")
+	}
+	return s.GetPostForUser(ctx, claimed.UserID, claimed.ID)
+}
+
 // ClaimScheduledForPublishing atomically verifies that a scheduled post is
 // still due while moving it to publishing. This closes the race where a worker
 // lists an ID and the user cancels or postpones it before publication starts.
@@ -1202,10 +1301,16 @@ ORDER BY scheduled_at, id LIMIT ?`, PostStatusScheduled, now.UTC().Format(time.R
 }
 
 func (s *Store) RecoverStalePublishing(ctx context.Context, staleBefore time.Time) (int64, error) {
-	const warning = "Previous publication was interrupted; check the MAX channel before retrying to avoid a duplicate post."
+	const publishWarning = "Previous publication was interrupted; check the MAX channel before retrying to avoid a duplicate post."
+	const editWarning = "Previous MAX update was interrupted; refresh the post before making another change."
 	result, err := s.db.ExecContext(ctx, `
-UPDATE posts SET status = ?, last_error = ?, scheduled_at = NULL, updated_at = ?
-WHERE owner_id <> '' AND status = ? AND updated_at < ?`, PostStatusFailed, warning, nowText(), PostStatusPublishing,
+UPDATE posts
+SET status = CASE WHEN max_message_id <> '' THEN ? ELSE ? END,
+    last_error = CASE WHEN max_message_id <> '' THEN ? ELSE ? END,
+    scheduled_at = NULL,
+    updated_at = ?
+WHERE owner_id <> '' AND status = ? AND updated_at < ?`,
+		PostStatusPublished, PostStatusFailed, editWarning, publishWarning, nowText(), PostStatusPublishing,
 		staleBefore.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return 0, fmt.Errorf("recover stale publishing posts: %w", err)
@@ -1300,6 +1405,7 @@ func scanPost(row scanner) (Post, error) {
 		return Post{}, fmt.Errorf("scan post: %w", err)
 	}
 	post.LinkButtons = linkButtons
+	post.Attachments = []PostAttachment{}
 	post.ScheduledAt = parseNullableTime(scheduledAt)
 	if maxViews.Valid {
 		post.MAXViews = &maxViews.Int64

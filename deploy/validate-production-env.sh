@@ -232,7 +232,7 @@ case "$bootstrap_mode" in
     expect_exact FRONTEND_ORIGIN "https://maxposty.ru"
     expect_exact GRAFANA_ROOT_URL "https://maxposty.ru/monitoring/"
     expect_exact YANDEX_REDIRECT_URI "https://maxposty.ru/api/v1/auth/yandex/callback"
-    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
+    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
       if [[ -z "$(env_value "$key")" ]]; then
         echo "$key must not be empty in production mode" >&2
         exit 1

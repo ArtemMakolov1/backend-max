@@ -929,8 +929,14 @@ func (a *App) GenerateImageForUser(ctx context.Context, userID string, request o
 // object. A failed write releases the reservation; stale reservations are also
 // reclaimed by the periodic orphan job after the configured grace period.
 func (a *App) SaveMediaForUser(ctx context.Context, userID, filename string, reader io.Reader) (result media.File, resultErr error) {
+	return a.SaveAttachmentMediaForUser(ctx, userID, media.AttachmentTypeImage, filename, reader)
+}
+
+// SaveAttachmentMediaForUser validates an attachment into a bounded temporary
+// file, reserves tenant quota, and only then streams it to object storage.
+func (a *App) SaveAttachmentMediaForUser(ctx context.Context, userID, attachmentType, filename string, reader io.Reader) (result media.File, resultErr error) {
 	defer func() { a.metrics.ObserveMediaOperation("upload", metricOutcome(resultErr)) }()
-	upload, err := a.media.Prepare(filename, reader)
+	upload, err := a.media.PrepareAttachment(attachmentType, filename, reader)
 	if err != nil {
 		return media.File{}, err
 	}
@@ -1005,9 +1011,7 @@ func (a *App) GeneratePostImage(ctx context.Context, userID string, postID int64
 		return store.Post{}, err
 	}
 	prompt := request.Prompt
-	return a.store.UpdatePost(ctx, postID, store.PostChanges{
-		ImageURL: &file.URL, ImagePath: &file.Path, ImagePrompt: &prompt,
-	})
+	return a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(ctx, post, attachmentFromImage(file), prompt)
 }
 
 func (a *App) SavePostImage(ctx context.Context, postID int64, filename string, reader io.Reader) (store.Post, error) {
@@ -1015,17 +1019,22 @@ func (a *App) SavePostImage(ctx context.Context, postID int64, filename string, 
 	if err != nil {
 		return store.Post{}, err
 	}
-	if post.Status == store.PostStatusPublishing {
-		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
-	}
-	file, err := a.SaveMediaForUser(ctx, post.UserID, filename, reader)
+	return a.SavePostImageForUser(ctx, post.UserID, postID, filename, reader)
+}
+
+func (a *App) SavePostImageForUser(ctx context.Context, userID string, postID int64, filename string, reader io.Reader) (store.Post, error) {
+	post, err := a.store.GetPostForUser(ctx, userID, postID)
 	if err != nil {
 		return store.Post{}, err
 	}
-	emptyPrompt := ""
-	return a.store.UpdatePost(ctx, postID, store.PostChanges{
-		ImageURL: &file.URL, ImagePath: &file.Path, ImagePrompt: &emptyPrompt,
-	})
+	if post.Status == store.PostStatusPublishing {
+		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
+	}
+	file, err := a.SaveMediaForUser(ctx, userID, filename, reader)
+	if err != nil {
+		return store.Post{}, err
+	}
+	return a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(ctx, post, attachmentFromImage(file), "")
 }
 
 func (a *App) PublishPost(ctx context.Context, postID int64) (store.Post, error) {
@@ -1061,13 +1070,13 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (result s
 		})
 	}
 
-	tokens, err := a.imageTokens(ctx, post)
+	mediaTokens, imageTokens, err := a.postMediaTokens(ctx, post)
 	if err != nil {
 		return a.fail(postID, err)
 	}
-	message, err := a.publishWithAttachmentRetry(ctx, maxclient.PublishRequest{
+	message, err := a.max.Publish(ctx, maxclient.PublishRequest{
 		ChatID: channel.MAXChatID, Text: post.Content, Format: maxclient.Format(post.Format),
-		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons),
+		MediaTokens: mediaTokens, ImageTokens: imageTokens, LinkButtons: maxLinkButtons(post.LinkButtons),
 		DisableLinkPreview: post.DisableLinkPreview,
 	})
 	if err != nil {
@@ -1119,30 +1128,44 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result sto
 	if err := validateMAXMessageOwnership(message, post.MAXMessageID, channel.MAXChatID); err != nil {
 		return store.Post{}, err
 	}
-	tokens := make([]string, 0)
-	if post.ImageURL != "" {
-		tokens, err = a.imageTokens(ctx, post)
-		if err != nil {
-			return store.Post{}, err
-		}
+	mediaTokens, imageTokens, err := a.postMediaTokens(ctx, post)
+	if err != nil {
+		return store.Post{}, err
 	}
-	err = a.editWithAttachmentRetry(ctx, maxclient.EditRequest{
-		MessageID: post.MAXMessageID, Text: post.Content, Format: maxclient.Format(post.Format),
-		ImageTokens: tokens, LinkButtons: maxLinkButtons(post.LinkButtons),
+	if len(post.Attachments) == 0 && post.ImageURL == "" {
+		// A non-nil empty slice tells MAX to remove media that existed in the
+		// previously published version instead of leaving attachments unchanged.
+		mediaTokens = []maxclient.MediaToken{}
+	}
+	claimed, err := a.store.ClaimPublishedForUpdate(ctx, post)
+	if err != nil {
+		return store.Post{}, fmt.Errorf("%w: %w", ErrConflict, err)
+	}
+	err = a.max.Edit(ctx, maxclient.EditRequest{
+		MessageID: claimed.MAXMessageID, Text: claimed.Content, Format: maxclient.Format(claimed.Format),
+		MediaTokens: mediaTokens, ImageTokens: imageTokens, LinkButtons: maxLinkButtons(claimed.LinkButtons),
 	})
 	if err != nil {
 		// MAX edit operations can return HTTP 200 with success=false and no
 		// machine-readable reason. Re-read the message to distinguish an
 		// external deletion (including the small race after our preflight)
 		// from a genuine edit failure.
+		missing := false
 		if isMAXOperationFailed(err) {
-			if _, getErr := a.max.GetMessage(ctx, post.MAXMessageID); isMAXMessageNotFound(getErr) {
-				return a.markMAXPublicationMissing(ctx, post)
+			if _, getErr := a.max.GetMessage(ctx, claimed.MAXMessageID); isMAXMessageNotFound(getErr) {
+				missing = true
 			}
+		}
+		released, releaseErr := a.releasePublishedUpdate(claimed, publicationFailureMessage(err))
+		if releaseErr != nil {
+			return store.Post{}, errors.Join(err, releaseErr)
+		}
+		if missing {
+			return a.markMAXPublicationMissing(ctx, released)
 		}
 		return store.Post{}, err
 	}
-	return a.store.GetPost(ctx, postID)
+	return a.releasePublishedUpdate(claimed, "")
 }
 
 func (a *App) DeletePublication(ctx context.Context, userID string, postID int64) (result store.Post, resultErr error) {
@@ -1732,13 +1755,16 @@ func (a *App) validateForPublish(ctx context.Context, post store.Post) (store.Ch
 	if !store.ValidFormat(post.Format) {
 		return store.Channel{}, errors.New("post format must be markdown or html")
 	}
-	if strings.TrimSpace(post.Content) == "" && post.ImageURL == "" {
-		return store.Channel{}, errors.New("post content or an image is required")
+	if strings.TrimSpace(post.Content) == "" && len(post.Attachments) == 0 && post.ImageURL == "" {
+		return store.Channel{}, errors.New("post content or a media attachment is required")
 	}
 	if utf8.RuneCountInString(post.Content) > 4000 {
 		return store.Channel{}, errors.New("MAX post content must not exceed 4000 characters")
 	}
 	if err := store.ValidateLinkButtonsForPublish(post.LinkButtons); err != nil {
+		return store.Channel{}, err
+	}
+	if err := validatePostAttachments(post); err != nil {
 		return store.Channel{}, err
 	}
 	if post.ChannelID == nil {
@@ -1854,56 +1880,10 @@ func (a *App) imageTokens(ctx context.Context, post store.Post) ([]string, error
 	return []string{upload.Token}, nil
 }
 
-func (a *App) publishWithAttachmentRetry(ctx context.Context, request maxclient.PublishRequest) (maxclient.Message, error) {
-	delays := []time.Duration{0, time.Second, 3 * time.Second, 7 * time.Second}
-	var lastErr error
-	for _, delay := range delays {
-		if delay > 0 {
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return maxclient.Message{}, ctx.Err()
-			case <-timer.C:
-			}
-		}
-		message, err := a.max.Publish(ctx, request)
-		if err == nil {
-			return message, nil
-		}
-		lastErr = err
-		var apiErr *maxclient.Error
-		if !errors.As(err, &apiErr) || apiErr.Code != "attachment.not.ready" {
-			return maxclient.Message{}, err
-		}
-	}
-	return maxclient.Message{}, lastErr
-}
-
-func (a *App) editWithAttachmentRetry(ctx context.Context, request maxclient.EditRequest) error {
-	delays := []time.Duration{0, time.Second, 3 * time.Second, 7 * time.Second}
-	var lastErr error
-	for _, delay := range delays {
-		if delay > 0 {
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-			}
-		}
-		if err := a.max.Edit(ctx, request); err != nil {
-			lastErr = err
-			var apiErr *maxclient.Error
-			if !errors.As(err, &apiErr) || apiErr.Code != "attachment.not.ready" {
-				return err
-			}
-			continue
-		}
-		return nil
-	}
-	return lastErr
+func (a *App) releasePublishedUpdate(claimed store.Post, lastError string) (store.Post, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return a.store.ReleasePublishedUpdate(ctx, claimed, lastError)
 }
 
 func (a *App) fail(postID int64, cause error) (store.Post, error) {

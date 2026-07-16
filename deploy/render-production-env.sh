@@ -22,7 +22,6 @@ required_secret_names=(
 )
 if [[ "$deploy_stage" == "production" ]]; then
   required_secret_names+=(
-    ALERTMANAGER_WEBHOOK_URL
     YANDEX_CLIENT_ID
     YANDEX_CLIENT_SECRET
     MAX_BOT_TOKEN
@@ -84,7 +83,7 @@ else
   rendered_s3_bucket=${S3_BUCKET:-}
   rendered_s3_region=${S3_REGION:-}
   rendered_openai_key=${OPENAI_API_KEY:-}
-  rendered_alertmanager_webhook_url=$ALERTMANAGER_WEBHOOK_URL
+  rendered_alertmanager_webhook_url=${ALERTMANAGER_WEBHOOK_URL:-}
 fi
 
 {

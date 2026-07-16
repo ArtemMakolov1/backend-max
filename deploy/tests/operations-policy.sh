@@ -113,6 +113,31 @@ production_alertmanager="$sandbox/alertmanager.yml"
 grep -F "url: 'https://alerts.example.test/private-receiver'" "$production_alertmanager" >/dev/null
 grep -F 'send_resolved: true' "$production_alertmanager" >/dev/null
 [[ $(stat -f '%Lp' "$production_alertmanager" 2>/dev/null || stat -c '%a' "$production_alertmanager") == 600 ]]
+
+without_alerts_env="$sandbox/without-alerts.env"
+env \
+  DEPLOY_STAGE=production \
+  POSTGRES_OWNER_PASSWORD=owner_password_0123456789abcdef0123456789abcdef \
+  POSTGRES_APP_PASSWORD=app_password_0123456789abcdef0123456789abcdef \
+  POSTGRES_MONITOR_PASSWORD=monitor_password_0123456789abcdef0123456789abcdef \
+  GRAFANA_ADMIN_PASSWORD=grafana_admin_0123456789abcdef0123456789abcdef \
+  GRAFANA_SECRET_KEY=grafana_secret_0123456789abcdef0123456789abcdef \
+  YANDEX_CLIENT_ID=yandex-client-id \
+  YANDEX_CLIENT_SECRET=yandex-client-secret \
+  OBSERVABILITY_ADMIN_USERS=makolov99 \
+  MAX_BOT_TOKEN=max-bot-token \
+  MAX_WEBHOOK_SECRET=0123456789abcdef0123456789abcdef \
+  S3_HOST=https://s3.example.test \
+  S3_ACCESS_KEY=test-access-key \
+  S3_SECRET_KEY=test-secret-key+/= \
+  "$repo_root/deploy/render-production-env.sh" "$without_alerts_env"
+without_alerts_config="$sandbox/alertmanager-disabled.yml"
+"$renderer" "$without_alerts_env" "$without_alerts_config"
+grep -F 'receiver: operator-disabled' "$without_alerts_config" >/dev/null
+if grep -F 'webhook_configs:' "$without_alerts_config"; then
+  echo "Alertmanager must stay local when no receiver URL is configured" >&2
+  exit 1
+fi
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   docker run --rm --entrypoint=/bin/amtool \
     --volume "$sandbox:/config:ro" \

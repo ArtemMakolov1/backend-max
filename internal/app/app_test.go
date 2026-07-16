@@ -79,6 +79,7 @@ type fakeMAX struct {
 	getPinnedErr       error
 	editErr            error
 	deleteErr          error
+	uploadImageFn      func(context.Context, string, io.Reader) (maxclient.UploadResult, error)
 	getMessageCalls    int
 	getPinnedCalls     int
 	pinCalls           int
@@ -212,8 +213,11 @@ func (f *fakeMAX) SendClaimConfirmation(context.Context, string, string, string,
 	return nil
 }
 func (f *fakeMAX) AnswerCallback(context.Context, string, string, string) error { return nil }
-func (f *fakeMAX) UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error) {
+func (f *fakeMAX) UploadImage(ctx context.Context, filename string, content io.Reader) (maxclient.UploadResult, error) {
 	f.uploadCalls++
+	if f.uploadImageFn != nil {
+		return f.uploadImageFn(ctx, filename, content)
+	}
 	return maxclient.UploadResult{Token: "image-token"}, nil
 }
 func (f *fakeMAX) Publish(_ context.Context, request maxclient.PublishRequest) (maxclient.Message, error) {

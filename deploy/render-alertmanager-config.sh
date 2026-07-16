@@ -23,7 +23,7 @@ umask 077
 temporary=$(mktemp "${output}.tmp.XXXXXX")
 trap 'rm -f "$temporary"' EXIT
 
-if [[ "$bootstrap_mode" == "true" ]]; then
+if [[ "$bootstrap_mode" == "true" || -z "$webhook_url" ]]; then
   cat >"$temporary" <<'YAML'
 global:
   resolve_timeout: 5m

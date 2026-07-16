@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/png"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,7 @@ type fakeS3 struct {
 	getErr      error
 	deleteErr   error
 	deletedKeys []string
+	getRanges   []string
 }
 
 func (f *fakeS3) PutObject(_ context.Context, input *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
@@ -65,6 +67,23 @@ func (f *fakeS3) GetObject(_ context.Context, input *s3.GetObjectInput, _ ...fun
 	payload, exists := f.objects[aws.ToString(input.Key)]
 	if !exists {
 		return nil, &types.NoSuchKey{}
+	}
+	requestedRange := strings.TrimSpace(aws.ToString(input.Range))
+	f.getRanges = append(f.getRanges, requestedRange)
+	if requestedRange != "" {
+		bounds := strings.SplitN(strings.TrimPrefix(requestedRange, "bytes="), "-", 2)
+		if len(bounds) != 2 {
+			return nil, errors.New("invalid fake S3 range")
+		}
+		start, startErr := strconv.ParseInt(bounds[0], 10, 64)
+		end, endErr := strconv.ParseInt(bounds[1], 10, 64)
+		if startErr != nil || endErr != nil || start < 0 || end < start || start >= int64(len(payload)) {
+			return nil, errors.New("invalid fake S3 range")
+		}
+		if end >= int64(len(payload)) {
+			end = int64(len(payload)) - 1
+		}
+		payload = payload[start : end+1]
 	}
 	now := time.Now().UTC()
 	return &s3.GetObjectOutput{
@@ -123,6 +142,32 @@ func TestS3StoreKeepsObjectsPrivateBehindServiceURL(t *testing.T) {
 	}
 	if !bytes.Equal(stored, encoded.Bytes()) || object.MIMEType != "image/png" {
 		t.Fatalf("stored object metadata or bytes differ: mime=%q size=%d", object.MIMEType, len(stored))
+	}
+}
+
+func TestS3RangeReadUsesProviderRange(t *testing.T) {
+	client := &fakeS3{
+		objects: map[string][]byte{"clip.mp4": []byte("0123456789")},
+		types:   map[string]string{"clip.mp4": "video/mp4"},
+	}
+	mediaStore, err := newStore(&s3Backend{client: client, bucket: "maxposty-media"}, "https://maxposty.ru")
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := mediaStore.OpenRange(context.Background(), "clip.mp4", 2, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = object.Body.Close() }()
+	payload, err := io.ReadAll(object.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(payload) != "2345" || object.Size != 4 || object.TotalSize != 10 {
+		t.Fatalf("range object = %q size=%d total=%d", payload, object.Size, object.TotalSize)
+	}
+	if len(client.getRanges) != 1 || client.getRanges[0] != "bytes=2-5" {
+		t.Fatalf("S3 requested ranges = %v", client.getRanges)
 	}
 }
 
