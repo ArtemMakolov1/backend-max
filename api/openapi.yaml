@@ -17,6 +17,12 @@ tags:
   - name: Analytics
   - name: AI
   - name: Integration
+  - name: Workspaces
+  - name: Billing
+  - name: Collaboration
+  - name: Notifications
+  - name: Brand
+  - name: Campaigns
 paths:
   /health:
     get:
@@ -31,6 +37,21 @@ paths:
                 $ref: '#/components/schemas/HealthStatus'
         default:
           $ref: '#/components/responses/Problem'
+  /plans:
+    get:
+      tags: [Billing]
+      operationId: listPublicBillingPlans
+      summary: List public and currently available plan versions
+      description: Internal or unavailable future plans are never returned.
+      responses:
+        '200':
+          description: Public plan catalog; currently contains only Free
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/BillingCatalogEntry'}
+        default: {$ref: '#/components/responses/Problem'}
   /auth/yandex/start:
     post:
       tags: [Authentication]
@@ -510,7 +531,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/GenerateImageInput'
+              $ref: '#/components/schemas/GeneratePostImageInput'
       responses:
         '200':
           $ref: '#/components/responses/Post'
@@ -763,6 +784,1136 @@ paths:
           $ref: '#/components/responses/Post'
         default:
           $ref: '#/components/responses/Problem'
+  /workspaces:
+    get:
+      tags: [Workspaces]
+      operationId: listWorkspaces
+      summary: List workspaces available to the current user with authoritative capabilities
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceList'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Workspaces]
+      operationId: createWorkspace
+      summary: Create a team workspace
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceCreate'}
+      responses:
+        '201': {$ref: '#/components/responses/WorkspaceEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspace-invitations/{token}/accept:
+    parameters: [{$ref: '#/components/parameters/InvitationToken'}]
+    post:
+      tags: [Workspaces]
+      operationId: acceptWorkspaceInvitation
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Workspaces]
+      operationId: getWorkspace
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Workspaces]
+      operationId: updateWorkspace
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceUpdate'}
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Workspaces]
+      operationId: deleteWorkspace
+      summary: Delete a non-personal workspace
+      security: [{sessionCookie: []}]
+      responses:
+        '204': {description: Workspace deleted}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/transfer-ownership:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Workspaces]
+      operationId: transferWorkspaceOwnership
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceTransfer'}
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/billing:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Billing]
+      operationId: getWorkspaceBilling
+      summary: Read the workspace plan, entitlements and current usage
+      description: |
+        Requires workspace.read. Monthly AI usage is always observed. Hard
+        monthly enforcement is enabled only when the deployment explicitly
+        opts in; minute/day AI safety limits remain independent.
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Workspace subscription and tenant-scoped usage
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkspaceBilling'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/members:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Workspaces]
+      operationId: listWorkspaceMembers
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceMemberList'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Workspaces]
+      operationId: addWorkspaceMember
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceMemberCreate'}
+      responses:
+        '201': {$ref: '#/components/responses/WorkspaceMember'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/members/{user_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/UserId'}
+    patch:
+      tags: [Workspaces]
+      operationId: updateWorkspaceMember
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceRoleUpdate'}
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceMember'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Workspaces]
+      operationId: removeWorkspaceMember
+      security: [{sessionCookie: []}]
+      responses:
+        '204': {description: Member removed}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/invitations:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Workspaces]
+      operationId: listWorkspaceInvitations
+      security: [{sessionCookie: []}]
+      parameters:
+        - name: include_closed
+          in: query
+          schema: {type: boolean, default: false}
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceInvitationList'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Workspaces]
+      operationId: createWorkspaceInvitation
+      description: The raw bearer token and accept URL are returned only by this response and are never listed later.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceInvitationCreate'}
+      responses:
+        '201': {$ref: '#/components/responses/WorkspaceInvitationSecret'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/invitations/{invitation_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/InvitationId'}
+    delete:
+      tags: [Workspaces]
+      operationId: revokeWorkspaceInvitation
+      security: [{sessionCookie: []}]
+      responses:
+        '204': {description: Invitation revoked}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/audit:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Collaboration]
+      operationId: listWorkspaceAudit
+      security: [{sessionCookie: []}]
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/BeforeId'}
+      responses:
+        '200': {$ref: '#/components/responses/AuditEventList'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Channels]
+      operationId: listWorkspaceChannels
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/ChannelList'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Channels]
+      operationId: createWorkspaceChannelClaim
+      summary: Start a verified MAX channel connection for this workspace
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelConnectInput'}
+      responses:
+        '201': {$ref: '#/components/responses/ChannelConnectionClaim'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels/connect/start:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Channels]
+      operationId: startWorkspaceChannelConnect
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelConnectInput'}
+      responses:
+        '201': {$ref: '#/components/responses/ChannelConnectionClaim'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels/connect/{claim_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/ClaimId'}
+    get:
+      tags: [Channels]
+      operationId: getWorkspaceChannelConnect
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/ChannelConnectionClaim'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels/{channel_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/ChannelId'}
+    get:
+      tags: [Channels]
+      operationId: getWorkspaceChannel
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Channel'}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Channels]
+      operationId: updateWorkspaceChannel
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelUpdate'}
+      responses:
+        '200': {$ref: '#/components/responses/Channel'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Channels]
+      operationId: deleteWorkspaceChannel
+      security: [{sessionCookie: []}]
+      responses:
+        '204': {description: Channel disconnected}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Posts]
+      operationId: listWorkspacePosts
+      security: [{sessionCookie: []}]
+      parameters:
+        - name: channel_id
+          in: query
+          schema: {type: integer, format: int64, minimum: 1}
+        - name: status
+          in: query
+          schema: {$ref: '#/components/schemas/PostStatus'}
+      responses:
+        '200': {$ref: '#/components/responses/PostList'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Posts]
+      operationId: createWorkspacePost
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EditablePost'}
+      responses:
+        '201': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/format-content:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: formatWorkspacePostContent
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/FormatContentInput'}
+      responses:
+        '200': {description: Formatted content, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/research/generate:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: generateWorkspaceResearch
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceResearchInput'}
+      responses:
+        '200': {description: Research result, content: {application/json: {schema: {$ref: '#/components/schemas/ResearchResult'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/brand-kit:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Brand]
+      operationId: getWorkspaceBrandKit
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Workspace brand kit, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceBrandKit'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    put:
+      tags: [Brand]
+      operationId: replaceWorkspaceBrandKit
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceBrandKitUpdate'}
+      responses:
+        '200': {description: Updated workspace brand kit, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceBrandKit'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Brand]
+      operationId: updateWorkspaceBrandKit
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WorkspaceBrandKitUpdate'}
+      responses:
+        '200': {description: Updated workspace brand kit, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceBrandKit'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channel-templates:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Brand]
+      operationId: listWorkspaceChannelTemplates
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Channel templates
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/ChannelTemplate'}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Brand]
+      operationId: createWorkspaceChannelTemplate
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelTemplateCreate'}
+      responses:
+        '201': {description: Created channel template, content: {application/json: {schema: {$ref: '#/components/schemas/ChannelTemplate'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channel-templates/{template_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: template_id, in: path, required: true, schema: {type: integer, format: int64, minimum: 1}}
+    get:
+      tags: [Brand]
+      operationId: getWorkspaceChannelTemplate
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Channel template, content: {application/json: {schema: {$ref: '#/components/schemas/ChannelTemplate'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    put:
+      tags: [Brand]
+      operationId: replaceWorkspaceChannelTemplate
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelTemplateUpdate'}
+      responses:
+        '200': {description: Updated channel template, content: {application/json: {schema: {$ref: '#/components/schemas/ChannelTemplate'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Brand]
+      operationId: updateWorkspaceChannelTemplate
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelTemplateUpdate'}
+      responses:
+        '200': {description: Updated channel template, content: {application/json: {schema: {$ref: '#/components/schemas/ChannelTemplate'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Brand]
+      operationId: deleteWorkspaceChannelTemplate
+      security: [{sessionCookie: []}]
+      parameters:
+        - {name: expected_version, in: query, required: true, schema: {type: integer, format: int64, minimum: 1}}
+      responses:
+        '204': {description: Channel template deleted}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/analytics:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: channel_id, in: query, schema: {oneOf: [{type: integer, format: int64, minimum: 1}, {type: string, const: all}]}}
+      - {name: from, in: query, schema: {type: string, format: date}}
+      - {name: to, in: query, schema: {type: string, format: date}}
+      - {name: tz_offset_minutes, in: query, schema: {type: integer, minimum: -840, maximum: 840}}
+    get:
+      tags: [Analytics]
+      operationId: getWorkspaceContentAnalytics
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Workspace content analytics, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceContentAnalyticsEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/analytics/content:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: channel_id, in: query, schema: {oneOf: [{type: integer, format: int64, minimum: 1}, {type: string, const: all}]}}
+      - {name: from, in: query, schema: {type: string, format: date}}
+      - {name: to, in: query, schema: {type: string, format: date}}
+      - {name: tz_offset_minutes, in: query, schema: {type: integer, minimum: -840, maximum: 840}}
+    get:
+      tags: [Analytics]
+      operationId: getWorkspaceContentAnalyticsDetail
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Workspace content analytics, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceContentAnalyticsEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/analytics/content/posts/{post_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - {name: from, in: query, schema: {type: string, format: date}}
+      - {name: to, in: query, schema: {type: string, format: date}}
+    get:
+      tags: [Analytics]
+      operationId: getWorkspacePostAnalytics
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Detailed analytics for a workspace post, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspacePostAnalyticsEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/analytics/content/posts/{post_id}/variation:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Analytics]
+      operationId: createWorkspaceAnalyticsVariation
+      security: [{sessionCookie: []}]
+      responses:
+        '201': {description: Draft variation, content: {application/json: {schema: {$ref: '#/components/schemas/AnalyticsVariationResult'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/analytics/content/posts/{post_id}/repeat:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Analytics]
+      operationId: createWorkspaceAnalyticsRepeat
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AnalyticsRepeatInput'}
+      responses:
+        '201': {description: Durable repeat campaign plan, content: {application/json: {schema: {$ref: '#/components/schemas/AnalyticsRepeatResult'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/calendar:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: from, in: query, schema: {type: string, format: date-time}}
+      - {name: to, in: query, schema: {type: string, format: date-time}}
+      - {name: channel_id, in: query, schema: {type: integer, format: int64, minimum: 1}}
+    get:
+      tags: [Campaigns]
+      operationId: listWorkspaceCalendar
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Posts and campaign variants in the calendar range
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/CalendarItem'}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/calendar/posts/{post_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    put:
+      tags: [Campaigns]
+      operationId: rescheduleWorkspaceCalendarPost
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CalendarRescheduleInput'}
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/campaigns:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Campaigns]
+      operationId: listWorkspaceCampaigns
+      security: [{sessionCookie: []}]
+      parameters:
+        - {name: include_archived, in: query, schema: {type: boolean, default: false}}
+      responses:
+        '200':
+          description: Workspace campaigns
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Campaign'}}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Campaigns]
+      operationId: createWorkspaceCampaign
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignCreate'}
+      responses:
+        '201': {description: Created campaign, content: {application/json: {schema: {$ref: '#/components/schemas/Campaign'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/campaigns/{campaign_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: campaign_id, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+    get:
+      tags: [Campaigns]
+      operationId: getWorkspaceCampaign
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Campaign, content: {application/json: {schema: {$ref: '#/components/schemas/Campaign'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Campaigns]
+      operationId: updateWorkspaceCampaign
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignUpdate'}
+      responses:
+        '200': {description: Updated campaign, content: {application/json: {schema: {$ref: '#/components/schemas/Campaign'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Campaigns]
+      operationId: archiveWorkspaceCampaign
+      security: [{sessionCookie: []}]
+      parameters:
+        - {name: expected_updated_at, in: query, required: true, schema: {type: string, format: date-time}}
+      responses:
+        '204': {description: Campaign archived}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/campaigns/{campaign_id}/variants:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: campaign_id, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+    post:
+      tags: [Campaigns]
+      operationId: addWorkspaceCampaignVariants
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignVariantsAdd'}
+      responses:
+        '201': {description: Campaign with added variants, content: {application/json: {schema: {$ref: '#/components/schemas/Campaign'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/campaigns/{campaign_id}/variants/{variant_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: campaign_id, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+      - {name: variant_id, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+    patch:
+      tags: [Campaigns]
+      operationId: updateWorkspaceCampaignVariant
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignVariantUpdate'}
+      responses:
+        '200': {description: Updated campaign variant, content: {application/json: {schema: {$ref: '#/components/schemas/CampaignVariant'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Campaigns]
+      operationId: deleteWorkspaceCampaignVariant
+      security: [{sessionCookie: []}]
+      parameters:
+        - {name: expected_updated_at, in: query, required: true, schema: {type: string, format: date-time}}
+      responses:
+        '204': {description: Campaign variant deleted}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/campaigns/{campaign_id}/materialize:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: campaign_id, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+    post:
+      tags: [Campaigns]
+      operationId: materializeWorkspaceCampaign
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignMaterializeInput'}
+      responses:
+        '200': {description: Materialized campaign drafts, content: {application/json: {schema: {$ref: '#/components/schemas/Campaign'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/campaigns/{campaign_id}/schedule:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: campaign_id, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+    post:
+      tags: [Campaigns]
+      operationId: scheduleWorkspaceCampaign
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CampaignScheduleInput'}
+      responses:
+        '200': {description: Atomically scheduled campaign, content: {application/json: {schema: {$ref: '#/components/schemas/Campaign'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/images/generate:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: generateWorkspaceImage
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GenerateImageInput'}
+      responses:
+        '201': {$ref: '#/components/responses/MediaFile'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/media:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Posts]
+      operationId: uploadWorkspaceMedia
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '201': {$ref: '#/components/responses/MediaFile'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/media/{filename}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/Filename'}
+    get:
+      tags: [Posts]
+      operationId: getWorkspaceMedia
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Private workspace media bytes
+          content:
+            image/*: {schema: {type: string, format: binary}}
+            video/*: {schema: {type: string, format: binary}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    get:
+      tags: [Posts]
+      operationId: getWorkspacePost
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Posts]
+      operationId: updateWorkspacePost
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostUpdate'}
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Posts]
+      operationId: deleteWorkspacePost
+      security: [{sessionCookie: []}]
+      responses:
+        '204': {description: Post deleted}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/duplicate:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: duplicateWorkspacePost
+      security: [{sessionCookie: []}]
+      responses:
+        '201': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/schedule:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: scheduleWorkspacePost
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostSchedule'}
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Posts]
+      operationId: cancelWorkspacePostSchedule
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/publish:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: publishWorkspacePost
+      description: Requires `posts.publish` and an approved current revision when workspace approval is enabled.
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/update-published:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: updateWorkspacePublishedPost
+      summary: Replace the existing MAX publication with the approved current revision
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/sync-max:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: syncWorkspaceMAXPublication
+      summary: Refresh URL, views and pin state from MAX
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/pin:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: pinWorkspacePost
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Posts]
+      operationId: unpinWorkspacePost
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/publication:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    delete:
+      tags: [Posts]
+      operationId: deleteWorkspacePublication
+      summary: Delete the MAX message while preserving the local post and view history
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/view-history:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    get:
+      tags: [Posts]
+      operationId: getWorkspacePostViewHistory
+      security: [{sessionCookie: []}]
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 500}
+        - name: before
+          in: query
+          schema: {type: string, format: date-time}
+      responses:
+        '200':
+          description: Newest-first immutable MAX view observations
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/PostViewSnapshot'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/generate-image:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [AI]
+      operationId: generateWorkspacePostImage
+      summary: Generate and attach an image to a workspace post
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/GeneratePostImageInput'}
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/image:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: uploadWorkspacePostImage
+      summary: Upload and attach an image to a workspace post
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/attachments:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Posts]
+      operationId: uploadWorkspacePostAttachment
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: '#/components/schemas/AttachmentUpload'}
+      responses:
+        '201': {$ref: '#/components/responses/PostAttachmentMutation'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/attachments/{attachment_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - {$ref: '#/components/parameters/AttachmentId'}
+    put:
+      tags: [Posts]
+      operationId: replaceWorkspacePostAttachment
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: '#/components/schemas/AttachmentUpload'}
+      responses:
+        '200': {$ref: '#/components/responses/PostAttachmentMutation'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Posts]
+      operationId: deleteWorkspacePostAttachment
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/attachments/order:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    patch:
+      tags: [Posts]
+      operationId: reorderWorkspacePostAttachments
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AttachmentOrder'}
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/revisions:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    get:
+      tags: [Collaboration]
+      operationId: listWorkspacePostRevisions
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/PostRevisionList'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/reviews:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    get:
+      tags: [Collaboration]
+      operationId: listWorkspacePostReviews
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/PostReviewList'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/review/submit:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Collaboration]
+      operationId: submitWorkspacePostReview
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/PostReviewSubmission'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/review/approve:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Collaboration]
+      operationId: approveWorkspacePostReview
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostReviewDecisionInput'}
+      responses:
+        '201': {$ref: '#/components/responses/PostReview'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/review/request-changes:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Collaboration]
+      operationId: requestWorkspacePostChanges
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostReviewDecisionInput'}
+      responses:
+        '201': {$ref: '#/components/responses/PostReview'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/reviews/{revision_id}/decision:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - {$ref: '#/components/parameters/RevisionId'}
+    post:
+      tags: [Collaboration]
+      operationId: decideWorkspacePostReview
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostReviewDecisionInput'}
+      responses:
+        '201': {$ref: '#/components/responses/PostReview'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/comments:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    get:
+      tags: [Collaboration]
+      operationId: listWorkspacePostComments
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/PostCommentList'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [Collaboration]
+      operationId: createWorkspacePostComment
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostCommentCreate'}
+      responses:
+        '201': {$ref: '#/components/responses/PostComment'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/comments/{comment_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - {$ref: '#/components/parameters/CommentId'}
+    patch:
+      tags: [Collaboration]
+      operationId: resolveWorkspacePostComment
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostCommentResolve'}
+      responses:
+        '200': {$ref: '#/components/responses/PostComment'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Collaboration]
+      operationId: deleteWorkspacePostComment
+      security: [{sessionCookie: []}]
+      responses:
+        '204': {description: Comment deleted}
+        default: {$ref: '#/components/responses/Problem'}
+  /notifications:
+    get:
+      tags: [Notifications]
+      operationId: listNotifications
+      security: [{sessionCookie: []}]
+      parameters:
+        - {name: workspace_id, in: query, schema: {type: string}}
+        - {name: unread_only, in: query, schema: {type: boolean, default: false}}
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/BeforeId'}
+      responses:
+        '200': {$ref: '#/components/responses/NotificationList'}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Notifications]
+      operationId: markAllNotificationsRead
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/NotificationsReadInput'}
+      responses:
+        '200': {description: Number updated, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /notifications/{notification_id}:
+    parameters: [{$ref: '#/components/parameters/NotificationId'}]
+    patch:
+      tags: [Notifications]
+      operationId: markNotificationRead
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/Notification'}
+        default: {$ref: '#/components/responses/Problem'}
+  /images/generate:
+    post:
+      tags: [AI]
+      operationId: generateImage
+      summary: Generate an image in the personal workspace
+      description: Legacy personal-workspace alias. New clients should use the workspace-scoped endpoint.
+      deprecated: true
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateImageInput'
+      responses:
+        '201': {$ref: '#/components/responses/MediaFile'}
+        default: {$ref: '#/components/responses/Problem'}
   /research/generate:
     post:
       tags: [AI]
@@ -883,6 +2034,69 @@ components:
         type: integer
         format: int64
         minimum: 1
+    WorkspaceId:
+      name: workspace_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 256}
+    InvitationId:
+      name: invitation_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+    InvitationToken:
+      name: token
+      in: path
+      required: true
+      schema: {type: string, minLength: 32, maxLength: 256}
+    ChannelId:
+      name: channel_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    ClaimId:
+      name: claim_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+    PostId:
+      name: post_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    RevisionId:
+      name: revision_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    CommentId:
+      name: comment_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    NotificationId:
+      name: notification_id
+      in: path
+      required: true
+      schema: {type: integer, format: int64, minimum: 1}
+    Filename:
+      name: filename
+      in: path
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 512}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 100, default: 50}
+    BeforeId:
+      name: before_id
+      in: query
+      schema: {type: integer, format: int64, minimum: 1}
   responses:
     Problem:
       description: Request failed
@@ -908,6 +2122,66 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/PostAttachmentMutation'
+    WorkspaceEnvelope:
+      description: Workspace and authoritative access context
+      content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceEnvelope'}}}
+    WorkspaceList:
+      description: Available workspaces
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/WorkspaceEnvelope'}}}}
+    WorkspaceMember:
+      description: Workspace member
+      content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceMember'}}}
+    WorkspaceMemberList:
+      description: Workspace members
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/WorkspaceMember'}}}}
+    WorkspaceInvitationList:
+      description: Workspace invitations without bearer secrets
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/WorkspaceInvitation'}}}}
+    WorkspaceInvitationSecret:
+      description: Newly created invitation with one-time bearer token
+      content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceInvitationSecret'}}}
+    Channel:
+      description: Workspace channel
+      content: {application/json: {schema: {$ref: '#/components/schemas/Channel'}}}
+    ChannelList:
+      description: Workspace channels
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Channel'}}}}
+    ChannelConnectionClaim:
+      description: Channel ownership verification claim
+      content: {application/json: {schema: {$ref: '#/components/schemas/ChannelConnectionClaim'}}}
+    PostList:
+      description: Workspace posts
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Post'}}}}
+    MediaFile:
+      description: Private workspace media metadata
+      content: {application/json: {schema: {$ref: '#/components/schemas/MediaFile'}}}
+    PostRevisionList:
+      description: Immutable post revisions
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PostRevision'}}}}
+    PostReviewSubmission:
+      description: Submitted current revision
+      content: {application/json: {schema: {$ref: '#/components/schemas/PostReviewSubmission'}}}
+    PostReview:
+      description: Review decision
+      content: {application/json: {schema: {$ref: '#/components/schemas/PostReview'}}}
+    PostReviewList:
+      description: Review decisions
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PostReview'}}}}
+    PostComment:
+      description: Post comment
+      content: {application/json: {schema: {$ref: '#/components/schemas/PostComment'}}}
+    PostCommentList:
+      description: Post comments
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PostComment'}}}}
+    AuditEventList:
+      description: Workspace audit events
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/AuditEvent'}}}}
+    Notification:
+      description: User notification
+      content: {application/json: {schema: {$ref: '#/components/schemas/Notification'}}}
+    NotificationList:
+      description: User notifications
+      content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Notification'}}}}
   schemas:
     ProblemEnvelope:
       type: object
@@ -1024,6 +2298,418 @@ components:
           type: [string, 'null']
         message:
           type: [string, 'null']
+    WorkspaceCapability:
+      type: string
+      enum:
+        - workspace.read
+        - workspace.update
+        - workspace.delete
+        - members.read
+        - members.manage
+        - invitations.read
+        - invitations.manage
+        - channels.read
+        - channels.manage
+        - posts.read
+        - posts.write
+        - posts.delete
+        - media.read
+        - media.write
+        - ai.use
+        - comments.read
+        - comments.write
+        - comments.resolve
+        - review.submit
+        - review.decide
+        - posts.publish
+        - audit.read
+        - notifications.read
+        - notifications.manage
+    WorkspaceRole:
+      type: string
+      enum: [owner, editor, approver, viewer]
+    Workspace:
+      type: object
+      required:
+        - id
+        - name
+        - owner_user_id
+        - is_personal
+        - approval_required
+        - require_distinct_approver
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string}
+        name: {type: string, minLength: 1, maxLength: 120}
+        owner_user_id: {type: string}
+        is_personal: {type: boolean}
+        approval_required: {type: boolean}
+        require_distinct_approver: {type: boolean}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        archived_at: {type: [string, 'null'], format: date-time}
+    WorkspaceAccess:
+      type: object
+      required: [workspace_id, role, capabilities]
+      properties:
+        workspace_id: {type: string}
+        role: {$ref: '#/components/schemas/WorkspaceRole'}
+        capabilities:
+          type: array
+          uniqueItems: true
+          items: {$ref: '#/components/schemas/WorkspaceCapability'}
+    WorkspaceEnvelope:
+      type: object
+      required: [workspace, access]
+      properties:
+        workspace: {$ref: '#/components/schemas/Workspace'}
+        access: {$ref: '#/components/schemas/WorkspaceAccess'}
+    BillingPlan:
+      type: object
+      required:
+        - code
+        - version
+        - catalog_version
+        - name
+        - description
+        - currency_code
+        - monthly_price_minor
+        - billing_interval
+        - public
+        - available
+      properties:
+        code: {type: string, pattern: '^[a-z][a-z0-9_]{0,31}$'}
+        version: {type: integer, minimum: 1}
+        catalog_version: {type: string, format: date}
+        name: {type: string, minLength: 1}
+        description: {type: string}
+        currency_code: {type: string, pattern: '^[A-Z]{3}$', example: RUB}
+        monthly_price_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Monthly price in minor currency units; kopecks for RUB.
+        billing_interval: {type: string, enum: [month]}
+        public: {type: boolean}
+        available: {type: boolean}
+    BillingEntitlement:
+      type: object
+      required: [key, usage_metric, limit, limit_base_units, unit, period, unit_scale, hard_limit]
+      properties:
+        key: {type: string, pattern: '^[a-z][a-z0-9_]{0,63}$'}
+        usage_metric:
+          type: string
+          pattern: '^[a-z][a-z0-9_]{0,63}$'
+          description: Base-unit metric used by the usage ledger.
+        limit: {type: integer, format: int64, minimum: 0}
+        limit_base_units:
+          type: integer
+          format: int64
+          minimum: 0
+          description: limit multiplied by unit_scale; authoritative for hard enforcement.
+        unit:
+          type: string
+          description: User-facing unit such as channel, seat, byte, request or medium_equivalent_image.
+        period: {type: string, enum: [current, month]}
+        unit_scale:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Ledger base units in one displayed unit. ai_images_monthly uses 9:
+            low=1 credit, medium/default=9 and high=36.
+        hard_limit: {type: boolean}
+    BillingCatalogEntry:
+      type: object
+      required: [plan, entitlements]
+      properties:
+        plan: {$ref: '#/components/schemas/BillingPlan'}
+        entitlements:
+          type: array
+          items: {$ref: '#/components/schemas/BillingEntitlement'}
+    WorkspaceSubscription:
+      type: object
+      required: [plan, status, started_at, updated_at]
+      properties:
+        plan: {$ref: '#/components/schemas/BillingPlan'}
+        status: {type: string, enum: [active, trialing, paused, canceled]}
+        started_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    WorkspaceUsageMetric:
+      type: object
+      required: [metric, quantity, period]
+      properties:
+        metric:
+          type: string
+          description: Includes ai_image_credits, ai_research_requests and ai_format_requests.
+        quantity: {type: integer, format: int64, minimum: 0}
+        period: {type: string, enum: [current, month]}
+        period_start: {type: string, format: date-time}
+        period_end: {type: string, format: date-time}
+    WorkspaceBilling:
+      type: object
+      required:
+        - workspace_id
+        - subscription
+        - entitlements
+        - usage
+        - monthly_enforcement_enabled
+      properties:
+        workspace_id: {type: string}
+        subscription: {$ref: '#/components/schemas/WorkspaceSubscription'}
+        entitlements:
+          type: array
+          items: {$ref: '#/components/schemas/BillingEntitlement'}
+        usage:
+          type: array
+          items: {$ref: '#/components/schemas/WorkspaceUsageMetric'}
+        monthly_enforcement_enabled:
+          type: boolean
+          description: False means observe-only; usage still increments atomically.
+    WorkspaceCreate:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 120}
+    WorkspaceUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name: {type: string, minLength: 1, maxLength: 120}
+        approval_required: {type: boolean}
+        require_distinct_approver: {type: boolean}
+    WorkspaceTransfer:
+      type: object
+      required: [new_owner_user_id]
+      properties:
+        new_owner_user_id: {type: string, minLength: 1, maxLength: 256}
+    WorkspaceMember:
+      type: object
+      required: [workspace_id, user_id, role, display_name, joined_at, updated_at]
+      properties:
+        workspace_id: {type: string}
+        user_id: {type: string}
+        role: {$ref: '#/components/schemas/WorkspaceRole'}
+        display_name: {type: string}
+        email:
+          type: string
+          format: email
+          description: Present only when the caller has members.manage.
+        avatar_url: {type: string}
+        created_by: {type: string}
+        joined_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    WorkspaceMemberCreate:
+      type: object
+      required: [user_id, role]
+      properties:
+        user_id: {type: string, minLength: 1, maxLength: 256}
+        role: {type: string, enum: [editor, approver, viewer]}
+    WorkspaceRoleUpdate:
+      type: object
+      required: [role]
+      properties:
+        role: {type: string, enum: [editor, approver, viewer]}
+    WorkspaceInvitation:
+      type: object
+      required: [id, workspace_id, email, role, status, invited_by, created_at, expires_at]
+      properties:
+        id: {type: string}
+        workspace_id: {type: string}
+        email: {type: string}
+        target_user_id: {type: string}
+        role: {type: string, enum: [editor, approver, viewer]}
+        status: {type: string, enum: [pending, accepted, revoked, expired]}
+        invited_by: {type: string}
+        accepted_by: {type: string}
+        created_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        accepted_at: {type: [string, 'null'], format: date-time}
+        revoked_at: {type: [string, 'null'], format: date-time}
+    WorkspaceInvitationCreate:
+      type: object
+      required: [role]
+      description: "email and target_user_id are mutually exclusive; omit both to create a bearer invitation."
+      properties:
+        email: {type: string, format: email, maxLength: 320}
+        target_user_id: {type: string, maxLength: 256}
+        role: {type: string, enum: [editor, approver, viewer]}
+        expires_in_days: {type: integer, minimum: 1, maximum: 30, default: 7}
+    WorkspaceInvitationSecret:
+      type: object
+      required: [invitation, token, accept_url]
+      properties:
+        invitation: {$ref: '#/components/schemas/WorkspaceInvitation'}
+        token: {type: string, writeOnly: true}
+        accept_url: {type: string, format: uri}
+    ChannelConnectInput:
+      type: object
+      properties:
+        public_link: {type: string, format: uri}
+        max_chat_id: {type: string}
+        title: {type: string, maxLength: 200}
+      anyOf:
+        - required: [public_link]
+        - required: [max_chat_id]
+    ChannelUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        title: {type: string, minLength: 1, maxLength: 200}
+        active: {type: boolean}
+    FormatContentInput:
+      type: object
+      required: [content, format]
+      properties:
+        content: {type: string, minLength: 1, maxLength: 4000}
+        format: {$ref: '#/components/schemas/PostFormat'}
+    MediaFile:
+      type: object
+      required: [type, url, filename, mime_type, size, width, height]
+      properties:
+        type: {type: string, enum: [image, video]}
+        url: {type: string}
+        filename: {type: string}
+        mime_type: {type: string}
+        size: {type: integer, format: int64, minimum: 0}
+        width: {type: integer, minimum: 0}
+        height: {type: integer, minimum: 0}
+        duration_ms: {type: integer, format: int64, minimum: 0}
+    PostSchedule:
+      type: object
+      required: [scheduled_at]
+      properties:
+        scheduled_at: {type: string, format: date-time}
+    AttachmentUpload:
+      type: object
+      required: [file]
+      properties:
+        file: {type: string, format: binary}
+        type: {type: string, enum: [image, video]}
+        position: {type: integer, minimum: 0, maximum: 11}
+    AttachmentOrder:
+      type: object
+      required: [attachment_ids]
+      properties:
+        attachment_ids:
+          type: array
+          maxItems: 12
+          uniqueItems: true
+          items: {type: integer, format: int64, minimum: 1}
+    PostReviewStatus:
+      type: string
+      enum: [draft, in_review, changes_requested, approved]
+    PostViewSnapshot:
+      type: object
+      required: [id, post_id, max_message_id, views, captured_at]
+      properties:
+        id: {type: integer, format: int64}
+        post_id: {type: integer, format: int64}
+        max_message_id: {type: string}
+        views: {type: integer, format: int64, minimum: 0}
+        captured_at: {type: string, format: date-time}
+    PostRevision:
+      type: object
+      required: [id, workspace_id, post_id, number, author_user_id, snapshot, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        workspace_id: {type: string}
+        post_id: {type: integer, format: int64}
+        number: {type: integer, minimum: 1}
+        author_user_id: {type: string}
+        author_display_name: {type: string}
+        snapshot: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+    PostReviewDecisionInput:
+      type: object
+      required: [revision_id]
+      properties:
+        revision_id: {type: integer, format: int64, minimum: 1}
+        decision: {type: string, enum: [approved, changes_requested]}
+        comment: {type: string, maxLength: 4000}
+    PostReview:
+      type: object
+      required: [id, workspace_id, post_id, revision_id, reviewer_user_id, decision, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        workspace_id: {type: string}
+        post_id: {type: integer, format: int64}
+        revision_id: {type: integer, format: int64}
+        reviewer_user_id: {type: string}
+        reviewer_display_name: {type: string}
+        decision: {type: string, enum: [approved, changes_requested]}
+        comment: {type: string}
+        created_at: {type: string, format: date-time}
+    PostReviewSubmission:
+      type: object
+      required: [review_status, revision]
+      properties:
+        review_status: {type: string, const: in_review}
+        revision: {$ref: '#/components/schemas/PostRevision'}
+    PostCommentCreate:
+      type: object
+      required: [body]
+      properties:
+        revision_id: {type: integer, format: int64, minimum: 1}
+        parent_id: {type: integer, format: int64, minimum: 1}
+        body: {type: string, minLength: 1, maxLength: 4000}
+    PostCommentResolve:
+      type: object
+      required: [resolved]
+      properties:
+        resolved: {type: boolean}
+    PostComment:
+      type: object
+      required: [id, workspace_id, post_id, author_user_id, body, created_at, updated_at]
+      properties:
+        id: {type: integer, format: int64}
+        workspace_id: {type: string}
+        post_id: {type: integer, format: int64}
+        revision_id: {type: integer, format: int64}
+        parent_id: {type: integer, format: int64}
+        author_user_id: {type: string}
+        author_display_name: {type: string}
+        body: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        deleted_at: {type: [string, 'null'], format: date-time}
+        resolved_at: {type: [string, 'null'], format: date-time}
+        resolved_by_user_id: {type: string}
+        resolved_by_display_name: {type: string}
+    AuditEvent:
+      type: object
+      required: [id, workspace_id, action, entity_type, metadata, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        workspace_id: {type: string}
+        actor_user_id: {type: string}
+        actor_display_name: {type: string}
+        action: {type: string}
+        entity_type: {type: string}
+        entity_id: {type: string}
+        metadata: {type: object, additionalProperties: true}
+        created_at: {type: string, format: date-time}
+    Notification:
+      type: object
+      required: [id, workspace_id, user_id, kind, title, body, metadata, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        workspace_id: {type: string}
+        user_id: {type: string}
+        kind: {type: string}
+        title: {type: string}
+        body: {type: string}
+        entity_type: {type: string}
+        entity_id: {type: string}
+        metadata: {type: object, additionalProperties: true}
+        read_at: {type: [string, 'null'], format: date-time}
+        created_at: {type: string, format: date-time}
+    NotificationsReadInput:
+      type: object
+      properties:
+        workspace_id: {type: string}
     Channel:
       type: object
       required:
@@ -1037,6 +2723,8 @@ components:
         id:
           type: integer
           format: int64
+        workspace_id:
+          type: string
         max_chat_id:
           type: string
         title:
@@ -1300,6 +2988,8 @@ components:
         id:
           type: integer
           format: int64
+        workspace_id:
+          type: string
         title:
           type: string
         content:
@@ -1356,9 +3046,14 @@ components:
         published_at:
           type: [string, 'null']
           format: date-time
+        review_status:
+          $ref: '#/components/schemas/PostReviewStatus'
+        current_revision_id:
+          type: [integer, 'null']
+          format: int64
     GenerateImageInput:
       type: object
-      required: [prompt, size, quality]
+      required: [prompt]
       properties:
         prompt:
           type: string
@@ -1367,9 +3062,26 @@ components:
         size:
           type: string
           enum: [1024x1024, 1536x1024, 1024x1536]
+          default: 1024x1024
         quality:
           type: string
           enum: [low, medium, high]
+          default: medium
+    GeneratePostImageInput:
+      type: object
+      properties:
+        prompt:
+          type: string
+          maxLength: 2000
+          description: Optional override; a blank or omitted value uses the post image prompt.
+        size:
+          type: string
+          enum: [1024x1024, 1536x1024, 1024x1536]
+          default: 1024x1024
+        quality:
+          type: string
+          enum: [low, medium, high]
+          default: medium
     AnalyticsPeriod:
       type: object
       required: [from, to]
@@ -1468,10 +3180,95 @@ components:
           type: string
         tone:
           type: string
+          maxLength: 100
+        cta:
+          type: string
+          maxLength: 500
+        forbidden_words:
+          type: array
+          maxItems: 50
+          items: {type: string, maxLength: 100}
+        example_posts:
+          type: array
+          maxItems: 10
+          items: {type: string, maxLength: 4000}
+        visual_style:
+          type: string
+          maxLength: 1000
         format:
           $ref: '#/components/schemas/PostFormat'
         include_sources:
           type: boolean
+    WorkspaceResearchInput:
+      allOf:
+        - $ref: '#/components/schemas/ResearchInput'
+        - type: object
+          properties:
+            channel_template_id: {type: integer, format: int64, minimum: 1}
+            channel_id: {type: integer, format: int64, minimum: 1}
+    BrandProfile:
+      type: object
+      required: [audience, tone, cta, forbidden_words, example_posts, visual_style]
+      properties:
+        audience: {type: string, maxLength: 500}
+        tone: {type: string, maxLength: 100}
+        cta: {type: string, maxLength: 500}
+        forbidden_words:
+          type: array
+          maxItems: 50
+          items: {type: string, maxLength: 100}
+        example_posts:
+          type: array
+          maxItems: 10
+          items: {type: string, maxLength: 4000}
+        visual_style: {type: string, maxLength: 1000}
+    WorkspaceBrandKit:
+      allOf:
+        - $ref: '#/components/schemas/BrandProfile'
+        - type: object
+          required: [workspace_id, version, created_at, updated_at]
+          properties:
+            workspace_id: {type: string}
+            version: {type: integer, format: int64, minimum: 1}
+            created_at: {type: string, format: date-time}
+            updated_at: {type: string, format: date-time}
+    WorkspaceBrandKitUpdate:
+      allOf:
+        - $ref: '#/components/schemas/BrandProfile'
+        - type: object
+          required: [expected_version]
+          properties:
+            expected_version: {type: integer, format: int64, minimum: 1}
+    ChannelTemplate:
+      allOf:
+        - $ref: '#/components/schemas/BrandProfile'
+        - type: object
+          required: [id, workspace_id, name, is_default, version, created_at, updated_at]
+          properties:
+            id: {type: integer, format: int64, minimum: 1}
+            workspace_id: {type: string}
+            channel_id: {type: integer, format: int64, minimum: 1}
+            name: {type: string, minLength: 1, maxLength: 120}
+            is_default: {type: boolean}
+            version: {type: integer, format: int64, minimum: 1}
+            created_at: {type: string, format: date-time}
+            updated_at: {type: string, format: date-time}
+    ChannelTemplateCreate:
+      allOf:
+        - $ref: '#/components/schemas/BrandProfile'
+        - type: object
+          required: [name, is_default]
+          properties:
+            channel_id: {type: integer, format: int64, minimum: 1}
+            name: {type: string, minLength: 1, maxLength: 120}
+            is_default: {type: boolean}
+    ChannelTemplateUpdate:
+      allOf:
+        - $ref: '#/components/schemas/ChannelTemplateCreate'
+        - type: object
+          required: [expected_version]
+          properties:
+            expected_version: {type: integer, format: int64, minimum: 1}
     ResearchSource:
       type: object
       required: [title, url]
@@ -1507,6 +3304,379 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ResearchSource'
+    AnalyticsContentScope:
+      type: object
+      required: [kind, channels_count]
+      properties:
+        kind: {type: string, enum: [workspace, channel]}
+        channel_id: {type: [integer, 'null'], format: int64}
+        channel_title: {type: string}
+        channels_count: {type: integer, minimum: 0}
+    AnalyticsChannelSummary:
+      type: object
+      required: [id, title, participants_count]
+      properties:
+        id: {type: integer, format: int64}
+        title: {type: string}
+        icon_url: {type: string}
+        participants_count: {type: integer, minimum: 0}
+    AnalyticsContentSummary:
+      type: object
+      required:
+        - posts_total
+        - published_posts
+        - known_views_posts
+        - total_views
+        - participants_current
+        - participants_change
+        - views_change
+        - views_per_1k_audience
+        - average_views_per_hour
+      properties:
+        posts_total: {type: integer, format: int64, minimum: 0}
+        published_posts: {type: integer, format: int64, minimum: 0}
+        known_views_posts: {type: integer, minimum: 0}
+        total_views: {type: [integer, 'null'], format: int64, minimum: 0}
+        participants_current: {type: [integer, 'null'], minimum: 0}
+        participants_change: {type: [integer, 'null']}
+        views_change: {type: [integer, 'null'], format: int64}
+        views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
+        average_views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+    AnalyticsContentPost:
+      type: object
+      required:
+        - id
+        - title
+        - channel_id
+        - channel_title
+        - audience
+        - published_at
+        - views
+        - views_per_1k_audience
+        - views_per_hour
+        - score
+        - max_stats_synced_at
+        - publication_state
+        - removed_from_max
+      properties:
+        id: {type: integer, format: int64, minimum: 1}
+        title: {type: string}
+        channel_id: {type: integer, format: int64, minimum: 1}
+        channel_title: {type: string}
+        audience: {type: integer, minimum: 0}
+        published_at: {type: [string, 'null'], format: date-time}
+        views: {type: [integer, 'null'], format: int64, minimum: 0}
+        views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
+        views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+        score: {type: [number, 'null'], format: double, minimum: 0}
+        max_message_url: {type: string, format: uri}
+        max_stats_synced_at: {type: [string, 'null'], format: date-time}
+        publication_state: {type: string, enum: [published, removed]}
+        removed_from_max: {type: boolean}
+    AnalyticsHeatmapCell:
+      type: object
+      required: [weekday, hour, posts, views_per_1k_audience, views_per_hour, score]
+      properties:
+        weekday: {type: integer, minimum: 0, maximum: 6}
+        hour: {type: integer, minimum: 0, maximum: 23}
+        posts: {type: integer, minimum: 0}
+        views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
+        views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+        score: {type: [number, 'null'], format: double, minimum: 0}
+    AnalyticsBestTime:
+      type: object
+      required: [weekday, hour, sample_size, views_per_1k_audience, views_per_hour, score, next_at]
+      properties:
+        weekday: {type: integer, minimum: 0, maximum: 6}
+        hour: {type: integer, minimum: 0, maximum: 23}
+        sample_size: {type: integer, minimum: 1}
+        views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
+        views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+        score: {type: number, format: double, minimum: 0}
+        next_at: {type: string, format: date-time}
+    WorkspaceContentAnalytics:
+      type: object
+      required: [scope, channel, period, summary, daily, posts, heatmap, best_time, timezone_offset_minutes]
+      properties:
+        scope: {$ref: '#/components/schemas/AnalyticsContentScope'}
+        channel: {$ref: '#/components/schemas/AnalyticsChannelSummary'}
+        period: {$ref: '#/components/schemas/AnalyticsPeriod'}
+        summary: {$ref: '#/components/schemas/AnalyticsContentSummary'}
+        daily:
+          type: array
+          items: {$ref: '#/components/schemas/AnalyticsDailyPoint'}
+        posts:
+          type: array
+          items: {$ref: '#/components/schemas/AnalyticsContentPost'}
+        heatmap:
+          type: array
+          minItems: 168
+          maxItems: 168
+          items: {$ref: '#/components/schemas/AnalyticsHeatmapCell'}
+        best_time:
+          oneOf:
+            - {$ref: '#/components/schemas/AnalyticsBestTime'}
+            - {type: 'null'}
+        timezone_offset_minutes: {type: integer, minimum: -840, maximum: 840}
+    WorkspaceContentAnalyticsEnvelope:
+      type: object
+      required: [analytics]
+      properties:
+        analytics: {$ref: '#/components/schemas/WorkspaceContentAnalytics'}
+    WorkspacePostAnalyticsPost:
+      type: object
+      required:
+        - id
+        - title
+        - channel_id
+        - channel_title
+        - published_at
+        - publication_state
+        - removed_from_max
+        - max_message_url
+        - max_stats_synced_at
+      properties:
+        id: {type: integer, format: int64, minimum: 1}
+        title: {type: string}
+        channel_id: {type: [integer, 'null'], format: int64, minimum: 1}
+        channel_title: {type: string}
+        published_at: {type: [string, 'null'], format: date-time}
+        publication_state: {type: string, enum: [published, removed, unpublished]}
+        removed_from_max: {type: boolean}
+        max_message_url: {type: string}
+        max_stats_synced_at: {type: [string, 'null'], format: date-time}
+    WorkspacePostAnalyticsSummary:
+      type: object
+      required:
+        - views
+        - views_change
+        - audience
+        - audience_source
+        - views_per_1k_audience
+        - lifetime_views_per_hour
+        - observed_views_per_hour
+        - observations
+        - first_observed_at
+        - last_observed_at
+        - correction_detected
+        - series_truncated
+      properties:
+        views: {type: [integer, 'null'], format: int64, minimum: 0}
+        views_change:
+          type: [integer, 'null']
+          format: int64
+          description: Difference between the first and last returned comparable observations; the first point can be the anchor immediately before period.from.
+        audience: {type: [integer, 'null'], format: int64, minimum: 0}
+        audience_source: {type: string, enum: [snapshot_at_publish, current_channel, missing]}
+        views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
+        lifetime_views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+        observed_views_per_hour:
+          type: [number, 'null']
+          format: double
+          minimum: 0
+          description: Average observed growth rate; null when the series contains any counter correction.
+        observations:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: Number of returned series points, including the optional pre-period anchor.
+        first_observed_at:
+          type: [string, 'null']
+          format: date-time
+          description: Timestamp of the first returned point, which can precede period.from when it is the anchor.
+        last_observed_at: {type: [string, 'null'], format: date-time}
+        correction_detected: {type: boolean}
+        series_truncated:
+          type: boolean
+          description: True when older observations were omitted and summary window metrics use only the returned series.
+    WorkspacePostAnalyticsSeriesPoint:
+      type: object
+      required: [captured_at, views, delta, interval_views_per_hour, correction]
+      properties:
+        captured_at: {type: string, format: date-time}
+        views: {type: integer, format: int64, minimum: 0}
+        delta: {type: [integer, 'null'], format: int64}
+        interval_views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+        correction: {type: boolean}
+    WorkspacePostAnalytics:
+      type: object
+      required: [post, period, summary, series]
+      properties:
+        post: {$ref: '#/components/schemas/WorkspacePostAnalyticsPost'}
+        period: {$ref: '#/components/schemas/AnalyticsPeriod'}
+        summary: {$ref: '#/components/schemas/WorkspacePostAnalyticsSummary'}
+        series:
+          type: array
+          maxItems: 1000
+          description: Up to 1000 points ordered by captured_at ascending; the first point can be the latest same-publication anchor immediately before period.from, and it counts toward the limit.
+          items: {$ref: '#/components/schemas/WorkspacePostAnalyticsSeriesPoint'}
+    WorkspacePostAnalyticsEnvelope:
+      type: object
+      required: [analytics]
+      properties:
+        analytics: {$ref: '#/components/schemas/WorkspacePostAnalytics'}
+    AnalyticsVariationResult:
+      type: object
+      required: [post]
+      properties:
+        post: {$ref: '#/components/schemas/Post'}
+    AnalyticsRepeatInput:
+      type: object
+      required: [planned_at]
+      properties:
+        planned_at: {type: string, format: date-time}
+    AnalyticsRepeatResult:
+      type: object
+      required: [post, planned_at, requires_approval, campaign_id, variant_id, campaign]
+      properties:
+        post: {$ref: '#/components/schemas/Post'}
+        planned_at: {type: string, format: date-time}
+        requires_approval: {type: boolean}
+        campaign_id: {type: string}
+        variant_id: {type: string}
+        campaign: {$ref: '#/components/schemas/Campaign'}
+    CalendarItem:
+      type: object
+      required: [id, kind, channel_id, channel_title, title, occurs_at, status]
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [post, campaign_variant]}
+        campaign_id: {type: string}
+        variant_id: {type: string}
+        post_id: {type: integer, format: int64, minimum: 1}
+        channel_id: {type: integer, format: int64, minimum: 1}
+        channel_title: {type: string}
+        title: {type: string}
+        occurs_at: {type: string, format: date-time}
+        status: {type: string}
+        review_status: {type: string}
+        post_updated_at: {type: string, format: date-time}
+        variant_updated_at: {type: string, format: date-time}
+    CalendarRescheduleInput:
+      type: object
+      required: [scheduled_at, expected_updated_at]
+      properties:
+        scheduled_at: {type: string, format: date-time}
+        expected_updated_at: {type: string, format: date-time}
+    CampaignVariant:
+      type: object
+      required:
+        - id
+        - workspace_id
+        - campaign_id
+        - channel_id
+        - title
+        - content
+        - format
+        - planned_at
+        - status
+        - created_by
+        - created_at
+        - updated_at
+      properties:
+        id: {type: string}
+        workspace_id: {type: string}
+        campaign_id: {type: string}
+        channel_id: {type: integer, format: int64, minimum: 1}
+        channel_title: {type: string}
+        post_id: {type: integer, format: int64, minimum: 1}
+        title: {type: string, maxLength: 200}
+        content: {type: string, maxLength: 4000}
+        format: {$ref: '#/components/schemas/PostFormat'}
+        planned_at: {type: string, format: date-time}
+        status: {type: string, enum: [planned, materialized, scheduled, published]}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        post_status: {type: string}
+        review_status: {type: string}
+        post_updated_at: {type: string, format: date-time}
+    Campaign:
+      type: object
+      required: [id, workspace_id, name, description, status, created_by, created_at, updated_at, variants]
+      properties:
+        id: {type: string}
+        workspace_id: {type: string}
+        name: {type: string, minLength: 1, maxLength: 160}
+        description: {type: string, maxLength: 4000}
+        status: {type: string, enum: [planned, active, completed, archived]}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        archived_at: {type: string, format: date-time}
+        variants:
+          type: array
+          items: {$ref: '#/components/schemas/CampaignVariant'}
+    CampaignVariantCreate:
+      type: object
+      required: [channel_id, title, content, format, planned_at]
+      properties:
+        channel_id: {type: integer, format: int64, minimum: 1}
+        title: {type: string, maxLength: 200}
+        content: {type: string, minLength: 1, maxLength: 4000}
+        format: {$ref: '#/components/schemas/PostFormat'}
+        planned_at: {type: string, format: date-time}
+    CampaignCreate:
+      type: object
+      required: [name, variants]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 160}
+        description: {type: string, maxLength: 4000}
+        variants:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: {$ref: '#/components/schemas/CampaignVariantCreate'}
+    CampaignUpdate:
+      type: object
+      required: [expected_updated_at]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 160}
+        description: {type: string, maxLength: 4000}
+        expected_updated_at: {type: string, format: date-time}
+    CampaignVariantsAdd:
+      type: object
+      required: [variants]
+      properties:
+        variants:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: {$ref: '#/components/schemas/CampaignVariantCreate'}
+    CampaignVariantUpdate:
+      type: object
+      required: [expected_updated_at]
+      properties:
+        channel_id: {type: integer, format: int64, minimum: 1}
+        title: {type: string, maxLength: 200}
+        content: {type: string, minLength: 1, maxLength: 4000}
+        format: {$ref: '#/components/schemas/PostFormat'}
+        planned_at: {type: string, format: date-time}
+        expected_updated_at: {type: string, format: date-time}
+    CampaignMaterializeInput:
+      type: object
+      properties:
+        variant_ids:
+          type: array
+          maxItems: 200
+          uniqueItems: true
+          items: {type: string, minLength: 1, maxLength: 128}
+    CampaignScheduleItem:
+      type: object
+      required: [variant_id, expected_updated_at]
+      properties:
+        variant_id: {type: string, minLength: 1, maxLength: 128}
+        scheduled_at: {type: string, format: date-time}
+        expected_updated_at: {type: string, format: date-time}
+    CampaignScheduleInput:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: {$ref: '#/components/schemas/CampaignScheduleItem'}
     TestResult:
       type: object
       required: [ok]

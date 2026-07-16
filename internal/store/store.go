@@ -19,14 +19,15 @@ import (
 )
 
 var (
-	ErrNotFound           = errors.New("not found")
-	ErrConflict           = errors.New("state conflict")
-	ErrPublicationExists  = errors.New("MAX publication exists")
-	ErrChannelOwned       = errors.New("channel is already connected to another account")
-	ErrScheduleNotDue     = errors.New("scheduled post is not due")
-	ErrMigrationIntegrity = errors.New("migration integrity check failed")
-	ErrMediaQuotaExceeded = errors.New("media storage quota exceeded")
-	ErrMediaUploadBusy    = errors.New("media upload is already in progress")
+	ErrNotFound                = errors.New("not found")
+	ErrConflict                = errors.New("state conflict")
+	ErrPublicationExists       = errors.New("MAX publication exists")
+	ErrChannelOwned            = errors.New("channel is already connected to another account")
+	ErrScheduleNotDue          = errors.New("scheduled post is not due")
+	ErrMigrationIntegrity      = errors.New("migration integrity check failed")
+	ErrMediaQuotaExceeded      = errors.New("media storage quota exceeded")
+	ErrMediaUploadBusy         = errors.New("media upload is already in progress")
+	ErrOwnedTeamWorkspaceLimit = errors.New("team workspace ownership limit reached")
 )
 
 type Store struct {
@@ -52,7 +53,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "015_post_attachments.sql"
+const RequiredSchemaVersion = "019_workspace_plans.sql"
 
 type schemaMigration struct {
 	version        string
@@ -517,7 +518,7 @@ func bindSQL(query string) string {
 
 func nowText() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-const channelColumns = `id, owner_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url,
+const channelColumns = `id, owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url,
 participants_count, is_channel, active, created_at, updated_at`
 
 func (s *Store) CreateChannel(ctx context.Context, channel Channel) (Channel, error) {
@@ -533,8 +534,8 @@ func (s *Store) CreateChannel(ctx context.Context, channel Channel) (Channel, er
 	now := nowText()
 	var id int64
 	err := s.db.QueryRowContext(ctx, `
-INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, channel.UserID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title,
+INSERT INTO channels(owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
+VALUES (?, NULLIF(?,''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, channel.UserID, channel.WorkspaceID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title,
 		channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsChannel, channel.Active, now, now).Scan(&id)
 	if err != nil {
 		return Channel{}, fmt.Errorf("create channel: %w", err)
@@ -554,8 +555,8 @@ func (s *Store) UpsertConnectedChannel(ctx context.Context, channel Channel) (Ch
 	}
 	now := nowText()
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO channels(owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
+VALUES (?, NULLIF(?,''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(max_chat_id) DO UPDATE SET
 	title = excluded.title,
 	public_link = excluded.public_link,
@@ -564,7 +565,7 @@ ON CONFLICT(max_chat_id) DO UPDATE SET
 	is_channel = excluded.is_channel,
 	active = excluded.active,
 	updated_at = excluded.updated_at`,
-		channel.UserID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
+		channel.UserID, channel.WorkspaceID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
 		channel.IsChannel, channel.Active, now, now)
 	if err != nil {
 		return Channel{}, fmt.Errorf("connect channel: %w", err)
@@ -611,7 +612,9 @@ func (s *Store) ListChannelsForUser(ctx context.Context, userID string) ([]Chann
 		return nil, errors.New("user id is required")
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT `+channelColumns+`
-FROM channels WHERE owner_id = ? ORDER BY active DESC, lower(title), id`, userID)
+FROM channels WHERE owner_id = ? AND workspace_id IN (
+SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL
+) ORDER BY active DESC, lower(title), id`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list user channels: %w", err)
 	}
@@ -634,12 +637,22 @@ func (s *Store) GetChannel(ctx context.Context, id int64) (Channel, error) {
 
 func (s *Store) GetChannelForUser(ctx context.Context, userID string, id int64) (Channel, error) {
 	return scanChannel(s.db.QueryRowContext(ctx, `SELECT `+channelColumns+
-		` FROM channels WHERE owner_id = ? AND id = ?`, userID, id))
+		` FROM channels WHERE owner_id = ? AND id = ? AND workspace_id IN (
+SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL)`, userID, id))
+}
+
+// getChannelForOwner is an owner-scoped primitive for trusted store workflows.
+// HTTP authorization must continue to use GetChannelForUser or workspace
+// membership APIs; team resources use an immutable synthetic compat owner.
+func (s *Store) getChannelForOwner(ctx context.Context, ownerID string, id int64) (Channel, error) {
+	return scanChannel(s.db.QueryRowContext(ctx, `SELECT `+channelColumns+
+		` FROM channels WHERE owner_id = ? AND id = ?`, ownerID, id))
 }
 
 func (s *Store) GetChannelByMAXChatIDForUser(ctx context.Context, userID, maxChatID string) (Channel, error) {
 	return scanChannel(s.db.QueryRowContext(ctx, `SELECT `+channelColumns+
-		` FROM channels WHERE owner_id = ? AND max_chat_id = ?`, userID, maxChatID))
+		` FROM channels WHERE owner_id = ? AND max_chat_id = ? AND workspace_id IN (
+SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL)`, userID, maxChatID))
 }
 
 func (s *Store) GetChannelByMAXChatID(ctx context.Context, maxChatID string) (Channel, error) {
@@ -686,7 +699,8 @@ func (s *Store) UpdateChannelForUser(ctx context.Context, userID string, id int6
 		current.Active = *active
 	}
 	result, err := s.db.ExecContext(ctx, `UPDATE channels SET title = ?, active = ?, updated_at = ?
-WHERE owner_id = ? AND id = ?`, current.Title, current.Active, nowText(), userID, id)
+WHERE owner_id = ? AND id = ? AND workspace_id IN (
+SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL)`, current.Title, current.Active, nowText(), userID, id)
 	if err != nil {
 		return Channel{}, fmt.Errorf("update user channel: %w", err)
 	}
@@ -746,7 +760,9 @@ WHERE id = ?
 func (s *Store) DeleteChannelForUser(ctx context.Context, userID string, id int64) error {
 	result, err := s.db.ExecContext(ctx, `
 DELETE FROM channels
-WHERE owner_id = ? AND id = ?
+WHERE owner_id = ? AND id = ? AND workspace_id IN (
+  SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL
+)
   AND NOT EXISTS (
 	SELECT 1 FROM posts
 	WHERE channel_id = ?
@@ -802,11 +818,11 @@ func (s *Store) CreatePost(ctx context.Context, post Post) (Post, error) {
 	now := nowText()
 	var id int64
 	err = s.db.QueryRowContext(ctx, `
-INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
+INSERT INTO posts(owner_id, workspace_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
                   notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views,
                   max_stats_synced_at, max_is_pinned, last_error, published_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-		post.UserID, post.Title, post.Content, post.Format, post.Status, nullableInt64(post.ChannelID), post.ImageURL,
+VALUES (?, NULLIF(?,''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+		post.UserID, post.WorkspaceID, post.Title, post.Content, post.Format, post.Status, nullableInt64(post.ChannelID), post.ImageURL,
 		post.ImagePath, post.ImagePrompt, linkButtonsJSON, post.Notify, post.DisableLinkPreview, nullableTime(post.ScheduledAt),
 		post.MAXMessageID, post.MAXMessageURL, nullableInt64(post.MAXViews), nullableTime(post.MAXStatsSyncedAt),
 		post.MAXIsPinned, post.LastError, nullableTime(post.PublishedAt), now, now).Scan(&id)
@@ -859,7 +875,8 @@ func (s *Store) ListPosts(ctx context.Context, status string, channelID *int64) 
 }
 
 func (s *Store) ListPostsForUser(ctx context.Context, userID, status string, channelID *int64) ([]Post, error) {
-	query := `SELECT ` + postColumns + ` FROM posts WHERE owner_id = ?`
+	query := `SELECT ` + postColumns + ` FROM posts WHERE owner_id = ? AND workspace_id IN (
+SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL)`
 	args := []any{userID}
 	if status != "" {
 		query += ` AND status = ?`
@@ -920,12 +937,30 @@ func (s *Store) GetPostForUser(ctx context.Context, userID string, id int64) (Po
 	return posts[0], nil
 }
 
+// getPostForOwner is the trusted owner-scoped counterpart to the deliberately
+// personal-only GetPostForUser. It is used after a mutation already matched
+// both owner_id and the globally unique post ID, including team compat owners.
+func (s *Store) getPostForOwner(ctx context.Context, ownerID string, id int64) (Post, error) {
+	post, err := scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+
+		` FROM posts WHERE owner_id = ? AND id = ?`, ownerID, id))
+	if err != nil {
+		return Post{}, err
+	}
+	posts := []Post{post}
+	if err := s.hydratePostAttachments(ctx, posts); err != nil {
+		return Post{}, err
+	}
+	return posts[0], nil
+}
+
 func (s *Store) getPostWithoutAttachments(ctx context.Context, id int64) (Post, error) {
 	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE id = ?`, id))
 }
 
 func (s *Store) getPostForUserWithoutAttachments(ctx context.Context, userID string, id int64) (Post, error) {
-	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE owner_id = ? AND id = ?`, userID, id))
+	return scanPost(s.db.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts
+WHERE owner_id = ? AND id = ? AND workspace_id IN (
+SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL)`, userID, id))
 }
 
 func (s *Store) UpdatePost(ctx context.Context, id int64, changes PostChanges) (Post, error) {
@@ -1062,7 +1097,8 @@ func (s *Store) DeletePost(ctx context.Context, id int64) error {
 func (s *Store) DeletePostForUser(ctx context.Context, userID string, id int64) error {
 	result, err := s.db.ExecContext(ctx, `
 DELETE FROM posts
-WHERE owner_id = ? AND id = ? AND status != ? AND max_message_id = ''`,
+WHERE owner_id = ? AND id = ? AND status != ? AND max_message_id = ''
+AND workspace_id IN (SELECT id FROM workspaces WHERE is_personal AND archived_at IS NULL)`,
 		userID, id, PostStatusPublishing)
 	if err != nil {
 		return fmt.Errorf("delete user post: %w", err)
@@ -1089,10 +1125,10 @@ func (s *Store) DuplicatePost(ctx context.Context, id int64) (Post, error) {
 	now := nowText()
 	var copyID int64
 	err = tx.QueryRowContext(ctx, bindSQL(`
-INSERT INTO posts(owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
+INSERT INTO posts(owner_id, workspace_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 	              notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views,
 	              max_stats_synced_at, max_is_pinned, last_error, published_at, created_at, updated_at)
-SELECT owner_id, trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt, link_buttons,
+SELECT owner_id, workspace_id, trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt, link_buttons,
 	   notify, disable_link_preview, NULL, '', '', NULL, NULL, FALSE, '', NULL, ?, ?
 FROM posts WHERE id = ? AND status != ? RETURNING id`), PostStatusDraft, now, now, id, PostStatusPublishing).Scan(&copyID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1102,10 +1138,10 @@ FROM posts WHERE id = ? AND status != ? RETURNING id`), PostStatusDraft, now, no
 		return Post{}, fmt.Errorf("duplicate post: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, bindSQL(`
-INSERT INTO post_attachments(owner_id, post_id, type, position, storage_key, processing_status, size_bytes, mime_type,
+INSERT INTO post_attachments(owner_id, workspace_id, post_id, type, position, storage_key, processing_status, size_bytes, mime_type,
                              width, height, duration_ms, provider_token, provider_token_expires_at, provider_meta,
                              error_code, created_at, updated_at)
-SELECT owner_id, ?, type, position, storage_key, 'ready', size_bytes, mime_type,
+SELECT owner_id, workspace_id, ?, type, position, storage_key, 'ready', size_bytes, mime_type,
        width, height, duration_ms, '', NULL, '{}', '', ?, ?
 FROM post_attachments
 WHERE post_id = ?
@@ -1227,7 +1263,7 @@ WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return Post{}, s.postWriteMiss(ctx, current.ID, "post changed before its MAX update; reload and retry")
 	}
-	return s.GetPostForUser(ctx, current.UserID, current.ID)
+	return s.getPostForOwner(ctx, current.UserID, current.ID)
 }
 
 // ReleasePublishedUpdate returns an edit claim to its normal published state.
@@ -1246,7 +1282,7 @@ WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return Post{}, s.postWriteMiss(ctx, claimed.ID, "MAX update claim changed before it could be released")
 	}
-	return s.GetPostForUser(ctx, claimed.UserID, claimed.ID)
+	return s.getPostForOwner(ctx, claimed.UserID, claimed.ID)
 }
 
 // ClaimScheduledForPublishing atomically verifies that a scheduled post is
@@ -1258,7 +1294,8 @@ UPDATE posts SET status = ?, scheduled_at = NULL, last_error = '', updated_at = 
 WHERE id = ?
   AND status = ?
   AND scheduled_at IS NOT NULL
-  AND scheduled_at <= ?`,
+  AND scheduled_at <= ?
+  AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=posts.workspace_id AND w.archived_at IS NULL)`,
 		PostStatusPublishing, nowText(), id, PostStatusScheduled, now.UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return Post{}, fmt.Errorf("claim scheduled post: %w", err)
@@ -1280,9 +1317,9 @@ func (s *Store) DuePostIDs(ctx context.Context, now time.Time, limit int) ([]int
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id FROM posts
-WHERE owner_id <> '' AND status = ? AND scheduled_at IS NOT NULL AND scheduled_at <= ?
-ORDER BY scheduled_at, id LIMIT ?`, PostStatusScheduled, now.UTC().Format(time.RFC3339Nano), limit)
+SELECT p.id FROM posts p JOIN workspaces w ON w.id=p.workspace_id
+WHERE p.owner_id <> '' AND w.archived_at IS NULL AND p.status = ? AND p.scheduled_at IS NOT NULL AND p.scheduled_at <= ?
+ORDER BY p.scheduled_at, p.id LIMIT ?`, PostStatusScheduled, now.UTC().Format(time.RFC3339Nano), limit)
 	if err != nil {
 		return nil, fmt.Errorf("list due posts: %w", err)
 	}
@@ -1352,9 +1389,9 @@ UPDATE posts SET status = ?, last_error = ?, scheduled_at = NULL, updated_at = ?
 	return s.GetPost(ctx, id)
 }
 
-const postColumns = `id, owner_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
+const postColumns = `id, owner_id, workspace_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views, max_stats_synced_at,
-max_stats_attempted_at, max_is_pinned, last_error, created_at, updated_at, published_at`
+max_stats_attempted_at, max_is_pinned, last_error, created_at, updated_at, published_at, review_status, current_revision_id`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -1362,7 +1399,7 @@ type scanner interface {
 
 func scanChannel(row scanner) (Channel, error) {
 	var channel Channel
-	if err := row.Scan(&channel.ID, &channel.UserID, &channel.VerifiedMAXOwnerID, &channel.MAXChatID, &channel.Title,
+	if err := row.Scan(&channel.ID, &channel.UserID, &channel.WorkspaceID, &channel.VerifiedMAXOwnerID, &channel.MAXChatID, &channel.Title,
 		&channel.PublicLink, &channel.IconURL, &channel.ParticipantsCount, &channel.IsChannel, &channel.Active,
 		&channel.CreatedAt, &channel.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1387,11 +1424,12 @@ func scanPost(row scanner) (Post, error) {
 	var channelID sql.NullInt64
 	var scheduledAt, publishedAt, statsSyncedAt, statsAttemptedAt sql.NullTime
 	var maxViews sql.NullInt64
+	var currentRevisionID sql.NullInt64
 	var linkButtonsJSON []byte
-	if err := row.Scan(&post.ID, &post.UserID, &post.Title, &post.Content, &post.Format, &post.Status, &channelID,
+	if err := row.Scan(&post.ID, &post.UserID, &post.WorkspaceID, &post.Title, &post.Content, &post.Format, &post.Status, &channelID,
 		&post.ImageURL, &post.ImagePath, &post.ImagePrompt, &linkButtonsJSON, &post.Notify, &post.DisableLinkPreview,
 		&scheduledAt, &post.MAXMessageID, &post.MAXMessageURL, &maxViews, &statsSyncedAt, &statsAttemptedAt, &post.MAXIsPinned,
-		&post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt); err != nil {
+		&post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt, &post.ReviewStatus, &currentRevisionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Post{}, ErrNotFound
 		}
@@ -1413,6 +1451,9 @@ func scanPost(row scanner) (Post, error) {
 	post.MAXStatsSyncedAt = parseNullableTime(statsSyncedAt)
 	post.MAXStatsAttemptedAt = parseNullableTime(statsAttemptedAt)
 	post.PublishedAt = parseNullableTime(publishedAt)
+	if currentRevisionID.Valid {
+		post.CurrentRevisionID = &currentRevisionID.Int64
+	}
 	post.CreatedAt = post.CreatedAt.UTC()
 	post.UpdatedAt = post.UpdatedAt.UTC()
 	return post, nil

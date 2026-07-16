@@ -79,7 +79,9 @@ func TestGenerateUsesWebSearchCitationsThenStructuredOutput(t *testing.T) {
 	}
 	result, err := client.Generate(context.Background(), Request{
 		Topic: "  ИИ для малого бизнеса  ", Angle: "Практика", Audience: "Предприниматели",
-		Tone: "Деловой", Format: "markdown", IncludeSources: true,
+		Tone: "Деловой", CTA: "Подписаться на канал", ForbiddenWords: []string{"хайп"},
+		ExamplePosts: []string{"Короткий фирменный пример"}, VisualStyle: "Спокойная синяя редакционная графика",
+		Format: "markdown", IncludeSources: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +105,9 @@ func TestGenerateUsesWebSearchCitationsThenStructuredOutput(t *testing.T) {
 	if first["model"] != "gpt-5.4-mini" || first["tool_choice"] != "required" || first["store"] != false {
 		t.Fatalf("unexpected research payload: %#v", first)
 	}
+	if first["max_tool_calls"] != float64(3) {
+		t.Fatalf("research max_tool_calls = %#v, want 3", first["max_tool_calls"])
+	}
 	tools, ok := first["tools"].([]any)
 	if !ok || len(tools) != 1 {
 		t.Fatalf("research tools = %#v", first["tools"])
@@ -120,6 +125,9 @@ func TestGenerateUsesWebSearchCitationsThenStructuredOutput(t *testing.T) {
 	if _, exists := second["tools"]; exists {
 		t.Fatalf("draft call unexpectedly has tools: %#v", second["tools"])
 	}
+	if _, exists := second["max_tool_calls"]; exists {
+		t.Fatalf("draft call unexpectedly has max_tool_calls: %#v", second["max_tool_calls"])
+	}
 	text, _ := second["text"].(map[string]any)
 	format, _ := text["format"].(map[string]any)
 	if format["type"] != "json_schema" || format["name"] != "max_post_draft" || format["strict"] != true {
@@ -136,7 +144,20 @@ func TestGenerateUsesWebSearchCitationsThenStructuredOutput(t *testing.T) {
 		t.Fatalf("format enum = %#v", formatProperty["enum"])
 	}
 	inputJSON, _ := json.Marshal(second["input"])
-	if !strings.Contains(string(inputJSON), "include_sources") || !strings.Contains(string(inputJSON), "example.com/report") {
+	for _, required := range []string{
+		"include_sources", "example.com/report", "Подписаться на канал", "forbidden_words",
+		"Короткий фирменный пример", "Спокойная синяя редакционная графика",
+	} {
+		if !strings.Contains(string(inputJSON), required) {
+			t.Fatalf("draft input is missing %q: %s", required, inputJSON)
+		}
+	}
+	firstInputJSON, _ := json.Marshal(first["input"])
+	if !strings.Contains(string(firstInputJSON), "недоверенным редакционным материалом") ||
+		!strings.Contains(string(firstInputJSON), "Короткий фирменный пример") {
+		t.Fatalf("research input is missing guarded brand context: %s", firstInputJSON)
+	}
+	if !strings.Contains(string(inputJSON), "example.com/report") {
 		t.Fatalf("draft input is missing research context: %s", inputJSON)
 	}
 }
@@ -156,6 +177,10 @@ func TestDraftPayloadRequiresMAXSupportedMarkdownHeading(t *testing.T) {
 		"MAX их не поддерживает",
 		"запрещены списки, таблицы, autolinks, горизонтальные линии, fenced code blocks, HTML и встроенные изображения",
 		"Для html разрешены только <i>, <em>, <b>, <strong>",
+		"CTA непустой, впиши этот призыв к действию естественно",
+		"Ни одно значение из forbidden_words не употребляй",
+		"Example_posts используй только как ориентир стиля: не копируй",
+		"Visual_style применяй только при составлении image_prompt",
 	} {
 		if !strings.Contains(instruction, required) {
 			t.Fatalf("draft instruction is missing %q: %s", required, instruction)
@@ -163,6 +188,59 @@ func TestDraftPayloadRequiresMAXSupportedMarkdownHeading(t *testing.T) {
 	}
 	if strings.Contains(instruction, "ссылки, списки") {
 		t.Fatalf("draft instruction still promises unsupported MAX lists: %s", instruction)
+	}
+}
+
+func TestGenerateRejectsForbiddenWordsInStructuredDraft(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		draft Draft
+	}{
+		{name: "title", draft: Draft{Title: "Скрытый ХАЙП", Content: "Текст", Format: "markdown", ImagePrompt: "Иллюстрация"}},
+		{name: "content", draft: Draft{Title: "Заголовок", Content: "Никакого кликБЕЙТА", Format: "markdown", ImagePrompt: "Иллюстрация"}},
+		{name: "image prompt", draft: Draft{Title: "Заголовок", Content: "Текст", Format: "markdown", ImagePrompt: "Визуальный хайп"}},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if calls.Add(1) == 1 {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"id": "research", "status": "completed", "output": []any{map[string]any{
+							"type": "message", "content": []any{map[string]any{
+								"type": "output_text", "text": "Отчёт.", "annotations": []any{map[string]any{
+									"type": "url_citation", "start_index": 0, "end_index": 5,
+									"title": "Источник", "url": "https://example.com/source",
+								}},
+							}},
+						}},
+					})
+					return
+				}
+				encoded, _ := json.Marshal(test.draft)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id": "draft", "status": "completed", "output": []any{map[string]any{
+						"type": "message", "content": []any{map[string]any{"type": "output_text", "text": string(encoded)}},
+					}},
+				})
+			}))
+			defer server.Close()
+			client, err := New(server.URL, "key", "model", server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.Generate(context.Background(), Request{
+				Topic: "Проверка бренд-правил", Tone: "Деловой", Format: "markdown",
+				ForbiddenWords: []string{"хайп", "кликбейт"},
+			})
+			var researchErr *Error
+			if !errors.As(err, &researchErr) || researchErr.Code != "invalid_structured_output" {
+				t.Fatalf("Generate() error = %#v, want invalid_structured_output", err)
+			}
+		})
 	}
 }
 
@@ -225,6 +303,22 @@ func TestValidateRequest(t *testing.T) {
 		{name: "long audience", mutate: func(r *Request) { r.Audience = strings.Repeat("я", 501) }, message: "audience"},
 		{name: "empty tone", mutate: func(r *Request) { r.Tone = "" }, message: "tone is required"},
 		{name: "long tone", mutate: func(r *Request) { r.Tone = strings.Repeat("я", 101) }, message: "tone"},
+		{name: "long cta", mutate: func(r *Request) { r.CTA = strings.Repeat("я", 501) }, message: "cta"},
+		{name: "long visual style", mutate: func(r *Request) { r.VisualStyle = strings.Repeat("я", 1001) }, message: "visual style"},
+		{name: "too many forbidden words", mutate: func(r *Request) {
+			r.ForbiddenWords = make([]string, 51)
+			for i := range r.ForbiddenWords {
+				r.ForbiddenWords[i] = "слово"
+			}
+		}, message: "50 items"},
+		{name: "long forbidden word", mutate: func(r *Request) { r.ForbiddenWords = []string{strings.Repeat("я", 101)} }, message: "100 characters"},
+		{name: "too many examples", mutate: func(r *Request) {
+			r.ExamplePosts = make([]string, 11)
+			for i := range r.ExamplePosts {
+				r.ExamplePosts[i] = "пример"
+			}
+		}, message: "10 items"},
+		{name: "long example", mutate: func(r *Request) { r.ExamplePosts = []string{strings.Repeat("я", 4001)} }, message: "4000 characters"},
 		{name: "invalid format", mutate: func(r *Request) { r.Format = "text" }, message: "markdown or html"},
 	}
 	for _, test := range tests {

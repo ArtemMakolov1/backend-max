@@ -30,6 +30,7 @@ var (
 	ErrOpenAINotConfigured          = errors.New("OpenAI integration is not configured")
 	ErrResearchNotConfigured        = errors.New("OpenAI research integration is not configured")
 	ErrConflict                     = errors.New("resource state conflict")
+	ErrApprovalRequired             = errors.New("the current post revision must be approved before scheduling or publishing")
 )
 
 const (
@@ -244,13 +245,15 @@ func (a *App) ContentFormattingConfigured() bool {
 	return a.research != nil && ok
 }
 
-// ValidateImageRequest performs every available local check before an API
-// handler reserves quota. The real OpenAI client validates its configured
-// model's size rules; test or alternative clients still receive the common
-// prompt and quality checks.
+// ValidateImageRequest applies the public API policy before an API handler
+// reserves quota, then lets the configured client enforce its model's exact
+// upstream rules. Alternative clients still receive the common validation.
 func (a *App) ValidateImageRequest(request openaiimg.GenerateRequest) error {
 	if a.images == nil {
 		return ErrOpenAINotConfigured
+	}
+	if err := openaiimg.ValidateAPIRequest(request); err != nil {
+		return err
 	}
 	if validator, ok := a.images.(imageRequestValidator); ok {
 		return validator.Validate(request)
@@ -925,6 +928,18 @@ func (a *App) GenerateImageForUser(ctx context.Context, userID string, request o
 	return a.SaveMediaForUser(ctx, userID, "openai.png", bytes.NewReader(result.Bytes))
 }
 
+func (a *App) GenerateImageForWorkspace(ctx context.Context, actorUserID, workspaceID string, request openaiimg.GenerateRequest) (media.File, error) {
+	if a.images == nil {
+		return media.File{}, ErrOpenAINotConfigured
+	}
+	result, err := a.images.Generate(ctx, request)
+	if err != nil {
+		return media.File{}, err
+	}
+	return a.SaveAttachmentMediaForWorkspace(ctx, actorUserID, workspaceID,
+		media.AttachmentTypeImage, "openai.png", bytes.NewReader(result.Bytes))
+}
+
 // SaveMediaForUser reserves quota in PostgreSQL before writing the private S3
 // object. A failed write releases the reservation; stale reservations are also
 // reclaimed by the periodic orphan job after the configured grace period.
@@ -944,6 +959,42 @@ func (a *App) SaveAttachmentMediaForUser(ctx context.Context, userID, attachment
 	file := upload.File()
 	policy := a.currentMediaPolicy()
 	reservation, err := a.store.ReserveMedia(ctx, userID, file.Filename, file.Size, store.MediaLimits{
+		MaxFiles: policy.MaxFiles, MaxBytes: policy.MaxBytes,
+	}, a.now().UTC())
+	if err != nil {
+		return media.File{}, err
+	}
+	if err := upload.Store(ctx); err != nil {
+		a.releaseMediaReservation(reservation)
+		return media.File{}, err
+	}
+	if err := a.store.CompleteMediaReservation(ctx, reservation, a.now().UTC()); err != nil {
+		a.releaseMediaReservation(reservation)
+		return media.File{}, err
+	}
+	return file, nil
+}
+
+func (a *App) SaveAttachmentMediaForWorkspace(ctx context.Context, actorUserID, workspaceID, attachmentType, filename string, reader io.Reader) (result media.File, resultErr error) {
+	workspace, err := a.store.GetWorkspaceForUser(ctx, actorUserID, workspaceID)
+	if err != nil {
+		return media.File{}, err
+	}
+	// Personal workspace routes are aliases of the legacy personal API. Keep
+	// one authoritative quota ledger so alternating URL families cannot double
+	// the user's storage allowance.
+	if workspace.IsPersonal {
+		return a.SaveAttachmentMediaForUser(ctx, actorUserID, attachmentType, filename, reader)
+	}
+	defer func() { a.metrics.ObserveMediaOperation("upload", metricOutcome(resultErr)) }()
+	upload, err := a.media.PrepareAttachment(attachmentType, filename, reader)
+	if err != nil {
+		return media.File{}, err
+	}
+	defer func() { _ = upload.Close() }()
+	file := upload.File()
+	policy := a.currentMediaPolicy()
+	reservation, err := a.store.ReserveMediaForWorkspace(ctx, actorUserID, workspaceID, file.Filename, file.Size, store.MediaLimits{
 		MaxFiles: policy.MaxFiles, MaxBytes: policy.MaxBytes,
 	}, a.now().UTC())
 	if err != nil {
@@ -1014,6 +1065,38 @@ func (a *App) GeneratePostImage(ctx context.Context, userID string, postID int64
 	return a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(ctx, post, attachmentFromImage(file), prompt)
 }
 
+func (a *App) GeneratePostImageForWorkspace(ctx context.Context, actorUserID, workspaceID string, postID int64, request openaiimg.GenerateRequest) (store.Post, error) {
+	post, err := a.store.GetPostForWorkspace(ctx, actorUserID, workspaceID, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if post.Status == store.PostStatusPublishing {
+		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
+	}
+	if strings.TrimSpace(request.Prompt) == "" {
+		request.Prompt = post.ImagePrompt
+	}
+	file, err := a.GenerateImageForWorkspace(ctx, actorUserID, workspaceID, request)
+	if err != nil {
+		return store.Post{}, err
+	}
+	updated, err := a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(
+		ctx, post, attachmentFromImage(file), request.Prompt)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if updated.WorkspaceID != workspaceID {
+		return store.Post{}, store.ErrNotFound
+	}
+	_, err = a.store.CreateAuditEvent(ctx, actorUserID, store.AuditEvent{
+		WorkspaceID: workspaceID, Action: "post.image_generated", EntityType: "post", EntityID: fmt.Sprint(postID),
+	})
+	if err != nil {
+		return store.Post{}, err
+	}
+	return updated, nil
+}
+
 func (a *App) SavePostImage(ctx context.Context, postID int64, filename string, reader io.Reader) (store.Post, error) {
 	post, err := a.store.GetPost(ctx, postID)
 	if err != nil {
@@ -1037,11 +1120,47 @@ func (a *App) SavePostImageForUser(ctx context.Context, userID string, postID in
 	return a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(ctx, post, attachmentFromImage(file), "")
 }
 
+func (a *App) SavePostImageForWorkspace(ctx context.Context, actorUserID, workspaceID string, postID int64, filename string, reader io.Reader) (store.Post, error) {
+	post, err := a.store.GetPostForWorkspace(ctx, actorUserID, workspaceID, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if post.Status == store.PostStatusPublishing {
+		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
+	}
+	file, err := a.SaveAttachmentMediaForWorkspace(
+		ctx, actorUserID, workspaceID, media.AttachmentTypeImage, filename, reader)
+	if err != nil {
+		return store.Post{}, err
+	}
+	updated, err := a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(ctx, post, attachmentFromImage(file), "")
+	if err != nil {
+		return store.Post{}, err
+	}
+	if updated.WorkspaceID != workspaceID {
+		return store.Post{}, store.ErrNotFound
+	}
+	_, err = a.store.CreateAuditEvent(ctx, actorUserID, store.AuditEvent{
+		WorkspaceID: workspaceID, Action: "post.image_uploaded", EntityType: "post", EntityID: fmt.Sprint(postID),
+	})
+	if err != nil {
+		return store.Post{}, err
+	}
+	return updated, nil
+}
+
 func (a *App) PublishPost(ctx context.Context, postID int64) (store.Post, error) {
+	post, err := a.store.GetPost(ctx, postID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if err := a.requireApprovedCurrentRevision(ctx, post); err != nil {
+		return store.Post{}, err
+	}
 	if a.max == nil {
 		return store.Post{}, ErrMAXNotConfigured
 	}
-	post, err := a.store.ClaimForPublishing(ctx, postID)
+	post, err = a.store.ClaimForPublishing(ctx, postID)
 	if err != nil {
 		return store.Post{}, fmt.Errorf("%w: %w", ErrConflict, err)
 	}
@@ -1054,6 +1173,13 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (result s
 		a.metrics.ObservePublicationOperation("publish", metricOutcome(resultErr), time.Since(startedAt))
 	}()
 	postID := post.ID
+	// The first approval check gives callers a fast failure, but the post may
+	// change before its publishing claim is acquired. Once claimed, content and
+	// attachment writes are blocked, so this second check closes that TOCTOU
+	// window before any request reaches MAX.
+	if err := a.requireApprovedCurrentRevision(ctx, post); err != nil {
+		return a.fail(postID, err)
+	}
 	channel, err := a.validateForPublish(ctx, post)
 	if err != nil {
 		return a.fail(postID, err)
@@ -1106,6 +1232,9 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result sto
 	if post.Status != store.PostStatusPublished || post.MAXMessageID == "" {
 		return store.Post{}, fmt.Errorf("%w: post has no active MAX publication", ErrConflict)
 	}
+	if err := a.requireApprovedCurrentRevision(ctx, post); err != nil {
+		return store.Post{}, err
+	}
 	channel, err := a.validateForPublish(ctx, post)
 	if err != nil {
 		return store.Post{}, err
@@ -1140,6 +1269,12 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result sto
 	claimed, err := a.store.ClaimPublishedForUpdate(ctx, post)
 	if err != nil {
 		return store.Post{}, fmt.Errorf("%w: %w", ErrConflict, err)
+	}
+	if err := a.requireApprovedCurrentRevision(ctx, claimed); err != nil {
+		if _, releaseErr := a.releasePublishedUpdate(claimed, publicationFailureMessage(err)); releaseErr != nil {
+			return store.Post{}, errors.Join(err, releaseErr)
+		}
+		return store.Post{}, err
 	}
 	err = a.max.Edit(ctx, maxclient.EditRequest{
 		MessageID: claimed.MAXMessageID, Text: claimed.Content, Format: maxclient.Format(claimed.Format),
@@ -1270,6 +1405,37 @@ func (a *App) syncClaimedMAXPublicationForUser(ctx context.Context, userID strin
 		return store.Post{}, err
 	}
 	return a.syncClaimedMAXPublication(ctx, userID, post, channel, syncedAt)
+}
+
+// syncClaimedMAXPublicationForWorker consumes only a row selected by the
+// cross-tenant scheduler and then revalidates its immutable workspace/compat
+// owner boundary. It must not call personal-only HTTP authorization getters.
+func (a *App) syncClaimedMAXPublicationForWorker(ctx context.Context, expected store.Post, syncedAt time.Time) (store.Post, error) {
+	post, err := a.store.GetPost(ctx, expected.ID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if post.WorkspaceID != expected.WorkspaceID || post.UserID != expected.UserID {
+		return store.Post{}, fmt.Errorf("%w: scheduled stats post changed workspace", ErrConflict)
+	}
+	workspace, err := a.store.GetWorkspace(ctx, post.WorkspaceID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if workspace.ArchivedAt != nil || workspace.CompatOwnerUserID != post.UserID {
+		return store.Post{}, fmt.Errorf("%w: publication workspace is no longer active", ErrConflict)
+	}
+	if post.Status != store.PostStatusPublished || strings.TrimSpace(post.MAXMessageID) == "" || post.ChannelID == nil {
+		return store.Post{}, fmt.Errorf("%w: post has no active MAX publication", ErrConflict)
+	}
+	channel, err := a.store.GetChannel(ctx, *post.ChannelID)
+	if err != nil {
+		return store.Post{}, err
+	}
+	if channel.WorkspaceID != post.WorkspaceID || channel.UserID != post.UserID || !channel.Active {
+		return store.Post{}, fmt.Errorf("%w: publication channel changed workspace or is inactive", ErrConflict)
+	}
+	return a.syncClaimedMAXPublication(ctx, post.UserID, post, channel, syncedAt)
 }
 
 func (a *App) syncClaimedMAXPublication(ctx context.Context, userID string, post store.Post, channel store.Channel, syncedAt time.Time) (result store.Post, resultErr error) {
@@ -1545,7 +1711,7 @@ func (a *App) syncDueMAXStats(ctx context.Context, now time.Time) {
 					continue
 				}
 				syncCtx, cancel := context.WithTimeout(ctx, time.Minute)
-				_, syncErr := a.syncClaimedMAXPublicationForUser(syncCtx, post.UserID, post.ID, now.UTC())
+				_, syncErr := a.syncClaimedMAXPublicationForWorker(syncCtx, post, now.UTC())
 				cancel()
 				if syncErr != nil {
 					a.metrics.ObserveSchedulerJob("stats_sync", "error")
@@ -1630,6 +1796,13 @@ func (a *App) syncDueChannelParticipantStats(ctx context.Context, now time.Time)
 }
 
 func (a *App) syncClaimedChannelParticipantStats(ctx context.Context, channel store.Channel, capturedAt time.Time) (store.Channel, error) {
+	workspace, err := a.store.GetWorkspace(ctx, channel.WorkspaceID)
+	if err != nil {
+		return store.Channel{}, err
+	}
+	if workspace.ArchivedAt != nil || workspace.CompatOwnerUserID != channel.UserID {
+		return store.Channel{}, fmt.Errorf("%w: workspace channel is no longer active", ErrConflict)
+	}
 	info, err := a.max.GetChat(ctx, channel.MAXChatID)
 	if err != nil {
 		return store.Channel{}, err
@@ -1717,6 +1890,13 @@ dispatch:
 }
 
 func (a *App) publishScheduledPost(ctx context.Context, postID int64, now time.Time) (bool, error) {
+	queued, err := a.store.GetPost(ctx, postID)
+	if err != nil {
+		return false, err
+	}
+	if err := a.requireApprovedCurrentRevision(ctx, queued); err != nil {
+		return false, err
+	}
 	post, err := a.store.ClaimScheduledForPublishing(ctx, postID, now.UTC())
 	if errors.Is(err, store.ErrScheduleNotDue) {
 		return false, nil
@@ -1740,7 +1920,39 @@ func (a *App) SchedulePost(ctx context.Context, postID int64, scheduledAt time.T
 	if _, err := a.validateForPublish(ctx, post); err != nil {
 		return store.Post{}, err
 	}
+	if err := a.requireApprovedCurrentRevision(ctx, post); err != nil {
+		return store.Post{}, err
+	}
 	return a.store.SetPostScheduledIfUnchanged(ctx, post, scheduledAt)
+}
+
+// requireApprovedCurrentRevision is shared by manual and scheduled publishing.
+// Personal workspaces preserve the legacy flow because their approval policy
+// is disabled by default. Team workspaces fail closed on missing/stale review.
+func (a *App) requireApprovedCurrentRevision(ctx context.Context, post store.Post) error {
+	if strings.TrimSpace(post.WorkspaceID) == "" {
+		// Compatibility for callers constructing transient posts in tests. Every
+		// persisted post receives a workspace_id from migration 016.
+		return nil
+	}
+	workspace, err := a.store.GetWorkspace(ctx, post.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	if workspace.ArchivedAt != nil {
+		return fmt.Errorf("%w: workspace is archived", ErrConflict)
+	}
+	if !workspace.ApprovalRequired {
+		return nil
+	}
+	approved, err := a.store.IsCurrentRevisionApproved(ctx, post.WorkspaceID, post.ID)
+	if err != nil {
+		return err
+	}
+	if !approved {
+		return ErrApprovalRequired
+	}
+	return nil
 }
 
 // ValidatePostForScheduling performs all local checks required before a post
@@ -1777,7 +1989,11 @@ func (a *App) validateForPublish(ctx context.Context, post store.Post) (store.Ch
 	if !channel.Active {
 		return store.Channel{}, errors.New("selected MAX channel is inactive")
 	}
-	if post.UserID == "" || channel.UserID != post.UserID {
+	if post.WorkspaceID != "" {
+		if channel.WorkspaceID == "" || channel.WorkspaceID != post.WorkspaceID {
+			return store.Channel{}, errors.New("post and channel workspace do not match")
+		}
+	} else if post.UserID == "" || channel.UserID != post.UserID {
 		return store.Channel{}, errors.New("post and channel ownership do not match")
 	}
 	return channel, nil

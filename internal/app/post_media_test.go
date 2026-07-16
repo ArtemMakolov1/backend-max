@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"io"
@@ -198,6 +199,107 @@ func TestPublishedPostRejectsAttachmentReplacementDuringUpload(t *testing.T) {
 	}
 	if fake.uploadCalls != 2 || fake.editCalls != 1 || len(post.Attachments) != 1 || post.Attachments[0].ProviderToken != "image-token" {
 		t.Fatalf("retry did not publish current attachment: post=%#v fake=%#v", post, fake)
+	}
+}
+
+func TestWorkspacePostImageUploadUsesWorkspaceTenantAndAudit(t *testing.T) {
+	ctx := context.Background()
+	application, storage := newTestApp(t, nil)
+	workspace, err := storage.CreateWorkspace(ctx, "test-owner", store.Workspace{Name: "Media team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePostForWorkspace(ctx, "test-owner", workspace.ID, store.Post{
+		Title: "Workspace image", Content: "body", Format: store.FormatMarkdown,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := application.SavePostImageForWorkspace(
+		ctx, "test-owner", workspace.ID, post.ID, "workspace.png", bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.WorkspaceID != workspace.ID || updated.UserID != workspace.CompatOwnerUserID ||
+		len(updated.Attachments) != 1 {
+		t.Fatalf("workspace image escaped tenant: %#v", updated)
+	}
+	usage, err := storage.GetWorkspaceMediaUsage(ctx, workspace.ID)
+	if err != nil || usage.AssetCount != 1 || usage.TotalBytes <= 0 {
+		t.Fatalf("workspace media usage=%#v err=%v", usage, err)
+	}
+	events, err := storage.ListAuditEvents(ctx, "test-owner", workspace.ID, 100, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Action == "post.image_uploaded" && event.EntityID == fmt.Sprint(post.ID) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("workspace image audit missing: %#v", events)
+	}
+}
+
+func TestPersonalWorkspaceAndLegacyMediaRoutesShareOneQuota(t *testing.T) {
+	ctx := context.Background()
+	application, storage := newTestApp(t, nil)
+	if err := application.ConfigureMediaPolicy(MediaPolicy{
+		MaxFiles: 1, MaxBytes: 1 << 20, OrphanGrace: time.Hour,
+		CleanupInterval: time.Hour, CleanupBatch: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.UpsertUser(ctx, store.User{ID: "media-alias-second", DisplayName: "Second"}); err != nil {
+		t.Fatal(err)
+	}
+	personalWorkspace := func(userID string) store.Workspace {
+		workspaces, err := storage.ListWorkspaces(ctx, userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, access := range workspaces {
+			if access.Workspace.IsPersonal {
+				return access.Workspace
+			}
+		}
+		t.Fatalf("personal workspace missing for %s", userID)
+		return store.Workspace{}
+	}
+	imageNumber := 0
+	imageReader := func() *bytes.Reader {
+		imageNumber++
+		var encoded bytes.Buffer
+		if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2+imageNumber, 2))); err != nil {
+			t.Fatal(err)
+		}
+		return bytes.NewReader(encoded.Bytes())
+	}
+
+	first := personalWorkspace("test-owner")
+	if _, err := application.SaveMediaForUser(ctx, "test-owner", "legacy-first.png", imageReader()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.SaveAttachmentMediaForWorkspace(ctx, "test-owner", first.ID,
+		media.AttachmentTypeImage, "nested-bypass.png", imageReader()); !errors.Is(err, store.ErrMediaQuotaExceeded) {
+		t.Fatalf("nested personal media bypass=%v", err)
+	}
+
+	second := personalWorkspace("media-alias-second")
+	if _, err := application.SaveAttachmentMediaForWorkspace(ctx, "media-alias-second", second.ID,
+		media.AttachmentTypeImage, "nested-first.png", imageReader()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.SaveMediaForUser(ctx, "media-alias-second", "legacy-bypass.png",
+		imageReader()); !errors.Is(err, store.ErrMediaQuotaExceeded) {
+		t.Fatalf("legacy personal media bypass=%v", err)
 	}
 }
 

@@ -189,6 +189,63 @@ func TestCleanupOrphanMediaIsTenantSafe(t *testing.T) {
 	}
 }
 
+func TestCleanupOrphanWorkspaceMediaAfterArchive(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "workspace-media-archive-cleanup.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	const (
+		owner    = "workspace-media-archive-owner"
+		filename = "archived-workspace-orphan.png"
+	)
+	if err := storage.UpsertUser(ctx, User{ID: owner, DisplayName: owner}); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := storage.CreateWorkspace(ctx, owner, Workspace{Name: "Archived media cleanup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	reservation, err := storage.ReserveMediaForWorkspace(ctx, owner, workspace.ID, filename, 64,
+		MediaLimits{MaxFiles: 10, MaxBytes: 1 << 20}, old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.CompleteMediaReservation(ctx, reservation, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.DeleteWorkspace(ctx, owner, workspace.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var deleted []string
+	cleanup, err := storage.CleanupOrphanMedia(ctx, time.Now().UTC().Add(-24*time.Hour), 10,
+		func(_ context.Context, got string) error {
+			deleted = append(deleted, got)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(deleted) != fmt.Sprint([]string{filename}) {
+		t.Fatalf("deleted objects=%v, want [%s]", deleted, filename)
+	}
+	if cleanup.AssetsRemoved != 1 || cleanup.ObjectsDeleted != 1 || cleanup.BytesReleased != 64 {
+		t.Fatalf("cleanup result=%#v, want 1 asset, 1 object, 64 bytes", cleanup)
+	}
+	usage, err := storage.GetWorkspaceMediaUsage(ctx, workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.AssetCount != 0 || usage.TotalBytes != 0 {
+		t.Fatalf("workspace usage=(%d files, %d bytes), want zero", usage.AssetCount, usage.TotalBytes)
+	}
+}
+
 func TestCleanupOrphanMediaCommitsOwnershipBeforeObjectDeletion(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

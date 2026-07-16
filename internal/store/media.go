@@ -18,10 +18,11 @@ type MediaLimits struct {
 }
 
 type MediaReservation struct {
-	OwnerID  string
-	Filename string
-	Token    string
-	Existing bool
+	OwnerID     string
+	WorkspaceID string
+	Filename    string
+	Token       string
+	Existing    bool
 }
 
 type MediaCleanupResult struct {
@@ -31,8 +32,9 @@ type MediaCleanupResult struct {
 }
 
 type mediaCleanupCandidate struct {
-	ownerID  string
-	filename string
+	ownerID     string
+	workspaceID string
+	filename    string
 }
 
 func validateMediaKey(userID, filename string) (string, error) {
@@ -138,9 +140,14 @@ func (s *Store) CompleteMediaReservation(ctx context.Context, reservation MediaR
 	if reservation.Existing {
 		return nil
 	}
-	result, err := s.db.ExecContext(ctx, bindSQL(`UPDATE media_assets SET state='ready', reservation_token='', updated_at=?
-WHERE owner_id=? AND filename=? AND state='pending' AND reservation_token=?`),
-		now.UTC(), reservation.OwnerID, reservation.Filename, reservation.Token)
+	query := `UPDATE media_assets SET state='ready',reservation_token='',updated_at=?
+WHERE owner_id=? AND filename=? AND state='pending' AND reservation_token=?`
+	args := []any{now.UTC(), reservation.OwnerID, reservation.Filename, reservation.Token}
+	if reservation.WorkspaceID != "" {
+		query += ` AND workspace_id=?`
+		args = append(args, reservation.WorkspaceID)
+	}
+	result, err := s.db.ExecContext(ctx, bindSQL(query), args...)
 	if err != nil {
 		return fmt.Errorf("complete media reservation: %w", err)
 	}
@@ -167,16 +174,27 @@ func (s *Store) ReleaseMediaReservation(ctx context.Context, reservation MediaRe
 		return fmt.Errorf("lock media reservation release: %w", err)
 	}
 	var size int64
-	err = tx.QueryRowContext(ctx, bindSQL(`DELETE FROM media_assets
-WHERE owner_id=? AND filename=? AND state='pending' AND reservation_token=?
-RETURNING size_bytes`), reservation.OwnerID, reservation.Filename, reservation.Token).Scan(&size)
+	query := `DELETE FROM media_assets WHERE owner_id=? AND filename=? AND state='pending' AND reservation_token=?`
+	args := []any{reservation.OwnerID, reservation.Filename, reservation.Token}
+	if reservation.WorkspaceID != "" {
+		query += ` AND workspace_id=?`
+		args = append(args, reservation.WorkspaceID)
+	}
+	query += ` RETURNING size_bytes`
+	err = tx.QueryRowContext(ctx, bindSQL(query), args...).Scan(&size)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("release media ownership: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET
+	if reservation.WorkspaceID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE workspace_media_usage SET
+asset_count=GREATEST(asset_count-1,0),total_bytes=GREATEST(total_bytes-$1,0),updated_at=$2
+WHERE workspace_id=$3`, size, now.UTC(), reservation.WorkspaceID); err != nil {
+			return fmt.Errorf("release workspace media quota: %w", err)
+		}
+	} else if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET
 asset_count=GREATEST(asset_count-1,0), total_bytes=GREATEST(total_bytes-?,0), updated_at=?
 WHERE owner_id=?`), size, now.UTC(), reservation.OwnerID); err != nil {
 		return fmt.Errorf("release media quota: %w", err)
@@ -195,14 +213,14 @@ func (s *Store) CleanupOrphanMedia(ctx context.Context, before time.Time, limit 
 		return MediaCleanupResult{}, errors.New("valid media cleanup limit and deleter are required")
 	}
 	candidates, err := func() ([]mediaCleanupCandidate, error) {
-		rows, err := s.db.QueryContext(ctx, bindSQL(`SELECT owner_id, filename FROM media_assets ma
+		rows, err := s.db.QueryContext(ctx, bindSQL(`SELECT owner_id, workspace_id, filename FROM media_assets ma
 WHERE ma.updated_at < ? AND (
     ma.state='pending' OR (
         NOT EXISTS (
-            SELECT 1 FROM posts p WHERE p.owner_id=ma.owner_id AND p.image_path=ma.filename
+            SELECT 1 FROM posts p WHERE p.workspace_id=ma.workspace_id AND p.image_path=ma.filename
         ) AND NOT EXISTS (
             SELECT 1 FROM post_attachments pa
-            WHERE pa.owner_id=ma.owner_id AND pa.storage_key=ma.filename
+            WHERE pa.workspace_id=ma.workspace_id AND pa.storage_key=ma.filename
         )
     )
 )
@@ -214,7 +232,7 @@ ORDER BY ma.updated_at, ma.owner_id, ma.filename LIMIT ?`), before.UTC(), limit)
 		result := make([]mediaCleanupCandidate, 0, limit)
 		for rows.Next() {
 			var candidate mediaCleanupCandidate
-			if err := rows.Scan(&candidate.ownerID, &candidate.filename); err != nil {
+			if err := rows.Scan(&candidate.ownerID, &candidate.workspaceID, &candidate.filename); err != nil {
 				return nil, fmt.Errorf("scan orphan media asset: %w", err)
 			}
 			result = append(result, candidate)
@@ -290,8 +308,13 @@ func (s *Store) cleanupMediaAsset(ctx context.Context, candidate mediaCleanupCan
 	var state string
 	var size int64
 	var updated time.Time
-	err = tx.QueryRowContext(ctx, bindSQL(`SELECT state, size_bytes, updated_at FROM media_assets
-WHERE owner_id=? AND filename=? FOR UPDATE`), candidate.ownerID, candidate.filename).Scan(&state, &size, &updated)
+	var personalWorkspace bool
+	err = tx.QueryRowContext(ctx, bindSQL(`SELECT ma.state,ma.size_bytes,ma.updated_at,w.is_personal FROM media_assets ma
+JOIN workspaces w ON w.id=ma.workspace_id
+WHERE ma.owner_id=? AND ma.workspace_id=? AND ma.filename=? FOR UPDATE`),
+		candidate.ownerID, candidate.workspaceID, candidate.filename).Scan(&state, &size, &updated, &personalWorkspace)
+	// workspace_id is included in the candidate to prevent a same-owner object
+	// in another workspace from affecting this quota ledger.
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, 0, tx.Commit()
 	}
@@ -304,22 +327,30 @@ WHERE owner_id=? AND filename=? FOR UPDATE`), candidate.ownerID, candidate.filen
 	if state == "ready" {
 		var referenced bool
 		if err := tx.QueryRowContext(ctx, bindSQL(`SELECT
-EXISTS(SELECT 1 FROM posts WHERE owner_id=? AND image_path=?) OR
-EXISTS(SELECT 1 FROM post_attachments WHERE owner_id=? AND storage_key=?)`),
-			candidate.ownerID, candidate.filename, candidate.ownerID, candidate.filename).Scan(&referenced); err != nil {
+EXISTS(SELECT 1 FROM posts WHERE workspace_id=? AND image_path=?) OR
+EXISTS(SELECT 1 FROM post_attachments WHERE workspace_id=? AND storage_key=?)`),
+			candidate.workspaceID, candidate.filename, candidate.workspaceID, candidate.filename).Scan(&referenced); err != nil {
 			return false, 0, err
 		}
 		if referenced {
 			return false, 0, tx.Commit()
 		}
 	}
-	if _, err := tx.ExecContext(ctx, bindSQL(`DELETE FROM media_assets WHERE owner_id=? AND filename=?`), candidate.ownerID, candidate.filename); err != nil {
+	if _, err := tx.ExecContext(ctx, bindSQL(`DELETE FROM media_assets WHERE owner_id=? AND workspace_id=? AND filename=?`),
+		candidate.ownerID, candidate.workspaceID, candidate.filename); err != nil {
 		return false, 0, err
 	}
-	if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET
+	if _, err := tx.ExecContext(ctx, `UPDATE workspace_media_usage SET
+asset_count=GREATEST(asset_count-1,0),total_bytes=GREATEST(total_bytes-$1,0),updated_at=CURRENT_TIMESTAMP
+WHERE workspace_id=$2`, size, candidate.workspaceID); err != nil {
+		return false, 0, err
+	}
+	if personalWorkspace {
+		if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET
 asset_count=GREATEST(asset_count-1,0), total_bytes=GREATEST(total_bytes-?,0), updated_at=CURRENT_TIMESTAMP
 WHERE owner_id=?`), size, candidate.ownerID); err != nil {
-		return false, 0, err
+			return false, 0, err
+		}
 	}
 	// The delete trigger inserted the queue row with the deletion time. This
 	// asset has already survived the grace period, so preserve its older

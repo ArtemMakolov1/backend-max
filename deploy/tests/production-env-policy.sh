@@ -44,6 +44,8 @@ grep -Fx 'MEDIA_USER_MAX_BYTES=1073741824' "$production_env" >/dev/null
 grep -Fx 'MEDIA_ORPHAN_GRACE_PERIOD=24h' "$production_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_INTERVAL=15m' "$production_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=50' "$production_env" >/dev/null
+grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=5' "$production_env" >/dev/null
+grep -Fx 'BILLING_ENFORCEMENT_ENABLED=false' "$production_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$production_env"
 
 configured_s3_env="$sandbox/configured-s3.env"
@@ -66,12 +68,39 @@ grep -Fx 'MEDIA_CLEANUP_INTERVAL=30m' "$configured_media_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=75' "$configured_media_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_media_env"
 
+configured_workspace_env="$sandbox/configured-workspace.env"
+render_production "$configured_workspace_env" WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=25
+grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=25' "$configured_workspace_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_workspace_env"
+
+configured_billing_env="$sandbox/configured-billing.env"
+render_production "$configured_billing_env" BILLING_ENFORCEMENT_ENABLED=true
+grep -Fx 'BILLING_ENFORCEMENT_ENABLED=true' "$configured_billing_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_billing_env"
+
+awk -F= '$1 == "BILLING_ENFORCEMENT_ENABLED" { print "BILLING_ENFORCEMENT_ENABLED=sometimes"; next } { print }' \
+  "$production_env" >"$sandbox/invalid-billing-enforcement.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-billing-enforcement.env" >/dev/null 2>&1; then
+  echo "Production validation accepted invalid BILLING_ENFORCEMENT_ENABLED" >&2
+  exit 1
+fi
+
 for required_secret in \
   POSTGRES_MONITOR_PASSWORD GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY \
   YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET \
   S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
   if render_production "$sandbox/missing-$required_secret.env" "$required_secret=" >/dev/null 2>&1; then
     echo "Production render accepted an empty $required_secret" >&2
+    exit 1
+  fi
+done
+
+for workspace_limit in 0 1001 not-a-number; do
+  awk -F= -v value="$workspace_limit" \
+    '$1 == "WORKSPACE_MAX_OWNED_TEAM_WORKSPACES" { print "WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=" value; next } { print }' \
+    "$production_env" >"$sandbox/invalid-workspace-limit.env"
+  if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-workspace-limit.env" >/dev/null 2>&1; then
+    echo "Production validation accepted unsafe WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=$workspace_limit" >&2
     exit 1
   fi
 done

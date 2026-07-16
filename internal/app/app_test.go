@@ -403,6 +403,40 @@ func TestChannelParticipantStatsWorkerRefreshesAndBacksOffWithoutMembershipLooku
 	}
 }
 
+func TestChannelParticipantStatsWorkerRefreshesTeamWorkspace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2041, time.September, 3, 10, 0, 0, 0, time.UTC)
+	fake := &fakeMAX{chat: maxclient.ChatInfo{
+		ChatID: "-team-125", OwnerID: "team-max-owner", Type: "channel", Status: "active", Title: "Team channel",
+		Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/channels/team-worker.png"}, ParticipantsCount: 144,
+	}}
+	application, storage := newTestApp(t, fake)
+	application.now = func() time.Time { return now }
+	if err := storage.UpsertUser(ctx, store.User{ID: "participants-team-owner", DisplayName: "Team owner"}); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := storage.CreateWorkspace(ctx, "participants-team-owner", store.Workspace{Name: "Participants team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := storage.CreateChannelForWorkspace(ctx, "participants-team-owner", workspace.ID, store.Channel{
+		VerifiedMAXOwnerID: fake.chat.OwnerID, MAXChatID: fake.chat.ChatID, Title: fake.chat.Title,
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.syncDueChannelParticipantStats(ctx, now)
+	stored, err := storage.GetChannelForWorkspace(ctx, "participants-team-owner", workspace.ID, channel.ID)
+	if err != nil || stored.ParticipantsCount != fake.chat.ParticipantsCount || stored.IconURL != fake.chat.Icon.URL {
+		t.Fatalf("team participant worker channel = %#v, %v", stored, err)
+	}
+	if fake.getChatCalls != 1 {
+		t.Fatalf("team participant worker MAX calls = %d", fake.getChatCalls)
+	}
+}
+
 func TestConnectChannelRejectsMissingRequiredPermissions(t *testing.T) {
 	t.Parallel()
 	fake := &fakeMAX{
@@ -1257,6 +1291,63 @@ func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	}
 	if fake.lastEditRequest.Notify != nil {
 		t.Fatalf("edit Notify = %#v, want omitted for channel publication", fake.lastEditRequest.Notify)
+	}
+}
+
+func TestPublishClaimRechecksApprovalAfterConcurrentEdit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fake := &fakeMAX{}
+	application, storage := newTestApp(t, fake)
+	for _, user := range []store.User{
+		{ID: "approval-owner", Email: "owner@example.test", DisplayName: "Owner"},
+		{ID: "approval-reviewer", Email: "reviewer@example.test", DisplayName: "Reviewer"},
+	} {
+		if err := storage.UpsertUser(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspace, err := storage.CreateWorkspace(ctx, "approval-owner", store.Workspace{Name: "Approval team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.AddWorkspaceMember(ctx, "approval-owner", store.WorkspaceMember{
+		WorkspaceID: workspace.ID, UserID: "approval-reviewer", Role: store.WorkspaceRoleApprover,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePostForWorkspace(ctx, "approval-owner", workspace.ID, store.Post{
+		Title: "Approved payload", Content: "Original", Format: store.FormatMarkdown,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := storage.SubmitPostForReview(ctx, "approval-owner", workspace.ID, post.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.DecidePostReview(ctx, "approval-reviewer", workspace.ID, post.ID, revision.ID,
+		store.ReviewDecisionApproved, "OK", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	approved, err := storage.GetPostForWorkspace(ctx, "approval-owner", workspace.ID, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := "Changed in the approval/claim window"
+	if _, err := storage.UpdatePostForWorkspaceIfUnchanged(ctx, "approval-owner", workspace.ID, approved,
+		store.PostChanges{Content: &changed}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := storage.ClaimForPublishing(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.publishClaimedPost(ctx, claimed); !errors.Is(err, ErrApprovalRequired) {
+		t.Fatalf("publishClaimedPost() error = %v, want ErrApprovalRequired", err)
+	}
+	if fake.publishCalls != 0 {
+		t.Fatalf("stale approval reached MAX: publish calls = %d", fake.publishCalls)
 	}
 }
 

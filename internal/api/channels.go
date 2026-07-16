@@ -121,6 +121,14 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	workspaceID := strings.TrimSpace(chi.URLParam(r, "workspace_id"))
+	if workspaceID != "" {
+		_, access, allowed := s.requireWorkspaceCapability(w, r, app.CapabilityChannelsManage)
+		if !allowed {
+			return
+		}
+		workspaceID = access.WorkspaceID
+	}
 	var request createChannelRequest
 	if !s.decodeJSON(w, r, &request) {
 		return
@@ -153,7 +161,11 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 	// A previously linked MAX identity is already an explicit ownership proof.
 	// The application method rechecks that identity, the observed channel owner,
 	// current API metadata and bot permissions before the transactional connect.
-	connected, connectErr := s.app.ConnectDiscoverableChannelForUser(ctx, userID, candidate.Info.ChatID)
+	var connected app.ChannelCheck
+	connectErr := store.ErrNotFound
+	if workspaceID == "" {
+		connected, connectErr = s.app.ConnectDiscoverableChannelForUser(ctx, userID, candidate.Info.ChatID)
+	}
 	switch {
 	case connectErr == nil:
 		claimID, tokenErr := randomURLToken(32)
@@ -175,6 +187,11 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing, getErr := s.app.Store().GetChannelByMAXChatID(r.Context(), candidate.Info.ChatID); getErr == nil {
+		if workspaceID != "" && existing.UserID == userID {
+			// Continue to the explicit owner-proof claim. Completion may move an
+			// actor-owned personal channel into the selected team workspace.
+			goto createClaim
+		}
 		if existing.UserID != userID {
 			s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к другому аккаунту", nil)
 			return
@@ -185,6 +202,8 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, getErr)
 		return
 	}
+
+createClaim:
 	claimID, err := randomURLToken(32)
 	if err != nil {
 		s.writeError(w, err)
@@ -210,7 +229,8 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 	claimTitle := firstNonEmpty(strings.TrimSpace(candidate.Info.Title), request.Title, "MAX "+candidate.Info.ChatID)
 	claim := store.ChannelClaim{
 		ID: claimID, TokenHash: sha256Hex(deepToken), UserID: userID, MAXChatID: candidate.Info.ChatID,
-		PublicLink: candidate.Info.Link, RequestedTitle: claimTitle, Status: store.ChannelClaimPending,
+		WorkspaceID: workspaceID,
+		PublicLink:  candidate.Info.Link, RequestedTitle: claimTitle, Status: store.ChannelClaimPending,
 		RequesterLabel: requesterLabel, ComparisonCode: comparisonCode,
 		CreatedAt: now, ExpiresAt: now.Add(channelClaimTTL), UpdatedAt: now,
 	}
@@ -249,6 +269,14 @@ func (s *Server) getChannelConnect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	workspaceID := strings.TrimSpace(chi.URLParam(r, "workspace_id"))
+	if workspaceID != "" {
+		_, access, allowed := s.requireWorkspaceCapability(w, r, app.CapabilityChannelsManage)
+		if !allowed {
+			return
+		}
+		workspaceID = access.WorkspaceID
+	}
 	claimID := strings.TrimSpace(chi.URLParam(r, "claim_id"))
 	if claimID == "" || len(claimID) > 128 {
 		s.problem(w, http.StatusNotFound, "not_found", "Connection attempt was not found", nil)
@@ -257,6 +285,10 @@ func (s *Server) getChannelConnect(w http.ResponseWriter, r *http.Request) {
 	claim, err := s.app.Store().GetChannelClaimForUser(r.Context(), userID, claimID, s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)
+		return
+	}
+	if workspaceID != "" && claim.WorkspaceID != workspaceID {
+		s.writeError(w, store.ErrNotFound)
 		return
 	}
 	var channel any
@@ -284,7 +316,13 @@ func (s *Server) getChannelConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		channel, diagnostics = connected, checked
 	} else if claim.Status == store.ChannelClaimConnected && claim.ChannelID != nil {
-		connected, getErr := s.app.Store().GetChannelForUser(r.Context(), userID, *claim.ChannelID)
+		var connected store.Channel
+		var getErr error
+		if workspaceID != "" {
+			connected, getErr = s.app.Store().GetChannelForWorkspace(r.Context(), userID, workspaceID, *claim.ChannelID)
+		} else {
+			connected, getErr = s.app.Store().GetChannelForUser(r.Context(), userID, *claim.ChannelID)
+		}
 		if getErr == nil {
 			channel = connected
 		}

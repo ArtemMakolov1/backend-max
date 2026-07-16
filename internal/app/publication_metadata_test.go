@@ -463,6 +463,48 @@ func TestStatsWorkerRefreshesDuePostsWithoutMembershipLookup(t *testing.T) {
 	}
 }
 
+func TestStatsWorkerRefreshesTeamWorkspacePublication(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	views := int64(42)
+	now := time.Date(2038, time.April, 6, 6, 7, 8, 0, time.UTC)
+	fake := &fakeMAX{
+		chat:    maxclient.ChatInfo{ChatID: "-team-204", OwnerID: "team-max-owner", Type: "channel", Status: "active", Title: "Team"},
+		message: maxclient.Message{MessageID: "mid.team.worker", ChatID: "-team-204", URL: "https://max.ru/channel/team-worker", Views: &views},
+	}
+	application, storage := newTestApp(t, fake)
+	application.now = func() time.Time { return now }
+	if err := storage.UpsertUser(ctx, store.User{ID: "stats-team-owner", DisplayName: "Team owner"}); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := storage.CreateWorkspace(ctx, "stats-team-owner", store.Workspace{Name: "Stats team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := storage.CreateChannelForWorkspace(ctx, "stats-team-owner", workspace.ID, store.Channel{
+		VerifiedMAXOwnerID: "team-max-owner", MAXChatID: fake.chat.ChatID, Title: "Team", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishedAt := now.Add(-2 * time.Hour)
+	post, err := storage.CreatePostForWorkspace(ctx, "stats-team-owner", workspace.ID, store.Post{
+		Title: "Team worker", Content: "body", Format: store.FormatMarkdown, Status: store.PostStatusPublished,
+		ChannelID: &channel.ID, MAXMessageID: fake.message.MessageID, PublishedAt: &publishedAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.syncDueMAXStats(ctx, now)
+	post, err = storage.GetPostForWorkspace(ctx, "stats-team-owner", workspace.ID, post.ID)
+	if err != nil || post.MAXViews == nil || *post.MAXViews != views || post.MAXStatsSyncedAt == nil {
+		t.Fatalf("team worker post = %#v, %v", post, err)
+	}
+	if fake.getMessageCalls != 1 || fake.getPinnedCalls != 1 {
+		t.Fatalf("team worker MAX calls = %#v", fake)
+	}
+}
+
 func TestStatsWorkerBacksOffAfterUpstreamFailure(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2038, time.April, 5, 9, 0, 0, 0, time.UTC)

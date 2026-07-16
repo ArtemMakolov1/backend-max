@@ -506,6 +506,54 @@ func TestPublishAndEditNormalizeLegacyMarkdownHeadingPayloads(t *testing.T) {
 	}
 }
 
+func TestPublishAndEditPreserveEmojiInJSONPayloads(t *testing.T) {
+	t.Parallel()
+	const emojiText = "🚀 ❤️ 👋🏽 🇷🇺 👨‍👩‍👧‍👦"
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body struct {
+			Text   string `json:"text"`
+			Format Format `json:"format"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode emoji message request: %v", err)
+		}
+		if body.Text != emojiText {
+			t.Errorf("emoji text = %q, want %q", body.Text, emojiText)
+		}
+		if body.Format != FormatMarkdown {
+			t.Errorf("format = %q, want markdown", body.Format)
+		}
+
+		switch r.Method {
+		case http.MethodPost:
+			_, _ = io.WriteString(w, `{"message":{"body":{"mid":"mid-emoji"}}}`)
+		case http.MethodPut:
+			_, _ = io.WriteString(w, `{"success":true}`)
+		default:
+			t.Errorf("unexpected method %s", r.Method)
+		}
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	if _, err := client.Publish(context.Background(), PublishRequest{
+		ChatID: "-987654321", Text: emojiText, Format: FormatMarkdown,
+	}); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if err := client.Edit(context.Background(), EditRequest{
+		MessageID: "mid-emoji", Text: emojiText, Format: FormatMarkdown,
+	}); err != nil {
+		t.Fatalf("Edit() error = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("message calls = %d, want 2", calls.Load())
+	}
+}
+
 func TestEditAndDeleteBuildMAXContract(t *testing.T) {
 	t.Parallel()
 

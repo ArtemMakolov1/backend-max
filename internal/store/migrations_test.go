@@ -335,7 +335,7 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "016_future_additive.sql"
+	const futureVersion = "020_future_additive.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {

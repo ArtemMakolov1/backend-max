@@ -249,6 +249,64 @@ func TestLoadUsesSafeAIQuotaDefaultsAndAcceptsBoundedOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadBillingEnforcementIsExplicitOptIn(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BillingEnforcementEnabled {
+		t.Fatal("billing enforcement must default to observe mode")
+	}
+
+	t.Setenv("BILLING_ENFORCEMENT_ENABLED", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.BillingEnforcementEnabled {
+		t.Fatal("billing enforcement opt-in was ignored")
+	}
+
+	t.Setenv("BILLING_ENFORCEMENT_ENABLED", "sometimes")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BILLING_ENFORCEMENT_ENABLED") {
+		t.Fatalf("invalid billing enforcement error=%v", err)
+	}
+}
+
+func TestLoadUsesBoundedOwnedTeamWorkspaceLimit(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxOwnedTeamWorkspaces != 5 {
+		t.Fatalf("default owned team workspace limit=%d, want 5", cfg.MaxOwnedTeamWorkspaces)
+	}
+
+	t.Setenv("WORKSPACE_MAX_OWNED_TEAM_WORKSPACES", "17")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxOwnedTeamWorkspaces != 17 {
+		t.Fatalf("owned team workspace limit=%d, want 17", cfg.MaxOwnedTeamWorkspaces)
+	}
+
+	for _, value := range []string{"0", "1001", "many"} {
+		t.Run(value, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv("WORKSPACE_MAX_OWNED_TEAM_WORKSPACES", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WORKSPACE_MAX_OWNED_TEAM_WORKSPACES") {
+				t.Fatalf("Load() error=%v, want workspace limit validation", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsUnsafeAIQuotaValues(t *testing.T) {
 	tests := map[string]string{
 		"AI_GLOBAL_MAX_CONCURRENT": "0",
@@ -391,6 +449,7 @@ func clearAuthEnv(t *testing.T) {
 		"ADMIN_API_KEY", "YANDEX_CLIENT_ID", "YANDEX_CLIENT_SECRET", "YANDEX_REDIRECT_URI",
 		"YANDEX_ALLOWED_USERS", "OBSERVABILITY_ADMIN_USERS", "AUTH_SESSION_TTL", "ALLOW_INSECURE_NO_AUTH", "AUTH_BOOTSTRAP_MODE", "OAUTH_TRUST_X_REAL_IP",
 		"OAUTH_RATE_LIMIT_AT_EDGE", "AI_GLOBAL_MAX_CONCURRENT", "AI_USER_MAX_CONCURRENT",
+		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
 		"OPENAI_API_KEY", "OPENAI_API_BASE_URL",

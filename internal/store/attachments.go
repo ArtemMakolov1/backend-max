@@ -69,7 +69,7 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`),
 	if err := tx.Commit(); err != nil {
 		return Post{}, fmt.Errorf("commit attachment insert: %w", err)
 	}
-	return s.GetPostForUser(ctx, userID, postID)
+	return s.GetPost(ctx, postID)
 }
 
 // ReplacePostAttachmentForUser swaps one object without changing its stable
@@ -111,7 +111,7 @@ WHERE owner_id=? AND post_id=? AND id=?`), replacement.Type, replacement.Storage
 	if err := tx.Commit(); err != nil {
 		return Post{}, fmt.Errorf("commit attachment replacement: %w", err)
 	}
-	return s.GetPostForUser(ctx, userID, postID)
+	return s.GetPost(ctx, postID)
 }
 
 // ReplaceFirstImageAttachmentForUser preserves the legacy single-image API:
@@ -230,7 +230,7 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id`),
 	if err := tx.Commit(); err != nil {
 		return Post{}, fmt.Errorf("commit atomic image replacement: %w", err)
 	}
-	return s.GetPostForUser(ctx, current.UserID, current.ID)
+	return s.GetPost(ctx, current.ID)
 }
 
 func (s *Store) ReorderPostAttachmentsForUser(ctx context.Context, userID string, postID int64, orderedIDs []int64) (Post, error) {
@@ -262,7 +262,7 @@ func (s *Store) ReorderPostAttachmentsForUser(ctx context.Context, userID string
 	if err := tx.Commit(); err != nil {
 		return Post{}, fmt.Errorf("commit attachment reorder: %w", err)
 	}
-	return s.GetPostForUser(ctx, userID, postID)
+	return s.GetPost(ctx, postID)
 }
 
 func (s *Store) DeletePostAttachmentForUser(ctx context.Context, userID string, postID, attachmentID int64) (Post, error) {
@@ -299,7 +299,7 @@ WHERE owner_id=? AND post_id=? AND id=?`), userID, postID, attachmentID)
 	if err := tx.Commit(); err != nil {
 		return Post{}, fmt.Errorf("commit attachment deletion: %w", err)
 	}
-	return s.GetPostForUser(ctx, userID, postID)
+	return s.GetPost(ctx, postID)
 }
 
 func (s *Store) ListPostAttachmentsForUser(ctx context.Context, userID string, postID int64) ([]PostAttachment, error) {

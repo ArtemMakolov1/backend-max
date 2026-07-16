@@ -64,6 +64,7 @@ type PostAttachment struct {
 type Channel struct {
 	ID                 int64     `json:"id"`
 	UserID             string    `json:"-"`
+	WorkspaceID        string    `json:"workspace_id,omitempty"`
 	VerifiedMAXOwnerID string    `json:"-"`
 	MAXChatID          string    `json:"max_chat_id"`
 	Title              string    `json:"title"`
@@ -150,6 +151,7 @@ type DiscoverableChannelRefreshCandidates struct {
 type Post struct {
 	ID                  int64            `json:"id"`
 	UserID              string           `json:"-"`
+	WorkspaceID         string           `json:"workspace_id,omitempty"`
 	Title               string           `json:"title"`
 	Content             string           `json:"content"`
 	Format              string           `json:"format"`
@@ -173,6 +175,169 @@ type Post struct {
 	CreatedAt           time.Time        `json:"created_at"`
 	UpdatedAt           time.Time        `json:"updated_at"`
 	PublishedAt         *time.Time       `json:"published_at,omitempty"`
+	ReviewStatus        string           `json:"review_status,omitempty"`
+	CurrentRevisionID   *int64           `json:"current_revision_id,omitempty"`
+}
+
+const (
+	WorkspaceRoleOwner    = "owner"
+	WorkspaceRoleEditor   = "editor"
+	WorkspaceRoleApprover = "approver"
+	WorkspaceRoleViewer   = "viewer"
+
+	InvitationStatusPending  = "pending"
+	InvitationStatusAccepted = "accepted"
+	InvitationStatusRevoked  = "revoked"
+	InvitationStatusExpired  = "expired"
+
+	ReviewStatusDraft            = "draft"
+	ReviewStatusInReview         = "in_review"
+	ReviewStatusChangesRequested = "changes_requested"
+	ReviewStatusApproved         = "approved"
+
+	ReviewDecisionApproved         = "approved"
+	ReviewDecisionChangesRequested = "changes_requested"
+)
+
+// Workspace is the tenant boundary for channels, posts and collaborative
+// state. OwnerUserID is lifecycle ownership; authorization always comes from
+// workspace_members rather than this field alone.
+type Workspace struct {
+	ID                      string     `json:"id"`
+	Name                    string     `json:"name"`
+	OwnerUserID             string     `json:"owner_user_id"`
+	CompatOwnerUserID       string     `json:"-"`
+	IsPersonal              bool       `json:"is_personal"`
+	ApprovalRequired        bool       `json:"approval_required"`
+	RequireDistinctApprover bool       `json:"require_distinct_approver"`
+	CreatedBy               string     `json:"created_by,omitempty"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
+	ArchivedAt              *time.Time `json:"archived_at,omitempty"`
+}
+
+type WorkspaceChanges struct {
+	Name                    *string
+	ApprovalRequired        *bool
+	RequireDistinctApprover *bool
+}
+
+type WorkspaceMember struct {
+	WorkspaceID string    `json:"workspace_id"`
+	UserID      string    `json:"user_id"`
+	Role        string    `json:"role"`
+	CreatedBy   string    `json:"created_by,omitempty"`
+	JoinedAt    time.Time `json:"joined_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	DisplayName string    `json:"display_name,omitempty"`
+	Email       string    `json:"email,omitempty"`
+	AvatarURL   string    `json:"avatar_url,omitempty"`
+}
+
+type WorkspaceCapabilities struct {
+	ManageWorkspace bool `json:"manage_workspace"`
+	ManageMembers   bool `json:"manage_members"`
+	EditContent     bool `json:"edit_content"`
+	SubmitReview    bool `json:"submit_review"`
+	ApproveReview   bool `json:"approve_review"`
+	Comment         bool `json:"comment"`
+	ViewAudit       bool `json:"view_audit"`
+}
+
+type WorkspaceAccess struct {
+	Workspace    Workspace             `json:"workspace"`
+	Member       WorkspaceMember       `json:"member"`
+	Capabilities WorkspaceCapabilities `json:"capabilities"`
+}
+
+type WorkspaceInvitation struct {
+	ID           string     `json:"id"`
+	WorkspaceID  string     `json:"workspace_id"`
+	Email        string     `json:"email"`
+	TargetUserID string     `json:"target_user_id,omitempty"`
+	TokenHash    string     `json:"-"`
+	Role         string     `json:"role"`
+	Status       string     `json:"status"`
+	InvitedBy    string     `json:"invited_by"`
+	AcceptedBy   string     `json:"accepted_by,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	ExpiresAt    time.Time  `json:"expires_at"`
+	AcceptedAt   *time.Time `json:"accepted_at,omitempty"`
+	RevokedAt    *time.Time `json:"revoked_at,omitempty"`
+}
+
+type PostRevision struct {
+	ID                int64           `json:"id"`
+	WorkspaceID       string          `json:"workspace_id"`
+	PostID            int64           `json:"post_id"`
+	Number            int             `json:"number"`
+	AuthorUserID      string          `json:"author_user_id"`
+	AuthorDisplayName string          `json:"author_display_name,omitempty"`
+	Snapshot          json.RawMessage `json:"snapshot"`
+	CreatedAt         time.Time       `json:"created_at"`
+}
+
+type PostReview struct {
+	ID                  int64     `json:"id"`
+	WorkspaceID         string    `json:"workspace_id"`
+	PostID              int64     `json:"post_id"`
+	RevisionID          int64     `json:"revision_id"`
+	ReviewerUserID      string    `json:"reviewer_user_id"`
+	ReviewerDisplayName string    `json:"reviewer_display_name,omitempty"`
+	Decision            string    `json:"decision"`
+	Comment             string    `json:"comment,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+type PostComment struct {
+	ID                    int64      `json:"id"`
+	WorkspaceID           string     `json:"workspace_id"`
+	PostID                int64      `json:"post_id"`
+	RevisionID            *int64     `json:"revision_id,omitempty"`
+	ParentID              *int64     `json:"parent_id,omitempty"`
+	AuthorUserID          string     `json:"author_user_id"`
+	AuthorDisplayName     string     `json:"author_display_name,omitempty"`
+	Body                  string     `json:"body"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
+	DeletedAt             *time.Time `json:"deleted_at,omitempty"`
+	ResolvedAt            *time.Time `json:"resolved_at,omitempty"`
+	ResolvedByUserID      string     `json:"resolved_by_user_id,omitempty"`
+	ResolvedByDisplayName string     `json:"resolved_by_display_name,omitempty"`
+}
+
+type AuditEvent struct {
+	ID               int64           `json:"id"`
+	WorkspaceID      string          `json:"workspace_id"`
+	ActorUserID      string          `json:"actor_user_id,omitempty"`
+	ActorDisplayName string          `json:"actor_display_name,omitempty"`
+	Action           string          `json:"action"`
+	EntityType       string          `json:"entity_type"`
+	EntityID         string          `json:"entity_id,omitempty"`
+	Metadata         json.RawMessage `json:"metadata"`
+	CreatedAt        time.Time       `json:"created_at"`
+}
+
+type Notification struct {
+	ID          int64           `json:"id"`
+	WorkspaceID string          `json:"workspace_id"`
+	UserID      string          `json:"user_id"`
+	Kind        string          `json:"kind"`
+	Title       string          `json:"title"`
+	Body        string          `json:"body"`
+	EntityType  string          `json:"entity_type,omitempty"`
+	EntityID    string          `json:"entity_id,omitempty"`
+	Metadata    json.RawMessage `json:"metadata"`
+	DedupeKey   string          `json:"-"`
+	ReadAt      *time.Time      `json:"read_at,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+type WorkspaceMediaUsage struct {
+	WorkspaceID string    `json:"workspace_id"`
+	AssetCount  int64     `json:"asset_count"`
+	TotalBytes  int64     `json:"total_bytes"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type PostChanges struct {
@@ -306,6 +471,8 @@ type ChannelClaim struct {
 	ConfirmTokenHash string     `json:"-"`
 	CancelTokenHash  string     `json:"-"`
 	UserID           string     `json:"-"`
+	WorkspaceID      string     `json:"workspace_id,omitempty"`
+	ActorUserID      string     `json:"-"`
 	MAXChatID        string     `json:"max_chat_id"`
 	PublicLink       string     `json:"public_link,omitempty"`
 	RequestedTitle   string     `json:"-"`

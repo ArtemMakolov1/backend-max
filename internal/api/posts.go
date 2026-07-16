@@ -497,7 +497,8 @@ func (s *Server) generateImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationImage, s.now().UTC())
+	release, err := s.aiLimiter.acquireAmount(
+		r.Context(), userID, store.AIOperationImage, imageUsageCredits(request.Quality), s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -540,7 +541,8 @@ func (s *Server) generatePostImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationImage, s.now().UTC())
+	release, err := s.aiLimiter.acquireAmount(
+		r.Context(), userID, store.AIOperationImage, imageUsageCredits(request.Quality), s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)
 		return

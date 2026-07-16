@@ -111,6 +111,7 @@ fi
   printf 'YANDEX_ALLOWED_USERS=%s\n' "$rendered_allowed_users"
   printf 'OBSERVABILITY_ADMIN_USERS=%s\n' "$rendered_observability_admins"
   printf 'AUTH_SESSION_TTL=%s\n' "${AUTH_SESSION_TTL:-12h}"
+  printf 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=%s\n' "${WORKSPACE_MAX_OWNED_TEAM_WORKSPACES:-5}"
   printf 'OAUTH_TRUST_X_REAL_IP=true\n'
   printf 'OAUTH_RATE_LIMIT_AT_EDGE=false\n'
   printf 'MAX_API_BASE_URL=https://platform-api2.max.ru\n'
@@ -139,6 +140,7 @@ fi
   printf 'AI_RESEARCH_PER_MINUTE=%s\n' "${AI_RESEARCH_PER_MINUTE:-2}"
   printf 'AI_RESEARCH_PER_DAY=%s\n' "${AI_RESEARCH_PER_DAY:-20}"
   printf 'AI_LEASE_TTL=%s\n' "${AI_LEASE_TTL:-4m}"
+  printf 'BILLING_ENFORCEMENT_ENABLED=%s\n' "${BILLING_ENFORCEMENT_ENABLED:-false}"
   printf 'SCHEDULER_INTERVAL=%s\n' "${SCHEDULER_INTERVAL:-15s}"
   printf 'BACKUP_RETENTION_DAYS=%s\n' "${BACKUP_RETENTION_DAYS:-14}"
   printf 'PITR_RETENTION_DAYS=%s\n' "${PITR_RETENTION_DAYS:-7}"

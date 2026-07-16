@@ -32,38 +32,40 @@ type YandexOAuthClient interface {
 }
 
 type AuthOptions struct {
-	YandexClient        YandexOAuthClient
-	RedirectURI         string
-	AllowedUsers        []string
-	ObservabilityAdmins []string
-	SessionTTL          time.Duration
-	SecureCookies       bool
-	TrustXRealIP        bool
-	RateLimitAtEdge     bool
-	AILimits            *AILimitOptions
-	Metrics             *observability.Metrics
+	YandexClient           YandexOAuthClient
+	RedirectURI            string
+	AllowedUsers           []string
+	ObservabilityAdmins    []string
+	SessionTTL             time.Duration
+	SecureCookies          bool
+	TrustXRealIP           bool
+	RateLimitAtEdge        bool
+	AILimits               *AILimitOptions
+	Metrics                *observability.Metrics
+	MaxOwnedTeamWorkspaces int
 }
 
 type Server struct {
-	app                 *app.App
-	logger              *slog.Logger
-	frontendOrigin      string
-	webhookSecret       string
-	yandexClient        YandexOAuthClient
-	yandexRedirect      string
-	yandexAllowed       map[string]struct{}
-	observabilityAdmins map[string]struct{}
-	sessionTTL          time.Duration
-	secureCookies       bool
-	oauthStartLimiter   *keyedWindowLimiter
-	aiLimiter           *aiRequestLimiter
-	mediaUploads        *mediaUploadGate
-	trustXRealIP        bool
-	now                 func() time.Time
-	metrics             *observability.Metrics
-	activityMu          sync.Mutex
-	activityDay         string
-	activityUsers       map[string]struct{}
+	app                    *app.App
+	logger                 *slog.Logger
+	frontendOrigin         string
+	webhookSecret          string
+	yandexClient           YandexOAuthClient
+	yandexRedirect         string
+	yandexAllowed          map[string]struct{}
+	observabilityAdmins    map[string]struct{}
+	sessionTTL             time.Duration
+	secureCookies          bool
+	oauthStartLimiter      *keyedWindowLimiter
+	aiLimiter              *aiRequestLimiter
+	mediaUploads           *mediaUploadGate
+	trustXRealIP           bool
+	now                    func() time.Time
+	metrics                *observability.Metrics
+	activityMu             sync.Mutex
+	activityDay            string
+	activityUsers          map[string]struct{}
+	maxOwnedTeamWorkspaces int
 }
 
 type principalContextKey struct{}
@@ -81,6 +83,7 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		oauthStartLimiter: newKeyedWindowLimiter(12, 600, time.Minute, 4096), now: time.Now,
 		mediaUploads:        newMediaUploadGate(8, 2),
 		observabilityAdmins: make(map[string]struct{}), activityUsers: make(map[string]struct{}),
+		maxOwnedTeamWorkspaces: 5,
 	}
 	if len(authOptions) != 0 {
 		options := authOptions[0]
@@ -111,6 +114,9 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		if options.Metrics != nil {
 			metrics = options.Metrics
 		}
+		if options.MaxOwnedTeamWorkspaces > 0 {
+			server.maxOwnedTeamWorkspaces = options.MaxOwnedTeamWorkspaces
+		}
 	}
 	server.metrics = metrics
 	server.aiLimiter = newAIRequestLimiter(application.Store(), logger, aiLimits)
@@ -129,6 +135,7 @@ func (s *Server) Handler() http.Handler {
 	router.With(s.requireSession).Get("/media/{filename}", s.serveMedia)
 	router.Route("/api/v1", func(r chi.Router) {
 		r.Get("/health", s.health)
+		r.Get("/plans", s.listPublicBillingPlans)
 		r.Post("/webhooks/max", s.maxWebhook)
 		r.Get("/auth/session", s.authSession)
 		r.Post("/auth/yandex/start", s.startYandexAuth)
@@ -141,6 +148,76 @@ func (s *Server) Handler() http.Handler {
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireSession)
+
+			r.Get("/workspaces", s.listWorkspaces)
+			r.Post("/workspaces", s.createWorkspace)
+			r.Post("/workspace-invitations/{token}/accept", s.acceptWorkspaceInvitation)
+			r.Route("/workspaces/{workspace_id}", func(r chi.Router) {
+				r.Get("/", s.getWorkspace)
+				r.Get("/billing", s.getWorkspaceBilling)
+				r.Patch("/", s.updateWorkspace)
+				r.Delete("/", s.deleteWorkspace)
+				s.RegisterWorkspaceBrandRoutes(r)
+				s.RegisterAnalyticsContentRoutes(r)
+				s.registerCampaignRoutes(r)
+				r.Post("/transfer-ownership", s.transferWorkspaceOwnership)
+				r.Get("/members", s.listWorkspaceMembers)
+				r.Post("/members", s.addWorkspaceMember)
+				r.Patch("/members/{user_id}", s.updateWorkspaceMember)
+				r.Delete("/members/{user_id}", s.removeWorkspaceMember)
+				r.Get("/invitations", s.listWorkspaceInvitations)
+				r.Post("/invitations", s.createWorkspaceInvitation)
+				r.Delete("/invitations/{invitation_id}", s.revokeWorkspaceInvitation)
+				r.Get("/audit", s.listWorkspaceAudit)
+				r.Get("/channels", s.listWorkspaceChannels)
+				r.Post("/channels", s.startChannelConnect)
+				r.Post("/channels/connect/start", s.startChannelConnect)
+				r.Get("/channels/connect/{claim_id}", s.getChannelConnect)
+				r.Get("/channels/{channel_id}", s.getWorkspaceChannel)
+				r.Patch("/channels/{channel_id}", s.updateWorkspaceChannel)
+				r.Delete("/channels/{channel_id}", s.deleteWorkspaceChannel)
+				r.Get("/posts", s.listWorkspacePosts)
+				r.Post("/posts", s.createWorkspacePost)
+				r.Post("/posts/format-content", s.formatWorkspacePostContent)
+				r.Post("/research/generate", s.generateWorkspaceResearch)
+				r.Post("/images/generate", s.generateWorkspaceImage)
+				r.Post("/media", s.uploadWorkspaceMedia)
+				r.Get("/media/{filename}", s.serveWorkspaceMedia)
+				r.Get("/posts/{post_id}", s.getWorkspacePost)
+				r.Patch("/posts/{post_id}", s.updateWorkspacePost)
+				r.Put("/posts/{post_id}", s.updateWorkspacePost)
+				r.Delete("/posts/{post_id}", s.deleteWorkspacePost)
+				r.Post("/posts/{post_id}/duplicate", s.duplicateWorkspacePost)
+				r.Post("/posts/{post_id}/schedule", s.scheduleWorkspacePost)
+				r.Delete("/posts/{post_id}/schedule", s.cancelWorkspaceSchedule)
+				r.Post("/posts/{post_id}/publish", s.publishWorkspacePost)
+				r.Post("/posts/{post_id}/update-published", s.updateWorkspacePublishedPost)
+				r.Post("/posts/{post_id}/sync-max", s.syncWorkspaceMAXPublication)
+				r.Post("/posts/{post_id}/pin", s.pinWorkspacePost)
+				r.Delete("/posts/{post_id}/pin", s.unpinWorkspacePost)
+				r.Delete("/posts/{post_id}/publication", s.deleteWorkspacePublication)
+				r.Get("/posts/{post_id}/view-history", s.getWorkspacePostViewHistory)
+				r.Post("/posts/{post_id}/image", s.uploadWorkspacePostImage)
+				r.Post("/posts/{post_id}/generate-image", s.generateWorkspacePostImage)
+				r.Post("/posts/{post_id}/attachments", s.uploadWorkspacePostAttachment)
+				r.Put("/posts/{post_id}/attachments/{attachment_id}", s.replaceWorkspacePostAttachment)
+				r.Patch("/posts/{post_id}/attachments/order", s.reorderWorkspacePostAttachments)
+				r.Delete("/posts/{post_id}/attachments/{attachment_id}", s.deleteWorkspacePostAttachment)
+				r.Get("/posts/{post_id}/revisions", s.listPostRevisions)
+				r.Get("/posts/{post_id}/reviews", s.listPostReviews)
+				r.Post("/posts/{post_id}/review", s.submitPostReview)
+				r.Post("/posts/{post_id}/review/submit", s.submitPostReview)
+				r.Post("/posts/{post_id}/review/approve", s.approvePostReview)
+				r.Post("/posts/{post_id}/review/request-changes", s.requestPostChanges)
+				r.Post("/posts/{post_id}/reviews/{revision_id}/decision", s.decidePostReview)
+				r.Get("/posts/{post_id}/comments", s.listPostComments)
+				r.Post("/posts/{post_id}/comments", s.createPostComment)
+				r.Patch("/posts/{post_id}/comments/{comment_id}", s.resolvePostComment)
+				r.Delete("/posts/{post_id}/comments/{comment_id}", s.deletePostComment)
+			})
+			r.Get("/notifications", s.listNotifications)
+			r.Patch("/notifications", s.markAllNotificationsRead)
+			r.Patch("/notifications/{notification_id}", s.markNotificationRead)
 
 			r.Get("/channels", s.listChannels)
 			r.Get("/channels/discoverable", s.listDiscoverableChannels)
@@ -420,6 +497,13 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	if err == nil {
 		return
 	}
+	var planInactiveErr *store.WorkspacePlanInactiveError
+	if errors.As(err, &planInactiveErr) {
+		w.Header().Set("Cache-Control", "no-store")
+		s.problem(w, http.StatusForbidden, "plan_inactive",
+			"Workspace plan is inactive.", map[string]any{"status": planInactiveErr.Status})
+		return
+	}
 	var aiLimitErr *store.AILimitError
 	if errors.As(err, &aiLimitErr) {
 		retryAfter := retryAfterSeconds(aiLimitErr.RetryAfter)
@@ -451,6 +535,9 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, app.ErrApprovalRequired):
+		s.problem(w, http.StatusConflict, "post_approval_required",
+			"The current post revision must be approved before scheduling or publishing.", nil)
 	case errors.Is(err, errMediaUploadRateLimited):
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
@@ -462,6 +549,9 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrMediaUploadBusy):
 		s.problem(w, http.StatusConflict, "media_upload_in_progress",
 			"Это изображение уже загружается. Подождите несколько секунд и попробуйте ещё раз.", nil)
+	case errors.Is(err, store.ErrOwnedTeamWorkspaceLimit):
+		s.problem(w, http.StatusConflict, "workspace_owner_limit_reached",
+			"Team workspace ownership limit reached. Transfer ownership before creating or accepting another workspace; archived workspaces still retain their storage.", nil)
 	case errors.Is(err, store.ErrNotFound):
 		s.problem(w, http.StatusNotFound, "not_found", "Запрошенные данные не найдены.", nil)
 	case errors.Is(err, store.ErrConflict):

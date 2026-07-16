@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/store"
 )
@@ -140,7 +141,30 @@ func (s *Server) serveMedia(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusNotFound, "not_found", "Media file was not found", nil)
 		return
 	}
+	s.serveAuthorizedMedia(w, r, filename)
+}
+
+func (s *Server) serveWorkspaceMedia(w http.ResponseWriter, r *http.Request) {
+	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityMediaRead)
+	if !ok {
+		return
+	}
+	filename := chi.URLParam(r, "filename")
+	owned, err := s.app.Store().WorkspaceOwnsMedia(r.Context(), access.UserID, access.WorkspaceID, filename)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if !owned {
+		s.problem(w, http.StatusNotFound, "not_found", "Media file was not found", nil)
+		return
+	}
+	s.serveAuthorizedMedia(w, r, filename)
+}
+
+func (s *Server) serveAuthorizedMedia(w http.ResponseWriter, r *http.Request, filename string) {
 	var object media.Object
+	var err error
 	status := http.StatusOK
 	var requestedRange mediaByteRange
 	var rangeTotal int64
