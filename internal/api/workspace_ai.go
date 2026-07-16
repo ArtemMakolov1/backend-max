@@ -104,6 +104,8 @@ func (s *Server) uploadWorkspaceMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	defer releaseUpload()
 	r.Body = http.MaxBytesReader(w, r.Body, media.MaxImageBytes+(1<<20))
+	// #nosec G120 -- MaxBytesReader bounds the entire multipart request before
+	// ParseMultipartForm can allocate memory or spill parts to temporary files.
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		s.writeError(w, errors.New("invalid multipart upload or image is too large"))
 		return

@@ -414,10 +414,10 @@ func buildPostAnalyticsSeries(
 	summary.FirstObservedAt = &firstObservedAt
 	summary.LastObservedAt = &lastObservedAt
 
+	previous := observations[0]
 	for index, observation := range observations {
 		point := PostAnalyticsPoint{CapturedAt: observation.CapturedAt, Views: observation.Views}
 		if index > 0 {
-			previous := observations[index-1]
 			delta := observation.Views - previous.Views
 			point.Delta = &delta
 			point.Correction = delta < 0
@@ -429,6 +429,7 @@ func buildPostAnalyticsSeries(
 			}
 		}
 		series = append(series, point)
+		previous = observation
 	}
 
 	if len(observations) >= 2 {

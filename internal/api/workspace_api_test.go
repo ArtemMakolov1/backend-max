@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -350,14 +349,4 @@ func (f workspaceAPIFixture) handler(t *testing.T, userID string) http.Handler {
 	t.Helper()
 	return withTestSession(t, f.storage,
 		New(f.app, f.logger, "http://localhost:4321", "webhook-secret", AuthOptions{YandexClient: &fakeYandexOAuth{}}).Handler(), userID)
-}
-
-func decodeProblemCode(response *httptest.ResponseRecorder) string {
-	var payload struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	_ = json.Unmarshal(response.Body.Bytes(), &payload)
-	return payload.Error.Code
 }

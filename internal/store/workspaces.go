@@ -823,16 +823,6 @@ func validNonOwnerWorkspaceRole(role string) bool {
 	return role == WorkspaceRoleEditor || role == WorkspaceRoleApprover || role == WorkspaceRoleViewer
 }
 
-func scanWorkspaceMember(row scanner) (WorkspaceMember, error) {
-	var member WorkspaceMember
-	if err := row.Scan(&member.WorkspaceID, &member.UserID, &member.Role, &member.CreatedBy,
-		&member.JoinedAt, &member.UpdatedAt); err != nil {
-		return WorkspaceMember{}, err
-	}
-	normalizeWorkspaceMember(&member)
-	return member, nil
-}
-
 func scanWorkspaceInvitation(row scanner) (WorkspaceInvitation, error) {
 	var invitation WorkspaceInvitation
 	if err := row.Scan(&invitation.ID, &invitation.WorkspaceID, &invitation.Email, &invitation.TargetUserID, &invitation.TokenHash,

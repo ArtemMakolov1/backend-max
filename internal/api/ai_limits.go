@@ -138,17 +138,6 @@ func (l *aiRequestLimiter) acquireMetric(
 	return release, nil
 }
 
-func (l *aiRequestLimiter) acquireWorkspace(ctx context.Context, workspaceID, operation string, now time.Time) (func(), error) {
-	return l.acquireWorkspaceAmount(ctx, workspaceID, operation, 1, now)
-}
-
-func (l *aiRequestLimiter) acquireWorkspaceAmount(
-	ctx context.Context, workspaceID, operation string, amount int64, now time.Time,
-) (func(), error) {
-	return l.acquireWorkspaceMetric(
-		ctx, workspaceID, operation, defaultAIMonthlyMetric(operation), amount, now)
-}
-
 func (l *aiRequestLimiter) acquireWorkspaceMetric(
 	ctx context.Context, workspaceID, operation, monthlyMetric string, amount int64, now time.Time,
 ) (func(), error) {

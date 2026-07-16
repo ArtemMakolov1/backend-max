@@ -643,10 +643,18 @@ func notifyRolesTx(ctx context.Context, tx *sql.Tx, workspaceID, excludedUserID 
 	for rows.Next() {
 		var recipient recipient
 		if err := rows.Scan(&recipient.userID, &recipient.role); err != nil {
-			_ = rows.Close()
+			if closeErr := rows.Close(); closeErr != nil {
+				return errors.Join(err, closeErr)
+			}
 			return err
 		}
 		recipients = append(recipients, recipient)
+	}
+	if err := rows.Err(); err != nil {
+		if closeErr := rows.Close(); closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
+		return err
 	}
 	if err := rows.Close(); err != nil {
 		return err
@@ -719,18 +727,6 @@ WHERE user_id=$2 AND ($3='' OR workspace_id=$3) AND read_at IS NULL`, now.UTC(),
 	return result.RowsAffected()
 }
 
-func scanPostRevision(row scanner) (PostRevision, error) {
-	var revision PostRevision
-	if err := row.Scan(&revision.ID, &revision.WorkspaceID, &revision.PostID, &revision.Number,
-		&revision.AuthorUserID, &revision.Snapshot, &revision.CreatedAt); errors.Is(err, sql.ErrNoRows) {
-		return PostRevision{}, ErrNotFound
-	} else if err != nil {
-		return PostRevision{}, err
-	}
-	normalizePostRevision(&revision)
-	return revision, nil
-}
-
 func scanPostRevisionWithAuthor(row scanner) (PostRevision, error) {
 	var revision PostRevision
 	if err := row.Scan(&revision.ID, &revision.WorkspaceID, &revision.PostID, &revision.Number,
@@ -771,19 +767,6 @@ WHERE r.workspace_id=$1 AND r.id=$2`, workspaceID, reviewID).Scan(
 }
 
 func normalizePostRevision(revision *PostRevision) { revision.CreatedAt = revision.CreatedAt.UTC() }
-
-func scanPostComment(row scanner) (PostComment, error) {
-	var comment PostComment
-	if err := row.Scan(&comment.ID, &comment.WorkspaceID, &comment.PostID, &comment.RevisionID,
-		&comment.ParentID, &comment.AuthorUserID, &comment.Body, &comment.CreatedAt,
-		&comment.UpdatedAt, &comment.DeletedAt, &comment.ResolvedAt, &comment.ResolvedByUserID); errors.Is(err, sql.ErrNoRows) {
-		return PostComment{}, ErrNotFound
-	} else if err != nil {
-		return PostComment{}, err
-	}
-	normalizePostComment(&comment)
-	return comment, nil
-}
 
 func scanPostCommentWithAuthors(row scanner) (PostComment, error) {
 	var comment PostComment

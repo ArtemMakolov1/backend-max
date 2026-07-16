@@ -417,13 +417,17 @@ RETURNING id,name,channel_id,version`, now, workspaceID, exceptID)
 	for rows.Next() {
 		var template clearedTemplate
 		if err := rows.Scan(&template.id, &template.name, &template.channelID, &template.version); err != nil {
-			_ = rows.Close()
+			if closeErr := rows.Close(); closeErr != nil {
+				return errors.Join(err, closeErr)
+			}
 			return err
 		}
 		cleared = append(cleared, template)
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
+		if closeErr := rows.Close(); closeErr != nil {
+			return errors.Join(err, closeErr)
+		}
 		return err
 	}
 	if err := rows.Close(); err != nil {

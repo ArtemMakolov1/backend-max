@@ -424,8 +424,11 @@ WHERE workspace_id=$1 AND period_start=$2`, workspaceID, periodStart)
 		var metric string
 		var quantity int64
 		if err := rows.Scan(&metric, &quantity); err != nil {
-			_ = rows.Close()
-			return nil, fmt.Errorf("scan workspace monthly usage: %w", err)
+			scanErr := fmt.Errorf("scan workspace monthly usage: %w", err)
+			if closeErr := rows.Close(); closeErr != nil {
+				return nil, errors.Join(scanErr, closeErr)
+			}
+			return nil, scanErr
 		}
 		quantities[metric] = quantity
 	}

@@ -669,10 +669,18 @@ FROM campaign_variants WHERE workspace_id=$1 AND campaign_id=$2 ORDER BY id`, wo
 	for rows.Next() {
 		var row materializeRow
 		if err := rows.Scan(&row.id, &row.channelID, &row.title, &row.content, &row.format, &row.plannedAt, &row.postID); err != nil {
-			_ = rows.Close()
+			if closeErr := rows.Close(); closeErr != nil {
+				return Campaign{}, errors.Join(err, closeErr)
+			}
 			return Campaign{}, err
 		}
 		all = append(all, row)
+	}
+	if err := rows.Err(); err != nil {
+		if closeErr := rows.Close(); closeErr != nil {
+			return Campaign{}, errors.Join(err, closeErr)
+		}
+		return Campaign{}, err
 	}
 	if err := rows.Close(); err != nil {
 		return Campaign{}, err

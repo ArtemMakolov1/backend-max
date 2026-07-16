@@ -1399,14 +1399,6 @@ func (a *App) SyncMAXPublication(ctx context.Context, userID string, postID int6
 	return a.syncClaimedMAXPublication(ctx, userID, post, channel, now)
 }
 
-func (a *App) syncClaimedMAXPublicationForUser(ctx context.Context, userID string, postID int64, syncedAt time.Time) (store.Post, error) {
-	post, channel, err := a.publishedPostForUser(ctx, userID, postID)
-	if err != nil {
-		return store.Post{}, err
-	}
-	return a.syncClaimedMAXPublication(ctx, userID, post, channel, syncedAt)
-}
-
 // syncClaimedMAXPublicationForWorker consumes only a row selected by the
 // cross-tenant scheduler and then revalidates its immutable workspace/compat
 // owner boundary. It must not call personal-only HTTP authorization getters.
