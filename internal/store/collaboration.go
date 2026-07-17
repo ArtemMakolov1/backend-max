@@ -248,7 +248,9 @@ WHERE workspace_id=$3 AND id=$4`, decision, now.UTC(), workspaceID, postID); err
 			Title: "Решение по согласованию", Body: strings.TrimSpace(comment), EntityType: "post",
 			EntityID: fmt.Sprint(postID), Metadata: mustJSON(map[string]any{"decision": decision, "revision_id": revisionID}),
 			CreatedAt: now,
-		}); err != nil {
+		}); err != nil && !errors.Is(err, ErrNotFound) {
+			// The revision author may have already left the workspace; a missing
+			// notification target must not block recording the review decision.
 			return PostReview{}, err
 		}
 	}

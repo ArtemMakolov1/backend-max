@@ -94,6 +94,26 @@ func TestReserveMediaQuotaIsAtomic(t *testing.T) {
 	if usedFiles != 1 || usedBytes != 10 {
 		t.Fatalf("usage after duplicate=(%d files, %d bytes), want (1, 10)", usedFiles, usedBytes)
 	}
+
+	workspaceFiles, workspaceBytes := personalWorkspaceMediaUsage(t, storage, userID)
+	if workspaceFiles != 1 || workspaceBytes != 10 {
+		t.Fatalf("personal workspace usage=(%d files, %d bytes), want (1, 10)", workspaceFiles, workspaceBytes)
+	}
+}
+
+// personalWorkspaceMediaUsage reads the workspace_media_usage ledger of the
+// owner's personal workspace. Reservation must keep it in sync with
+// media_usage because GC and release drain both ledgers.
+func personalWorkspaceMediaUsage(t *testing.T, storage *Store, ownerID string) (int64, int64) {
+	t.Helper()
+	var files, bytes int64
+	if err := storage.db.QueryRowContext(context.Background(), `SELECT wmu.asset_count, wmu.total_bytes
+FROM workspace_media_usage wmu
+JOIN workspaces w ON w.id=wmu.workspace_id
+WHERE w.owner_user_id=$1 AND w.is_personal`, ownerID).Scan(&files, &bytes); err != nil {
+		t.Fatal(err)
+	}
+	return files, bytes
 }
 
 func TestCleanupOrphanMediaIsTenantSafe(t *testing.T) {
@@ -186,6 +206,15 @@ func TestCleanupOrphanMediaIsTenantSafe(t *testing.T) {
 	}
 	if filesA != 1 || bytesA != 100 || filesB != 0 || bytesB != 0 {
 		t.Fatalf("usage A=(%d,%d) B=(%d,%d), want A=(1,100) B=(0,0)", filesA, bytesA, filesB, bytesB)
+	}
+
+	// GC drains both ledgers for personal workspaces, so the workspace ledger
+	// must track exactly the same bytes as media_usage after cleanup.
+	wsFilesA, wsBytesA := personalWorkspaceMediaUsage(t, storage, ownerA)
+	wsFilesB, wsBytesB := personalWorkspaceMediaUsage(t, storage, ownerB)
+	if wsFilesA != 1 || wsBytesA != 100 || wsFilesB != 0 || wsBytesB != 0 {
+		t.Fatalf("workspace usage A=(%d,%d) B=(%d,%d), want A=(1,100) B=(0,0)",
+			wsFilesA, wsBytesA, wsFilesB, wsBytesB)
 	}
 }
 
@@ -368,5 +397,106 @@ func TestCleanupOrphanMediaRetriesFailedObjectDeletion(t *testing.T) {
 	}
 	if retryCalls != 1 || result.ObjectsDeleted != 1 {
 		t.Fatalf("retry calls=%d cleanup=%#v", retryCalls, result)
+	}
+}
+
+func TestMediaLedgersStaySymmetricAcrossReserveAndRelease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "media-ledger-symmetry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	const owner = "media-ledger-owner"
+	if err := storage.UpsertUser(ctx, User{ID: owner, DisplayName: owner}); err != nil {
+		t.Fatal(err)
+	}
+	limits := MediaLimits{MaxFiles: 10, MaxBytes: 1 << 20}
+	now := time.Now().UTC()
+	assertPersonalLedgers := func(step string, files, bytes int64) {
+		t.Helper()
+		var ownerFiles, ownerBytes int64
+		if err := storage.db.QueryRowContext(ctx,
+			`SELECT COALESCE((SELECT asset_count FROM media_usage WHERE owner_id=$1),0),
+COALESCE((SELECT total_bytes FROM media_usage WHERE owner_id=$1),0)`, owner).
+			Scan(&ownerFiles, &ownerBytes); err != nil {
+			t.Fatal(err)
+		}
+		workspaceFiles, workspaceBytes := personalWorkspaceMediaUsage(t, storage, owner)
+		if ownerFiles != files || ownerBytes != bytes || workspaceFiles != files || workspaceBytes != bytes {
+			t.Fatalf("%s: media_usage=(%d,%d) workspace=(%d,%d), want both (%d,%d)",
+				step, ownerFiles, ownerBytes, workspaceFiles, workspaceBytes, files, bytes)
+		}
+	}
+
+	reservation, err := storage.ReserveMedia(ctx, owner, "personal-path.png", 30, limits, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPersonalLedgers("after personal reserve", 1, 30)
+	if err := storage.ReleaseMediaReservation(ctx, reservation, now); err != nil {
+		t.Fatal(err)
+	}
+	assertPersonalLedgers("after personal release", 0, 0)
+
+	var personalWorkspaceID string
+	workspaces, err := storage.ListWorkspaces(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, access := range workspaces {
+		if access.Workspace.IsPersonal {
+			personalWorkspaceID = access.Workspace.ID
+		}
+	}
+	if personalWorkspaceID == "" {
+		t.Fatal("personal workspace is missing")
+	}
+	reservation, err = storage.ReserveMediaForWorkspace(ctx, owner, personalWorkspaceID,
+		"workspace-path.png", 50, limits, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPersonalLedgers("after personal workspace reserve", 1, 50)
+	if err := storage.ReleaseMediaReservation(ctx, reservation, now); err != nil {
+		t.Fatal(err)
+	}
+	assertPersonalLedgers("after personal workspace release", 0, 0)
+
+	team, err := storage.CreateWorkspace(ctx, owner, Workspace{Name: "Ledger symmetry team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err = storage.ReserveMediaForWorkspace(ctx, owner, team.ID, "team-path.png", 70, limits, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPersonalLedgers("after team reserve", 0, 0)
+	teamUsage, err := storage.GetWorkspaceMediaUsage(ctx, team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if teamUsage.AssetCount != 1 || teamUsage.TotalBytes != 70 {
+		t.Fatalf("team usage=(%d,%d), want (1,70)", teamUsage.AssetCount, teamUsage.TotalBytes)
+	}
+	if err := storage.ReleaseMediaReservation(ctx, reservation, now); err != nil {
+		t.Fatal(err)
+	}
+	teamUsage, err = storage.GetWorkspaceMediaUsage(ctx, team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if teamUsage.AssetCount != 0 || teamUsage.TotalBytes != 0 {
+		t.Fatalf("team usage after release=(%d,%d), want (0,0)", teamUsage.AssetCount, teamUsage.TotalBytes)
+	}
+	var compatRows int64
+	if err := storage.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM media_usage WHERE owner_id=$1`, team.CompatOwnerUserID).Scan(&compatRows); err != nil {
+		t.Fatal(err)
+	}
+	if compatRows != 0 {
+		t.Fatalf("team reservation touched the personal media_usage ledger (%d rows)", compatRows)
 	}
 }

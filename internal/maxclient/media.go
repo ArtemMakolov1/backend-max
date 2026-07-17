@@ -15,7 +15,20 @@ import (
 
 const maxVideoBytes int64 = 250 << 20
 
-var defaultAttachmentRetryDelays = []time.Duration{0, 250 * time.Millisecond, time.Second}
+// defaultAttachmentRetryDelays gives MAX time to finish processing freshly
+// uploaded media before a message referencing it is treated as failed. Video
+// transcoding routinely takes tens of seconds, so the delays grow
+// exponentially to a total budget of about 45 seconds. withAttachmentRetry
+// stops early when the caller's context is done.
+var defaultAttachmentRetryDelays = []time.Duration{
+	0,
+	time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	15 * time.Second,
+	15 * time.Second,
+}
 
 // UploadAttachment streams one image or video to a freshly reserved MAX
 // upload URL. It is an alias for UploadMedia kept for callers that model the

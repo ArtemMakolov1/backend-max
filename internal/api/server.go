@@ -613,7 +613,7 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 				"Исследование с ИИ сейчас недоступно. Попробуйте позже.", nil)
 			return
 		}
-		if isValidationError(err) {
+		if errors.Is(err, errValidation) || isValidationError(err) {
 			s.logger.Info("request validation failed", "error", err)
 			s.problem(w, http.StatusBadRequest, "validation_error",
 				"Проверьте заполнение полей и попробуйте ещё раз.", nil)
@@ -640,9 +640,27 @@ func storeConflictMessage(err error) string {
 func parseID(r *http.Request) (int64, error) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil || id <= 0 {
-		return 0, errors.New("id must be a positive integer")
+		return 0, validationError("id must be a positive integer")
 	}
 	return id, nil
+}
+
+// errValidation is a typed sentinel for client-facing validation failures.
+// Handlers wrap human-readable messages with validationError so writeError
+// classifies them as HTTP 400 validation_error via errors.Is instead of the
+// legacy substring heuristic in isValidationError, which remains a fallback
+// for errors produced by lower layers.
+var errValidation = errors.New("request validation failed")
+
+type validationFailure struct{ message string }
+
+func (e validationFailure) Error() string { return e.message }
+
+func (validationFailure) Is(target error) bool { return target == errValidation }
+
+// validationError marks message as a request validation failure.
+func validationError(message string) error {
+	return validationFailure{message: message}
 }
 
 func isValidationError(err error) bool {

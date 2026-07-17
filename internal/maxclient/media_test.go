@@ -264,6 +264,28 @@ func TestPublishAndEditPreserveMixedMediaOrderAndKeyboard(t *testing.T) {
 	}
 }
 
+func TestDefaultAttachmentRetryDelaysBudget(t *testing.T) {
+	t.Parallel()
+
+	if len(defaultAttachmentRetryDelays) == 0 || defaultAttachmentRetryDelays[0] != 0 {
+		t.Fatalf("first attempt must be immediate: %v", defaultAttachmentRetryDelays)
+	}
+	var total time.Duration
+	previous := time.Duration(0)
+	for _, delay := range defaultAttachmentRetryDelays[1:] {
+		if delay < previous {
+			t.Fatalf("retry delays must not shrink: %v", defaultAttachmentRetryDelays)
+		}
+		previous = delay
+		total += delay
+	}
+	// MAX needs tens of seconds to transcode an uploaded video before a
+	// message referencing it stops failing with attachment.not.ready.
+	if total < 30*time.Second || total > 60*time.Second {
+		t.Fatalf("total retry budget = %v, want between 30s and 60s", total)
+	}
+}
+
 func TestPublishAndEditRetryAttachmentNotReady(t *testing.T) {
 	t.Parallel()
 

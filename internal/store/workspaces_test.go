@@ -461,6 +461,18 @@ VALUES($1,$2,$3,'image',0,'attachment.png',10,'image/png')`,
 	if _, err := storage.CancelSchedule(ctx, second.ID); err != nil {
 		t.Fatal(err)
 	}
+	channel, err := storage.CreateChannel(ctx, Channel{
+		WorkspaceID: workspace.ID, MAXChatID: "review-archive-chat", Title: "Review channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.DeleteWorkspace(ctx, "test-owner", workspace.ID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("workspace archived with a connected channel: %v", err)
+	}
+	if err := storage.DeleteChannel(ctx, channel.ID); err != nil {
+		t.Fatal(err)
+	}
 	archiveTokenHash := strings.Repeat("f", 64)
 	archiveInvite, err := storage.CreateWorkspaceInvitation(ctx, "test-owner", WorkspaceInvitation{
 		WorkspaceID: workspace.ID, Role: WorkspaceRoleViewer, TokenHash: archiveTokenHash,
@@ -497,6 +509,45 @@ VALUES($1,$2,$3,'image',0,'attachment.png',10,'image/png')`,
 	var auditCount int
 	if err := storage.db.QueryRowContext(ctx, `SELECT count(*) FROM audit_events WHERE workspace_id=$1`, workspace.ID).Scan(&auditCount); err != nil || auditCount == 0 {
 		t.Fatalf("audit count=%d err=%v", auditCount, err)
+	}
+}
+
+func TestDecidePostReviewSurvivesRemovedRevisionAuthor(t *testing.T) {
+	ctx := context.Background()
+	storage := openWorkspaceTestStore(t, "review-removed-author")
+	upsertWorkspaceUser(t, storage, "editor", "editor@example.test")
+	upsertWorkspaceUser(t, storage, "approver", "approver@example.test")
+	workspace, err := storage.CreateWorkspace(ctx, "test-owner", Workspace{Name: "Review orphans"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for userID, role := range map[string]string{"editor": WorkspaceRoleEditor, "approver": WorkspaceRoleApprover} {
+		if _, err := storage.AddWorkspaceMember(ctx, "test-owner", WorkspaceMember{WorkspaceID: workspace.ID, UserID: userID, Role: role}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	post, err := storage.CreatePostForWorkspace(ctx, "editor", workspace.ID, Post{Title: "Orphaned", Content: "Body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	revision, err := storage.SubmitPostForReview(ctx, "editor", workspace.ID, post.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.RemoveWorkspaceMember(ctx, "test-owner", workspace.ID, "editor"); err != nil {
+		t.Fatal(err)
+	}
+	decision, err := storage.DecidePostReview(ctx, "approver", workspace.ID, post.ID, revision.ID,
+		ReviewDecisionApproved, "OK", now.Add(time.Second))
+	if err != nil {
+		t.Fatalf("decision with removed revision author=%v", err)
+	}
+	if decision.Decision != ReviewDecisionApproved {
+		t.Fatalf("decision=%#v", decision)
+	}
+	if approved, err := storage.IsCurrentRevisionApproved(ctx, workspace.ID, post.ID); err != nil || !approved {
+		t.Fatalf("approved=%v err=%v", approved, err)
 	}
 }
 

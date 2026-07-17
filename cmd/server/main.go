@@ -157,7 +157,11 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	go application.RunScheduler(rootCtx, cfg.SchedulerInterval)
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		application.RunScheduler(rootCtx, cfg.SchedulerInterval)
+	}()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -175,14 +179,25 @@ func main() {
 	case err := <-serverErr:
 		if err != nil {
 			logger.Error("HTTP server failed", "error", err)
-			stop()
 		}
 	}
+	// Restore default signal handling so a second SIGINT/SIGTERM terminates
+	// the process immediately instead of waiting for graceful shutdown.
+	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
+	}
+	// An in-flight scheduled publication keeps running on a context detached
+	// from the stop signal, so a routine deploy does not turn a half-sent post
+	// into a terminal failure or a duplicate. Wait for the scheduler goroutine
+	// to drain; the bound follows the 3-minute per-publication budget.
+	select {
+	case <-schedulerDone:
+	case <-time.After(3*time.Minute + 30*time.Second):
+		logger.Error("scheduler did not stop before the shutdown deadline")
 	}
 	logger.Info("server stopped")
 }

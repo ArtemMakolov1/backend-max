@@ -82,7 +82,13 @@ services:
       - -c
       - archive_timeout=300s
       - -c
-      - archive_command=test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f
+      # Archive atomically: copy to a temp name, flush, then rename so a crash
+      # mid-copy never leaves a truncated segment under the final name. An
+      # already-archived byte-identical segment is success, so a retry after an
+      # interrupted archive cycle stays idempotent, but a differing file under
+      # the same name fails instead of being overwritten, as the PostgreSQL
+      # docs require (timeline divergence, a second cluster on this volume).
+      - archive_command=if [ -f /var/lib/postgresql/wal-archive/%f ]; then cmp -s %p /var/lib/postgresql/wal-archive/%f; else cp %p /var/lib/postgresql/wal-archive/%f.tmp && sync && mv /var/lib/postgresql/wal-archive/%f.tmp /var/lib/postgresql/wal-archive/%f && sync; fi
     expose:
       - "5432"
     volumes:
@@ -238,7 +244,10 @@ services:
       timeout: 3s
       retries: 8
       start_period: 10s
-    stop_grace_period: 30s
+    # Must exceed HTTP shutdown (20s) plus the scheduler publication drain
+    # (up to 3m30s in cmd/server/main.go), or Docker SIGKILLs in-flight
+    # publications and strands posts in the publishing state.
+    stop_grace_period: 4m15s
     logging: *default-logging
     depends_on:
       pgbouncer:

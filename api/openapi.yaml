@@ -213,7 +213,7 @@ paths:
                 max_chat_id:
                   type: string
       responses:
-        '201':
+        '200':
           description: Connected channel
           content:
             application/json:
@@ -253,7 +253,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ChannelConnectionClaimEnvelope'
+                $ref: '#/components/schemas/ChannelConnectionClaim'
         default:
           $ref: '#/components/responses/Problem'
   /channels/connect/{claim_id}:
@@ -276,7 +276,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/ChannelConnectionClaimEnvelope'
+                $ref: '#/components/schemas/ChannelConnectionClaim'
         default:
           $ref: '#/components/responses/Problem'
   /channels/{id}/test:
@@ -709,6 +709,47 @@ paths:
           $ref: '#/components/responses/Post'
         default:
           $ref: '#/components/responses/Problem'
+    put:
+      tags: [Posts]
+      operationId: schedulePostPut
+      summary: Schedule a post for a future time
+      description: Legacy alias for POST /posts/{id}/schedule.
+      deprecated: true
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scheduled_at]
+              properties:
+                scheduled_at:
+                  type: string
+                  format: date-time
+      responses:
+        '200':
+          $ref: '#/components/responses/Post'
+        default:
+          $ref: '#/components/responses/Problem'
+    delete:
+      tags: [Posts]
+      operationId: deletePostSchedule
+      summary: Cancel a scheduled post
+      description: Legacy alias for POST /posts/{id}/cancel-schedule.
+      deprecated: true
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Post'
+        default:
+          $ref: '#/components/responses/Problem'
   /posts/{id}/cancel-schedule:
     post:
       tags: [Posts]
@@ -726,6 +767,21 @@ paths:
     post:
       tags: [Posts]
       operationId: updatePublishedPost
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Post'
+        default:
+          $ref: '#/components/responses/Problem'
+  /posts/{id}/sync:
+    post:
+      tags: [Posts]
+      operationId: syncPost
+      description: Legacy alias for POST /posts/{id}/update-published.
+      deprecated: true
       parameters:
         - $ref: '#/components/parameters/Id'
       security:
@@ -775,6 +831,21 @@ paths:
     delete:
       tags: [Posts]
       operationId: deletePublication
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          $ref: '#/components/responses/Post'
+        default:
+          $ref: '#/components/responses/Problem'
+  /posts/{id}/delete-publication:
+    post:
+      tags: [Posts]
+      operationId: deletePublicationPost
+      description: Legacy alias for DELETE /posts/{id}/publication.
+      deprecated: true
       parameters:
         - $ref: '#/components/parameters/Id'
       security:
@@ -1508,6 +1579,20 @@ paths:
       responses:
         '200': {$ref: '#/components/responses/Post'}
         default: {$ref: '#/components/responses/Problem'}
+    put:
+      tags: [Posts]
+      operationId: updateWorkspacePostPut
+      description: Legacy alias for PATCH /workspaces/{workspace_id}/posts/{post_id}.
+      deprecated: true
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PostUpdate'}
+      responses:
+        '200': {$ref: '#/components/responses/Post'}
+        default: {$ref: '#/components/responses/Problem'}
     delete:
       tags: [Posts]
       operationId: deleteWorkspacePost
@@ -1755,6 +1840,19 @@ paths:
       responses:
         '200': {$ref: '#/components/responses/PostReviewList'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/review:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [Collaboration]
+      operationId: submitWorkspacePostReviewLegacy
+      description: Legacy alias for POST /workspaces/{workspace_id}/posts/{post_id}/review/submit.
+      deprecated: true
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/PostReviewSubmission'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/posts/{post_id}/review/submit:
     parameters:
       - {$ref: '#/components/parameters/WorkspaceId'}
@@ -1955,6 +2053,40 @@ paths:
     post:
       tags: [Integration]
       operationId: testMaxIntegration
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Integration test result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TestResult'
+        default:
+          $ref: '#/components/responses/Problem'
+  /integrations/max:
+    get:
+      tags: [Integration]
+      operationId: getMaxIntegrationLegacy
+      description: Legacy alias for GET /integration/max.
+      deprecated: true
+      security:
+        - sessionCookie: []
+      responses:
+        '200':
+          description: MAX integration status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntegrationStatus'
+        default:
+          $ref: '#/components/responses/Problem'
+  /integrations/max/test:
+    post:
+      tags: [Integration]
+      operationId: testMaxIntegrationLegacy
+      description: Legacy alias for POST /integration/max/test.
+      deprecated: true
       security:
         - sessionCookie: []
       responses:
@@ -2850,12 +2982,6 @@ components:
           oneOf:
             - $ref: '#/components/schemas/Channel'
             - type: 'null'
-    ChannelConnectionClaimEnvelope:
-      type: object
-      required: [claim]
-      properties:
-        claim:
-          $ref: '#/components/schemas/ChannelConnectionClaim'
     PostFormat:
       type: string
       enum: [markdown, html]

@@ -1164,10 +1164,15 @@ func (a *App) PublishPost(ctx context.Context, postID int64) (store.Post, error)
 	if err != nil {
 		return store.Post{}, fmt.Errorf("%w: %w", ErrConflict, err)
 	}
-	return a.publishClaimedPost(ctx, post)
+	return a.publishClaimedPost(ctx, post, nil)
 }
 
-func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (result store.Post, resultErr error) {
+// publishClaimedPost publishes a post that already holds the publishing claim.
+// sendStarted, when non-nil, is set to true immediately before the message
+// request is handed to MAX: past that point the message may have reached the
+// channel even if the call returns an error, so callers must not retry
+// automatically.
+func (a *App) publishClaimedPost(ctx context.Context, post store.Post, sendStarted *bool) (result store.Post, resultErr error) {
 	startedAt := time.Now()
 	defer func() {
 		a.metrics.ObservePublicationOperation("publish", metricOutcome(resultErr), time.Since(startedAt))
@@ -1199,6 +1204,9 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post) (result s
 	mediaTokens, imageTokens, err := a.postMediaTokens(ctx, post)
 	if err != nil {
 		return a.fail(postID, err)
+	}
+	if sendStarted != nil {
+		*sendStarted = true
 	}
 	message, err := a.max.Publish(ctx, maxclient.PublishRequest{
 		ChatID: channel.MAXChatID, Text: post.Content, Format: maxclient.Format(post.Format),
@@ -1853,7 +1861,13 @@ func (a *App) publishDueAt(ctx context.Context, now time.Time) {
 		go func() {
 			defer workers.Done()
 			for id := range jobs {
-				publishCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+				// A stop signal cancels ctx immediately, but aborting a post
+				// mid-publication can turn a message that already reached MAX
+				// into a terminal failed post (and a duplicate after a manual
+				// retry). Publications therefore run on a context detached from
+				// scheduler cancellation, bounded by their own timeout; main
+				// waits for the scheduler goroutine before exiting.
+				publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
 				published, publishErr := a.publishScheduledPost(publishCtx, id, now)
 				cancel()
 				if publishErr != nil {
@@ -1887,6 +1901,21 @@ func (a *App) publishScheduledPost(ctx context.Context, postID int64, now time.T
 		return false, err
 	}
 	if err := a.requireApprovedCurrentRevision(ctx, queued); err != nil {
+		if errors.Is(err, ErrApprovalRequired) {
+			// A revoked approval is not a transient failure: left scheduled, the
+			// post would be retried every cycle forever and could crowd fresh due
+			// posts out of the DuePostIDs batch. Take it off the calendar with a
+			// clear last_error; re-approving and rescheduling brings it back.
+			claimed, claimErr := a.store.ClaimScheduledForPublishing(ctx, postID, now.UTC())
+			if errors.Is(claimErr, store.ErrScheduleNotDue) {
+				return false, nil
+			}
+			if claimErr != nil {
+				return false, claimErr
+			}
+			_, failErr := a.fail(claimed.ID, err)
+			return false, failErr
+		}
 		return false, err
 	}
 	post, err := a.store.ClaimScheduledForPublishing(ctx, postID, now.UTC())
@@ -1896,8 +1925,32 @@ func (a *App) publishScheduledPost(ctx context.Context, postID int64, now time.T
 	if err != nil {
 		return false, err
 	}
-	_, err = a.publishClaimedPost(ctx, post)
+	sendStarted := false
+	_, err = a.publishClaimedPost(ctx, post, &sendStarted)
+	if err != nil && errors.Is(err, context.Canceled) && !sendStarted && queued.ScheduledAt != nil {
+		// The publication was interrupted by a canceled context (typically a
+		// service stop) before anything was sent to MAX, so retrying cannot
+		// duplicate the message. Return the post to the calendar with its
+		// original slot so the next cycle retries it instead of leaving a
+		// terminal failure behind. Once the send has started the message may
+		// already be in the channel, so the post stays failed with last_error
+		// for a human to resolve.
+		a.restoreInterruptedSchedule(postID, *queued.ScheduledAt)
+	}
 	return err == nil, err
+}
+
+// restoreInterruptedSchedule undoes the failed/publishing state of a
+// scheduled publication that was cut short by a canceled context. It runs on
+// its own short-lived context because the interrupting cancellation must not
+// prevent the state from being written.
+func (a *App) restoreInterruptedSchedule(postID int64, scheduledAt time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.store.RestoreInterruptedSchedule(ctx, postID, scheduledAt); err != nil {
+		a.logger.Error("could not restore the schedule of an interrupted publication",
+			"post_id", postID, "error", err)
+	}
 }
 
 func (a *App) SchedulePost(ctx context.Context, postID int64, scheduledAt time.Time) (store.Post, error) {
@@ -2096,7 +2149,12 @@ func (a *App) releasePublishedUpdate(claimed store.Post, lastError string) (stor
 
 func (a *App) fail(postID int64, cause error) (store.Post, error) {
 	a.logger.Warn("MAX publication failed", "post_id", postID, "error", cause)
-	if _, err := a.store.MarkPublishFailed(context.Background(), postID, publicationFailureMessage(cause)); err != nil {
+	// The failure is recorded on a context detached from the caller (which may
+	// already be canceled) but bounded, so a hung database write cannot block a
+	// scheduler worker forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := a.store.MarkPublishFailed(ctx, postID, publicationFailureMessage(cause)); err != nil {
 		a.logger.Error("could not persist publication failure", "post_id", postID, "error", err)
 	}
 	return store.Post{}, cause
@@ -2105,6 +2163,9 @@ func (a *App) fail(postID int64, cause error) (store.Post, error) {
 func publicationFailureMessage(cause error) string {
 	if errors.Is(cause, context.DeadlineExceeded) {
 		return "MAX не ответил вовремя. Проверьте канал и попробуйте опубликовать ещё раз."
+	}
+	if errors.Is(cause, ErrApprovalRequired) {
+		return "Согласование текущей версии поста отозвано. Отправьте пост на согласование и опубликуйте или запланируйте его заново."
 	}
 	var channelErr *ChannelAccessError
 	if errors.As(cause, &channelErr) {

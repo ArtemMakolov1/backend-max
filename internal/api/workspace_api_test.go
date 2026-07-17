@@ -133,6 +133,30 @@ func TestWorkspaceAPIAuthorizationCollaborationAndApprovalGate(t *testing.T) {
 	})
 }
 
+func TestCreateWorkspacePostWithExplicitNullScheduleCreatesDraftUnderApprovalPolicy(t *testing.T) {
+	fixture := newWorkspaceAPIFixture(t)
+	editor := fixture.handler(t, "ws-editor")
+	base := "/api/v1/workspaces/" + fixture.workspace.ID
+
+	response := performJSONRequest(editor, http.MethodPost, base+"/posts",
+		`{"title":"Draft","content":"body","format":"markdown","scheduled_at":null}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("draft with explicit null schedule = %d %s", response.Code, response.Body.String())
+	}
+	var created store.Post
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Status != store.PostStatusDraft || created.ScheduledAt != nil {
+		t.Fatalf("created post = %#v", created)
+	}
+
+	scheduleAt := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	response = performJSONRequest(editor, http.MethodPost, base+"/posts",
+		`{"title":"Scheduled","content":"body","format":"markdown","channel_id":`+postID(fixture.channel.ID)+`,"scheduled_at":"`+scheduleAt+`"}`)
+	assertProblemCode(t, response, http.StatusConflict, "post_approval_required")
+}
+
 func TestWorkspaceCapabilitiesAreExhaustiveAndStable(t *testing.T) {
 	owner := app.AccessContextForRole("workspace", "owner", store.WorkspaceRoleOwner)
 	want := []app.Capability{
