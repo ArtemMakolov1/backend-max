@@ -447,8 +447,19 @@ func (s *Server) deleteWorkspaceChannel(w http.ResponseWriter, r *http.Request) 
 		s.writeError(w, err)
 		return
 	}
-	if err := s.app.Store().DeleteChannelForWorkspace(r.Context(), access.UserID, access.WorkspaceID, channelID); err != nil {
-		s.writeError(w, err)
+	var deleteErr error
+	if r.URL.Query().Get("delete_content") == "true" {
+		deleteErr = s.app.Store().DeleteChannelContentForWorkspace(r.Context(), access.UserID, access.WorkspaceID, channelID)
+	} else {
+		deleteErr = s.app.Store().DeleteChannelForWorkspace(r.Context(), access.UserID, access.WorkspaceID, channelID)
+	}
+	if errors.Is(deleteErr, store.ErrChannelPublicationInProgress) {
+		s.problem(w, http.StatusConflict, "channel_publication_in_progress",
+			"Дождитесь завершения текущей публикации и повторите удаление канала.", nil)
+		return
+	}
+	if deleteErr != nil {
+		s.writeError(w, deleteErr)
 		return
 	}
 	s.writeJSON(w, http.StatusNoContent, nil)
