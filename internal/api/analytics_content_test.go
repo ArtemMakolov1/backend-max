@@ -108,6 +108,9 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 	report := payload.Analytics
 	if report.Scope.Kind != "workspace" || report.Summary.PublishedPosts != 2 ||
 		report.Summary.ViewsPer1KAudience == nil || report.Summary.AverageViewsPerHour == nil ||
+		report.Summary.AverageReach == nil || *report.Summary.AverageReach != 70 ||
+		report.Summary.ERR30D == nil || *report.Summary.ERR30D != 7.25 || report.Summary.ERR30DSample != 2 ||
+		report.Summary.PublishedLast24H != 1 || report.Summary.PostsPerDay == nil ||
 		report.TimezoneOffsetMinutes != 180 || len(report.Heatmap) != 7*24 ||
 		len(report.Posts) != 2 || report.Posts[0].Audience != 800 ||
 		report.Posts[0].Score == nil || *report.Posts[0].Score != 31.62 {

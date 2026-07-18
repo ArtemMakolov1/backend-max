@@ -50,10 +50,11 @@ type AnalyticsSummary struct {
 // ViewsTotal is the latest known cumulative total on the date. Dates with no
 // MAX observation are not manufactured as zero-valued points.
 type AnalyticsDailyPoint struct {
-	Date              string `json:"date"`
-	Views             *int64 `json:"views"`
-	ViewsTotal        *int64 `json:"views_total"`
-	ParticipantsCount *int   `json:"participants_count"`
+	Date               string `json:"date"`
+	Views              *int64 `json:"views"`
+	ViewsTotal         *int64 `json:"views_total"`
+	ParticipantsCount  *int   `json:"participants_count"`
+	ParticipantsChange *int   `json:"participants_change"`
 }
 
 type AnalyticsPost struct {
@@ -200,7 +201,9 @@ ORDER BY post.published_at DESC, post.id DESC`,
 		return ChannelAnalytics{}, err
 	}
 
-	report.Daily, report.Summary.ViewsChange = buildAnalyticsDaily(viewObservations, participantHistory)
+	report.Daily, report.Summary.ViewsChange = buildAnalyticsDaily(
+		viewObservations, participantHistory, participantBaseline,
+	)
 	participantsCurrent := channel.ParticipantsCount
 	if len(participantHistory) > 0 {
 		participantsCurrent = participantHistory[len(participantHistory)-1].ParticipantsCount
@@ -279,6 +282,7 @@ LIMIT 1`, userID, channelID, before.Format(time.DateOnly)).Scan(
 
 func buildAnalyticsDaily(viewObservations []analyticsViewObservation,
 	participantHistory []ChannelParticipantSnapshot,
+	participantBaseline *ChannelParticipantSnapshot,
 ) ([]AnalyticsDailyPoint, *int64) {
 	points := make(map[string]*AnalyticsDailyPoint)
 	viewDays := make(map[string][]analyticsViewObservation)
@@ -325,7 +329,9 @@ func buildAnalyticsDaily(viewObservations []analyticsViewObservation,
 		points[day] = point
 	}
 
-	for _, snapshot := range participantHistory {
+	previousParticipant := participantBaseline
+	for index := range participantHistory {
+		snapshot := participantHistory[index]
 		point := points[snapshot.ObservedOn]
 		if point == nil {
 			point = &AnalyticsDailyPoint{Date: snapshot.ObservedOn}
@@ -333,6 +339,13 @@ func buildAnalyticsDaily(viewObservations []analyticsViewObservation,
 		}
 		value := snapshot.ParticipantsCount
 		point.ParticipantsCount = &value
+		if previousParticipant != nil && analyticsDaysAreConsecutive(
+			previousParticipant.ObservedOn, snapshot.ObservedOn,
+		) {
+			change := snapshot.ParticipantsCount - previousParticipant.ParticipantsCount
+			point.ParticipantsChange = &change
+		}
+		previousParticipant = &participantHistory[index]
 	}
 
 	days := make([]string, 0, len(points))
@@ -349,6 +362,12 @@ func buildAnalyticsDaily(viewObservations []analyticsViewObservation,
 		observedViewsChange = int64Pointer(viewsChange)
 	}
 	return result, observedViewsChange
+}
+
+func analyticsDaysAreConsecutive(previous, current string) bool {
+	previousDay, previousErr := time.Parse(time.DateOnly, previous)
+	currentDay, currentErr := time.Parse(time.DateOnly, current)
+	return previousErr == nil && currentErr == nil && currentDay.Equal(previousDay.AddDate(0, 0, 1))
 }
 
 func int64Pointer(value int64) *int64 {

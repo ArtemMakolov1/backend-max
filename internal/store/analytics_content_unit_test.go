@@ -51,6 +51,44 @@ func TestAnalyticsContentBestTimeRequiresBothNormalizedSignals(t *testing.T) {
 	}
 }
 
+func TestApplyAnalyticsERRUsesAudienceAtPublishAndNearestHourlySnapshots(t *testing.T) {
+	publishedAt := time.Date(2026, time.June, 10, 10, 0, 0, 0, time.UTC)
+	firstViews, secondViews := int64(60), int64(100)
+	posts := []AnalyticsContentPost{
+		{
+			ID: 1, Audience: 100, PublishedAt: &publishedAt, Views: &firstViews,
+			maxMessageID: "first",
+		},
+		{
+			ID: 2, Audience: 200, PublishedAt: &publishedAt, Views: &secondViews,
+			maxMessageID: "second",
+		},
+	}
+	observations := analyticsReachObservations{
+		{PostID: 1, MAXMessageID: "first"}: {
+			{PostID: 1, MAXMessageID: "first", Views: 40, CapturedAt: publishedAt.Add(23*time.Hour + 50*time.Minute)},
+			{PostID: 1, MAXMessageID: "first", Views: 50, CapturedAt: publishedAt.Add(48*time.Hour + 30*time.Minute)},
+		},
+		{PostID: 2, MAXMessageID: "second"}: {
+			{PostID: 2, MAXMessageID: "second", Views: 80, CapturedAt: publishedAt.Add(25*time.Hour + 30*time.Minute)},
+			{PostID: 2, MAXMessageID: "second", Views: 90, CapturedAt: publishedAt.Add(47 * time.Hour)},
+		},
+	}
+
+	var summary AnalyticsContentSummary
+	applyAnalyticsERR(&summary, posts, observations, publishedAt.Add(72*time.Hour))
+
+	if summary.ERR24H == nil || *summary.ERR24H != 40 || summary.ERR24HSample != 2 {
+		t.Fatalf("ERR 24h = %#v, sample=%d", summary.ERR24H, summary.ERR24HSample)
+	}
+	if summary.ERR48H == nil || *summary.ERR48H != 47.5 || summary.ERR48HSample != 2 {
+		t.Fatalf("ERR 48h = %#v, sample=%d", summary.ERR48H, summary.ERR48HSample)
+	}
+	if summary.ERR30D == nil || *summary.ERR30D != 55 || summary.ERR30DSample != 2 {
+		t.Fatalf("ERR 30d = %#v, sample=%d", summary.ERR30D, summary.ERR30DSample)
+	}
+}
+
 func TestCreateAnalyticsRepeatPlanRollsBackDraftWhenCampaignCannotBeCreated(t *testing.T) {
 	ctx := context.Background()
 	storage := openWorkspaceTestStore(t, "analytics-repeat-atomic")

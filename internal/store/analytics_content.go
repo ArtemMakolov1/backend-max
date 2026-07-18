@@ -35,15 +35,27 @@ type AnalyticsContentScope struct {
 }
 
 type AnalyticsContentSummary struct {
-	PostsTotal          int64    `json:"posts_total"`
-	PublishedPosts      int64    `json:"published_posts"`
-	KnownViewsPosts     int      `json:"known_views_posts"`
-	TotalViews          *int64   `json:"total_views"`
-	ParticipantsCurrent *int     `json:"participants_current"`
-	ParticipantsChange  *int     `json:"participants_change"`
-	ViewsChange         *int64   `json:"views_change"`
-	ViewsPer1KAudience  *float64 `json:"views_per_1k_audience"`
-	AverageViewsPerHour *float64 `json:"average_views_per_hour"`
+	PostsTotal                   int64      `json:"posts_total"`
+	PublishedPosts               int64      `json:"published_posts"`
+	PublishedLast24H             int64      `json:"published_last_24h"`
+	KnownViewsPosts              int        `json:"known_views_posts"`
+	TotalViews                   *int64     `json:"total_views"`
+	AverageReach                 *float64   `json:"average_reach"`
+	ParticipantsCurrent          *int       `json:"participants_current"`
+	ParticipantsChange           *int       `json:"participants_change"`
+	ParticipantsChange24H        *int       `json:"participants_change_24h"`
+	ParticipantsChange24HPercent *float64   `json:"participants_change_24h_percent"`
+	ViewsChange                  *int64     `json:"views_change"`
+	ViewsPer1KAudience           *float64   `json:"views_per_1k_audience"`
+	AverageViewsPerHour          *float64   `json:"average_views_per_hour"`
+	ERR24H                       *float64   `json:"err_24h"`
+	ERR48H                       *float64   `json:"err_48h"`
+	ERR30D                       *float64   `json:"err_30d"`
+	ERR24HSample                 int        `json:"err_24h_sample"`
+	ERR48HSample                 int        `json:"err_48h_sample"`
+	ERR30DSample                 int        `json:"err_30d_sample"`
+	PostsPerDay                  *float64   `json:"posts_per_day"`
+	LastPublishedAt              *time.Time `json:"last_published_at"`
 }
 
 type AnalyticsContentPost struct {
@@ -61,6 +73,7 @@ type AnalyticsContentPost struct {
 	MAXStatsSyncedAt   *time.Time `json:"max_stats_synced_at"`
 	PublicationState   string     `json:"publication_state"`
 	RemovedFromMAX     bool       `json:"removed_from_max"`
+	maxMessageID       string
 }
 
 type AnalyticsHeatmapCell struct {
@@ -160,6 +173,15 @@ func (s *Store) GetWorkspaceAnalyticsContent(
 	currentAudience := audienceTotal
 	report.Summary.ParticipantsCurrent = &currentAudience
 	toExclusive := toDay.AddDate(0, 0, 1)
+	analysisEnd := asOf
+	if toExclusive.Before(analysisEnd) {
+		analysisEnd = toExclusive
+	}
+	metricFrom := asOf.AddDate(0, 0, -30)
+	queryFrom := fromDay
+	if metricFrom.Before(queryFrom) {
+		queryFrom = metricFrom
+	}
 
 	countQuery := `SELECT COUNT(*) FROM posts WHERE workspace_id=? AND created_at>=? AND created_at<?`
 	countArgs := []any{workspaceID, fromDay, toExclusive}
@@ -178,7 +200,8 @@ SELECT post.id, post.title, post.channel_id, channel.title,
        COALESCE(latest.views, CASE WHEN post.max_stats_synced_at < ? THEN post.max_views END),
        post.max_message_url,
        COALESCE(latest.captured_at, CASE WHEN post.max_stats_synced_at < ? THEN post.max_stats_synced_at END),
-       CASE WHEN post.status = ? AND post.max_message_id <> '' THEN 'published' ELSE 'removed' END
+       CASE WHEN post.status = ? AND post.max_message_id <> '' THEN 'published' ELSE 'removed' END,
+       COALESCE(latest.max_message_id,post.max_message_id)
 FROM posts AS post
 JOIN channels AS channel ON channel.workspace_id=post.workspace_id AND channel.id=post.channel_id
 LEFT JOIN LATERAL (
@@ -189,7 +212,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) AS audience_at_publish ON TRUE
 LEFT JOIN LATERAL (
-    SELECT snapshot.views, snapshot.captured_at
+    SELECT snapshot.max_message_id, snapshot.views, snapshot.captured_at
     FROM post_view_snapshots AS snapshot
     WHERE snapshot.owner_id=post.owner_id AND snapshot.post_id=post.id
       AND snapshot.captured_at < ?
@@ -198,7 +221,7 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) AS latest ON TRUE
 WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
-	postArgs := []any{toExclusive, toExclusive, PostStatusPublished, toExclusive, workspaceID, fromDay, toExclusive}
+	postArgs := []any{toExclusive, toExclusive, PostStatusPublished, toExclusive, workspaceID, queryFrom, toExclusive}
 	if selected != nil {
 		postQuery += ` AND post.channel_id=?`
 		postArgs = append(postArgs, selected.ID)
@@ -210,15 +233,12 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 	}
 	defer func() { _ = rows.Close() }()
 
-	analysisEnd := asOf
-	if toExclusive.Before(analysisEnd) {
-		analysisEnd = toExclusive
-	}
 	var totalViews int64
 	var normalizedViews int64
 	var audienceExposure int64
 	var viewsPerHourTotal float64
 	var viewsPerHourCount int
+	metricPosts := make([]AnalyticsContentPost, 0)
 	for rows.Next() {
 		var post AnalyticsContentPost
 		var publishedAt, syncedAt sql.NullTime
@@ -226,6 +246,7 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 		if err := rows.Scan(
 			&post.ID, &post.Title, &post.ChannelID, &post.ChannelTitle, &post.Audience,
 			&publishedAt, &views, &post.MAXMessageURL, &syncedAt, &post.PublicationState,
+			&post.maxMessageID,
 		); err != nil {
 			return AnalyticsContentReport{}, fmt.Errorf("scan workspace analytics post: %w", err)
 		}
@@ -238,13 +259,9 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 		if views.Valid {
 			value := views.Int64
 			post.Views = &value
-			totalViews += value
-			report.Summary.KnownViewsPosts++
 			if post.Audience > 0 {
 				normalized := roundAnalyticsMetric(float64(value) * 1000 / float64(post.Audience))
 				post.ViewsPer1KAudience = &normalized
-				normalizedViews += value
-				audienceExposure += int64(post.Audience)
 			}
 			if post.PublishedAt != nil {
 				ageHours := analysisEnd.Sub(post.PublishedAt.UTC()).Hours()
@@ -253,13 +270,36 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 				}
 				rate := roundAnalyticsMetric(float64(value) / ageHours)
 				post.ViewsPerHour = &rate
-				viewsPerHourTotal += rate
-				viewsPerHourCount++
 			}
 			if score, ok := analyticsContentScore(post.ViewsPer1KAudience, post.ViewsPerHour); ok {
 				rounded := roundAnalyticsMetric(score)
 				post.Score = &rounded
 			}
+		}
+		if post.PublishedAt != nil && !post.PublishedAt.Before(metricFrom) && !post.PublishedAt.After(asOf) {
+			metricPosts = append(metricPosts, post)
+		}
+		if post.PublishedAt == nil || post.PublishedAt.Before(fromDay) || !post.PublishedAt.Before(toExclusive) {
+			continue
+		}
+		if post.Views != nil {
+			totalViews += *post.Views
+			report.Summary.KnownViewsPosts++
+			if post.Audience > 0 {
+				normalizedViews += *post.Views
+				audienceExposure += int64(post.Audience)
+			}
+			if post.ViewsPerHour != nil {
+				viewsPerHourTotal += *post.ViewsPerHour
+				viewsPerHourCount++
+			}
+		}
+		if !post.PublishedAt.Before(asOf.Add(-24*time.Hour)) && !post.PublishedAt.After(asOf) {
+			report.Summary.PublishedLast24H++
+		}
+		if report.Summary.LastPublishedAt == nil || post.PublishedAt.After(*report.Summary.LastPublishedAt) {
+			lastPublishedAt := post.PublishedAt.UTC()
+			report.Summary.LastPublishedAt = &lastPublishedAt
 		}
 		report.Posts = append(report.Posts, post)
 	}
@@ -269,6 +309,8 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 	report.Summary.PublishedPosts = int64(len(report.Posts))
 	if report.Summary.KnownViewsPosts > 0 {
 		report.Summary.TotalViews = &totalViews
+		averageReach := roundAnalyticsMetric(float64(totalViews) / float64(report.Summary.KnownViewsPosts))
+		report.Summary.AverageReach = &averageReach
 	}
 	if audienceExposure > 0 {
 		metric := roundAnalyticsMetric(float64(normalizedViews) * 1000 / float64(audienceExposure))
@@ -278,6 +320,23 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 		metric := roundAnalyticsMetric(viewsPerHourTotal / float64(viewsPerHourCount))
 		report.Summary.AverageViewsPerHour = &metric
 	}
+	activityToDay := toDay
+	if currentDay := utcDate(asOf); currentDay.Before(activityToDay) {
+		activityToDay = currentDay
+	}
+	if !activityToDay.Before(fromDay) {
+		activityDays := int(activityToDay.Sub(fromDay)/(24*time.Hour)) + 1
+		postsPerDay := roundAnalyticsMetric(float64(report.Summary.PublishedPosts) / float64(activityDays))
+		report.Summary.PostsPerDay = &postsPerDay
+	}
+
+	reachObservations, err := s.listWorkspaceAnalyticsReachObservations(
+		ctx, workspaceID, channelID, metricFrom, asOf,
+	)
+	if err != nil {
+		return AnalyticsContentReport{}, err
+	}
+	applyAnalyticsERR(&report.Summary, metricPosts, reachObservations, asOf)
 
 	observations, err := s.listWorkspaceAnalyticsViewObservations(
 		ctx, workspaceID, channelID, fromDay, toExclusive,
@@ -291,13 +350,40 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 	if err != nil {
 		return AnalyticsContentReport{}, err
 	}
-	report.Daily, report.Summary.ViewsChange = buildAnalyticsDaily(observations, participantHistory)
+	participantBaseline, err := s.latestWorkspaceAnalyticsParticipantSnapshotBefore(
+		ctx, workspaceID, channelID, fromDay,
+	)
+	if err != nil {
+		return AnalyticsContentReport{}, err
+	}
+	report.Daily, report.Summary.ViewsChange = buildAnalyticsDaily(
+		observations, participantHistory, participantBaseline,
+	)
 	if selected != nil && len(participantHistory) > 0 {
-		latest := participantHistory[len(participantHistory)-1].ParticipantsCount
+		latestSnapshot := participantHistory[len(participantHistory)-1]
+		latest := latestSnapshot.ParticipantsCount
 		report.Summary.ParticipantsCurrent = &latest
-		if len(participantHistory) >= 2 {
+		if participantBaseline != nil {
+			change := latest - participantBaseline.ParticipantsCount
+			report.Summary.ParticipantsChange = &change
+		} else if len(participantHistory) >= 2 {
 			change := latest - participantHistory[0].ParticipantsCount
 			report.Summary.ParticipantsChange = &change
+		}
+		var previous *ChannelParticipantSnapshot
+		if len(participantHistory) >= 2 {
+			previous = &participantHistory[len(participantHistory)-2]
+		} else {
+			previous = participantBaseline
+		}
+		if previous != nil && latestSnapshot.ObservedOn == activityToDay.Format(time.DateOnly) &&
+			analyticsDaysAreConsecutive(previous.ObservedOn, latestSnapshot.ObservedOn) {
+			change := latest - previous.ParticipantsCount
+			report.Summary.ParticipantsChange24H = &change
+			if previous.ParticipantsCount > 0 {
+				percent := roundAnalyticsMetric(float64(change) * 100 / float64(previous.ParticipantsCount))
+				report.Summary.ParticipantsChange24HPercent = &percent
+			}
 		}
 	}
 
@@ -343,6 +429,122 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?
 	return result, rows.Err()
 }
 
+type analyticsReachObservations map[analyticsPublicationKey][]analyticsViewObservation
+
+func (s *Store) listWorkspaceAnalyticsReachObservations(
+	ctx context.Context,
+	workspaceID string,
+	channelID *int64,
+	publishedFrom, asOf time.Time,
+) (analyticsReachObservations, error) {
+	query := `
+SELECT snapshot.post_id,snapshot.max_message_id,snapshot.views,snapshot.captured_at
+FROM post_view_snapshots AS snapshot
+JOIN posts AS post ON post.owner_id=snapshot.owner_id AND post.id=snapshot.post_id
+WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<=?
+  AND snapshot.captured_at>=post.published_at AND snapshot.captured_at<=?`
+	args := []any{workspaceID, publishedFrom, asOf, asOf}
+	if channelID != nil {
+		query += ` AND post.channel_id=?`
+		args = append(args, *channelID)
+	}
+	query += ` ORDER BY snapshot.captured_at,snapshot.id`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace ERR observations: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	result := make(analyticsReachObservations)
+	for rows.Next() {
+		var observation analyticsViewObservation
+		if err := rows.Scan(
+			&observation.PostID, &observation.MAXMessageID, &observation.Views, &observation.CapturedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan workspace ERR observation: %w", err)
+		}
+		observation.CapturedAt = observation.CapturedAt.UTC()
+		key := analyticsPublicationKey{PostID: observation.PostID, MAXMessageID: observation.MAXMessageID}
+		result[key] = append(result[key], observation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate workspace ERR observations: %w", err)
+	}
+	return result, nil
+}
+
+func applyAnalyticsERR(
+	summary *AnalyticsContentSummary,
+	posts []AnalyticsContentPost,
+	observations analyticsReachObservations,
+	asOf time.Time,
+) {
+	if summary == nil {
+		return
+	}
+	const observationTolerance = 2 * time.Hour
+	var err24Total, err48Total, err30Total float64
+	for _, post := range posts {
+		if post.PublishedAt == nil || post.Audience <= 0 {
+			continue
+		}
+		if post.Views != nil {
+			err30Total += float64(*post.Views) * 100 / float64(post.Audience)
+			summary.ERR30DSample++
+		}
+		key := analyticsPublicationKey{PostID: post.ID, MAXMessageID: post.maxMessageID}
+		publicationObservations := observations[key]
+		target24H := post.PublishedAt.Add(24 * time.Hour)
+		if !target24H.After(asOf) {
+			if views, ok := closestAnalyticsReach(publicationObservations, target24H, observationTolerance); ok {
+				err24Total += float64(views) * 100 / float64(post.Audience)
+				summary.ERR24HSample++
+			}
+		}
+		target48H := post.PublishedAt.Add(48 * time.Hour)
+		if !target48H.After(asOf) {
+			if views, ok := closestAnalyticsReach(publicationObservations, target48H, observationTolerance); ok {
+				err48Total += float64(views) * 100 / float64(post.Audience)
+				summary.ERR48HSample++
+			}
+		}
+	}
+	if summary.ERR24HSample > 0 {
+		value := roundAnalyticsMetric(err24Total / float64(summary.ERR24HSample))
+		summary.ERR24H = &value
+	}
+	if summary.ERR48HSample > 0 {
+		value := roundAnalyticsMetric(err48Total / float64(summary.ERR48HSample))
+		summary.ERR48H = &value
+	}
+	if summary.ERR30DSample > 0 {
+		value := roundAnalyticsMetric(err30Total / float64(summary.ERR30DSample))
+		summary.ERR30D = &value
+	}
+}
+
+func closestAnalyticsReach(
+	observations []analyticsViewObservation,
+	target time.Time,
+	tolerance time.Duration,
+) (int64, bool) {
+	var selected int64
+	closestDistance := tolerance + time.Nanosecond
+	found := false
+	for _, observation := range observations {
+		distance := observation.CapturedAt.Sub(target)
+		if distance < 0 {
+			distance = -distance
+		}
+		if distance > tolerance || distance >= closestDistance {
+			continue
+		}
+		selected = observation.Views
+		closestDistance = distance
+		found = true
+	}
+	return selected, found
+}
+
 func (s *Store) listWorkspaceAnalyticsParticipantHistory(
 	ctx context.Context,
 	workspaceID string,
@@ -379,6 +581,37 @@ ORDER BY snapshot.observed_on,snapshot.captured_at`,
 		result = append(result, snapshot)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) latestWorkspaceAnalyticsParticipantSnapshotBefore(
+	ctx context.Context,
+	workspaceID string,
+	channelID *int64,
+	before time.Time,
+) (*ChannelParticipantSnapshot, error) {
+	if channelID == nil {
+		return nil, nil
+	}
+	var snapshot ChannelParticipantSnapshot
+	var observedOn time.Time
+	err := s.db.QueryRowContext(ctx, `
+SELECT history.observed_on,history.participants_count,history.captured_at
+FROM channel_participant_snapshots AS history
+JOIN channels AS channel ON channel.id=history.channel_id
+WHERE channel.workspace_id=? AND channel.id=? AND history.observed_on<?
+ORDER BY history.observed_on DESC,history.captured_at DESC
+LIMIT 1`, workspaceID, *channelID, before.Format(time.DateOnly)).Scan(
+		&observedOn, &snapshot.ParticipantsCount, &snapshot.CapturedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get workspace analytics participant baseline: %w", err)
+	}
+	snapshot.ObservedOn = observedOn.UTC().Format(time.DateOnly)
+	snapshot.CapturedAt = snapshot.CapturedAt.UTC()
+	return &snapshot, nil
 }
 
 type analyticsHeatmapAccumulator struct {

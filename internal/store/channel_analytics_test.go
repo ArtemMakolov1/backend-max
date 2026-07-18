@@ -182,7 +182,7 @@ func TestBuildAnalyticsDailyRequiresComparablePublicationSnapshots(t *testing.T)
 		{PostID: 2, MAXMessageID: "second", Views: 7, CapturedAt: dayTwo.Add(time.Minute)},
 	}
 
-	daily, change := buildAnalyticsDaily(observations, nil)
+	daily, change := buildAnalyticsDaily(observations, nil, nil)
 	if len(daily) != 2 {
 		t.Fatalf("daily = %#v", daily)
 	}
@@ -195,6 +195,26 @@ func TestBuildAnalyticsDailyRequiresComparablePublicationSnapshots(t *testing.T)
 	}
 	if change == nil || *change != 3 {
 		t.Fatalf("change = %#v", change)
+	}
+}
+
+func TestBuildAnalyticsDailyCalculatesOnlyConsecutiveParticipantGrowth(t *testing.T) {
+	baselineDay := time.Date(2026, time.July, 12, 0, 0, 0, 0, time.UTC)
+	baseline := &ChannelParticipantSnapshot{
+		ObservedOn: baselineDay.Format(time.DateOnly), ParticipantsCount: 10,
+	}
+	history := []ChannelParticipantSnapshot{
+		{ObservedOn: baselineDay.AddDate(0, 0, 1).Format(time.DateOnly), ParticipantsCount: 12},
+		{ObservedOn: baselineDay.AddDate(0, 0, 2).Format(time.DateOnly), ParticipantsCount: 11},
+		// A missing calendar day must not be presented as a 24-hour change.
+		{ObservedOn: baselineDay.AddDate(0, 0, 4).Format(time.DateOnly), ParticipantsCount: 15},
+	}
+
+	daily, _ := buildAnalyticsDaily(nil, history, baseline)
+	if len(daily) != 3 || daily[0].ParticipantsChange == nil || *daily[0].ParticipantsChange != 2 ||
+		daily[1].ParticipantsChange == nil || *daily[1].ParticipantsChange != -1 ||
+		daily[2].ParticipantsChange != nil {
+		t.Fatalf("participant daily growth = %#v", daily)
 	}
 }
 
