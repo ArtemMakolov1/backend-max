@@ -2687,6 +2687,17 @@ components:
         period: {type: string, enum: [current, month]}
         period_start: {type: string, format: date-time}
         period_end: {type: string, format: date-time}
+    ImageCreditCosts:
+      type: object
+      required: [low, medium, high]
+      description: |
+        ai_image_credits charged per generated image for each
+        GenerateImageInput quality. An omitted quality is charged as medium
+        and auto is charged as high.
+      properties:
+        low: {type: integer, format: int64, minimum: 1}
+        medium: {type: integer, format: int64, minimum: 1}
+        high: {type: integer, format: int64, minimum: 1}
     WorkspaceBilling:
       type: object
       required:
@@ -2695,6 +2706,7 @@ components:
         - entitlements
         - usage
         - monthly_enforcement_enabled
+        - image_credit_costs
       properties:
         workspace_id: {type: string}
         subscription: {$ref: '#/components/schemas/WorkspaceSubscription'}
@@ -2707,6 +2719,7 @@ components:
         monthly_enforcement_enabled:
           type: boolean
           description: False means observe-only; usage still increments atomically.
+        image_credit_costs: {$ref: '#/components/schemas/ImageCreditCosts'}
     WorkspaceCreate:
       type: object
       required: [name]
