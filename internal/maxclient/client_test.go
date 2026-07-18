@@ -925,6 +925,7 @@ func TestEditChatPatchesIconAndTitle(t *testing.T) {
 
 	client := mustClient(t, server.URL, "token", server.Client())
 	title := " Новое имя "
+	// #nosec G101 -- upload token fixture for the fake MAX server, not a credential.
 	chat, err := client.EditChat(context.Background(), "-100200300", ChatPatch{IconToken: "icon-upload-token", Title: &title})
 	if err != nil {
 		t.Fatalf("EditChat() error = %v", err)

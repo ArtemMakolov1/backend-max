@@ -15,8 +15,11 @@ for command_name in awk date docker find flock install mktemp openssl readlink s
 done
 docker compose version >/dev/null 2>&1 || { echo "Docker Compose v2 is required" >&2; exit 1; }
 
-script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-release_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd)
+# Physical paths (-P): CI invokes this script through the .../current
+# symlink, and the release guard below must see the resolved release
+# directory, not the symlinked path.
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+release_dir=$(CDPATH='' cd -- "$script_dir/../.." && pwd -P)
 releases_dir=$(dirname -- "$release_dir")
 installation_dir=$(dirname -- "$releases_dir")
 current_link="$installation_dir/current"

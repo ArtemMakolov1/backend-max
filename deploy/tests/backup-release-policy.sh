@@ -150,4 +150,32 @@ if grep -Eq 'curl[^\n]*(GHCR_TOKEN|github\.token)' "$repo_root/.github/workflows
   exit 1
 fi
 
+# The scheduled backup is invoked through the .../current symlink, so the
+# release guard must resolve physical paths: via-symlink calls pass the guard
+# while calls from an unaccepted location are still rejected. Requires the
+# same tooling the script itself checks for before the guard runs.
+if command -v flock >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  guard_message='must run from the currently accepted versioned release'
+  release_sha=0123456789abcdef0123456789abcdef01234567
+  install -d "$fixture/install/releases/$release_sha"
+  cp -R "$repo_root/deploy" "$fixture/install/releases/$release_sha/deploy"
+  ln -s "releases/$release_sha" "$fixture/install/current"
+
+  guard_stderr=$(printf 'token\n' | "$fixture/install/current/deploy/backup/run-scheduled-backup.sh" \
+    example/backend 2>&1 >/dev/null || true)
+  if grep -F "$guard_message" <<<"$guard_stderr" >/dev/null; then
+    echo "Release guard rejected an invocation through the current symlink" >&2
+    exit 1
+  fi
+
+  guard_stderr=$(printf 'token\n' | "$repo_root/deploy/backup/run-scheduled-backup.sh" \
+    example/backend 2>&1 >/dev/null || true)
+  if ! grep -F "$guard_message" <<<"$guard_stderr" >/dev/null; then
+    echo "Release guard accepted an invocation outside the accepted release" >&2
+    exit 1
+  fi
+else
+  echo "Release guard symlink test skipped: flock and docker compose are required."
+fi
+
 echo "Encrypted immutable backup policy tests passed."

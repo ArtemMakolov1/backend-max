@@ -21,13 +21,13 @@ import (
 )
 
 type fakeResearchClient struct {
-	mu              sync.Mutex
-	requests        []openairesearch.Request
-	result          openairesearch.Result
-	err             error
-	formatRequests  []openairesearch.FormatRequest
-	formatResult    openairesearch.FormatResult
-	formatErr       error
+	mu               sync.Mutex
+	requests         []openairesearch.Request
+	result           openairesearch.Result
+	err              error
+	formatRequests   []openairesearch.FormatRequest
+	formatResult     openairesearch.FormatResult
+	formatErr        error
 	suggestRequests  []openairesearch.SuggestImagePromptRequest
 	suggestResult    openairesearch.SuggestImagePromptResult
 	suggestErr       error
