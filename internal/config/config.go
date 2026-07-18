@@ -95,6 +95,12 @@ type Config struct {
 	AILeaseTTL                time.Duration
 	BillingEnforcementEnabled bool
 	SchedulerInterval         time.Duration
+	SMTPHost                  string
+	SMTPPort                  int
+	SMTPUsername              string
+	SMTPPassword              string
+	SMTPFromEmail             string
+	SMTPFromName              string
 }
 
 func Load() (Config, error) {
@@ -185,6 +191,11 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("BILLING_ENFORCEMENT_ENABLED must be true or false: %q", billingEnforcementText)
 	}
+	smtpPortText := env("SMTP_PORT", "587")
+	smtpPort, err := strconv.Atoi(smtpPortText)
+	if err != nil || smtpPort <= 0 || smtpPort > 65535 {
+		return Config{}, fmt.Errorf("SMTP_PORT must be an integer between 1 and 65535: %q", smtpPortText)
+	}
 
 	cfg := Config{
 		Host:                      env("HOST", defaultHost),
@@ -230,6 +241,12 @@ func Load() (Config, error) {
 		AILeaseTTL:                aiLeaseTTL,
 		BillingEnforcementEnabled: billingEnforcementEnabled,
 		SchedulerInterval:         interval,
+		SMTPHost:                  strings.TrimSpace(os.Getenv("SMTP_HOST")),
+		SMTPPort:                  smtpPort,
+		SMTPUsername:              strings.TrimSpace(os.Getenv("SMTP_USERNAME")),
+		SMTPPassword:              os.Getenv("SMTP_PASSWORD"),
+		SMTPFromEmail:             strings.TrimSpace(os.Getenv("SMTP_FROM_EMAIL")),
+		SMTPFromName:              strings.TrimSpace(os.Getenv("SMTP_FROM_NAME")),
 	}
 
 	if cfg.Host == "" || cfg.Port == "" || cfg.DatabaseURL == "" || cfg.MediaDir == "" || cfg.PublicBaseURL == "" {
@@ -315,6 +332,13 @@ func (c Config) YandexAuthEnabled() bool {
 
 func (c Config) S3Enabled() bool {
 	return c.S3Host != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
+}
+
+// SMTPConfigured reports whether transactional email delivery is enabled. Host
+// and sender address are the minimum required to build an SMTP sender; when
+// either is empty welcome emails are disabled and a NoopSender is wired instead.
+func (c Config) SMTPConfigured() bool {
+	return c.SMTPHost != "" && c.SMTPFromEmail != ""
 }
 
 func validateYandexRedirectURI(raw string) error {

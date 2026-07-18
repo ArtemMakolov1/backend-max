@@ -18,6 +18,7 @@ import (
 	"maxpilot/backend/internal/api"
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/config"
+	"maxpilot/backend/internal/email"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/observability"
@@ -119,6 +120,23 @@ func main() {
 		logger.Error("could not configure media policy", "error", err)
 		os.Exit(1)
 	}
+	var welcomeSender email.Sender = email.NewNoopSender(logger)
+	if cfg.SMTPConfigured() {
+		sender, err := email.NewSMTPSender(email.Config{
+			Host: cfg.SMTPHost, Port: cfg.SMTPPort, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
+			FromEmail: cfg.SMTPFromEmail, FromName: cfg.SMTPFromName,
+			AppURL: cfg.PublicBaseURL + "/app/#/posts", SiteURL: cfg.FrontendOrigin,
+		})
+		if err != nil {
+			logger.Error("could not initialize welcome email sender", "error", err)
+			os.Exit(1)
+		}
+		welcomeSender = sender
+		logger.Info("welcome emails enabled", "smtp_host", cfg.SMTPHost, "smtp_port", cfg.SMTPPort)
+	} else {
+		logger.Info("welcome emails disabled: SMTP not configured")
+	}
+
 	var yandexOAuth api.YandexOAuthClient
 	if cfg.YandexAuthEnabled() {
 		client, err := yandexauth.New(cfg.YandexClientID, cfg.YandexClientSecret, nil)
@@ -135,6 +153,7 @@ func main() {
 		SecureCookies:       strings.HasPrefix(strings.ToLower(cfg.YandexRedirectURI), "https://"),
 		TrustXRealIP:        cfg.OAuthTrustXRealIP, RateLimitAtEdge: cfg.OAuthRateLimitAtEdge,
 		MaxOwnedTeamWorkspaces: cfg.MaxOwnedTeamWorkspaces,
+		WelcomeSender:          welcomeSender,
 		AILimits: &api.AILimitOptions{
 			GlobalMaxConcurrent:    cfg.AIGlobalConcurrent,
 			UserMaxConcurrent:      cfg.AIUserConcurrent,

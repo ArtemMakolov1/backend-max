@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"maxpilot/backend/internal/app"
+	"maxpilot/backend/internal/email"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/openaiimg"
@@ -43,6 +44,9 @@ type AuthOptions struct {
 	AILimits               *AILimitOptions
 	Metrics                *observability.Metrics
 	MaxOwnedTeamWorkspaces int
+	// WelcomeSender delivers the first-sign-in welcome email. When nil the
+	// server falls back to a NoopSender so sign-in never depends on SMTP.
+	WelcomeSender email.Sender
 }
 
 type Server struct {
@@ -66,6 +70,11 @@ type Server struct {
 	activityDay            string
 	activityUsers          map[string]struct{}
 	maxOwnedTeamWorkspaces int
+	welcomeSender          email.Sender
+	// welcomeEmailDispatch runs the welcome-email delivery closure. Production
+	// spawns a detached goroutine so it never blocks the OAuth redirect; tests
+	// override it to run synchronously for deterministic assertions.
+	welcomeEmailDispatch func(func())
 }
 
 type principalContextKey struct{}
@@ -84,6 +93,8 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		mediaUploads:        newMediaUploadGate(8, 2),
 		observabilityAdmins: make(map[string]struct{}), activityUsers: make(map[string]struct{}),
 		maxOwnedTeamWorkspaces: 5,
+		welcomeSender:          email.NewNoopSender(logger),
+		welcomeEmailDispatch:   func(deliver func()) { go deliver() },
 	}
 	if len(authOptions) != 0 {
 		options := authOptions[0]
@@ -116,6 +127,9 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		}
 		if options.MaxOwnedTeamWorkspaces > 0 {
 			server.maxOwnedTeamWorkspaces = options.MaxOwnedTeamWorkspaces
+		}
+		if options.WelcomeSender != nil {
+			server.welcomeSender = options.WelcomeSender
 		}
 	}
 	server.metrics = metrics

@@ -19,7 +19,14 @@ const (
 // CreateAuthenticatedSession atomically upserts the local account, records
 // versioned consent evidence, and creates the browser session. A callback can
 // therefore never expose an authenticated session without its audit evidence.
-func (s *Store) CreateAuthenticatedSession(ctx context.Context, user User, consents []Consent, session AuthSession) error {
+//
+// created reports whether this call inserted the account for the first time (as
+// opposed to updating an existing one). It is derived inside the transaction
+// from PostgreSQL's system column xmax: a freshly inserted row has xmax = 0,
+// while a row touched by ON CONFLICT DO UPDATE carries the updating xid. This
+// lets callers trigger first-registration side effects (e.g. a welcome email)
+// without a separate existence probe that could race with the upsert.
+func (s *Store) CreateAuthenticatedSession(ctx context.Context, user User, consents []Consent, session AuthSession) (created bool, err error) {
 	ownerID := authSessionOwnerID(session)
 	provider := authSessionProvider(session)
 	providerSubject := strings.TrimSpace(session.ProviderSubject)
@@ -27,69 +34,70 @@ func (s *Store) CreateAuthenticatedSession(ctx context.Context, user User, conse
 		providerSubject = ownerID
 	}
 	if strings.TrimSpace(user.ID) == "" || user.ID != ownerID {
-		return errors.New("session user id must match the local user")
+		return false, errors.New("session user id must match the local user")
 	}
 	if err := validateAuthProvider(provider); err != nil {
-		return err
+		return false, err
 	}
 	if err := validateSHA256Hex("token hash", session.TokenHash); err != nil {
-		return err
+		return false, err
 	}
 	if err := validateLifetime(session.CreatedAt, session.ExpiresAt); err != nil {
-		return fmt.Errorf("auth session: %w", err)
+		return false, fmt.Errorf("auth session: %w", err)
 	}
 	if len(consents) != 2 {
-		return errors.New("terms and personal data consent evidence are required")
+		return false, errors.New("terms and personal data consent evidence are required")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin authenticated session transaction: %w", err)
+		return false, fmt.Errorf("begin authenticated session transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	now := session.CreatedAt.UTC()
-	if _, err := tx.ExecContext(ctx, `
+	if err := tx.QueryRowContext(ctx, `
 INSERT INTO users(id, login, email, display_name, avatar_url, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6, $6)
 ON CONFLICT(id) DO UPDATE SET login = excluded.login, email = excluded.email,
-display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_at = excluded.updated_at`,
-		user.ID, user.Login, user.Email, user.DisplayName, user.AvatarURL, now); err != nil {
-		return fmt.Errorf("upsert authenticated user: %w", err)
+display_name = excluded.display_name, avatar_url = excluded.avatar_url, updated_at = excluded.updated_at
+RETURNING (xmax = 0) AS inserted`,
+		user.ID, user.Login, user.Email, user.DisplayName, user.AvatarURL, now).Scan(&created); err != nil {
+		return false, fmt.Errorf("upsert authenticated user: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO auth_identities(provider, subject, owner_id, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $4)
 ON CONFLICT(provider, subject) DO UPDATE SET updated_at=excluded.updated_at
 WHERE auth_identities.owner_id=excluded.owner_id`, provider, providerSubject, ownerID, now); err != nil {
-		return fmt.Errorf("upsert authenticated identity: %w", err)
+		return false, fmt.Errorf("upsert authenticated identity: %w", err)
 	}
 	for _, consent := range consents {
 		if consent.Document != "terms" && consent.Document != "personal_data" {
-			return fmt.Errorf("unsupported consent document %q", consent.Document)
+			return false, fmt.Errorf("unsupported consent document %q", consent.Document)
 		}
 		if strings.TrimSpace(consent.Version) == "" || consent.AcceptedAt.IsZero() {
-			return errors.New("consent version and accepted_at are required")
+			return false, errors.New("consent version and accepted_at are required")
 		}
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO user_consents(owner_id, document, version, accepted_at, source)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT(owner_id, document, version) DO NOTHING`, user.ID, consent.Document,
 			consent.Version, consent.AcceptedAt.UTC(), consent.Source); err != nil {
-			return fmt.Errorf("record %s consent: %w", consent.Document, err)
+			return false, fmt.Errorf("record %s consent: %w", consent.Document, err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at <= $1`, now); err != nil {
-		return fmt.Errorf("delete expired auth sessions: %w", err)
+		return false, fmt.Errorf("delete expired auth sessions: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO auth_sessions(token_hash, yandex_user_id, provider, login, email, display_name, avatar_url, allowlist_identity, created_at, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`, session.TokenHash, ownerID, provider,
 		session.Login, session.Email, session.DisplayName, session.AvatarURL, session.AllowlistIdentity, now, session.ExpiresAt.UTC()); err != nil {
-		return fmt.Errorf("create auth session: %w", err)
+		return false, fmt.Errorf("create auth session: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit authenticated session: %w", err)
+		return false, fmt.Errorf("commit authenticated session: %w", err)
 	}
-	return nil
+	return created, nil
 }
 
 func (s *Store) UpsertUser(ctx context.Context, user User) error {
