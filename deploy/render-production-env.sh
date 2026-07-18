@@ -131,6 +131,13 @@ fi
   printf 'MEDIA_CLEANUP_BATCH_SIZE=%s\n' "${MEDIA_CLEANUP_BATCH_SIZE:-50}"
   printf 'OPENAI_API_KEY=%s\n' "$rendered_openai_key"
   printf 'OPENAI_API_BASE_URL=https://api.openai.com\n'
+  # Welcome-email SMTP is optional: empty values disable it (NoopSender).
+  printf 'SMTP_HOST=%s\n' "${SMTP_HOST:-}"
+  printf 'SMTP_PORT=%s\n' "${SMTP_PORT:-587}"
+  printf 'SMTP_USERNAME=%s\n' "${SMTP_USERNAME:-}"
+  printf 'SMTP_PASSWORD=%s\n' "${SMTP_PASSWORD:-}"
+  printf 'SMTP_FROM_EMAIL=%s\n' "${SMTP_FROM_EMAIL:-}"
+  printf 'SMTP_FROM_NAME=%s\n' "${SMTP_FROM_NAME:-MaxPosty}"
   printf 'OPENAI_IMAGE_MODEL=%s\n' "${OPENAI_IMAGE_MODEL:-gpt-image-2}"
   printf 'OPENAI_RESEARCH_MODEL=%s\n' "${OPENAI_RESEARCH_MODEL:-gpt-5.4-mini}"
   printf 'AI_GLOBAL_MAX_CONCURRENT=%s\n' "${AI_GLOBAL_MAX_CONCURRENT:-4}"

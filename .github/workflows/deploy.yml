@@ -245,6 +245,13 @@ jobs:
           WORKSPACE_MAX_OWNED_TEAM_WORKSPACES: ${{ vars.WORKSPACE_MAX_OWNED_TEAM_WORKSPACES || '5' }}
           BILLING_ENFORCEMENT_ENABLED: ${{ vars.BILLING_ENFORCEMENT_ENABLED || 'false' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Welcome-email SMTP (optional; unset leaves emails disabled).
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM_EMAIL: ${{ vars.SMTP_FROM_EMAIL }}
+          SMTP_FROM_NAME: ${{ vars.SMTP_FROM_NAME }}
           BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '14' }}
           PITR_RETENTION_DAYS: ${{ vars.PITR_RETENTION_DAYS || '7' }}
         run: |
