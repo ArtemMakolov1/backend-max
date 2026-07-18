@@ -29,6 +29,16 @@ render_production() {
     "$repo_root/deploy/render-production-env.sh" "$output"
 }
 
+deploy_workflow="$repo_root/.github/workflows/deploy.yml"
+for smtp_secret in \
+  SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL SMTP_FROM_NAME; do
+  expected="          ${smtp_secret}: \${{ secrets.${smtp_secret} }}"
+  if ! grep -Fx "$expected" "$deploy_workflow" >/dev/null; then
+    echo "Deploy workflow does not source $smtp_secret from the production secret" >&2
+    exit 1
+  fi
+done
+
 production_env="$sandbox/production.env"
 render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
