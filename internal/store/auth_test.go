@@ -85,6 +85,53 @@ func TestAuthSessionLifecycleAndExpiry(t *testing.T) {
 	}
 }
 
+func TestCreateAuthenticatedSessionReportsFirstRegistration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "first-registration.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	ownerID := "first-registration-owner"
+	createdAt := time.Date(2026, time.July, 18, 10, 0, 0, 0, time.UTC)
+	consentAt := createdAt.Add(-time.Minute)
+	consents := []Consent{
+		{Document: "terms", Version: "2026-07-01", AcceptedAt: consentAt, Source: "yandex_oauth"},
+		{Document: "personal_data", Version: "2026-07-01", AcceptedAt: consentAt, Source: "yandex_oauth"},
+	}
+	newLogin := func(tokenHash string) (User, AuthSession) {
+		user := User{ID: ownerID, Login: "newcomer", Email: "newcomer@example.test", DisplayName: "Новичок"}
+		session := AuthSession{
+			TokenHash: tokenHash, OwnerID: ownerID, Provider: "yandex", ProviderSubject: ownerID,
+			Login: "newcomer", Email: "newcomer@example.test", DisplayName: "Новичок",
+			AllowlistIdentity: ownerID, CreatedAt: createdAt, ExpiresAt: createdAt.Add(24 * time.Hour),
+		}
+		return user, session
+	}
+
+	user, session := newLogin(strings.Repeat("a", 64))
+	created, err := storage.CreateAuthenticatedSession(ctx, user, consents, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatalf("first CreateAuthenticatedSession() created = false, want true (account was inserted)")
+	}
+
+	// A repeated login for the same account id must upsert, not insert, so the
+	// welcome-email hook only fires once per user.
+	user, session = newLogin(strings.Repeat("b", 64))
+	created, err = storage.CreateAuthenticatedSession(ctx, user, consents, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created {
+		t.Fatalf("second CreateAuthenticatedSession() created = true, want false (account already existed)")
+	}
+}
+
 func TestOAuthStateConsumeIsOneTimeAndAtomic(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
