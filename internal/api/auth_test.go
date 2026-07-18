@@ -67,7 +67,7 @@ func TestYandexOAuthCreatesServerSessionAndLogoutInvalidatesIt(t *testing.T) {
 	if callbackResponse.Header().Get("Referrer-Policy") != "no-referrer" || callbackResponse.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("callback privacy headers = %#v", callbackResponse.Header())
 	}
-	if got := callbackResponse.Header().Get("Location"); got != "http://localhost:4321/app/#/calendar" {
+	if got := callbackResponse.Header().Get("Location"); got != "http://localhost:4321/app/?onboarding=1#/calendar" {
 		t.Fatalf("callback Location = %q", got)
 	}
 	if provider.exchangedCode != "confirmation-code" || provider.exchangedVerifier == "" || provider.userInfoToken != "provider-access-token" {
@@ -159,6 +159,19 @@ func TestYandexOAuthCreatesServerSessionAndLogoutInvalidatesIt(t *testing.T) {
 	handler.ServeHTTP(afterLogoutResponse, afterLogout)
 	if afterLogoutResponse.Code != http.StatusUnauthorized {
 		t.Fatalf("after logout status = %d, want 401", afterLogoutResponse.Code)
+	}
+}
+
+func TestRegistrationReturnToSignalsOnlyNewAccounts(t *testing.T) {
+	t.Parallel()
+	if got := registrationReturnTo("/app/#/calendar", true); got != "/app/?onboarding=1#/calendar" {
+		t.Fatalf("new-account return URL = %q", got)
+	}
+	if got := registrationReturnTo("/app/?source=pricing#/posts", true); got != "/app/?onboarding=1&source=pricing#/posts" {
+		t.Fatalf("return URL with query = %q", got)
+	}
+	if got := registrationReturnTo("/app/#/posts", false); got != "/app/#/posts" {
+		t.Fatalf("existing-account return URL = %q", got)
 	}
 }
 

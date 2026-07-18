@@ -182,7 +182,8 @@ func TestMAXAuthDeviceFlowCreatesProviderNeutralSession(t *testing.T) {
 	completeResponse := httptest.NewRecorder()
 	handler.ServeHTTP(completeResponse, complete)
 	if completeResponse.Code != http.StatusOK || !strings.Contains(completeResponse.Body.String(), `"status":"authenticated"`) ||
-		!strings.Contains(completeResponse.Body.String(), `"auth_method":"max"`) {
+		!strings.Contains(completeResponse.Body.String(), `"auth_method":"max"`) ||
+		!strings.Contains(completeResponse.Body.String(), `"is_new_user":true`) {
 		t.Fatalf("complete=%d %s", completeResponse.Code, completeResponse.Body.String())
 	}
 	sessionCookie := responseCookie(t, completeResponse, sessionCookieName)
