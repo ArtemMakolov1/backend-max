@@ -82,11 +82,11 @@ WHERE workspace_id=? AND channel_id=? FOR UPDATE`), workspaceID, channelID)
 	if err != nil {
 		return fmt.Errorf("lock channel posts for deletion: %w", err)
 	}
+	defer func() { _ = rows.Close() }()
 	hasPublishing := false
 	for rows.Next() {
 		var status string
 		if err := rows.Scan(&status); err != nil {
-			_ = rows.Close()
 			return fmt.Errorf("scan channel post before deletion: %w", err)
 		}
 		if status == PostStatusPublishing {
@@ -94,7 +94,6 @@ WHERE workspace_id=? AND channel_id=? FOR UPDATE`), workspaceID, channelID)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
 		return fmt.Errorf("iterate channel posts before deletion: %w", err)
 	}
 	if err := rows.Close(); err != nil {
