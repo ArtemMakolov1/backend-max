@@ -1389,6 +1389,29 @@ UPDATE posts SET status = ?, last_error = ?, scheduled_at = NULL, updated_at = ?
 	return s.GetPost(ctx, id)
 }
 
+// RestoreInterruptedSchedule returns a post whose scheduled publication was
+// cut short by a canceled context (typically a service stop) to the calendar
+// with its original slot. The publishing claim already cleared scheduled_at
+// and the failure handler may have marked the post failed before the restore
+// runs, so both intermediate states are accepted.
+func (s *Store) RestoreInterruptedSchedule(ctx context.Context, id int64, at time.Time) (Post, error) {
+	if at.IsZero() {
+		return Post{}, errors.New("scheduled_at must not be zero")
+	}
+	result, err := s.db.ExecContext(ctx, `
+UPDATE posts SET status = ?, scheduled_at = ?, last_error = '', updated_at = ?
+WHERE id = ? AND status IN (?, ?)`,
+		PostStatusScheduled, at.UTC().Format(time.RFC3339Nano), nowText(), id,
+		PostStatusPublishing, PostStatusFailed)
+	if err != nil {
+		return Post{}, fmt.Errorf("restore interrupted schedule: %w", err)
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return Post{}, s.postWriteMiss(ctx, id, "post changed before its schedule could be restored")
+	}
+	return s.GetPost(ctx, id)
+}
+
 const postColumns = `id, owner_id, workspace_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views, max_stats_synced_at,
 max_stats_attempted_at, max_is_pinned, last_error, created_at, updated_at, published_at, review_status, current_revision_id`

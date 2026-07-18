@@ -118,14 +118,25 @@ WHERE owner_id=? FOR UPDATE`), userID).Scan(&usedFiles, &usedBytes); err != nil 
 	if err != nil {
 		return MediaReservation{}, fmt.Errorf("create media reservation token: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, bindSQL(`INSERT INTO media_assets
+	// The insert trigger resolves the owner's personal workspace id. Charge
+	// that workspace ledger together with media_usage: release and GC drain
+	// both ledgers for personal workspaces, so reservation must fill both.
+	var workspaceID string
+	if err := tx.QueryRowContext(ctx, bindSQL(`INSERT INTO media_assets
 (owner_id, filename, created_at, size_bytes, state, reservation_token, updated_at)
-VALUES (?,?,?,?,'pending',?,?)`), userID, filename, now.UTC(), size, token, now.UTC()); err != nil {
+VALUES (?,?,?,?,'pending',?,?) RETURNING workspace_id`), userID, filename, now.UTC(), size, token, now.UTC()).Scan(&workspaceID); err != nil {
 		return MediaReservation{}, fmt.Errorf("reserve media ownership: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET asset_count=asset_count+1,
 total_bytes=total_bytes+?, updated_at=? WHERE owner_id=?`), size, now.UTC(), userID); err != nil {
 		return MediaReservation{}, fmt.Errorf("reserve media quota: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, bindSQL(`INSERT INTO workspace_media_usage(workspace_id, asset_count, total_bytes, updated_at)
+VALUES (?,1,?,?) ON CONFLICT(workspace_id) DO UPDATE SET
+asset_count=workspace_media_usage.asset_count+1,
+total_bytes=workspace_media_usage.total_bytes+excluded.total_bytes,
+updated_at=excluded.updated_at`), workspaceID, size, now.UTC()); err != nil {
+		return MediaReservation{}, fmt.Errorf("reserve workspace media quota: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, bindSQL(`DELETE FROM media_gc_queue WHERE filename=?`), filename); err != nil {
 		return MediaReservation{}, fmt.Errorf("cancel media garbage collection: %w", err)
@@ -174,30 +185,40 @@ func (s *Store) ReleaseMediaReservation(ctx context.Context, reservation MediaRe
 		return fmt.Errorf("lock media reservation release: %w", err)
 	}
 	var size int64
+	var workspaceID string
 	query := `DELETE FROM media_assets WHERE owner_id=? AND filename=? AND state='pending' AND reservation_token=?`
 	args := []any{reservation.OwnerID, reservation.Filename, reservation.Token}
 	if reservation.WorkspaceID != "" {
 		query += ` AND workspace_id=?`
 		args = append(args, reservation.WorkspaceID)
 	}
-	query += ` RETURNING size_bytes`
-	err = tx.QueryRowContext(ctx, bindSQL(query), args...).Scan(&size)
+	query += ` RETURNING size_bytes, workspace_id`
+	err = tx.QueryRowContext(ctx, bindSQL(query), args...).Scan(&size, &workspaceID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("release media ownership: %w", err)
 	}
-	if reservation.WorkspaceID != "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE workspace_media_usage SET
-asset_count=GREATEST(asset_count-1,0),total_bytes=GREATEST(total_bytes-$1,0),updated_at=$2
-WHERE workspace_id=$3`, size, now.UTC(), reservation.WorkspaceID); err != nil {
-			return fmt.Errorf("release workspace media quota: %w", err)
-		}
-	} else if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET
+	// Refund exactly the ledgers the reservation charged: the workspace ledger
+	// always, plus media_usage for personal workspaces. This mirrors
+	// cleanupMediaAsset and keeps the media_usage-before-workspace lock order
+	// shared by every media ledger writer.
+	var personalWorkspace bool
+	if err := tx.QueryRowContext(ctx, bindSQL(`SELECT is_personal FROM workspaces WHERE id=?`), workspaceID).Scan(&personalWorkspace); err != nil {
+		return fmt.Errorf("resolve released media workspace: %w", err)
+	}
+	if personalWorkspace {
+		if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET
 asset_count=GREATEST(asset_count-1,0), total_bytes=GREATEST(total_bytes-?,0), updated_at=?
 WHERE owner_id=?`), size, now.UTC(), reservation.OwnerID); err != nil {
-		return fmt.Errorf("release media quota: %w", err)
+			return fmt.Errorf("release media quota: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE workspace_media_usage SET
+asset_count=GREATEST(asset_count-1,0),total_bytes=GREATEST(total_bytes-$1,0),updated_at=$2
+WHERE workspace_id=$3`, size, now.UTC(), workspaceID); err != nil {
+		return fmt.Errorf("release workspace media quota: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit media reservation release: %w", err)
@@ -340,17 +361,20 @@ EXISTS(SELECT 1 FROM post_attachments WHERE workspace_id=? AND storage_key=?)`),
 		candidate.ownerID, candidate.workspaceID, candidate.filename); err != nil {
 		return false, 0, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE workspace_media_usage SET
-asset_count=GREATEST(asset_count-1,0),total_bytes=GREATEST(total_bytes-$1,0),updated_at=CURRENT_TIMESTAMP
-WHERE workspace_id=$2`, size, candidate.workspaceID); err != nil {
-		return false, 0, err
-	}
+	// Drain the same ledgers the reservation filled: media_usage for personal
+	// workspaces, then the workspace ledger. Keeping media_usage first matches
+	// the lock order of the reserve and release paths.
 	if personalWorkspace {
 		if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE media_usage SET
 asset_count=GREATEST(asset_count-1,0), total_bytes=GREATEST(total_bytes-?,0), updated_at=CURRENT_TIMESTAMP
 WHERE owner_id=?`), size, candidate.ownerID); err != nil {
 			return false, 0, err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE workspace_media_usage SET
+asset_count=GREATEST(asset_count-1,0),total_bytes=GREATEST(total_bytes-$1,0),updated_at=CURRENT_TIMESTAMP
+WHERE workspace_id=$2`, size, candidate.workspaceID); err != nil {
+		return false, 0, err
 	}
 	// The delete trigger inserted the queue row with the deletion time. This
 	// asset has already survived the grace period, so preserve its older

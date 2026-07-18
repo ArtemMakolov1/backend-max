@@ -202,3 +202,51 @@ func (s *Server) formatWorkspacePostContent(w http.ResponseWriter, r *http.Reque
 	}
 	s.writeJSON(w, http.StatusOK, result)
 }
+
+func (s *Server) suggestWorkspaceImagePrompt(w http.ResponseWriter, r *http.Request) {
+	workspace, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityAIUse)
+	if !ok {
+		return
+	}
+	var request openairesearch.SuggestImagePromptRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	// The Brand Kit tone/audience/visual style are tenant-owned style hints
+	// and stay untrusted editorial data in the prompt. A workspace without a
+	// saved kit simply gets no brand context.
+	kit, err := s.app.Store().GetWorkspaceBrandKit(r.Context(), access.UserID, access.WorkspaceID)
+	switch {
+	case err == nil:
+		request.BrandTone = kit.Tone
+		request.BrandAudience = kit.Audience
+		request.BrandVisualStyle = kit.VisualStyle
+	case !errors.Is(err, store.ErrNotFound):
+		s.writeError(w, err)
+		return
+	}
+	if err := openairesearch.ValidateSuggestImagePromptRequest(request); err != nil {
+		s.writeError(w, err)
+		return
+	}
+	if !s.app.ImagePromptSuggestionConfigured() {
+		s.writeError(w, app.ErrResearchNotConfigured)
+		return
+	}
+	release, err := s.aiLimiter.acquireForWorkspaceMetric(
+		r.Context(), access.UserID, workspace, store.AIOperationResearch,
+		store.UsageMetricAIFormatRequests, 1, s.now().UTC())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	defer release()
+	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
+	defer cancel()
+	result, err := s.app.SuggestImagePrompt(ctx, request)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, result)
+}

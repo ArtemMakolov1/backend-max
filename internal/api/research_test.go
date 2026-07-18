@@ -21,13 +21,19 @@ import (
 )
 
 type fakeResearchClient struct {
-	mu             sync.Mutex
-	requests       []openairesearch.Request
-	result         openairesearch.Result
-	err            error
-	formatRequests []openairesearch.FormatRequest
-	formatResult   openairesearch.FormatResult
-	formatErr      error
+	mu              sync.Mutex
+	requests        []openairesearch.Request
+	result          openairesearch.Result
+	err             error
+	formatRequests  []openairesearch.FormatRequest
+	formatResult    openairesearch.FormatResult
+	formatErr       error
+	suggestRequests  []openairesearch.SuggestImagePromptRequest
+	suggestResult    openairesearch.SuggestImagePromptResult
+	suggestErr       error
+	brandKitRequests []openairesearch.SuggestBrandKitRequest
+	brandKitResult   openairesearch.SuggestBrandKitResult
+	brandKitErr      error
 }
 
 func (f *fakeResearchClient) Generate(ctx context.Context, request openairesearch.Request) (openairesearch.Result, error) {
@@ -42,6 +48,20 @@ func (f *fakeResearchClient) FormatContent(_ context.Context, request openairese
 	f.formatRequests = append(f.formatRequests, request)
 	f.mu.Unlock()
 	return f.formatResult, f.formatErr
+}
+
+func (f *fakeResearchClient) SuggestImagePrompt(_ context.Context, request openairesearch.SuggestImagePromptRequest) (openairesearch.SuggestImagePromptResult, error) {
+	f.mu.Lock()
+	f.suggestRequests = append(f.suggestRequests, request)
+	f.mu.Unlock()
+	return f.suggestResult, f.suggestErr
+}
+
+func (f *fakeResearchClient) SuggestBrandKit(_ context.Context, request openairesearch.SuggestBrandKitRequest) (openairesearch.SuggestBrandKitResult, error) {
+	f.mu.Lock()
+	f.brandKitRequests = append(f.brandKitRequests, request)
+	f.mu.Unlock()
+	return f.brandKitResult, f.brandKitErr
 }
 
 func TestResearchGenerateReturnsExactContractUnderYandexSession(t *testing.T) {

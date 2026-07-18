@@ -69,6 +69,19 @@ WHERE workspace_id=$2 AND filename=$3`, now.UTC(), workspaceID, filename); err !
 	if !errors.Is(lookupErr, sql.ErrNoRows) {
 		return MediaReservation{}, lookupErr
 	}
+	// Personal workspaces alias the legacy personal API, where media_usage is
+	// the per-user ledger. Release and GC drain both ledgers for personal
+	// workspaces, so charge both here as well. media_usage goes first to keep
+	// the lock order shared by every media ledger writer.
+	if access.Workspace.IsPersonal {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO media_usage(owner_id,asset_count,total_bytes,updated_at)
+VALUES($1,1,$2,$3) ON CONFLICT(owner_id) DO UPDATE SET
+asset_count=media_usage.asset_count+1,
+total_bytes=media_usage.total_bytes+excluded.total_bytes,
+updated_at=excluded.updated_at`, access.Workspace.CompatOwnerUserID, size, now.UTC()); err != nil {
+			return MediaReservation{}, err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO workspace_media_usage(workspace_id,asset_count,total_bytes,updated_at)
 VALUES($1,0,0,$2) ON CONFLICT(workspace_id) DO NOTHING`, workspaceID, now.UTC()); err != nil {
 		return MediaReservation{}, err

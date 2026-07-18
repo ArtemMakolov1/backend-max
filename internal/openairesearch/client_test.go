@@ -170,7 +170,7 @@ func TestDraftPayloadRequiresMAXSupportedMarkdownHeading(t *testing.T) {
 	if len(payload.Input) == 0 {
 		t.Fatal("draft payload has no system instruction")
 	}
-	instruction := payload.Input[0].Content
+	instruction, _ := payload.Input[0].Content.(string)
 	for _, required := range []string{
 		"каждый заголовок начинай ровно с `# `",
 		"никогда не используй уровни `##`–`######`",

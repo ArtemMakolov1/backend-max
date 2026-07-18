@@ -133,6 +133,30 @@ func TestWriteErrorDoesNotExposeUpstreamOrConflictDetails(t *testing.T) {
 	}
 }
 
+func TestWriteErrorClassifiesTypedValidationFailuresWithoutKeywords(t *testing.T) {
+	t.Parallel()
+	server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	response := httptest.NewRecorder()
+	// The message deliberately avoids every isValidationError keyword so only
+	// the typed sentinel can classify it as a client-side validation failure.
+	server.writeError(response, fmt.Errorf("schedule post: %w", validationError("post cannot be published yet")))
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body = %s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Error.Code != "validation_error" {
+		t.Fatalf("code = %q, want %q", payload.Error.Code, "validation_error")
+	}
+}
+
 func TestWriteErrorTranslatesMediaQuotaFailures(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

@@ -893,6 +893,119 @@ func TestEditReportsUnsuccessfulTwoHundredResponse(t *testing.T) {
 	}
 }
 
+func TestEditChatPatchesIconAndTitle(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/chats/-100200300" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		var body struct {
+			Icon *struct {
+				Token string `json:"token"`
+			} `json:"icon"`
+			Title *string `json:"title"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode body: %v", err)
+		}
+		if body.Icon == nil || body.Icon.Token != "icon-upload-token" {
+			t.Errorf("body icon = %#v, want token icon-upload-token", body.Icon)
+		}
+		if body.Title == nil || *body.Title != "Новое имя" {
+			t.Errorf("body title = %v, want Новое имя", body.Title)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"chat_id":-100200300,"owner_id":777,"type":"channel","status":"active","title":"Новое имя","icon":{"url":"https://cdn.max.ru/icons/new.png"},"participants_count":42}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	title := " Новое имя "
+	chat, err := client.EditChat(context.Background(), "-100200300", ChatPatch{IconToken: "icon-upload-token", Title: &title})
+	if err != nil {
+		t.Fatalf("EditChat() error = %v", err)
+	}
+	if chat.ChatID != "-100200300" || chat.Title != "Новое имя" || chat.Icon.URL != "https://cdn.max.ru/icons/new.png" ||
+		chat.ParticipantsCount != 42 {
+		t.Fatalf("EditChat() = %#v", chat)
+	}
+}
+
+func TestEditChatOmitsUnchangedFields(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			t.Errorf("decode body %q: %v", raw, err)
+		}
+		if _, hasTitle := fields["title"]; hasTitle {
+			t.Errorf("body %q must not contain title", raw)
+		}
+		if _, hasIcon := fields["icon"]; !hasIcon {
+			t.Errorf("body %q must contain icon", raw)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"chat_id":-5,"type":"channel","status":"active","title":"Прежнее имя"}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	chat, err := client.EditChat(context.Background(), "-5", ChatPatch{IconToken: "only-icon"})
+	if err != nil {
+		t.Fatalf("EditChat() error = %v", err)
+	}
+	if chat.ChatID != "-5" || chat.Title != "Прежнее имя" {
+		t.Fatalf("EditChat() = %#v", chat)
+	}
+}
+
+func TestEditChatValidatesInput(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		// Ответ с чужим chat_id: клиент обязан отклонить его после запроса.
+		_, _ = io.WriteString(w, `{"chat_id":-999,"type":"channel","status":"active","title":"Другой чат"}`)
+	}))
+	defer server.Close()
+	client := mustClient(t, server.URL, "token", server.Client())
+
+	if _, err := client.EditChat(context.Background(), "not-numeric", ChatPatch{IconToken: "token"}); err == nil {
+		t.Fatal("EditChat() with non-numeric chat ID must fail")
+	}
+	if _, err := client.EditChat(context.Background(), "-5", ChatPatch{}); err == nil {
+		t.Fatal("EditChat() without changes must fail")
+	}
+	empty := "   "
+	if _, err := client.EditChat(context.Background(), "-5", ChatPatch{Title: &empty}); err == nil {
+		t.Fatal("EditChat() with blank title must fail")
+	}
+	long := strings.Repeat("я", 201)
+	if _, err := client.EditChat(context.Background(), "-5", ChatPatch{Title: &long}); err == nil {
+		t.Fatal("EditChat() with a 201-rune title must fail")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("validation calls = %d, want 0", calls.Load())
+	}
+	if _, err := client.EditChat(context.Background(), "-5", ChatPatch{IconToken: "token"}); err == nil {
+		t.Fatal("EditChat() must reject a response for another chat_id")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want 1", calls.Load())
+	}
+}
+
 func mustClient(t *testing.T, baseURL, token string, httpClient *http.Client) *Client {
 	t.Helper()
 	client, err := New(baseURL, token, httpClient)

@@ -1,11 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -131,6 +134,30 @@ func TestWorkspaceAPIAuthorizationCollaborationAndApprovalGate(t *testing.T) {
 		response = performJSONRequest(editor, http.MethodPost, base+"/posts/"+postID(fixture.post.ID)+"/publish", `{}`)
 		assertProblemCode(t, response, http.StatusConflict, "post_approval_required")
 	})
+}
+
+func TestCreateWorkspacePostWithExplicitNullScheduleCreatesDraftUnderApprovalPolicy(t *testing.T) {
+	fixture := newWorkspaceAPIFixture(t)
+	editor := fixture.handler(t, "ws-editor")
+	base := "/api/v1/workspaces/" + fixture.workspace.ID
+
+	response := performJSONRequest(editor, http.MethodPost, base+"/posts",
+		`{"title":"Draft","content":"body","format":"markdown","scheduled_at":null}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("draft with explicit null schedule = %d %s", response.Code, response.Body.String())
+	}
+	var created store.Post
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Status != store.PostStatusDraft || created.ScheduledAt != nil {
+		t.Fatalf("created post = %#v", created)
+	}
+
+	scheduleAt := time.Now().UTC().Add(2 * time.Hour).Format(time.RFC3339)
+	response = performJSONRequest(editor, http.MethodPost, base+"/posts",
+		`{"title":"Scheduled","content":"body","format":"markdown","channel_id":`+postID(fixture.channel.ID)+`,"scheduled_at":"`+scheduleAt+`"}`)
+	assertProblemCode(t, response, http.StatusConflict, "post_approval_required")
 }
 
 func TestWorkspaceCapabilitiesAreExhaustiveAndStable(t *testing.T) {
@@ -349,4 +376,158 @@ func (f workspaceAPIFixture) handler(t *testing.T, userID string) http.Handler {
 	t.Helper()
 	return withTestSession(t, f.storage,
 		New(f.app, f.logger, "http://localhost:4321", "webhook-secret", AuthOptions{YandexClient: &fakeYandexOAuth{}}).Handler(), userID)
+}
+
+func performChannelMAXInfoRequest(t *testing.T, handler http.Handler, path, title, filename string) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if title != "" {
+		if err := writer.WriteField("title", title); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if filename != "" {
+		part, err := writer.CreateFormFile("file", filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte("fake-png-bytes")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, path, &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func TestWorkspaceChannelMAXInfoUpdatePushesIconAndTitle(t *testing.T) {
+	fixture := newWorkspaceAPIFixture(t)
+	fake := &claimWebhookMAX{
+		chat: maxclient.ChatInfo{
+			ChatID: fixture.channel.MAXChatID, OwnerID: "max-owner", Type: "channel", Status: "active",
+			Title: "Agency channel", ParticipantsCount: 512,
+		},
+		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
+			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+		}},
+	}
+	application := app.New(fixture.storage, fixture.app.Media(), fake, nil, nil, fixture.logger)
+	handler := func(userID string) http.Handler {
+		return withTestSession(t, fixture.storage,
+			New(application, fixture.logger, "http://localhost:4321", "webhook-secret", AuthOptions{
+				YandexClient: &fakeYandexOAuth{},
+			}).Handler(), userID)
+	}
+	owner, viewer, outsider := handler("ws-owner"), handler("ws-viewer"), handler("ws-outsider")
+	path := "/api/v1/workspaces/" + fixture.workspace.ID + "/channels/" + postID(fixture.channel.ID) + "/max-info"
+
+	response := performChannelMAXInfoRequest(t, viewer, path, "Не должно пройти", "icon.png")
+	assertProblemCode(t, response, http.StatusForbidden, "workspace_forbidden")
+	response = performChannelMAXInfoRequest(t, outsider, path, "Не должно пройти", "icon.png")
+	assertProblemCode(t, response, http.StatusNotFound, "not_found")
+	if len(fake.editChatIDs) != 0 || len(fake.uploadedIcons) != 0 {
+		t.Fatalf("forbidden requests reached MAX: %#v %#v", fake.editChatIDs, fake.uploadedIcons)
+	}
+
+	response = performChannelMAXInfoRequest(t, owner, path, "", "")
+	assertProblemCode(t, response, http.StatusBadRequest, "validation_error")
+
+	response = performChannelMAXInfoRequest(t, owner, path, "Новое имя канала", "icon.png")
+	if response.Code != http.StatusOK {
+		t.Fatalf("owner max-info = %d %s", response.Code, response.Body.String())
+	}
+	var channel store.Channel
+	if err := json.Unmarshal(response.Body.Bytes(), &channel); err != nil {
+		t.Fatal(err)
+	}
+	if channel.Title != "Новое имя канала" {
+		t.Fatalf("channel title = %q", channel.Title)
+	}
+	if channel.IconURL != "https://cdn.max.ru/icons/uploaded-icon.png.png" {
+		t.Fatalf("channel icon = %q", channel.IconURL)
+	}
+	if len(fake.uploadedIcons) != 1 || fake.uploadedIcons[0] != "icon.png" {
+		t.Fatalf("uploaded icons = %#v", fake.uploadedIcons)
+	}
+	if len(fake.editChatIDs) != 1 || fake.editChatIDs[0] != fixture.channel.MAXChatID {
+		t.Fatalf("edit chat IDs = %#v", fake.editChatIDs)
+	}
+	patch := fake.editChatPatches[0]
+	if patch.IconToken != "uploaded-icon.png" || patch.Title == nil || *patch.Title != "Новое имя канала" {
+		t.Fatalf("edit chat patch = %#v", patch)
+	}
+
+	events, err := fixture.storage.ListAuditEvents(t.Context(), "ws-owner", fixture.workspace.ID, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := 0
+	for _, event := range events {
+		if event.Action == "channel.updated" && event.EntityType == "channel" {
+			updated++
+		}
+	}
+	if updated != 1 {
+		t.Fatalf("channel.updated audit events = %d, want 1; events = %#v", updated, events)
+	}
+
+	// Смена только фото тоже оставляет след в журнале и не трогает название.
+	response = performChannelMAXInfoRequest(t, owner, path, "", "second.png")
+	if response.Code != http.StatusOK {
+		t.Fatalf("icon-only max-info = %d %s", response.Code, response.Body.String())
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &channel); err != nil {
+		t.Fatal(err)
+	}
+	if channel.Title != "Новое имя канала" || channel.IconURL != "https://cdn.max.ru/icons/uploaded-second.png.png" {
+		t.Fatalf("icon-only update channel = %#v", channel)
+	}
+	events, err = fixture.storage.ListAuditEvents(t.Context(), "ws-owner", fixture.workspace.ID, 20, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated = 0
+	for _, event := range events {
+		if event.Action == "channel.updated" && event.EntityType == "channel" {
+			updated++
+		}
+	}
+	if updated != 2 {
+		t.Fatalf("channel.updated audit events after icon-only update = %d, want 2", updated)
+	}
+}
+
+func TestWorkspaceChannelMAXInfoUpdateRequiresBotAdmin(t *testing.T) {
+	fixture := newWorkspaceAPIFixture(t)
+	fake := &claimWebhookMAX{
+		chat: maxclient.ChatInfo{
+			ChatID: fixture.channel.MAXChatID, OwnerID: "max-owner", Type: "channel", Status: "active", Title: "Agency channel",
+		},
+		membership: maxclient.Membership{IsAdmin: false},
+	}
+	application := app.New(fixture.storage, fixture.app.Media(), fake, nil, nil, fixture.logger)
+	handler := withTestSession(t, fixture.storage,
+		New(application, fixture.logger, "http://localhost:4321", "webhook-secret", AuthOptions{
+			YandexClient: &fakeYandexOAuth{},
+		}).Handler(), "ws-owner")
+	path := "/api/v1/workspaces/" + fixture.workspace.ID + "/channels/" + postID(fixture.channel.ID) + "/max-info"
+
+	response := performChannelMAXInfoRequest(t, handler, path, "Новое имя", "")
+	assertProblemCode(t, response, http.StatusUnprocessableEntity, "max_channel_access")
+	if len(fake.editChatIDs) != 0 {
+		t.Fatalf("EditChat calls without admin rights = %#v", fake.editChatIDs)
+	}
+	stored, err := fixture.storage.GetChannelForWorkspace(t.Context(), "ws-owner", fixture.workspace.ID, fixture.channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Title != "Agency channel" {
+		t.Fatalf("title changed without admin rights: %q", stored.Title)
+	}
 }

@@ -16,6 +16,7 @@ import (
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/maxclient"
+	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/store"
 )
 
@@ -454,6 +455,88 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"ok": ok, "message": message, "channel": check.Channel, "diagnostics": check.Diagnostics,
 	})
+}
+
+// decodeChannelMAXInfoForm reads the optional title and icon file from a
+// multipart request. On success the returned cleanup releases the upload slot,
+// the opened file and multipart temp files; on failure the response is already
+// written and every acquired resource is released before returning.
+func (s *Server) decodeChannelMAXInfoForm(w http.ResponseWriter, r *http.Request, userID string) (app.ChannelMAXInfoUpdate, func(), bool) {
+	release, acquired := s.mediaUploads.tryAcquire(userID)
+	if !acquired {
+		s.writeError(w, errMediaUploadRateLimited)
+		return app.ChannelMAXInfoUpdate{}, nil, false
+	}
+	cleanups := []func(){release}
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	fail := func() (app.ChannelMAXInfoUpdate, func(), bool) {
+		cleanup()
+		return app.ChannelMAXInfoUpdate{}, nil, false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, media.MaxImageBytes+(1<<20))
+	// #nosec G120 -- MaxBytesReader bounds the entire multipart request before
+	// ParseMultipartForm can allocate memory or spill parts to temporary files.
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		s.problem(w, http.StatusBadRequest, "validation_error", "invalid multipart upload or image is too large", nil)
+		return fail()
+	}
+	if form := r.MultipartForm; form != nil {
+		cleanups = append(cleanups, func() { _ = form.RemoveAll() })
+	}
+	var update app.ChannelMAXInfoUpdate
+	if titles := r.MultipartForm.Value["title"]; len(titles) > 0 {
+		title := strings.TrimSpace(titles[0])
+		if title == "" || utf8.RuneCountInString(title) > 200 {
+			s.problem(w, http.StatusBadRequest, "validation_error", "title must contain 1 to 200 characters", nil)
+			return fail()
+		}
+		update.Title = &title
+	}
+	if header, err := firstFile(r, "file", "icon", "image"); err == nil {
+		upload, openErr := header.Open()
+		if openErr != nil {
+			s.writeError(w, openErr)
+			return fail()
+		}
+		cleanups = append(cleanups, func() { _ = upload.Close() })
+		update.Icon = upload
+		update.IconFilename = header.Filename
+	}
+	if update.Title == nil && update.Icon == nil {
+		s.problem(w, http.StatusBadRequest, "validation_error", "channel title or icon file is required", nil)
+		return fail()
+	}
+	return update, cleanup, true
+}
+
+func (s *Server) updateChannelMAXInfo(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
+	id, err := parseID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	update, cleanup, ok := s.decodeChannelMAXInfoForm(w, r, userID)
+	if !ok {
+		return
+	}
+	defer cleanup()
+	ctx, cancel := contextWithTimeout(r, time.Minute)
+	defer cancel()
+	channel, err := s.app.UpdateChannelMAXInfoForUser(ctx, userID, id, update)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, channel)
 }
 
 func contextWithTimeout(r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc) {

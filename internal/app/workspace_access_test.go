@@ -99,7 +99,7 @@ func TestClaimedTeamPostRechecksCurrentApprovalBeforeMAX(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := application.publishClaimedPost(ctx, claimed); !errors.Is(err, ErrApprovalRequired) {
+	if _, err := application.publishClaimedPost(ctx, claimed, nil); !errors.Is(err, ErrApprovalRequired) {
 		t.Fatalf("publishClaimedPost error = %v, want ErrApprovalRequired", err)
 	}
 	if fake.publishCalls != 0 || fake.getChatCalls != 0 {

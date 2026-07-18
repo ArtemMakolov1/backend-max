@@ -96,18 +96,18 @@ func (s *Server) createWorkspacePost(w http.ResponseWriter, r *http.Request) {
 		post.Notify = true // MAX channel publications always notify.
 	}
 	if len(request.ScheduledAt) > 0 {
-		if workspace.ApprovalRequired {
-			s.writeError(w, app.ErrApprovalRequired)
-			return
-		}
 		scheduledAt, err := decodeScheduledAt(request.ScheduledAt)
 		if err != nil {
 			s.writeError(w, err)
 			return
 		}
 		if scheduledAt != nil {
+			if workspace.ApprovalRequired {
+				s.writeError(w, app.ErrApprovalRequired)
+				return
+			}
 			if !scheduledAt.After(s.now().UTC()) {
-				s.writeError(w, errors.New("scheduled_at must be in the future"))
+				s.writeError(w, validationError("scheduled_at must be in the future"))
 				return
 			}
 			post.Status, post.ScheduledAt = store.PostStatusScheduled, scheduledAt
@@ -160,7 +160,7 @@ func (s *Server) updateWorkspacePost(w http.ResponseWriter, r *http.Request) {
 	if request.ExpectedUpdatedAt != nil {
 		expected, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(*request.ExpectedUpdatedAt))
 		if parseErr != nil {
-			s.writeError(w, errors.New("expected_updated_at must be an RFC3339 timestamp"))
+			s.writeError(w, validationError("expected_updated_at must be an RFC3339 timestamp"))
 			return
 		}
 		if !current.UpdatedAt.Equal(expected) {
@@ -221,7 +221,7 @@ func (s *Server) updateWorkspacePost(w http.ResponseWriter, r *http.Request) {
 		imageURL := ""
 		if string(request.ImageURL) != "null" {
 			if err := json.Unmarshal(request.ImageURL, &imageURL); err != nil {
-				s.writeError(w, errors.New("image_url must be a local media URL or null"))
+				s.writeError(w, validationError("image_url must be a local media URL or null"))
 				return
 			}
 		}
@@ -405,6 +405,31 @@ func (s *Server) updateWorkspaceChannel(w http.ResponseWriter, r *http.Request) 
 	}
 	channel, err := s.app.Store().UpdateChannelForWorkspace(
 		r.Context(), access.UserID, access.WorkspaceID, channelID, request.Title, request.Active)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, channel)
+}
+
+func (s *Server) updateWorkspaceChannelMAXInfo(w http.ResponseWriter, r *http.Request) {
+	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityChannelsManage)
+	if !ok {
+		return
+	}
+	channelID, err := parsePositivePathID(r, "channel_id")
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	update, cleanup, formOK := s.decodeChannelMAXInfoForm(w, r, access.UserID)
+	if !formOK {
+		return
+	}
+	defer cleanup()
+	ctx, cancel := contextWithTimeout(r, time.Minute)
+	defer cancel()
+	channel, err := s.app.UpdateChannelMAXInfoForWorkspace(ctx, access.UserID, access.WorkspaceID, channelID, update)
 	if err != nil {
 		s.writeError(w, err)
 		return

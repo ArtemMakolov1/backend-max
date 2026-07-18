@@ -71,7 +71,7 @@ done
 for contract in \
   'archive_mode=on' \
   'archive_timeout=300s' \
-  'archive_command=test ! -f /var/lib/postgresql/wal-archive/%f' \
+  'archive_command=if [ -f /var/lib/postgresql/wal-archive/%f ]; then cmp -s %p /var/lib/postgresql/wal-archive/%f; else cp %p /var/lib/postgresql/wal-archive/%f.tmp && sync && mv /var/lib/postgresql/wal-archive/%f.tmp /var/lib/postgresql/wal-archive/%f && sync; fi' \
   'postgres-wal-archive:/var/lib/postgresql/wal-archive' \
   'postgres-base-backups:/var/lib/postgresql/base-backups' \
   'alertmanager-config:/etc/alertmanager:ro' \

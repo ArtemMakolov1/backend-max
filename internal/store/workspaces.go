@@ -309,6 +309,18 @@ ORDER BY id LIMIT 1`, workspaceID).Scan(&activePostID)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("inspect workspace publication lifecycle: %w", err)
 	}
+	// Connected channels must be disconnected first: archived workspaces reject
+	// the channel UPDATEs issued by MAX webhook handlers, and the channel's
+	// max_chat_id would stay claimed by the archived workspace forever.
+	var connectedChannelID int64
+	err = tx.QueryRowContext(ctx, `SELECT id FROM channels
+WHERE workspace_id=$1 ORDER BY id LIMIT 1`, workspaceID).Scan(&connectedChannelID)
+	if err == nil {
+		return fmt.Errorf("%w: disconnect channels before archiving", ErrConflict)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect workspace channels: %w", err)
+	}
 	now := time.Now().UTC()
 	if err := appendAuditEventTx(ctx, tx, AuditEvent{
 		WorkspaceID: workspaceID, ActorUserID: actorUserID, Action: "workspace.archived",
