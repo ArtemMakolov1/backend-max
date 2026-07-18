@@ -85,6 +85,10 @@ type fakeMAX struct {
 	getPinnedCalls     int
 	pinCalls           int
 	unpinCalls         int
+	editChatCalls      int
+	editChatErr        error
+	lastEditChatID     string
+	lastChatPatch      maxclient.ChatPatch
 }
 
 type blockingRefreshMAX struct {
@@ -165,6 +169,26 @@ func (f *fakeMAX) GetChat(_ context.Context, chatID string) (maxclient.ChatInfo,
 	if chat.OwnerID == "" {
 		chat.OwnerID = "test-max-owner"
 	}
+	return chat, nil
+}
+func (f *fakeMAX) EditChat(_ context.Context, chatID string, patch maxclient.ChatPatch) (maxclient.ChatInfo, error) {
+	f.editChatCalls++
+	f.lastEditChatID = chatID
+	f.lastChatPatch = patch
+	if f.editChatErr != nil {
+		return maxclient.ChatInfo{}, f.editChatErr
+	}
+	chat := f.chat
+	if chat.OwnerID == "" {
+		chat.OwnerID = "test-max-owner"
+	}
+	if patch.Title != nil {
+		chat.Title = *patch.Title
+	}
+	if patch.IconToken != "" {
+		chat.Icon = maxclient.ChatIcon{URL: "https://cdn.max.ru/icons/" + patch.IconToken + ".png"}
+	}
+	f.chat = chat
 	return chat, nil
 }
 func (f *fakeMAX) GetChatAdmins(context.Context, string) ([]maxclient.ChatMember, error) {

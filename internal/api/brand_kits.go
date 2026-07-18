@@ -20,6 +20,7 @@ func (s *Server) RegisterWorkspaceBrandRoutes(r chi.Router) {
 	r.Get("/brand-kit", s.getWorkspaceBrandKit)
 	r.Put("/brand-kit", s.updateWorkspaceBrandKit)
 	r.Patch("/brand-kit", s.updateWorkspaceBrandKit)
+	r.Post("/brand-kit/suggest", s.suggestWorkspaceBrandKit)
 	r.Get("/channel-templates", s.listChannelTemplates)
 	r.Post("/channel-templates", s.createChannelTemplate)
 	r.Get("/channel-templates/{template_id}", s.getChannelTemplate)
@@ -172,6 +173,38 @@ func (s *Server) updateWorkspaceBrandKit(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, kit)
+}
+
+// suggestWorkspaceBrandKit returns a non-persisted Brand Kit draft derived
+// from the workspace's own posts. The user reviews the suggestion and saves it
+// through the regular brand kit update endpoint, so the capability requirement
+// matches updateWorkspaceBrandKit.
+func (s *Server) suggestWorkspaceBrandKit(w http.ResponseWriter, r *http.Request) {
+	workspace, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityPostsWrite)
+	if !ok {
+		return
+	}
+	if !s.app.BrandKitSuggestionConfigured() {
+		s.writeError(w, app.ErrResearchNotConfigured)
+		return
+	}
+	release, err := s.aiLimiter.acquireForWorkspaceMetric(
+		r.Context(), access.UserID, workspace, store.AIOperationResearch,
+		store.UsageMetricAIFormatRequests, 1, s.now().UTC())
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	defer release()
+	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
+	defer cancel()
+	result, err := s.app.SuggestBrandKit(ctx, access.UserID, access.WorkspaceID)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) listChannelTemplates(w http.ResponseWriter, r *http.Request) {

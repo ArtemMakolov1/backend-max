@@ -31,6 +31,7 @@ var (
 	ErrResearchNotConfigured        = errors.New("OpenAI research integration is not configured")
 	ErrConflict                     = errors.New("resource state conflict")
 	ErrApprovalRequired             = errors.New("the current post revision must be approved before scheduling or publishing")
+	ErrNotEnoughPostsForBrandKit    = errors.New("not enough posts with text to suggest a brand kit")
 )
 
 const (
@@ -49,6 +50,7 @@ const (
 
 type MAXClient interface {
 	GetMe(context.Context) (maxclient.BotInfo, error)
+	EditChat(context.Context, string, maxclient.ChatPatch) (maxclient.ChatInfo, error)
 	GetChat(context.Context, string) (maxclient.ChatInfo, error)
 	GetChatAdmins(context.Context, string) ([]maxclient.ChatMember, error)
 	GetChatByLink(context.Context, string) (maxclient.ChatInfo, error)
@@ -139,6 +141,14 @@ type ResearchClient interface {
 
 type ContentFormatter interface {
 	FormatContent(context.Context, openairesearch.FormatRequest) (openairesearch.FormatResult, error)
+}
+
+type ImagePromptSuggester interface {
+	SuggestImagePrompt(context.Context, openairesearch.SuggestImagePromptRequest) (openairesearch.SuggestImagePromptResult, error)
+}
+
+type BrandKitSuggester interface {
+	SuggestBrandKit(context.Context, openairesearch.SuggestBrandKitRequest) (openairesearch.SuggestBrandKitResult, error)
 }
 
 // Metrics receives only bounded operational dimensions. Implementations must
@@ -242,6 +252,16 @@ func (a *App) ResearchConfigured() bool { return a.research != nil }
 
 func (a *App) ContentFormattingConfigured() bool {
 	_, ok := a.research.(ContentFormatter)
+	return a.research != nil && ok
+}
+
+func (a *App) ImagePromptSuggestionConfigured() bool {
+	_, ok := a.research.(ImagePromptSuggester)
+	return a.research != nil && ok
+}
+
+func (a *App) BrandKitSuggestionConfigured() bool {
+	_, ok := a.research.(BrandKitSuggester)
 	return a.research != nil && ok
 }
 
@@ -917,6 +937,88 @@ func (a *App) TestChannelForUser(ctx context.Context, userID string, channelID i
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
 
+// ChannelMAXInfoUpdate carries channel metadata pushed to MAX itself. Icon is
+// streamed to the MAX upload endpoint first; Title changes both the MAX chat
+// and the cached channel record. The MAX Bot API cannot change descriptions.
+type ChannelMAXInfoUpdate struct {
+	Title        *string
+	IconFilename string
+	Icon         io.Reader
+}
+
+// pushChannelMAXInfo re-verifies channel ownership and bot admin rights, then
+// applies the patch in MAX and returns the fresh chat metadata for syncing.
+func (a *App) pushChannelMAXInfo(ctx context.Context, channel store.Channel, update ChannelMAXInfoUpdate) (maxclient.ChatInfo, error) {
+	if a.max == nil {
+		return maxclient.ChatInfo{}, ErrMAXNotConfigured
+	}
+	if update.Title == nil && update.Icon == nil {
+		return maxclient.ChatInfo{}, errors.New("channel title or icon is required")
+	}
+	info, membership, err := a.inspectChannel(ctx, channel)
+	if err != nil {
+		return maxclient.ChatInfo{}, err
+	}
+	diagnostics := channelDiagnostics(info, membership)
+	if !channel.Active || !membership.IsAdmin {
+		return maxclient.ChatInfo{}, &ChannelAccessError{Diagnostics: diagnostics,
+			Message: "The shared bot must administer an active channel to change its title or photo"}
+	}
+	patch := maxclient.ChatPatch{Title: update.Title}
+	if update.Icon != nil {
+		upload, uploadErr := a.max.UploadImage(ctx, update.IconFilename, update.Icon)
+		if uploadErr != nil {
+			return maxclient.ChatInfo{}, uploadErr
+		}
+		patch.IconToken = upload.Token
+	}
+	return a.max.EditChat(ctx, channel.MAXChatID, patch)
+}
+
+func (a *App) UpdateChannelMAXInfoForUser(ctx context.Context, userID string, channelID int64, update ChannelMAXInfoUpdate) (store.Channel, error) {
+	channel, err := a.store.GetChannelForUser(ctx, userID, channelID)
+	if err != nil {
+		return store.Channel{}, err
+	}
+	info, err := a.pushChannelMAXInfo(ctx, channel, update)
+	if err != nil {
+		return store.Channel{}, err
+	}
+	if update.Title != nil {
+		if _, err := a.store.UpdateChannelForUser(ctx, userID, channelID, update.Title, nil); err != nil {
+			return store.Channel{}, err
+		}
+	}
+	return a.store.SyncChannelParticipantStatsForUser(ctx, userID, channelID, channel.MAXChatID,
+		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount, a.now().UTC())
+}
+
+func (a *App) UpdateChannelMAXInfoForWorkspace(ctx context.Context, actorUserID, workspaceID string, channelID int64, update ChannelMAXInfoUpdate) (store.Channel, error) {
+	channel, err := a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, channelID)
+	if err != nil {
+		return store.Channel{}, err
+	}
+	info, err := a.pushChannelMAXInfo(ctx, channel, update)
+	if err != nil {
+		return store.Channel{}, err
+	}
+	if update.Title != nil {
+		// UpdateChannelForWorkspace также записывает событие channel.updated.
+		if _, err := a.store.UpdateChannelForWorkspace(ctx, actorUserID, workspaceID, channelID, update.Title, nil); err != nil {
+			return store.Channel{}, err
+		}
+	} else if _, err := a.store.CreateAuditEvent(ctx, actorUserID, store.AuditEvent{
+		WorkspaceID: workspaceID, Action: "channel.updated", EntityType: "channel", EntityID: fmt.Sprint(channelID),
+	}); err != nil {
+		return store.Channel{}, err
+	}
+	if _, err := a.store.SyncChannelParticipantStatsForUser(ctx, channel.UserID, channelID, channel.MAXChatID,
+		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount, a.now().UTC()); err != nil {
+		return store.Channel{}, err
+	}
+	return a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, channelID)
+}
+
 func (a *App) GenerateImageForUser(ctx context.Context, userID string, request openaiimg.GenerateRequest) (media.File, error) {
 	if a.images == nil {
 		return media.File{}, ErrOpenAINotConfigured
@@ -1044,6 +1146,143 @@ func (a *App) FormatPostContent(ctx context.Context, request openairesearch.Form
 		return openairesearch.FormatResult{}, ErrResearchNotConfigured
 	}
 	return formatter.FormatContent(ctx, request)
+}
+
+func (a *App) SuggestImagePrompt(ctx context.Context, request openairesearch.SuggestImagePromptRequest) (openairesearch.SuggestImagePromptResult, error) {
+	if err := openairesearch.ValidateSuggestImagePromptRequest(request); err != nil {
+		return openairesearch.SuggestImagePromptResult{}, err
+	}
+	suggester, ok := a.research.(ImagePromptSuggester)
+	if a.research == nil || !ok {
+		return openairesearch.SuggestImagePromptResult{}, ErrResearchNotConfigured
+	}
+	return suggester.SuggestImagePrompt(ctx, request)
+}
+
+// SuggestBrandKit assembles untrusted editorial material from the workspace's
+// own recent posts and asks the model for a Brand Kit draft. Nothing is
+// persisted: the caller shows the suggestion and the user edits and saves it
+// through the regular brand kit update flow.
+func (a *App) SuggestBrandKit(ctx context.Context, actorUserID, workspaceID string) (openairesearch.SuggestBrandKitResult, error) {
+	suggester, ok := a.research.(BrandKitSuggester)
+	if a.research == nil || !ok {
+		return openairesearch.SuggestBrandKitResult{}, ErrResearchNotConfigured
+	}
+	posts, err := a.store.ListPostsForWorkspace(ctx, actorUserID, workspaceID, "", nil)
+	if err != nil {
+		return openairesearch.SuggestBrandKitResult{}, err
+	}
+	candidates := make([]store.Post, 0, len(posts))
+	for _, post := range posts {
+		if strings.TrimSpace(post.Content) != "" {
+			candidates = append(candidates, post)
+		}
+	}
+	if len(candidates) < openairesearch.MinSuggestBrandKitPosts {
+		return openairesearch.SuggestBrandKitResult{}, ErrNotEnoughPostsForBrandKit
+	}
+	// Published posts represent the workspace's real voice best, so they come
+	// first; drafts only pad the sample. Each group keeps the store's
+	// newest-first ordering.
+	ordered := make([]store.Post, 0, len(candidates))
+	for _, post := range candidates {
+		if post.Status == store.PostStatusPublished {
+			ordered = append(ordered, post)
+		}
+	}
+	for _, post := range candidates {
+		if post.Status != store.PostStatusPublished {
+			ordered = append(ordered, post)
+		}
+	}
+	samples := make([]openairesearch.PostSample, 0, openairesearch.MaxSuggestBrandKitPosts)
+	selected := make([]store.Post, 0, openairesearch.MaxSuggestBrandKitPosts)
+	remaining := openairesearch.MaxSuggestBrandKitTotalRunes
+	for _, post := range ordered {
+		if len(samples) == openairesearch.MaxSuggestBrandKitPosts || remaining <= 0 {
+			break
+		}
+		text := strings.TrimSpace(post.Content)
+		if runes := []rune(text); len(runes) > remaining {
+			text = strings.TrimSpace(string(runes[:remaining]))
+			if text == "" {
+				break
+			}
+		}
+		remaining -= utf8.RuneCountInString(text)
+		samples = append(samples, openairesearch.PostSample{Text: text, Format: post.Format})
+		selected = append(selected, post)
+	}
+	if len(samples) < openairesearch.MinSuggestBrandKitPosts {
+		return openairesearch.SuggestBrandKitResult{}, ErrNotEnoughPostsForBrandKit
+	}
+	return suggester.SuggestBrandKit(ctx, openairesearch.SuggestBrandKitRequest{
+		Posts:  samples,
+		Images: a.collectBrandKitImages(ctx, selected),
+	})
+}
+
+// collectBrandKitImages loads up to MaxSuggestBrandKitImages cover images from
+// the sampled posts. Missing, oversized or unsupported files are skipped
+// silently: the suggestion then simply proceeds without a visual style.
+// Content-addressed keys are deduplicated so one reused cover is sent once.
+func (a *App) collectBrandKitImages(ctx context.Context, posts []store.Post) []openairesearch.ImageInput {
+	if a.media == nil {
+		return nil
+	}
+	images := make([]openairesearch.ImageInput, 0, openairesearch.MaxSuggestBrandKitImages)
+	seen := make(map[string]struct{}, openairesearch.MaxSuggestBrandKitImages)
+	for _, post := range posts {
+		if len(images) == openairesearch.MaxSuggestBrandKitImages {
+			break
+		}
+		key := a.brandKitImageKey(post)
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		if image, ok := a.loadBrandKitImage(ctx, key); ok {
+			images = append(images, image)
+		}
+	}
+	return images
+}
+
+func (a *App) brandKitImageKey(post store.Post) string {
+	for _, attachment := range post.Attachments {
+		if attachment.Type == store.PostAttachmentImage &&
+			attachment.ProcessingStatus == store.AttachmentStatusReady && attachment.StorageKey != "" {
+			return attachment.StorageKey
+		}
+	}
+	if post.ImagePath != "" {
+		return post.ImagePath
+	}
+	if post.ImageURL != "" {
+		if filename, err := a.media.FilenameFromURL(post.ImageURL); err == nil {
+			return filename
+		}
+	}
+	return ""
+}
+
+func (a *App) loadBrandKitImage(ctx context.Context, key string) (openairesearch.ImageInput, bool) {
+	object, err := a.media.Open(ctx, key)
+	if err != nil {
+		return openairesearch.ImageInput{}, false
+	}
+	defer func() { _ = object.Body.Close() }()
+	if !openairesearch.SupportedBrandKitImageMIME(object.MIMEType) {
+		return openairesearch.ImageInput{}, false
+	}
+	data, err := io.ReadAll(io.LimitReader(object.Body, openairesearch.MaxSuggestBrandKitImageBytes+1))
+	if err != nil || len(data) == 0 || len(data) > openairesearch.MaxSuggestBrandKitImageBytes {
+		return openairesearch.ImageInput{}, false
+	}
+	return openairesearch.ImageInput{MIME: object.MIMEType, Data: data}, true
 }
 
 func (a *App) GeneratePostImage(ctx context.Context, userID string, postID int64, request openaiimg.GenerateRequest) (store.Post, error) {

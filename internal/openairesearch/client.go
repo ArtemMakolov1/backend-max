@@ -261,9 +261,18 @@ type responsePayload struct {
 	Store           bool            `json:"store"`
 }
 
+// inputMessage carries either a plain string or a []inputContentPart in
+// Content. The Responses API accepts both shapes; parts are only needed for
+// multimodal messages that mix text with images.
 type inputMessage struct {
 	Role    string `json:"role"`
-	Content string `json:"content"`
+	Content any    `json:"content"`
+}
+
+type inputContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
 }
 
 type webSearchTool struct {

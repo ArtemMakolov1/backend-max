@@ -175,10 +175,12 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/channels/connect/{claim_id}", s.getChannelConnect)
 				r.Get("/channels/{channel_id}", s.getWorkspaceChannel)
 				r.Patch("/channels/{channel_id}", s.updateWorkspaceChannel)
+				r.Post("/channels/{channel_id}/max-info", s.updateWorkspaceChannelMAXInfo)
 				r.Delete("/channels/{channel_id}", s.deleteWorkspaceChannel)
 				r.Get("/posts", s.listWorkspacePosts)
 				r.Post("/posts", s.createWorkspacePost)
 				r.Post("/posts/format-content", s.formatWorkspacePostContent)
+				r.Post("/posts/suggest-image-prompt", s.suggestWorkspaceImagePrompt)
 				r.Post("/research/generate", s.generateWorkspaceResearch)
 				r.Post("/images/generate", s.generateWorkspaceImage)
 				r.Post("/media", s.uploadWorkspaceMedia)
@@ -229,6 +231,7 @@ func (s *Server) Handler() http.Handler {
 			r.Patch("/channels/{id}", s.updateChannel)
 			r.Put("/channels/{id}", s.updateChannel)
 			r.Delete("/channels/{id}", s.deleteChannel)
+			r.Post("/channels/{id}/max-info", s.updateChannelMAXInfo)
 			r.Post("/channels/{id}/test", s.testChannel)
 			r.Get("/channels/{id}/participant-history", s.getChannelParticipantHistory)
 			r.Get("/analytics", s.getAnalytics)
@@ -236,6 +239,7 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/posts", s.listPosts)
 			r.Post("/posts", s.createPost)
 			r.Post("/posts/format-content", s.formatPostContent)
+			r.Post("/posts/suggest-image-prompt", s.suggestImagePrompt)
 			r.Get("/posts/{id}", s.getPost)
 			r.Patch("/posts/{id}", s.updatePost)
 			r.Put("/posts/{id}", s.updatePost)
@@ -538,6 +542,9 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, app.ErrApprovalRequired):
 		s.problem(w, http.StatusConflict, "post_approval_required",
 			"The current post revision must be approved before scheduling or publishing.", nil)
+	case errors.Is(err, app.ErrNotEnoughPostsForBrandKit):
+		s.problem(w, http.StatusConflict, "not_enough_posts",
+			"Недостаточно постов с текстом для автозаполнения Brand Kit. Создайте хотя бы 3 поста с текстом и попробуйте ещё раз.", nil)
 	case errors.Is(err, errMediaUploadRateLimited):
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")

@@ -311,6 +311,37 @@ paths:
           description: Channel disconnected
         default:
           $ref: '#/components/responses/Problem'
+  /channels/{id}/max-info:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Channels]
+      operationId: updateChannelMaxInfo
+      summary: Change the channel photo and title in MAX itself
+      description: >-
+        Pushes a new icon and/or title to the MAX channel through the Bot API
+        and refreshes the cached channel record. At least one of title or file
+        is required. The channel description cannot be changed by bots.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                title: {type: string, minLength: 1, maxLength: 200}
+                file: {type: string, format: binary}
+      responses:
+        '200':
+          description: Updated channel
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Channel'
+        default:
+          $ref: '#/components/responses/Problem'
   /analytics:
     get:
       tags: [Analytics]
@@ -431,6 +462,28 @@ paths:
                 properties:
                   content:
                     type: string
+        default:
+          $ref: '#/components/responses/Problem'
+  /posts/suggest-image-prompt:
+    post:
+      tags: [AI]
+      operationId: suggestImagePrompt
+      summary: Suggest an image prompt from the post text
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuggestImagePromptInput'
+      responses:
+        '200':
+          description: Suggested image prompt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuggestedImagePrompt'
         default:
           $ref: '#/components/responses/Problem'
   /posts/{id}:
@@ -1117,6 +1170,31 @@ paths:
       responses:
         '204': {description: Channel disconnected}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels/{channel_id}/max-info:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/ChannelId'}
+    post:
+      tags: [Channels]
+      operationId: updateWorkspaceChannelMaxInfo
+      summary: Change the channel photo and title in MAX itself
+      description: >-
+        Pushes a new icon and/or title to the MAX channel through the Bot API
+        and refreshes the cached channel record. At least one of title or file
+        is required. The channel description cannot be changed by bots.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                title: {type: string, minLength: 1, maxLength: 200}
+                file: {type: string, format: binary}
+      responses:
+        '200': {$ref: '#/components/responses/Channel'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/posts:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
     get:
@@ -1158,6 +1236,20 @@ paths:
             schema: {$ref: '#/components/schemas/FormatContentInput'}
       responses:
         '200': {description: Formatted content, content: {application/json: {schema: {type: object}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/suggest-image-prompt:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: suggestWorkspaceImagePrompt
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SuggestImagePromptInput'}
+      responses:
+        '200': {description: Suggested image prompt, content: {application/json: {schema: {$ref: '#/components/schemas/SuggestedImagePrompt'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/research/generate:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
@@ -1205,6 +1297,21 @@ paths:
             schema: {$ref: '#/components/schemas/WorkspaceBrandKitUpdate'}
       responses:
         '200': {description: Updated workspace brand kit, content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceBrandKit'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/brand-kit/suggest:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Brand]
+      operationId: suggestWorkspaceBrandKit
+      summary: Suggest brand kit values from the workspace posts
+      description: >-
+        Analyzes the workspace's own recent posts (and up to three of their
+        images) and returns a Brand Kit draft. Nothing is persisted: the client
+        shows the suggestion for review and the user saves it through the
+        regular brand kit update endpoint.
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Suggested brand kit values, content: {application/json: {schema: {$ref: '#/components/schemas/BrandKitSuggestion'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/channel-templates:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
@@ -2697,6 +2804,17 @@ components:
       properties:
         content: {type: string, minLength: 1, maxLength: 4000}
         format: {$ref: '#/components/schemas/PostFormat'}
+    SuggestImagePromptInput:
+      type: object
+      required: [content]
+      properties:
+        content: {type: string, minLength: 1, maxLength: 4000}
+        format: {$ref: '#/components/schemas/PostFormat'}
+    SuggestedImagePrompt:
+      type: object
+      required: [prompt]
+      properties:
+        prompt: {type: string, minLength: 1, maxLength: 2000}
     MediaFile:
       type: object
       required: [type, url, filename, mime_type, size, width, height]
@@ -3395,6 +3513,18 @@ components:
           required: [expected_version]
           properties:
             expected_version: {type: integer, format: int64, minimum: 1}
+    BrandKitSuggestion:
+      type: object
+      required: [tone, audience, cta, visual_style, example_posts]
+      properties:
+        tone: {type: string, maxLength: 100}
+        audience: {type: string, maxLength: 500}
+        cta: {type: string, maxLength: 500}
+        visual_style: {type: string, maxLength: 1000}
+        example_posts:
+          type: array
+          maxItems: 2
+          items: {type: string, maxLength: 4000}
     ResearchSource:
       type: object
       required: [title, url]

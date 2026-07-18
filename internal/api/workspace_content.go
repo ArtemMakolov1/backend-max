@@ -412,6 +412,31 @@ func (s *Server) updateWorkspaceChannel(w http.ResponseWriter, r *http.Request) 
 	s.writeJSON(w, http.StatusOK, channel)
 }
 
+func (s *Server) updateWorkspaceChannelMAXInfo(w http.ResponseWriter, r *http.Request) {
+	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityChannelsManage)
+	if !ok {
+		return
+	}
+	channelID, err := parsePositivePathID(r, "channel_id")
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	update, cleanup, formOK := s.decodeChannelMAXInfoForm(w, r, access.UserID)
+	if !formOK {
+		return
+	}
+	defer cleanup()
+	ctx, cancel := contextWithTimeout(r, time.Minute)
+	defer cancel()
+	channel, err := s.app.UpdateChannelMAXInfoForWorkspace(ctx, access.UserID, access.WorkspaceID, channelID, update)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, channel)
+}
+
 func (s *Server) deleteWorkspaceChannel(w http.ResponseWriter, r *http.Request) {
 	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityChannelsManage)
 	if !ok {

@@ -55,6 +55,15 @@ type ChatInfo struct {
 	ParticipantsCount int      `json:"participants_count,omitempty"`
 }
 
+// ChatPatch describes the mutable chat metadata accepted by
+// PATCH /chats/{chatId}. MAX lets an administrator bot replace the chat photo
+// and title; the chat description is read-only in the Bot API.
+type ChatPatch struct {
+	// IconToken is an image upload token obtained through UploadImage.
+	IconToken string
+	Title     *string
+}
+
 type Permission string
 
 const (
