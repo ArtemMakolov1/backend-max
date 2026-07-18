@@ -9,7 +9,26 @@ import (
 
 type workspaceBillingResponse struct {
 	store.WorkspaceBillingState
-	MonthlyEnforcementEnabled bool `json:"monthly_enforcement_enabled"`
+	MonthlyEnforcementEnabled bool             `json:"monthly_enforcement_enabled"`
+	ImageCreditCosts          imageCreditCosts `json:"image_credit_costs"`
+}
+
+// imageCreditCosts mirrors the GenerateImageInput quality values so browsers
+// can render per-quality prices without hardcoding ledger constants. Values
+// are resolved through imageUsageCredits — the same function every image
+// charge goes through — so the response can never drift from what is billed.
+type imageCreditCosts struct {
+	Low    int64 `json:"low"`
+	Medium int64 `json:"medium"`
+	High   int64 `json:"high"`
+}
+
+func currentImageCreditCosts() imageCreditCosts {
+	return imageCreditCosts{
+		Low:    imageUsageCredits("low"),
+		Medium: imageUsageCredits("medium"),
+		High:   imageUsageCredits("high"),
+	}
 }
 
 // listPublicBillingPlans is intentionally unauthenticated for pricing pages.
@@ -40,5 +59,6 @@ func (s *Server) getWorkspaceBilling(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, workspaceBillingResponse{
 		WorkspaceBillingState:     state,
 		MonthlyEnforcementEnabled: s.aiLimiter.options.MonthlyPlanEnforcement,
+		ImageCreditCosts:          currentImageCreditCosts(),
 	})
 }

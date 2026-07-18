@@ -46,6 +46,10 @@ func TestPublicPlansExposeOnlyFreeWhileWorkspaceBillingIsTenantScoped(t *testing
 		billing.MonthlyEnforcementEnabled {
 		t.Fatalf("billing response = %#v", billing)
 	}
+	if billing.ImageCreditCosts != currentImageCreditCosts() {
+		t.Fatalf("billing image credit costs = %#v, want %#v",
+			billing.ImageCreditCosts, currentImageCreditCosts())
+	}
 
 	outsider := withTestSession(t, storage, rawHandler, "plans-outsider")
 	response = performJSONRequest(outsider, http.MethodGet,
@@ -206,6 +210,19 @@ func TestImageUsageCredits(t *testing.T) {
 		if got := imageUsageCredits(quality); got != want {
 			t.Fatalf("quality %q credits=%d, want %d", quality, got, want)
 		}
+	}
+}
+
+// The JSON keys must stay equal to the GenerateImageInput quality values and
+// the amounts must stay equal to what imageUsageCredits actually charges, so
+// browsers can price the quality picker without hardcoding 1/9/36.
+func TestImageCreditCostsMatchChargedCreditsPerQuality(t *testing.T) {
+	serialized, err := json.Marshal(currentImageCreditCosts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(serialized), `{"low":1,"medium":9,"high":36}`; got != want {
+		t.Fatalf("image credit costs = %s, want %s", got, want)
 	}
 }
 
