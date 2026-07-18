@@ -422,8 +422,19 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	if err := s.app.Store().DeleteChannelForUser(r.Context(), userID, id); err != nil {
-		s.writeError(w, err)
+	var deleteErr error
+	if r.URL.Query().Get("delete_content") == "true" {
+		deleteErr = s.app.Store().DeleteChannelContentForUser(r.Context(), userID, id)
+	} else {
+		deleteErr = s.app.Store().DeleteChannelForUser(r.Context(), userID, id)
+	}
+	if errors.Is(deleteErr, store.ErrChannelPublicationInProgress) {
+		s.problem(w, http.StatusConflict, "channel_publication_in_progress",
+			"Дождитесь завершения текущей публикации и повторите удаление канала.", nil)
+		return
+	}
+	if deleteErr != nil {
+		s.writeError(w, deleteErr)
 		return
 	}
 	s.writeJSON(w, http.StatusNoContent, nil)

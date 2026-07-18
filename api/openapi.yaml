@@ -304,6 +304,12 @@ paths:
       tags: [Channels]
       operationId: deleteChannel
       summary: Disconnect a channel
+      parameters:
+        - name: delete_content
+          in: query
+          required: false
+          description: Delete every local post and campaign item linked to the channel after explicit user confirmation.
+          schema: {type: boolean, default: false}
       security:
         - sessionCookie: []
       responses:
@@ -1166,6 +1172,12 @@ paths:
     delete:
       tags: [Channels]
       operationId: deleteWorkspaceChannel
+      parameters:
+        - name: delete_content
+          in: query
+          required: false
+          description: Delete every local post and campaign item linked to the channel after explicit user confirmation.
+          schema: {type: boolean, default: false}
       security: [{sessionCookie: []}]
       responses:
         '204': {description: Channel disconnected}
