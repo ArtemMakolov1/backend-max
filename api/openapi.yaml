@@ -2549,6 +2549,9 @@ components:
           type: [string, 'null']
         message:
           type: [string, 'null']
+        is_new_user:
+          type: boolean
+          description: True only in the response that creates a new local account.
     WorkspaceCapability:
       type: string
       enum:

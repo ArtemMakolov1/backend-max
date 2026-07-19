@@ -275,7 +275,7 @@ func (s *Server) finishYandexAuth(w http.ResponseWriter, r *http.Request) {
 	if created {
 		s.dispatchWelcomeEmail(r.Context(), email.WelcomeRecipient{Email: profile.DefaultEmail, DisplayName: displayName})
 	}
-	http.Redirect(w, r, s.frontendOrigin+state.ReturnTo, http.StatusSeeOther)
+	http.Redirect(w, r, s.frontendOrigin+registrationReturnTo(state.ReturnTo, created), http.StatusSeeOther)
 }
 
 // dispatchWelcomeEmail delivers the first-sign-in welcome email off the request
@@ -404,6 +404,23 @@ func safeReturnTo(raw string) string {
 	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/app" && !strings.HasPrefix(parsed.Path, "/app/")) {
 		return "/app/"
 	}
+	return parsed.String()
+}
+
+// registrationReturnTo carries a short-lived UI signal only when the account
+// was inserted by this callback. The browser removes it from the address bar
+// immediately after reading it, while repeat sign-ins keep their original URL.
+func registrationReturnTo(returnTo string, created bool) string {
+	if !created {
+		return returnTo
+	}
+	parsed, err := url.Parse(returnTo)
+	if err != nil {
+		return returnTo
+	}
+	query := parsed.Query()
+	query.Set("onboarding", "1")
+	parsed.RawQuery = query.Encode()
 	return parsed.String()
 }
 
