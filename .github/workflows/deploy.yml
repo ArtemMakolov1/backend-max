@@ -166,9 +166,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      # Production publishes a verified encrypted pre-migration snapshot as an
-      # immutable Release before it is allowed to apply additive migrations.
-      contents: write
+      # Offsite backups are published by the independent scheduled backup job.
+      # A deploy only needs repository metadata and the immutable image.
+      contents: read
       packages: read
     environment:
       name: ${{ vars.DEPLOY_STAGE == 'production' && 'production' || 'bootstrap' }}
@@ -210,6 +210,7 @@ jobs:
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
           GRAFANA_SECRET_KEY: ${{ secrets.GRAFANA_SECRET_KEY }}
           BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '14' }}
+          PITR_RETENTION_DAYS: ${{ vars.PITR_RETENTION_DAYS || '7' }}
         run: |
           set -euo pipefail
           output="$RUNNER_TEMP/maxposty-backend.env"
@@ -223,6 +224,7 @@ jobs:
           POSTGRES_MONITOR_PASSWORD: ${{ secrets.POSTGRES_MONITOR_PASSWORD }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
           GRAFANA_SECRET_KEY: ${{ secrets.GRAFANA_SECRET_KEY }}
+          ALERTMANAGER_WEBHOOK_URL: ${{ secrets.ALERTMANAGER_WEBHOOK_URL }}
           YANDEX_CLIENT_ID: ${{ secrets.YANDEX_CLIENT_ID }}
           YANDEX_CLIENT_SECRET: ${{ secrets.YANDEX_CLIENT_SECRET }}
           YANDEX_ALLOWED_USERS: ${{ vars.YANDEX_ALLOWED_USERS }}
@@ -235,8 +237,23 @@ jobs:
           S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
           S3_BUCKET: ${{ vars.S3_BUCKET }}
           S3_REGION: ${{ vars.S3_REGION }}
+          MEDIA_USER_MAX_FILES: ${{ vars.MEDIA_USER_MAX_FILES || '500' }}
+          MEDIA_USER_MAX_BYTES: ${{ vars.MEDIA_USER_MAX_BYTES || '1073741824' }}
+          MEDIA_ORPHAN_GRACE_PERIOD: ${{ vars.MEDIA_ORPHAN_GRACE_PERIOD || '24h' }}
+          MEDIA_CLEANUP_INTERVAL: ${{ vars.MEDIA_CLEANUP_INTERVAL || '15m' }}
+          MEDIA_CLEANUP_BATCH_SIZE: ${{ vars.MEDIA_CLEANUP_BATCH_SIZE || '50' }}
+          WORKSPACE_MAX_OWNED_TEAM_WORKSPACES: ${{ vars.WORKSPACE_MAX_OWNED_TEAM_WORKSPACES || '5' }}
+          BILLING_ENFORCEMENT_ENABLED: ${{ vars.BILLING_ENFORCEMENT_ENABLED || 'false' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Welcome-email SMTP (optional; unset leaves emails disabled).
+          SMTP_HOST: ${{ vars.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM_EMAIL: ${{ vars.SMTP_FROM_EMAIL }}
+          SMTP_FROM_NAME: ${{ vars.SMTP_FROM_NAME }}
           BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '14' }}
+          PITR_RETENTION_DAYS: ${{ vars.PITR_RETENTION_DAYS || '7' }}
         run: |
           set -euo pipefail
           output="$RUNNER_TEMP/maxposty-backend.env"

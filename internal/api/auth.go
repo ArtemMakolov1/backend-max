@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"maxpilot/backend/internal/email"
 	"maxpilot/backend/internal/store"
 	"maxpilot/backend/internal/yandexauth"
 )
@@ -252,7 +253,7 @@ func (s *Server) finishYandexAuth(w http.ResponseWriter, r *http.Request) {
 	yandexUserID := firstNonEmpty(profile.PSUID, profile.ID)
 	displayName := yandexDisplayName(profile)
 	avatarURL := yandexauth.AvatarURL(profile)
-	if err := s.app.Store().CreateAuthenticatedSession(r.Context(), store.User{
+	created, err := s.app.Store().CreateAuthenticatedSession(r.Context(), store.User{
 		ID: yandexUserID, Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName, AvatarURL: avatarURL,
 	}, []store.Consent{
 		{Document: "terms", Version: state.TermsVersion, AcceptedAt: state.ConsentAt, Source: "yandex_oauth"},
@@ -262,12 +263,45 @@ func (s *Server) finishYandexAuth(w http.ResponseWriter, r *http.Request) {
 		Login: profile.Login, Email: profile.DefaultEmail, DisplayName: displayName, AvatarURL: avatarURL,
 		AllowlistIdentity: allowlistIdentity,
 		CreatedAt:         now, ExpiresAt: now.Add(s.sessionTTL),
-	}); err != nil {
+	})
+	if err != nil {
 		s.writeError(w, err)
 		return
 	}
 	s.setSessionCookie(w, sessionToken, int(s.sessionTTL.Seconds()))
-	http.Redirect(w, r, s.frontendOrigin+state.ReturnTo, http.StatusSeeOther)
+	// Only a brand-new account triggers the welcome email; repeat sign-ins and
+	// the email-less MAX login path never reach this branch. Delivery is
+	// best-effort and detached so it cannot delay or fail the redirect.
+	if created {
+		s.dispatchWelcomeEmail(r.Context(), email.WelcomeRecipient{Email: profile.DefaultEmail, DisplayName: displayName})
+	}
+	http.Redirect(w, r, s.frontendOrigin+registrationReturnTo(state.ReturnTo, created), http.StatusSeeOther)
+}
+
+// dispatchWelcomeEmail delivers the first-sign-in welcome email off the request
+// path. It runs on a context detached from the request (so the redirect
+// returning does not cancel the send) with its own timeout, recovers from a
+// panic in the sender, and only logs failures. An empty recipient address is a
+// no-op. When SMTP is not configured the sender is a NoopSender, so this is a
+// fast, error-free no-op.
+func (s *Server) dispatchWelcomeEmail(parent context.Context, recipient email.WelcomeRecipient) {
+	recipient.Email = strings.TrimSpace(recipient.Email)
+	if recipient.Email == "" {
+		return
+	}
+	detached := context.WithoutCancel(parent)
+	s.welcomeEmailDispatch(func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				s.logger.Error("welcome email delivery panicked", "recover", recovered)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(detached, 20*time.Second)
+		defer cancel()
+		if err := s.welcomeSender.SendWelcome(ctx, recipient); err != nil {
+			s.logger.Warn("welcome email delivery failed", "email", recipient.Email, "error", err)
+		}
+	})
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
@@ -370,6 +404,23 @@ func safeReturnTo(raw string) string {
 	if err != nil || parsed.IsAbs() || parsed.Host != "" || (parsed.Path != "/app" && !strings.HasPrefix(parsed.Path, "/app/")) {
 		return "/app/"
 	}
+	return parsed.String()
+}
+
+// registrationReturnTo carries a short-lived UI signal only when the account
+// was inserted by this callback. The browser removes it from the address bar
+// immediately after reading it, while repeat sign-ins keep their original URL.
+func registrationReturnTo(returnTo string, created bool) string {
+	if !created {
+		return returnTo
+	}
+	parsed, err := url.Parse(returnTo)
+	if err != nil {
+		return returnTo
+	}
+	query := parsed.Query()
+	query.Set("onboarding", "1")
+	parsed.RawQuery = query.Encode()
 	return parsed.String()
 }
 

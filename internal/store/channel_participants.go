@@ -35,6 +35,7 @@ func (s *Store) ListChannelsDueForParticipantStats(ctx context.Context, now time
 	rows, err := s.db.QueryContext(ctx, `
 SELECT `+channelColumns+` FROM channels
 WHERE owner_id <> ''
+  AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=channels.workspace_id AND w.archived_at IS NULL)
   AND active
   AND COALESCE(participants_stats_attempted_at, '-infinity'::timestamptz) <= ?
 ORDER BY COALESCE(participants_stats_attempted_at, '-infinity'::timestamptz), id
@@ -80,7 +81,7 @@ WHERE owner_id = ? AND id = ? AND max_chat_id = ? AND active
 	if affected, _ := result.RowsAffected(); affected == 1 {
 		return true, nil
 	}
-	channel, err := s.GetChannelForUser(ctx, userID, channelID)
+	channel, err := s.getChannelForOwner(ctx, userID, channelID)
 	if err != nil {
 		return false, err
 	}
@@ -131,7 +132,7 @@ FROM channels WHERE owner_id = ? AND id = ? FOR UPDATE`), userID, channelID).Sca
 		if err := tx.Commit(); err != nil {
 			return Channel{}, fmt.Errorf("commit stale channel participant stats no-op: %w", err)
 		}
-		return s.GetChannelForUser(ctx, userID, channelID)
+		return s.getChannelForOwner(ctx, userID, channelID)
 	}
 	result, err := tx.ExecContext(ctx, bindSQL(`
 UPDATE channels
@@ -160,7 +161,7 @@ WHERE excluded.captured_at >= channel_participant_snapshots.captured_at`),
 	if err := tx.Commit(); err != nil {
 		return Channel{}, fmt.Errorf("commit channel participant stats sync: %w", err)
 	}
-	return s.GetChannelForUser(ctx, userID, channelID)
+	return s.getChannelForOwner(ctx, userID, channelID)
 }
 
 // ListChannelParticipantSnapshotsForUser returns an ascending daily series and

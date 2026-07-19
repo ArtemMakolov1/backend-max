@@ -162,8 +162,9 @@ func (s *Server) completeMAXAuth(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	prospectiveOwnerID := "max_" + newOwnerToken
 	session, err := s.app.Store().CompleteMAXAuthAttempt(r.Context(), requestID, sha256Hex(cookie.Value),
-		"max_"+newOwnerToken, store.AuthSession{
+		prospectiveOwnerID, store.AuthSession{
 			TokenHash: sha256Hex(sessionToken), Provider: "max",
 			CreatedAt: now, ExpiresAt: now.Add(s.sessionTTL),
 		}, now)
@@ -181,6 +182,7 @@ func (s *Server) completeMAXAuth(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"request_id": requestID, "status": store.MAXAuthAttemptAuthenticated, "return_to": attempt.ReturnTo,
 		"auth_method": "max", "session_expires_at": expiresAt,
+		"is_new_user": session.OwnerID == prospectiveOwnerID,
 		"user": authUser{ID: session.OwnerID, Provider: "max", Login: session.Login,
 			DisplayName: firstNonEmpty(session.DisplayName, session.Login, "Пользователь MAX"), AvatarURL: session.AvatarURL},
 	})

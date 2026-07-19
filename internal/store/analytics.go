@@ -25,6 +25,11 @@ type ProductAnalyticsSnapshot struct {
 	PostCreatedUsers              int64
 	PostScheduledOrPublishedUsers int64
 	PostPublishedUsers            int64
+	PublishedPosts                int64
+	PublishedPostsWithMedia       int64
+	PublishedPostsWithMultiple    int64
+	PublishedPostsWithVideo       int64
+	PublishedPostsWithMixedMedia  int64
 }
 
 // TouchUserActivity records only that an authenticated account was active on
@@ -126,6 +131,29 @@ post_published AS (
         WHERE posts.owner_id = post_scheduled_or_published.owner_id
           AND posts.published_at IS NOT NULL
     )
+),
+published_post_media AS (
+    SELECT
+        posts.id,
+        COUNT(post_attachments.id) AS attachment_count,
+        COUNT(post_attachments.id) FILTER (WHERE post_attachments.type = 'image') AS image_count,
+        COUNT(post_attachments.id) FILTER (WHERE post_attachments.type = 'video') AS video_count
+    FROM posts
+    LEFT JOIN post_attachments
+      ON post_attachments.owner_id = posts.owner_id
+     AND post_attachments.post_id = posts.id
+     AND post_attachments.processing_status = 'ready'
+    WHERE posts.published_at IS NOT NULL
+    GROUP BY posts.id
+),
+published_post_media_totals AS (
+    SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE attachment_count > 0) AS with_media,
+        COUNT(*) FILTER (WHERE attachment_count > 1) AS with_multiple,
+        COUNT(*) FILTER (WHERE video_count > 0) AS with_video,
+        COUNT(*) FILTER (WHERE image_count > 0 AND video_count > 0) AS with_mixed_media
+    FROM published_post_media
 )
 SELECT
     active_users.dau,
@@ -136,8 +164,14 @@ SELECT
     (SELECT COUNT(*) FROM channel_connected),
     (SELECT COUNT(*) FROM post_created),
     (SELECT COUNT(*) FROM post_scheduled_or_published),
-    (SELECT COUNT(*) FROM post_published)
-FROM active_users`, today.Format(time.DateOnly), weekStart.Format(time.DateOnly), monthStart.Format(time.DateOnly)).Scan(
+    (SELECT COUNT(*) FROM post_published),
+    published_post_media_totals.total,
+    published_post_media_totals.with_media,
+    published_post_media_totals.with_multiple,
+    published_post_media_totals.with_video,
+    published_post_media_totals.with_mixed_media
+FROM active_users
+CROSS JOIN published_post_media_totals`, today.Format(time.DateOnly), weekStart.Format(time.DateOnly), monthStart.Format(time.DateOnly)).Scan(
 		&snapshot.DailyActiveUsers,
 		&snapshot.WeeklyActiveUsers,
 		&snapshot.MonthlyActiveUsers,
@@ -147,6 +181,11 @@ FROM active_users`, today.Format(time.DateOnly), weekStart.Format(time.DateOnly)
 		&snapshot.PostCreatedUsers,
 		&snapshot.PostScheduledOrPublishedUsers,
 		&snapshot.PostPublishedUsers,
+		&snapshot.PublishedPosts,
+		&snapshot.PublishedPostsWithMedia,
+		&snapshot.PublishedPostsWithMultiple,
+		&snapshot.PublishedPostsWithVideo,
+		&snapshot.PublishedPostsWithMixedMedia,
 	)
 	if err != nil {
 		return ProductAnalyticsSnapshot{}, fmt.Errorf("get product analytics: %w", err)

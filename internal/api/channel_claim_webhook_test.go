@@ -44,6 +44,9 @@ type claimWebhookMAX struct {
 	getPinnedErr      error
 	pinRuns           int
 	unpinRuns         int
+	editChatIDs       []string
+	editChatPatches   []maxclient.ChatPatch
+	uploadedIcons     []string
 }
 
 func (f *claimWebhookMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
@@ -53,6 +56,20 @@ func (f *claimWebhookMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 func (f *claimWebhookMAX) GetChat(_ context.Context, chatID string) (maxclient.ChatInfo, error) {
 	f.getChatIDs = append(f.getChatIDs, chatID)
 	return f.chat, nil
+}
+
+func (f *claimWebhookMAX) EditChat(_ context.Context, chatID string, patch maxclient.ChatPatch) (maxclient.ChatInfo, error) {
+	f.editChatIDs = append(f.editChatIDs, chatID)
+	f.editChatPatches = append(f.editChatPatches, patch)
+	chat := f.chat
+	if patch.Title != nil {
+		chat.Title = *patch.Title
+	}
+	if patch.IconToken != "" {
+		chat.Icon = maxclient.ChatIcon{URL: "https://cdn.max.ru/icons/" + patch.IconToken + ".png"}
+	}
+	f.chat = chat
+	return chat, nil
 }
 
 func (f *claimWebhookMAX) GetChatAdmins(_ context.Context, chatID string) ([]maxclient.ChatMember, error) {
@@ -104,8 +121,9 @@ func (f *claimWebhookMAX) AnswerCallback(_ context.Context, callbackID, notifica
 	return nil
 }
 
-func (f *claimWebhookMAX) UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error) {
-	return maxclient.UploadResult{}, nil
+func (f *claimWebhookMAX) UploadImage(_ context.Context, filename string, _ io.Reader) (maxclient.UploadResult, error) {
+	f.uploadedIcons = append(f.uploadedIcons, filename)
+	return maxclient.UploadResult{Token: "uploaded-" + filename}, nil
 }
 
 func (f *claimWebhookMAX) Publish(context.Context, maxclient.PublishRequest) (maxclient.Message, error) {

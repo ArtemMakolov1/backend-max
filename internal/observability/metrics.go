@@ -42,6 +42,10 @@ type Metrics struct {
 	schedulerLastRun   prometheus.Gauge
 	schedulerInterval  prometheus.Gauge
 	recoveredPosts     prometheus.Counter
+	mediaOperations    *prometheus.CounterVec
+	attachmentUploads  *prometheus.CounterVec
+	attachmentReady    *prometheus.HistogramVec
+	attachmentBytes    *prometheus.HistogramVec
 
 	slowQueryThreshold time.Duration
 }
@@ -127,6 +131,24 @@ func NewWithRegistry(registry *prometheus.Registry) *Metrics {
 			Namespace: "maxposty", Name: "scheduler_recovered_publications_total",
 			Help: "Total interrupted publishing records recovered by the scheduler.",
 		}),
+		mediaOperations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "maxposty", Name: "media_operations_total",
+			Help: "Total private media operations by bounded operation and outcome.",
+		}, []string{"operation", "outcome"}),
+		attachmentUploads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "maxposty", Name: "attachment_uploads_total",
+			Help: "Total post attachment upload attempts by bounded media type and outcome.",
+		}, []string{"type", "outcome"}),
+		attachmentReady: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "maxposty", Name: "attachment_upload_ready_duration_seconds",
+			Help:    "Server-observed time from attachment upload start until it is ready for preview.",
+			Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120, 300},
+		}, []string{"type", "outcome"}),
+		attachmentBytes: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "maxposty", Name: "attachment_upload_size_bytes",
+			Help:    "Uploaded post attachment size by bounded media type.",
+			Buckets: []float64{10 << 10, 100 << 10, 1 << 20, 5 << 20, 20 << 20, 50 << 20, 100 << 20, 250 << 20},
+		}, []string{"type"}),
 		slowQueryThreshold: defaultSlowQueryThreshold,
 	}
 	registry.MustRegister(
@@ -135,7 +157,8 @@ func NewWithRegistry(registry *prometheus.Registry) *Metrics {
 		m.dbDuration, m.dbErrors, m.dbSlow,
 		m.publicationTotal, m.publicationTime,
 		m.schedulerJobs, m.schedulerDue, m.schedulerCycles, m.schedulerCycleTime,
-		m.schedulerLastRun, m.schedulerInterval, m.recoveredPosts,
+		m.schedulerLastRun, m.schedulerInterval, m.recoveredPosts, m.mediaOperations,
+		m.attachmentUploads, m.attachmentReady, m.attachmentBytes,
 	)
 	m.handler = promhttp.HandlerFor(registry, promhttp.HandlerOpts{EnableOpenMetrics: true})
 	return m
@@ -206,6 +229,44 @@ func (m *Metrics) SetSchedulerInterval(interval time.Duration) {
 func (m *Metrics) AddRecoveredPublications(count int64) {
 	if count > 0 {
 		m.recoveredPosts.Add(float64(count))
+	}
+}
+
+func (m *Metrics) ObserveMediaOperation(operation, outcome string) {
+	switch operation {
+	case "upload", "cleanup":
+	default:
+		operation = "other"
+	}
+	switch outcome {
+	case "success", "error", "quota_exceeded", "busy":
+	default:
+		outcome = "other"
+	}
+	m.mediaOperations.WithLabelValues(operation, outcome).Inc()
+}
+
+// ObserveAttachmentUpload records one browser-to-storage upload without using
+// filenames, MIME strings, account IDs or other unbounded labels. Rejected
+// formats use the "unknown" type because their content is intentionally not
+// accepted as an image or video.
+func (m *Metrics) ObserveAttachmentUpload(attachmentType, outcome string, sizeBytes int64, elapsed time.Duration) {
+	switch attachmentType {
+	case store.PostAttachmentImage, store.PostAttachmentVideo:
+	default:
+		attachmentType = "unknown"
+	}
+	switch outcome {
+	case "success", "error", "unsupported", "too_large", "quota_exceeded", "busy", "canceled":
+	default:
+		outcome = "other"
+	}
+	m.attachmentUploads.WithLabelValues(attachmentType, outcome).Inc()
+	if elapsed >= 0 {
+		m.attachmentReady.WithLabelValues(attachmentType, outcome).Observe(elapsed.Seconds())
+	}
+	if sizeBytes > 0 {
+		m.attachmentBytes.WithLabelValues(attachmentType).Observe(float64(sizeBytes))
 	}
 }
 
@@ -340,6 +401,7 @@ type productAnalyticsCollector struct {
 
 	activeUsers *prometheus.Desc
 	funnelUsers *prometheus.Desc
+	mediaPosts  *prometheus.Desc
 	errors      *prometheus.Desc
 	lastOK      *prometheus.Desc
 }
@@ -356,6 +418,9 @@ func newProductAnalyticsCollector(
 		funnelUsers: prometheus.NewDesc(
 			"maxposty_product_funnel_users", "Unique users at each progressive product funnel stage.", []string{"stage"}, nil,
 		),
+		mediaPosts: prometheus.NewDesc(
+			"maxposty_product_published_posts", "Published posts by bounded attachment adoption segment.", []string{"kind"}, nil,
+		),
 		errors: prometheus.NewDesc(
 			"maxposty_product_analytics_collect_errors_total", "Total failed product analytics refreshes.", nil, nil,
 		),
@@ -368,6 +433,7 @@ func newProductAnalyticsCollector(
 func (c *productAnalyticsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.activeUsers
 	ch <- c.funnelUsers
+	ch <- c.mediaPosts
 	ch <- c.errors
 	ch <- c.lastOK
 }
@@ -395,6 +461,15 @@ func (c *productAnalyticsCollector) Collect(ch chan<- prometheus.Metric) {
 		"published":              snapshot.PostPublishedUsers,
 	} {
 		ch <- prometheus.MustNewConstMetric(c.funnelUsers, prometheus.GaugeValue, float64(value), stage)
+	}
+	for kind, value := range map[string]int64{
+		"total":    snapshot.PublishedPosts,
+		"media":    snapshot.PublishedPostsWithMedia,
+		"multiple": snapshot.PublishedPostsWithMultiple,
+		"video":    snapshot.PublishedPostsWithVideo,
+		"mixed":    snapshot.PublishedPostsWithMixedMedia,
+	} {
+		ch <- prometheus.MustNewConstMetric(c.mediaPosts, prometheus.GaugeValue, float64(value), kind)
 	}
 	ch <- prometheus.MustNewConstMetric(c.errors, prometheus.CounterValue, errorsTotal)
 	lastSuccessUnix := float64(0)

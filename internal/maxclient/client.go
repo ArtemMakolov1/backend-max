@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -34,9 +33,10 @@ var (
 // Client is safe for concurrent use as long as its supplied http.Client is not
 // mutated concurrently.
 type Client struct {
-	baseURL    *url.URL
-	token      string
-	httpClient *http.Client
+	baseURL               *url.URL
+	token                 string
+	httpClient            *http.Client
+	attachmentRetryDelays []time.Duration
 }
 
 // New constructs a MAX API client. baseURL is explicit so configuration owns
@@ -68,7 +68,12 @@ func New(baseURL, token string, httpClient *http.Client) (*Client, error) {
 
 	copyURL := *parsed
 	copyURL.Path = strings.TrimRight(copyURL.Path, "/")
-	return &Client{baseURL: &copyURL, token: token, httpClient: httpClient}, nil
+	return &Client{
+		baseURL:               &copyURL,
+		token:                 token,
+		httpClient:            httpClient,
+		attachmentRetryDelays: append([]time.Duration(nil), defaultAttachmentRetryDelays...),
+	}, nil
 }
 
 // Test validates the configured credentials with GET /me.
@@ -219,6 +224,55 @@ func (c *Client) getChat(ctx context.Context, identifier string) (ChatInfo, erro
 	}
 	if !numericID(chat.ChatID) {
 		return ChatInfo{}, errors.New("MAX chat response does not contain a numeric chat_id")
+	}
+	return chat, nil
+}
+
+// EditChat updates the chat photo and title through PATCH /chats/{chatId}.
+// The MAX Bot API applies the change for every subscriber, so callers must
+// verify the bot still administers the verified channel before invoking it.
+func (c *Client) EditChat(ctx context.Context, chatID string, patch ChatPatch) (ChatInfo, error) {
+	if !numericID(chatID) {
+		return ChatInfo{}, errors.New("edit MAX chat: chat ID must be numeric")
+	}
+	iconToken := strings.TrimSpace(patch.IconToken)
+	if iconToken == "" && patch.Title == nil {
+		return ChatInfo{}, errors.New("edit MAX chat: an icon or a title is required")
+	}
+	body := struct {
+		Icon  *attachmentPayload `json:"icon,omitempty"`
+		Title *string            `json:"title,omitempty"`
+	}{}
+	if iconToken != "" {
+		body.Icon = &attachmentPayload{Token: iconToken}
+	}
+	if patch.Title != nil {
+		title := strings.TrimSpace(*patch.Title)
+		if title == "" || utf8.RuneCountInString(title) > 200 {
+			return ChatInfo{}, errors.New("edit MAX chat: title must contain 1 to 200 characters")
+		}
+		body.Title = &title
+	}
+	var response struct {
+		ChatID            json.RawMessage `json:"chat_id"`
+		OwnerID           json.RawMessage `json:"owner_id"`
+		Type              string          `json:"type"`
+		Status            string          `json:"status"`
+		Title             string          `json:"title"`
+		Link              string          `json:"link,omitempty"`
+		Icon              ChatIcon        `json:"icon,omitempty"`
+		ParticipantsCount int             `json:"participants_count,omitempty"`
+	}
+	if err := c.doJSON(ctx, http.MethodPatch, "/chats/"+url.PathEscape(chatID), nil, body, &response); err != nil {
+		return ChatInfo{}, err
+	}
+	chat := ChatInfo{
+		ChatID: jsonCode(response.ChatID), OwnerID: jsonCode(response.OwnerID), Type: response.Type, Status: response.Status,
+		Title: response.Title, Link: response.Link, Icon: response.Icon,
+		ParticipantsCount: response.ParticipantsCount,
+	}
+	if !numericID(chat.ChatID) || chat.ChatID != chatID {
+		return ChatInfo{}, errors.New("MAX chat response does not match the requested chat ID")
 	}
 	return chat, nil
 }
@@ -519,118 +573,14 @@ func (c *Client) AnswerCallback(ctx context.Context, callbackID, notification, m
 	return response.asError(http.StatusOK)
 }
 
-// UploadImage reserves an image upload, sends multipart field "data" to the
-// returned HTTPS URL, and returns the resulting attachment token.
+// UploadImage is the backwards-compatible image-only upload API. New code may
+// use UploadMedia to retain the media type together with the opaque token.
 func (c *Client) UploadImage(ctx context.Context, filename string, image io.Reader) (UploadResult, error) {
-	if ctx == nil {
-		return UploadResult{}, errors.New("upload image: nil context")
-	}
-	if filename == "" {
-		return UploadResult{}, errors.New("upload image: filename is required")
-	}
-	if image == nil {
-		return UploadResult{}, errors.New("upload image: reader is required")
-	}
-
-	query := url.Values{"type": []string{"image"}}
-	var reservation struct {
-		URL   string `json:"url"`
-		Token string `json:"token,omitempty"`
-	}
-	if err := c.doJSON(ctx, http.MethodPost, "/uploads", query, nil, &reservation); err != nil {
+	media, err := c.UploadMedia(ctx, MediaTypeImage, filename, image)
+	if err != nil {
 		return UploadResult{}, err
 	}
-
-	uploadURL, err := validateUploadURL(reservation.URL)
-	if err != nil {
-		return UploadResult{}, fmt.Errorf("MAX image upload URL: %w", err)
-	}
-
-	var body bytes.Buffer
-	multipartWriter := multipart.NewWriter(&body)
-	part, err := multipartWriter.CreateFormFile("data", filename)
-	if err != nil {
-		return UploadResult{}, fmt.Errorf("create image multipart body: %w", err)
-	}
-
-	written, copyErr := io.CopyN(part, image, maxImageBytes+1)
-	if copyErr != nil && !errors.Is(copyErr, io.EOF) {
-		return UploadResult{}, fmt.Errorf("read image: %w", copyErr)
-	}
-	if written > maxImageBytes {
-		return UploadResult{}, fmt.Errorf("image is larger than %d bytes", maxImageBytes)
-	}
-	if err := multipartWriter.Close(); err != nil {
-		return UploadResult{}, fmt.Errorf("finish image multipart body: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL.String(), bytes.NewReader(body.Bytes()))
-	if err != nil {
-		return UploadResult{}, fmt.Errorf("create image upload request: %w", err)
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
-	// The signed upload URL is a separate origin and must never receive the bot
-	// credential, even if a caller's custom transport adds defaults elsewhere.
-	req.Header.Del("Authorization")
-
-	uploadClient := *c.httpClient
-	callerRedirectPolicy := uploadClient.CheckRedirect
-	uploadClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if len(via) >= maxUploadRedirects {
-			return errors.New("too many image upload redirects")
-		}
-		if _, err := validateUploadURL(next.URL.String()); err != nil {
-			return fmt.Errorf("unsafe image upload redirect: %w", err)
-		}
-		if next.Method != http.MethodPost {
-			return fmt.Errorf("unsafe image upload redirect changed method to %s", next.Method)
-		}
-		if callerRedirectPolicy != nil {
-			if err := callerRedirectPolicy(next, via); err != nil {
-				return err
-			}
-		}
-		// Run this after a caller policy as well, so that policy cannot
-		// accidentally reintroduce the bot credential on the storage origin.
-		next.Header.Del("Authorization")
-		return nil
-	}
-
-	// #nosec G704 -- validateUploadURL requires an absolute HTTPS URL without userinfo/fragment, every redirect is revalidated, and Authorization is removed.
-	resp, err := uploadClient.Do(req)
-	if err != nil {
-		return UploadResult{}, fmt.Errorf("upload image to MAX storage: %w", err)
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	responseBody, readErr := readJSONBody(resp.Body)
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		if readErr != nil {
-			return UploadResult{}, responseReadError(resp, responseBody, readErr)
-		}
-		return UploadResult{}, apiError(resp, responseBody)
-	}
-	if readErr != nil {
-		return UploadResult{}, fmt.Errorf("read MAX image upload response: %w", readErr)
-	}
-
-	token := imageUploadToken(responseBody, reservation.Token, uploadURL.Query().Get("token"))
-	if token == "" {
-		// A syntactically successful storage response without an attachment
-		// token is still an upstream protocol failure. Keep it typed so the API
-		// returns max_api_error instead of hiding the problem as internal_error.
-		return UploadResult{}, &Error{
-			StatusCode: resp.StatusCode,
-			Code:       "invalid_upload_response",
-			Message:    "MAX image upload response does not contain a token",
-			RequestID:  firstHeader(resp.Header, "X-Request-Id", "X-Request-ID", "X-Max-Request-Id"),
-		}
-	}
-
-	return UploadResult{Token: token}, nil
+	return UploadResult{Token: media.Token}, nil
 }
 
 // imageUploadToken accepts both upload response shapes currently used by MAX:
@@ -677,7 +627,7 @@ func (c *Client) Publish(ctx context.Context, request PublishRequest) (Message, 
 		return Message{}, fmt.Errorf("publish MAX post: unsupported format %q", request.Format)
 	}
 
-	attachments, err := messageAttachments(request.ImageTokens, request.LinkButtons)
+	attachments, err := messageAttachments(request.MediaTokens, request.ImageTokens, request.LinkButtons)
 	if err != nil {
 		return Message{}, fmt.Errorf("publish MAX post: %w", err)
 	}
@@ -692,13 +642,28 @@ func (c *Client) Publish(ctx context.Context, request PublishRequest) (Message, 
 		"disable_link_preview": []string{strconv.FormatBool(request.DisableLinkPreview)},
 	}
 
-	var response struct {
-		Message apiMessage `json:"message"`
-	}
-	if err := c.doJSON(ctx, http.MethodPost, "/messages", query, body, &response); err != nil {
+	var response publishResponse
+	if err := c.withAttachmentRetry(ctx, func() error {
+		response = publishResponse{}
+		if err := c.doJSON(ctx, http.MethodPost, "/messages", query, body, &response); err != nil {
+			return err
+		}
+		if response.Success != nil && !*response.Success {
+			return operationResponse{
+				Success: false,
+				Code:    response.Code,
+				Message: rawJSONMessage(response.Message),
+			}.asError(http.StatusOK)
+		}
+		return nil
+	}); err != nil {
 		return Message{}, err
 	}
-	return response.Message.publicMessage(), nil
+	var message apiMessage
+	if err := json.Unmarshal(response.Message, &message); err != nil {
+		return Message{}, fmt.Errorf("decode MAX publish response message: %w", err)
+	}
+	return message.publicMessage(), nil
 }
 
 // Edit updates a post previously sent by the bot.
@@ -710,7 +675,7 @@ func (c *Client) Edit(ctx context.Context, request EditRequest) error {
 		return fmt.Errorf("edit MAX post: unsupported format %q", request.Format)
 	}
 
-	attachments, err := messageAttachments(request.ImageTokens, request.LinkButtons)
+	attachments, err := messageAttachments(request.MediaTokens, request.ImageTokens, request.LinkButtons)
 	if err != nil {
 		return fmt.Errorf("edit MAX post: %w", err)
 	}
@@ -723,10 +688,16 @@ func (c *Client) Edit(ctx context.Context, request EditRequest) error {
 	query := url.Values{"message_id": []string{request.MessageID}}
 
 	var response operationResponse
-	if err := c.doJSON(ctx, http.MethodPut, "/messages", query, body, &response); err != nil {
+	if err := c.withAttachmentRetry(ctx, func() error {
+		response = operationResponse{}
+		if err := c.doJSON(ctx, http.MethodPut, "/messages", query, body, &response); err != nil {
+			return err
+		}
+		return response.asError(http.StatusOK)
+	}); err != nil {
 		return err
 	}
-	return response.asError(http.StatusOK)
+	return nil
 }
 
 // Delete removes a post previously sent by the bot.
@@ -744,19 +715,41 @@ func (c *Client) Delete(ctx context.Context, messageID string) error {
 }
 
 type operationResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message,omitempty"`
+	Success bool            `json:"success"`
+	Code    json.RawMessage `json:"code,omitempty"`
+	Message string          `json:"message,omitempty"`
+}
+
+type publishResponse struct {
+	Success *bool           `json:"success,omitempty"`
+	Code    json.RawMessage `json:"code,omitempty"`
+	Message json.RawMessage `json:"message"`
 }
 
 func (r operationResponse) asError(status int) error {
 	if r.Success {
 		return nil
 	}
+	code := jsonCode(r.Code)
+	if code == "" && strings.Contains(strings.ToLower(strings.TrimSpace(r.Message)), "attachment.not.ready") {
+		code = "attachment.not.ready"
+	}
+	if code == "" {
+		code = "operation_failed"
+	}
 	return &Error{
 		StatusCode: status,
-		Code:       "operation_failed",
+		Code:       code,
 		Message:    r.Message,
 	}
+}
+
+func rawJSONMessage(value json.RawMessage) string {
+	var message string
+	if json.Unmarshal(value, &message) == nil {
+		return message
+	}
+	return strings.TrimSpace(string(value))
 }
 
 func (c *Client) doJSON(ctx context.Context, method, endpointPath string, query url.Values, body, output any) error {

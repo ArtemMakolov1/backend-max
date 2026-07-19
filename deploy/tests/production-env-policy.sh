@@ -15,6 +15,7 @@ render_production() {
     POSTGRES_MONITOR_PASSWORD=monitor_password_0123456789abcdef0123456789abcdef \
     GRAFANA_ADMIN_PASSWORD=grafana_admin_0123456789abcdef0123456789abcdef \
     GRAFANA_SECRET_KEY=grafana_secret_0123456789abcdef0123456789abcdef \
+    ALERTMANAGER_WEBHOOK_URL=https://alerts.example.test/maxposty \
     YANDEX_CLIENT_ID=yandex-client-id \
     YANDEX_CLIENT_SECRET=yandex-client-secret \
     OBSERVABILITY_ADMIN_USERS=makolov99 \
@@ -33,9 +34,18 @@ render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
 grep -Fx 'OPENAI_API_KEY=' "$production_env" >/dev/null
 grep -Fx 'GRAFANA_ROOT_URL=https://maxposty.ru/monitoring/' "$production_env" >/dev/null
+grep -Fx 'ALERTMANAGER_WEBHOOK_URL=https://alerts.example.test/maxposty' "$production_env" >/dev/null
+grep -Fx 'PITR_RETENTION_DAYS=7' "$production_env" >/dev/null
 grep -Fx 'S3_HOST=https://s3.example.test' "$production_env" >/dev/null
 grep -Fx 'S3_BUCKET=' "$production_env" >/dev/null
 grep -Fx 'S3_REGION=' "$production_env" >/dev/null
+grep -Fx 'MEDIA_USER_MAX_FILES=500' "$production_env" >/dev/null
+grep -Fx 'MEDIA_USER_MAX_BYTES=1073741824' "$production_env" >/dev/null
+grep -Fx 'MEDIA_ORPHAN_GRACE_PERIOD=24h' "$production_env" >/dev/null
+grep -Fx 'MEDIA_CLEANUP_INTERVAL=15m' "$production_env" >/dev/null
+grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=50' "$production_env" >/dev/null
+grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=5' "$production_env" >/dev/null
+grep -Fx 'BILLING_ENFORCEMENT_ENABLED=false' "$production_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$production_env"
 
 configured_s3_env="$sandbox/configured-s3.env"
@@ -44,12 +54,73 @@ grep -Fx 'S3_BUCKET=media.maxposty.ru' "$configured_s3_env" >/dev/null
 grep -Fx 'S3_REGION=ru-1' "$configured_s3_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_s3_env"
 
+configured_media_env="$sandbox/configured-media.env"
+render_production "$configured_media_env" \
+  MEDIA_USER_MAX_FILES=750 \
+  MEDIA_USER_MAX_BYTES=2147483648 \
+  MEDIA_ORPHAN_GRACE_PERIOD=48h \
+  MEDIA_CLEANUP_INTERVAL=30m \
+  MEDIA_CLEANUP_BATCH_SIZE=75
+grep -Fx 'MEDIA_USER_MAX_FILES=750' "$configured_media_env" >/dev/null
+grep -Fx 'MEDIA_USER_MAX_BYTES=2147483648' "$configured_media_env" >/dev/null
+grep -Fx 'MEDIA_ORPHAN_GRACE_PERIOD=48h' "$configured_media_env" >/dev/null
+grep -Fx 'MEDIA_CLEANUP_INTERVAL=30m' "$configured_media_env" >/dev/null
+grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=75' "$configured_media_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_media_env"
+
+configured_workspace_env="$sandbox/configured-workspace.env"
+render_production "$configured_workspace_env" WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=25
+grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=25' "$configured_workspace_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_workspace_env"
+
+configured_billing_env="$sandbox/configured-billing.env"
+render_production "$configured_billing_env" BILLING_ENFORCEMENT_ENABLED=true
+grep -Fx 'BILLING_ENFORCEMENT_ENABLED=true' "$configured_billing_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_billing_env"
+
+awk -F= '$1 == "BILLING_ENFORCEMENT_ENABLED" { print "BILLING_ENFORCEMENT_ENABLED=sometimes"; next } { print }' \
+  "$production_env" >"$sandbox/invalid-billing-enforcement.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-billing-enforcement.env" >/dev/null 2>&1; then
+  echo "Production validation accepted invalid BILLING_ENFORCEMENT_ENABLED" >&2
+  exit 1
+fi
+
 for required_secret in \
   POSTGRES_MONITOR_PASSWORD GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY \
   YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET \
   S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
   if render_production "$sandbox/missing-$required_secret.env" "$required_secret=" >/dev/null 2>&1; then
     echo "Production render accepted an empty $required_secret" >&2
+    exit 1
+  fi
+done
+
+for workspace_limit in 0 1001 not-a-number; do
+  awk -F= -v value="$workspace_limit" \
+    '$1 == "WORKSPACE_MAX_OWNED_TEAM_WORKSPACES" { print "WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=" value; next } { print }' \
+    "$production_env" >"$sandbox/invalid-workspace-limit.env"
+  if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-workspace-limit.env" >/dev/null 2>&1; then
+    echo "Production validation accepted unsafe WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=$workspace_limit" >&2
+    exit 1
+  fi
+done
+
+without_alerts_env="$sandbox/without-alerts.env"
+render_production "$without_alerts_env" ALERTMANAGER_WEBHOOK_URL=
+grep -Fx 'ALERTMANAGER_WEBHOOK_URL=' "$without_alerts_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$without_alerts_env"
+
+for invalid_alertmanager_url in \
+  'http://alerts.example.test/maxposty' \
+  'https://user:password@alerts.example.test/maxposty' \
+  'https://alerts.example.test/maxposty#receiver' \
+  'https://alerts..example.test/maxposty' \
+  'https://alerts.example.test:65536/maxposty'; do
+  awk -F= -v value="$invalid_alertmanager_url" \
+    '$1 == "ALERTMANAGER_WEBHOOK_URL" { print "ALERTMANAGER_WEBHOOK_URL=" value; next } { print }' \
+    "$production_env" >"$sandbox/invalid-alertmanager.env"
+  if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-alertmanager.env" >/dev/null 2>&1; then
+    echo "Production validation accepted an unsafe ALERTMANAGER_WEBHOOK_URL" >&2
     exit 1
   fi
 done
@@ -74,6 +145,22 @@ if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-s3-region.en
   echo "Production validation accepted an invalid S3_REGION" >&2
   exit 1
 fi
+
+for media_override in \
+  'MEDIA_USER_MAX_FILES=0' \
+  'MEDIA_USER_MAX_BYTES=0' \
+  'MEDIA_ORPHAN_GRACE_PERIOD=30m' \
+  'MEDIA_CLEANUP_INTERVAL=30s' \
+  'MEDIA_CLEANUP_BATCH_SIZE=1001'; do
+  key=${media_override%%=*}
+  awk -F= -v key="$key" -v replacement="$media_override" \
+    '$1 == key { print replacement; next } { print }' \
+    "$production_env" >"$sandbox/invalid-media.env"
+  if "$repo_root/deploy/validate-production-env.sh" "$sandbox/invalid-media.env" >/dev/null 2>&1; then
+    echo "Production validation accepted unsafe $media_override" >&2
+    exit 1
+  fi
+done
 
 if render_production "$sandbox/missing-observability-admins.env" OBSERVABILITY_ADMIN_USERS= >/dev/null 2>&1; then
   echo "Production render accepted empty OBSERVABILITY_ADMIN_USERS" >&2
@@ -109,6 +196,7 @@ env \
   POSTGRES_MONITOR_PASSWORD=monitor_password_0123456789abcdef0123456789abcdef \
   GRAFANA_ADMIN_PASSWORD=grafana_admin_0123456789abcdef0123456789abcdef \
   GRAFANA_SECRET_KEY=grafana_secret_0123456789abcdef0123456789abcdef \
+  ALERTMANAGER_WEBHOOK_URL=must-not-leak \
   YANDEX_CLIENT_ID=must-not-leak \
   OBSERVABILITY_ADMIN_USERS=must-not-leak \
   MAX_BOT_TOKEN=must-not-leak \
@@ -120,7 +208,7 @@ env \
   OPENAI_API_KEY=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY; do
+for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

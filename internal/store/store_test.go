@@ -291,6 +291,91 @@ func TestPublishingStateCASAndRecovery(t *testing.T) {
 	}
 }
 
+func TestPublishedUpdateClaimCASAndRecovery(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "published-update-claim.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	channel, err := storage.CreateChannel(ctx, Channel{
+		MAXChatID: "published-update-claim", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(ctx, Post{
+		Title: "Post", Content: "body", Format: FormatMarkdown, ChannelID: &channel.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err = storage.ClaimForPublishing(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err = storage.MarkPublished(ctx, post.ID, "mid-update-claim", "https://max.ru/channel/update-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stale := post
+	newContent := "new content"
+	post, err = storage.UpdatePost(ctx, post.ID, PostChanges{Content: &newContent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.ClaimPublishedForUpdate(ctx, stale); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale ClaimPublishedForUpdate() error=%v, want ErrConflict", err)
+	}
+
+	claimed, err := storage.ClaimPublishedForUpdate(ctx, post)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Status != PostStatusPublishing || claimed.MAXMessageID != post.MAXMessageID {
+		t.Fatalf("claimed post=%#v", claimed)
+	}
+	conflictingTitle := "concurrent autosave"
+	if _, err := storage.UpdatePost(ctx, post.ID, PostChanges{Title: &conflictingTitle}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("UpdatePost() while MAX edit claimed error=%v, want ErrConflict", err)
+	}
+	post, err = storage.ReleasePublishedUpdate(ctx, claimed, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.Status != PostStatusPublished || post.LastError != "" {
+		t.Fatalf("released post=%#v", post)
+	}
+	if _, err := storage.ReleasePublishedUpdate(ctx, claimed, ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("second ReleasePublishedUpdate() error=%v, want ErrConflict", err)
+	}
+
+	claimed, err = storage.ClaimPublishedForUpdate(ctx, post)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-20 * time.Minute)
+	if _, err := storage.db.ExecContext(ctx, `UPDATE posts SET updated_at=$1 WHERE id=$2`, old, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := storage.RecoverStalePublishing(ctx, time.Now().UTC().Add(-10*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered=%d, want one interrupted MAX update", recovered)
+	}
+	post, err = storage.GetPost(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.Status != PostStatusPublished || post.MAXMessageID != "mid-update-claim" || post.LastError == "" {
+		t.Fatalf("recovered published update=%#v", post)
+	}
+}
+
 func TestDeletePostForUserIsTenantScopedAndBlocksActivePublication(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

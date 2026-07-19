@@ -52,6 +52,7 @@ jobs:
           ./deploy/tests/pgbouncer-healthcheck-policy.sh
           ./deploy/tests/monitoring-policy.sh
           bash ./deploy/tests/production-env-policy.sh
+          ./deploy/tests/operations-policy.sh
           ./deploy/tests/backup-release-policy.sh
           ./deploy/tests/rollback-policy.sh
       - name: Run all tests with the race detector

@@ -17,71 +17,121 @@ var (
 )
 
 const (
-	defaultHost                = "127.0.0.1"
-	defaultPort                = "8080"
-	defaultMediaDir            = "./media"
-	defaultPublicBaseURL       = "http://localhost:8080"
-	defaultFrontendOrigin      = "http://localhost:4321"
-	defaultMAXAPIBaseURL       = "https://platform-api2.max.ru"
-	defaultOpenAIAPIBaseURL    = "https://api.openai.com"
-	defaultOpenAIImageModel    = "gpt-image-2"
-	defaultOpenAIResearchModel = "gpt-5.4-mini"
-	defaultSchedulerInterval   = 15 * time.Second
-	defaultAuthSessionTTL      = 12 * time.Hour
-	defaultAIGlobalConcurrent  = 4
-	defaultAIUserConcurrent    = 1
-	defaultAIImagePerMinute    = 2
-	defaultAIImagePerDay       = 20
-	defaultAIResearchPerMinute = 2
-	defaultAIResearchPerDay    = 20
-	defaultAILeaseTTL          = 4 * time.Minute
-	maxAIConfiguredConcurrent  = 100
-	maxAIConfiguredPerMinute   = 10_000
-	maxAIConfiguredPerDay      = 1_000_000
-	maxAIConfiguredLeaseTTL    = 24 * time.Hour
-	aiHandlerTimeout           = 3 * time.Minute
+	defaultHost                      = "127.0.0.1"
+	defaultPort                      = "8080"
+	defaultMediaDir                  = "./media"
+	defaultMediaUserMaxFiles         = int64(500)
+	defaultMediaUserMaxBytes         = int64(1 << 30)
+	defaultMediaOrphanGrace          = 24 * time.Hour
+	defaultMediaCleanupPeriod        = 15 * time.Minute
+	defaultMediaCleanupBatch         = 50
+	defaultPublicBaseURL             = "http://localhost:8080"
+	defaultFrontendOrigin            = "http://localhost:4321"
+	defaultMAXAPIBaseURL             = "https://platform-api2.max.ru"
+	defaultOpenAIAPIBaseURL          = "https://api.openai.com"
+	defaultOpenAIImageModel          = "gpt-image-2"
+	defaultOpenAIResearchModel       = "gpt-5.4-mini"
+	defaultSchedulerInterval         = 15 * time.Second
+	defaultAuthSessionTTL            = 12 * time.Hour
+	defaultMaxOwnedTeamWorkspaces    = 5
+	defaultAIGlobalConcurrent        = 4
+	defaultAIUserConcurrent          = 1
+	defaultAIImagePerMinute          = 2
+	defaultAIImagePerDay             = 20
+	defaultAIResearchPerMinute       = 2
+	defaultAIResearchPerDay          = 20
+	defaultAILeaseTTL                = 4 * time.Minute
+	maxAIConfiguredConcurrent        = 100
+	maxAIConfiguredPerMinute         = 10_000
+	maxAIConfiguredPerDay            = 1_000_000
+	maxAIConfiguredLeaseTTL          = 24 * time.Hour
+	maxMediaUserFiles                = int64(100_000)
+	maxMediaUserBytes                = int64(1 << 50)
+	maxConfiguredOwnedTeamWorkspaces = 1_000
+	aiHandlerTimeout                 = 3 * time.Minute
 )
 
 type Config struct {
-	Host                 string
-	Port                 string
-	DatabaseURL          string
-	MediaDir             string
-	PublicBaseURL        string
-	FrontendOrigin       string
-	S3Host               string
-	S3AccessKey          string
-	S3SecretKey          string
-	S3Bucket             string
-	S3Region             string
-	MAXAPIBaseURL        string
-	MAXBotToken          string
-	MAXWebhookSecret     string
-	MAXCACertFile        string
-	OAuthTrustXRealIP    bool
-	OAuthRateLimitAtEdge bool
-	AuthBootstrapMode    bool
-	YandexClientID       string
-	YandexClientSecret   string
-	YandexRedirectURI    string
-	YandexAllowedUsers   []string
-	ObservabilityAdmins  []string
-	AuthSessionTTL       time.Duration
-	OpenAIAPIKey         string
-	OpenAIAPIBaseURL     string
-	OpenAIImageModel     string
-	OpenAIResearchModel  string
-	AIGlobalConcurrent   int
-	AIUserConcurrent     int
-	AIImagePerMinute     int
-	AIImagePerDay        int
-	AIResearchPerMinute  int
-	AIResearchPerDay     int
-	AILeaseTTL           time.Duration
-	SchedulerInterval    time.Duration
+	Host                      string
+	Port                      string
+	DatabaseURL               string
+	MediaDir                  string
+	MediaUserMaxFiles         int64
+	MediaUserMaxBytes         int64
+	MediaOrphanGrace          time.Duration
+	MediaCleanupInterval      time.Duration
+	MediaCleanupBatch         int
+	PublicBaseURL             string
+	FrontendOrigin            string
+	S3Host                    string
+	S3AccessKey               string
+	S3SecretKey               string
+	S3Bucket                  string
+	S3Region                  string
+	MAXAPIBaseURL             string
+	MAXBotToken               string
+	MAXWebhookSecret          string
+	MAXCACertFile             string
+	OAuthTrustXRealIP         bool
+	OAuthRateLimitAtEdge      bool
+	AuthBootstrapMode         bool
+	YandexClientID            string
+	YandexClientSecret        string
+	YandexRedirectURI         string
+	YandexAllowedUsers        []string
+	ObservabilityAdmins       []string
+	AuthSessionTTL            time.Duration
+	MaxOwnedTeamWorkspaces    int
+	OpenAIAPIKey              string
+	OpenAIAPIBaseURL          string
+	OpenAIImageModel          string
+	OpenAIResearchModel       string
+	AIGlobalConcurrent        int
+	AIUserConcurrent          int
+	AIImagePerMinute          int
+	AIImagePerDay             int
+	AIResearchPerMinute       int
+	AIResearchPerDay          int
+	AILeaseTTL                time.Duration
+	BillingEnforcementEnabled bool
+	SchedulerInterval         time.Duration
+	SMTPHost                  string
+	SMTPPort                  int
+	SMTPUsername              string
+	SMTPPassword              string
+	SMTPFromEmail             string
+	SMTPFromName              string
 }
 
 func Load() (Config, error) {
+	mediaMaxFiles, err := boundedPositiveInt64Env("MEDIA_USER_MAX_FILES", defaultMediaUserMaxFiles, maxMediaUserFiles)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaMaxBytes, err := boundedPositiveInt64Env("MEDIA_USER_MAX_BYTES", defaultMediaUserMaxBytes, maxMediaUserBytes)
+	if err != nil {
+		return Config{}, err
+	}
+	mediaOrphanGraceText := env("MEDIA_ORPHAN_GRACE_PERIOD", defaultMediaOrphanGrace.String())
+	mediaOrphanGrace, err := time.ParseDuration(mediaOrphanGraceText)
+	if err != nil || mediaOrphanGrace < time.Hour || mediaOrphanGrace > 30*24*time.Hour {
+		return Config{}, fmt.Errorf("MEDIA_ORPHAN_GRACE_PERIOD must be between 1h and 720h: %q", mediaOrphanGraceText)
+	}
+	mediaCleanupIntervalText := env("MEDIA_CLEANUP_INTERVAL", defaultMediaCleanupPeriod.String())
+	mediaCleanupInterval, err := time.ParseDuration(mediaCleanupIntervalText)
+	if err != nil || mediaCleanupInterval < time.Minute || mediaCleanupInterval > 24*time.Hour {
+		return Config{}, fmt.Errorf("MEDIA_CLEANUP_INTERVAL must be between 1m and 24h: %q", mediaCleanupIntervalText)
+	}
+	mediaCleanupBatch, err := boundedPositiveIntEnv("MEDIA_CLEANUP_BATCH_SIZE", defaultMediaCleanupBatch, 1_000)
+	if err != nil {
+		return Config{}, err
+	}
+	maxOwnedTeamWorkspaces, err := boundedPositiveIntEnv(
+		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES", defaultMaxOwnedTeamWorkspaces, maxConfiguredOwnedTeamWorkspaces,
+	)
+	if err != nil {
+		return Config{}, err
+	}
 	intervalText := env("SCHEDULER_INTERVAL", defaultSchedulerInterval.String())
 	interval, err := time.ParseDuration(intervalText)
 	if err != nil || interval <= 0 {
@@ -136,44 +186,67 @@ func Load() (Config, error) {
 	if err != nil || aiLeaseTTL <= aiHandlerTimeout || aiLeaseTTL > maxAIConfiguredLeaseTTL {
 		return Config{}, fmt.Errorf("AI_LEASE_TTL must be greater than 3m and at most 24h: %q", aiLeaseTTLText)
 	}
+	billingEnforcementText := env("BILLING_ENFORCEMENT_ENABLED", "false")
+	billingEnforcementEnabled, err := strconv.ParseBool(billingEnforcementText)
+	if err != nil {
+		return Config{}, fmt.Errorf("BILLING_ENFORCEMENT_ENABLED must be true or false: %q", billingEnforcementText)
+	}
+	smtpPortText := env("SMTP_PORT", "587")
+	smtpPort, err := strconv.Atoi(smtpPortText)
+	if err != nil || smtpPort <= 0 || smtpPort > 65535 {
+		return Config{}, fmt.Errorf("SMTP_PORT must be an integer between 1 and 65535: %q", smtpPortText)
+	}
 
 	cfg := Config{
-		Host:                 env("HOST", defaultHost),
-		Port:                 env("PORT", defaultPort),
-		DatabaseURL:          strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		MediaDir:             env("MEDIA_DIR", defaultMediaDir),
-		PublicBaseURL:        strings.TrimRight(env("PUBLIC_BASE_URL", defaultPublicBaseURL), "/"),
-		FrontendOrigin:       strings.TrimRight(env("FRONTEND_ORIGIN", defaultFrontendOrigin), "/"),
-		S3Host:               strings.TrimSpace(os.Getenv("S3_HOST")),
-		S3AccessKey:          strings.TrimSpace(os.Getenv("S3_ACCESS_KEY")),
-		S3SecretKey:          strings.TrimSpace(os.Getenv("S3_SECRET_KEY")),
-		S3Bucket:             strings.TrimSpace(os.Getenv("S3_BUCKET")),
-		S3Region:             strings.TrimSpace(os.Getenv("S3_REGION")),
-		MAXAPIBaseURL:        env("MAX_API_BASE_URL", defaultMAXAPIBaseURL),
-		MAXBotToken:          strings.TrimSpace(os.Getenv("MAX_BOT_TOKEN")),
-		MAXWebhookSecret:     strings.TrimSpace(os.Getenv("MAX_WEBHOOK_SECRET")),
-		MAXCACertFile:        strings.TrimSpace(os.Getenv("MAX_CA_CERT_FILE")),
-		OAuthTrustXRealIP:    trustXRealIP,
-		OAuthRateLimitAtEdge: rateLimitAtEdge,
-		AuthBootstrapMode:    authBootstrapMode,
-		YandexClientID:       strings.TrimSpace(os.Getenv("YANDEX_CLIENT_ID")),
-		YandexClientSecret:   strings.TrimSpace(os.Getenv("YANDEX_CLIENT_SECRET")),
-		YandexRedirectURI:    strings.TrimSpace(os.Getenv("YANDEX_REDIRECT_URI")),
-		YandexAllowedUsers:   splitNormalizedCSV(os.Getenv("YANDEX_ALLOWED_USERS")),
-		ObservabilityAdmins:  splitNormalizedCSV(os.Getenv("OBSERVABILITY_ADMIN_USERS")),
-		AuthSessionTTL:       sessionTTL,
-		OpenAIAPIKey:         strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		OpenAIAPIBaseURL:     env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL),
-		OpenAIImageModel:     env("OPENAI_IMAGE_MODEL", defaultOpenAIImageModel),
-		OpenAIResearchModel:  env("OPENAI_RESEARCH_MODEL", defaultOpenAIResearchModel),
-		AIGlobalConcurrent:   aiGlobalConcurrent,
-		AIUserConcurrent:     aiUserConcurrent,
-		AIImagePerMinute:     aiImagePerMinute,
-		AIImagePerDay:        aiImagePerDay,
-		AIResearchPerMinute:  aiResearchPerMinute,
-		AIResearchPerDay:     aiResearchPerDay,
-		AILeaseTTL:           aiLeaseTTL,
-		SchedulerInterval:    interval,
+		Host:                      env("HOST", defaultHost),
+		Port:                      env("PORT", defaultPort),
+		DatabaseURL:               strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		MediaDir:                  env("MEDIA_DIR", defaultMediaDir),
+		MediaUserMaxFiles:         mediaMaxFiles,
+		MediaUserMaxBytes:         mediaMaxBytes,
+		MediaOrphanGrace:          mediaOrphanGrace,
+		MediaCleanupInterval:      mediaCleanupInterval,
+		MediaCleanupBatch:         mediaCleanupBatch,
+		PublicBaseURL:             strings.TrimRight(env("PUBLIC_BASE_URL", defaultPublicBaseURL), "/"),
+		FrontendOrigin:            strings.TrimRight(env("FRONTEND_ORIGIN", defaultFrontendOrigin), "/"),
+		S3Host:                    strings.TrimSpace(os.Getenv("S3_HOST")),
+		S3AccessKey:               strings.TrimSpace(os.Getenv("S3_ACCESS_KEY")),
+		S3SecretKey:               strings.TrimSpace(os.Getenv("S3_SECRET_KEY")),
+		S3Bucket:                  strings.TrimSpace(os.Getenv("S3_BUCKET")),
+		S3Region:                  strings.TrimSpace(os.Getenv("S3_REGION")),
+		MAXAPIBaseURL:             env("MAX_API_BASE_URL", defaultMAXAPIBaseURL),
+		MAXBotToken:               strings.TrimSpace(os.Getenv("MAX_BOT_TOKEN")),
+		MAXWebhookSecret:          strings.TrimSpace(os.Getenv("MAX_WEBHOOK_SECRET")),
+		MAXCACertFile:             strings.TrimSpace(os.Getenv("MAX_CA_CERT_FILE")),
+		OAuthTrustXRealIP:         trustXRealIP,
+		OAuthRateLimitAtEdge:      rateLimitAtEdge,
+		AuthBootstrapMode:         authBootstrapMode,
+		YandexClientID:            strings.TrimSpace(os.Getenv("YANDEX_CLIENT_ID")),
+		YandexClientSecret:        strings.TrimSpace(os.Getenv("YANDEX_CLIENT_SECRET")),
+		YandexRedirectURI:         strings.TrimSpace(os.Getenv("YANDEX_REDIRECT_URI")),
+		YandexAllowedUsers:        splitNormalizedCSV(os.Getenv("YANDEX_ALLOWED_USERS")),
+		ObservabilityAdmins:       splitNormalizedCSV(os.Getenv("OBSERVABILITY_ADMIN_USERS")),
+		AuthSessionTTL:            sessionTTL,
+		MaxOwnedTeamWorkspaces:    maxOwnedTeamWorkspaces,
+		OpenAIAPIKey:              strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		OpenAIAPIBaseURL:          env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL),
+		OpenAIImageModel:          env("OPENAI_IMAGE_MODEL", defaultOpenAIImageModel),
+		OpenAIResearchModel:       env("OPENAI_RESEARCH_MODEL", defaultOpenAIResearchModel),
+		AIGlobalConcurrent:        aiGlobalConcurrent,
+		AIUserConcurrent:          aiUserConcurrent,
+		AIImagePerMinute:          aiImagePerMinute,
+		AIImagePerDay:             aiImagePerDay,
+		AIResearchPerMinute:       aiResearchPerMinute,
+		AIResearchPerDay:          aiResearchPerDay,
+		AILeaseTTL:                aiLeaseTTL,
+		BillingEnforcementEnabled: billingEnforcementEnabled,
+		SchedulerInterval:         interval,
+		SMTPHost:                  strings.TrimSpace(os.Getenv("SMTP_HOST")),
+		SMTPPort:                  smtpPort,
+		SMTPUsername:              strings.TrimSpace(os.Getenv("SMTP_USERNAME")),
+		SMTPPassword:              os.Getenv("SMTP_PASSWORD"),
+		SMTPFromEmail:             strings.TrimSpace(os.Getenv("SMTP_FROM_EMAIL")),
+		SMTPFromName:              strings.TrimSpace(os.Getenv("SMTP_FROM_NAME")),
 	}
 
 	if cfg.Host == "" || cfg.Port == "" || cfg.DatabaseURL == "" || cfg.MediaDir == "" || cfg.PublicBaseURL == "" {
@@ -259,6 +332,13 @@ func (c Config) YandexAuthEnabled() bool {
 
 func (c Config) S3Enabled() bool {
 	return c.S3Host != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
+}
+
+// SMTPConfigured reports whether transactional email delivery is enabled. Host
+// and sender address are the minimum required to build an SMTP sender; when
+// either is empty welcome emails are disabled and a NoopSender is wired instead.
+func (c Config) SMTPConfigured() bool {
+	return c.SMTPHost != "" && c.SMTPFromEmail != ""
 }
 
 func validateYandexRedirectURI(raw string) error {
@@ -352,6 +432,15 @@ func splitNormalizedCSV(value string) []string {
 func boundedPositiveIntEnv(name string, fallback, maximum int) (int, error) {
 	raw := env(name, strconv.Itoa(fallback))
 	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between 1 and %d: %q", name, maximum, raw)
+	}
+	return value, nil
+}
+
+func boundedPositiveInt64Env(name string, fallback, maximum int64) (int64, error) {
+	raw := env(name, strconv.FormatInt(fallback, 10))
+	value, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || value <= 0 || value > maximum {
 		return 0, fmt.Errorf("%s must be an integer between 1 and %d: %q", name, maximum, raw)
 	}

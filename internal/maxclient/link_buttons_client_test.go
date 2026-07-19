@@ -3,6 +3,7 @@ package maxclient
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,32 @@ func TestPublishAndEditBuildInlineKeyboardAttachment(t *testing.T) {
 	}
 	if calls.Load() != 3 {
 		t.Fatalf("message calls = %d, want 3", calls.Load())
+	}
+}
+
+func TestMessageAttachmentLimits(t *testing.T) {
+	t.Parallel()
+
+	media := func(count int) []MediaToken {
+		result := make([]MediaToken, count)
+		for index := range result {
+			result[index] = MediaToken{Type: MediaTypeImage, Token: fmt.Sprintf("token-%d", index)}
+		}
+		return result
+	}
+	button := []LinkButton{{Text: "Открыть", URL: "https://example.com"}}
+
+	if attachments, err := messageAttachments(media(12), nil, nil); err != nil || attachments == nil || len(*attachments) != 12 {
+		t.Fatalf("12 media without keyboard = %#v, error = %v", attachments, err)
+	}
+	if _, err := messageAttachments(media(13), nil, nil); err == nil {
+		t.Fatal("13 media without keyboard were accepted")
+	}
+	if attachments, err := messageAttachments(media(11), nil, button); err != nil || attachments == nil || len(*attachments) != 12 {
+		t.Fatalf("11 media with keyboard = %#v, error = %v", attachments, err)
+	}
+	if _, err := messageAttachments(media(12), nil, button); err == nil {
+		t.Fatal("12 media with keyboard were accepted")
 	}
 }
 

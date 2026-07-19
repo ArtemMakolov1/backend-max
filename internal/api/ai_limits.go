@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,13 +28,14 @@ const (
 // account. The two image endpoints share the image operation, so users cannot
 // bypass a quota by switching routes.
 type AILimitOptions struct {
-	GlobalMaxConcurrent int
-	UserMaxConcurrent   int
-	ImagePerMinute      int
-	ImagePerDay         int
-	ResearchPerMinute   int
-	ResearchPerDay      int
-	LeaseTTL            time.Duration
+	GlobalMaxConcurrent    int
+	UserMaxConcurrent      int
+	ImagePerMinute         int
+	ImagePerDay            int
+	ResearchPerMinute      int
+	ResearchPerDay         int
+	LeaseTTL               time.Duration
+	MonthlyPlanEnforcement bool
 }
 
 func DefaultAILimitOptions() AILimitOptions {
@@ -92,6 +94,18 @@ func newAIRequestLimiter(storage *store.Store, logger *slog.Logger, options AILi
 }
 
 func (l *aiRequestLimiter) acquire(ctx context.Context, userID, operation string, now time.Time) (func(), error) {
+	return l.acquireAmount(ctx, userID, operation, 1, now)
+}
+
+func (l *aiRequestLimiter) acquireAmount(
+	ctx context.Context, userID, operation string, amount int64, now time.Time,
+) (func(), error) {
+	return l.acquireMetric(ctx, userID, operation, defaultAIMonthlyMetric(operation), amount, now)
+}
+
+func (l *aiRequestLimiter) acquireMetric(
+	ctx context.Context, userID, operation, monthlyMetric string, amount int64, now time.Time,
+) (func(), error) {
 	select {
 	case l.slots <- struct{}{}:
 	default:
@@ -103,7 +117,8 @@ func (l *aiRequestLimiter) acquire(ctx context.Context, userID, operation string
 		<-l.slots
 		return nil, err
 	}
-	lease, err := l.storage.AcquireAILease(ctx, userID, operation, limits, now)
+	lease, err := l.storage.AcquireAILeaseWithMonthlyUsage(
+		ctx, userID, operation, monthlyMetric, amount, l.options.MonthlyPlanEnforcement, limits, now)
 	if err != nil {
 		<-l.slots
 		return nil, err
@@ -121,6 +136,65 @@ func (l *aiRequestLimiter) acquire(ctx context.Context, userID, operation string
 		})
 	}
 	return release, nil
+}
+
+func (l *aiRequestLimiter) acquireWorkspaceMetric(
+	ctx context.Context, workspaceID, operation, monthlyMetric string, amount int64, now time.Time,
+) (func(), error) {
+	select {
+	case l.slots <- struct{}{}:
+	default:
+		return nil, &store.AILimitError{Reason: store.AILimitReasonGlobal, RetryAfter: time.Second}
+	}
+	limits, err := l.limitsFor(operation)
+	if err != nil {
+		<-l.slots
+		return nil, err
+	}
+	lease, err := l.storage.AcquireWorkspaceAILeaseWithMonthlyUsage(
+		ctx, workspaceID, operation, monthlyMetric, amount, l.options.MonthlyPlanEnforcement, limits, now)
+	if err != nil {
+		<-l.slots
+		return nil, err
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := l.storage.ReleaseWorkspaceAILease(releaseCtx, workspaceID, lease.ID); err != nil {
+				l.logger.Error("could not release workspace AI request lease", "operation", operation, "error", err)
+			}
+			<-l.slots
+		})
+	}, nil
+}
+
+func (l *aiRequestLimiter) acquireForWorkspace(
+	ctx context.Context, actorUserID string, workspace store.Workspace, operation string, now time.Time,
+) (func(), error) {
+	return l.acquireForWorkspaceAmount(ctx, actorUserID, workspace, operation, 1, now)
+}
+
+func (l *aiRequestLimiter) acquireForWorkspaceAmount(
+	ctx context.Context, actorUserID string, workspace store.Workspace, operation string, amount int64, now time.Time,
+) (func(), error) {
+	return l.acquireForWorkspaceMetric(
+		ctx, actorUserID, workspace, operation, defaultAIMonthlyMetric(operation), amount, now)
+}
+
+func (l *aiRequestLimiter) acquireForWorkspaceMetric(
+	ctx context.Context, actorUserID string, workspace store.Workspace,
+	operation, monthlyMetric string, amount int64, now time.Time,
+) (func(), error) {
+	// Nested personal routes and their legacy aliases must share the same
+	// buckets and leases; otherwise alternating between them doubles every
+	// minute/day/concurrency allowance. Team workspaces keep an independent
+	// workspace ledger because several members share that tenant.
+	if workspace.IsPersonal {
+		return l.acquireMetric(ctx, actorUserID, operation, monthlyMetric, amount, now)
+	}
+	return l.acquireWorkspaceMetric(ctx, workspace.ID, operation, monthlyMetric, amount, now)
 }
 
 func (l *aiRequestLimiter) limitsFor(operation string) (store.AILimits, error) {
@@ -148,4 +222,25 @@ func retryAfterSeconds(value time.Duration) int64 {
 		return 1
 	}
 	return seconds
+}
+
+// imageUsageCredits reflects the material provider-cost difference between
+// qualities. Empty quality follows the client default (medium); auto is charged
+// conservatively as high because the provider may choose the expensive tier.
+func imageUsageCredits(quality string) int64 {
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "low":
+		return 1
+	case "high", "auto":
+		return 36
+	default:
+		return 9
+	}
+}
+
+func defaultAIMonthlyMetric(operation string) string {
+	if operation == store.AIOperationImage {
+		return store.UsageMetricAIImageCredits
+	}
+	return store.UsageMetricAIResearchRequests
 }

@@ -114,6 +114,38 @@ func TestCalendarAPIRejectsPastMalformedAndIncompleteSchedules(t *testing.T) {
 	}
 }
 
+func TestSchedulePostAcceptsAttachmentOnlyPost(t *testing.T) {
+	t.Parallel()
+	handler, storage, channel := newCalendarTestHandler(t)
+	ctx := context.Background()
+	createBody, _ := json.Marshal(map[string]any{
+		"title": "Video only", "content": "", "format": "markdown", "channel_id": channel.ID,
+	})
+	created := performPostRequest(t, handler, http.MethodPost, "/api/v1/posts", string(createBody), http.StatusCreated)
+
+	reservation, err := storage.ReserveMedia(ctx, "test-owner", "clip.mp4", 202,
+		store.MediaLimits{MaxFiles: 20, MaxBytes: 1 << 30}, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.CompleteMediaReservation(ctx, reservation, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.AddPostAttachmentForUser(ctx, "test-owner", created.ID, store.PostAttachment{
+		Type: store.PostAttachmentVideo, Position: -1, StorageKey: "clip.mp4", SizeBytes: 202, MIMEType: "video/mp4",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	scheduleAt := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
+	scheduleBody, _ := json.Marshal(map[string]string{"scheduled_at": scheduleAt.Format(time.RFC3339)})
+	scheduled := performPostRequest(t, handler, http.MethodPost,
+		"/api/v1/posts/"+postID(created.ID)+"/schedule", string(scheduleBody), http.StatusOK)
+	if scheduled.Status != store.PostStatusScheduled || scheduled.ScheduledAt == nil || !scheduled.ScheduledAt.Equal(scheduleAt) {
+		t.Fatalf("attachment-only schedule = %#v", scheduled)
+	}
+}
+
 func TestParseFutureTimeUsesRFC3339OffsetAndUTC(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2030, time.January, 1, 10, 0, 0, 0, time.UTC)

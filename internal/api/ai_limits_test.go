@@ -84,6 +84,52 @@ func TestAIImageQuotaIsSharedByBothImageRoutesAndRejectsBeforeUpstream(t *testin
 	}
 }
 
+func TestPersonalWorkspaceAndLegacyAIRoutesShareOneQuota(t *testing.T) {
+	t.Parallel()
+	image := &quotaImageClient{}
+	options := testAILimitOptions()
+	options.ImagePerMinute = 1
+	server, storage, rawHandler := newAIQuotaTestServer(
+		t, image, nil, options, "quota-alias-first", "quota-alias-second")
+	quotaNow := time.Now().UTC().Truncate(time.Minute)
+	server.now = func() time.Time { return quotaNow }
+
+	personalID := func(userID string) string {
+		workspaces, err := storage.ListWorkspaces(context.Background(), userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, access := range workspaces {
+			if access.Workspace.IsPersonal {
+				return access.Workspace.ID
+			}
+		}
+		t.Fatalf("personal workspace missing for %s", userID)
+		return ""
+	}
+
+	first := withTestSession(t, storage, rawHandler, "quota-alias-first")
+	response := performJSONRequest(first, http.MethodPost, "/api/v1/images/generate", `{"prompt":"legacy first"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("legacy first = %d %s", response.Code, response.Body.String())
+	}
+	response = performJSONRequest(first, http.MethodPost,
+		"/api/v1/workspaces/"+personalID("quota-alias-first")+"/images/generate", `{"prompt":"nested bypass"}`)
+	assertAI429(t, response, store.AILimitReasonMinute, "60")
+
+	second := withTestSession(t, storage, rawHandler, "quota-alias-second")
+	response = performJSONRequest(second, http.MethodPost,
+		"/api/v1/workspaces/"+personalID("quota-alias-second")+"/images/generate", `{"prompt":"nested first"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("nested first = %d %s", response.Code, response.Body.String())
+	}
+	response = performJSONRequest(second, http.MethodPost, "/api/v1/images/generate", `{"prompt":"legacy bypass"}`)
+	assertAI429(t, response, store.AILimitReasonMinute, "60")
+	if image.callCount() != 2 {
+		t.Fatalf("personal alias quota reached upstream %d times, want 2", image.callCount())
+	}
+}
+
 func TestAIResearchQuotaRejectsBeforeUpstream(t *testing.T) {
 	t.Parallel()
 	research := &fakeResearchClient{result: openairesearch.Result{Topic: "Тема поста"}}

@@ -18,6 +18,7 @@ import (
 	"maxpilot/backend/internal/api"
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/config"
+	"maxpilot/backend/internal/email"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/observability"
@@ -111,6 +112,31 @@ func main() {
 	}
 
 	application := app.NewWithMetrics(storage, mediaStore, maxAPI, openAI, research, logger, metrics)
+	if err := application.ConfigureMediaPolicy(app.MediaPolicy{
+		MaxFiles: cfg.MediaUserMaxFiles, MaxBytes: cfg.MediaUserMaxBytes,
+		OrphanGrace: cfg.MediaOrphanGrace, CleanupInterval: cfg.MediaCleanupInterval,
+		CleanupBatch: cfg.MediaCleanupBatch,
+	}); err != nil {
+		logger.Error("could not configure media policy", "error", err)
+		os.Exit(1)
+	}
+	var welcomeSender email.Sender = email.NewNoopSender(logger)
+	if cfg.SMTPConfigured() {
+		sender, err := email.NewSMTPSender(email.Config{
+			Host: cfg.SMTPHost, Port: cfg.SMTPPort, Username: cfg.SMTPUsername, Password: cfg.SMTPPassword,
+			FromEmail: cfg.SMTPFromEmail, FromName: cfg.SMTPFromName,
+			AppURL: cfg.PublicBaseURL + "/app/#/posts", SiteURL: cfg.FrontendOrigin,
+		})
+		if err != nil {
+			logger.Error("could not initialize welcome email sender", "error", err)
+			os.Exit(1)
+		}
+		welcomeSender = sender
+		logger.Info("welcome emails enabled", "smtp_host", cfg.SMTPHost, "smtp_port", cfg.SMTPPort)
+	} else {
+		logger.Info("welcome emails disabled: SMTP not configured")
+	}
+
 	var yandexOAuth api.YandexOAuthClient
 	if cfg.YandexAuthEnabled() {
 		client, err := yandexauth.New(cfg.YandexClientID, cfg.YandexClientSecret, nil)
@@ -126,14 +152,17 @@ func main() {
 		ObservabilityAdmins: cfg.ObservabilityAdmins,
 		SecureCookies:       strings.HasPrefix(strings.ToLower(cfg.YandexRedirectURI), "https://"),
 		TrustXRealIP:        cfg.OAuthTrustXRealIP, RateLimitAtEdge: cfg.OAuthRateLimitAtEdge,
+		MaxOwnedTeamWorkspaces: cfg.MaxOwnedTeamWorkspaces,
+		WelcomeSender:          welcomeSender,
 		AILimits: &api.AILimitOptions{
-			GlobalMaxConcurrent: cfg.AIGlobalConcurrent,
-			UserMaxConcurrent:   cfg.AIUserConcurrent,
-			ImagePerMinute:      cfg.AIImagePerMinute,
-			ImagePerDay:         cfg.AIImagePerDay,
-			ResearchPerMinute:   cfg.AIResearchPerMinute,
-			ResearchPerDay:      cfg.AIResearchPerDay,
-			LeaseTTL:            cfg.AILeaseTTL,
+			GlobalMaxConcurrent:    cfg.AIGlobalConcurrent,
+			UserMaxConcurrent:      cfg.AIUserConcurrent,
+			ImagePerMinute:         cfg.AIImagePerMinute,
+			ImagePerDay:            cfg.AIImagePerDay,
+			ResearchPerMinute:      cfg.AIResearchPerMinute,
+			ResearchPerDay:         cfg.AIResearchPerDay,
+			LeaseTTL:               cfg.AILeaseTTL,
+			MonthlyPlanEnforcement: cfg.BillingEnforcementEnabled,
 		},
 		Metrics: metrics,
 	})
@@ -147,9 +176,11 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	if maxAPI != nil {
-		go application.RunScheduler(rootCtx, cfg.SchedulerInterval)
-	}
+	schedulerDone := make(chan struct{})
+	go func() {
+		defer close(schedulerDone)
+		application.RunScheduler(rootCtx, cfg.SchedulerInterval)
+	}()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -167,14 +198,25 @@ func main() {
 	case err := <-serverErr:
 		if err != nil {
 			logger.Error("HTTP server failed", "error", err)
-			stop()
 		}
 	}
+	// Restore default signal handling so a second SIGINT/SIGTERM terminates
+	// the process immediately instead of waiting for graceful shutdown.
+	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
+	}
+	// An in-flight scheduled publication keeps running on a context detached
+	// from the stop signal, so a routine deploy does not turn a half-sent post
+	// into a terminal failure or a duplicate. Wait for the scheduler goroutine
+	// to drain; the bound follows the 3-minute per-publication budget.
+	select {
+	case <-schedulerDone:
+	case <-time.After(3*time.Minute + 30*time.Second):
+		logger.Error("scheduler did not stop before the shutdown deadline")
 	}
 	logger.Info("server stopped")
 }

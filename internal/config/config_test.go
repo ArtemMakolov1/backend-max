@@ -151,6 +151,54 @@ func TestLoadAcceptsCompleteS3StorageConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadUsesBoundedMediaQuotaAndCleanupDefaults(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MediaUserMaxFiles != 500 || cfg.MediaUserMaxBytes != 1<<30 ||
+		cfg.MediaOrphanGrace != 24*time.Hour || cfg.MediaCleanupInterval != 15*time.Minute || cfg.MediaCleanupBatch != 50 {
+		t.Fatalf("unexpected media defaults: %#v", cfg)
+	}
+
+	t.Setenv("MEDIA_USER_MAX_FILES", "42")
+	t.Setenv("MEDIA_USER_MAX_BYTES", "10485760")
+	t.Setenv("MEDIA_ORPHAN_GRACE_PERIOD", "2h")
+	t.Setenv("MEDIA_CLEANUP_INTERVAL", "5m")
+	t.Setenv("MEDIA_CLEANUP_BATCH_SIZE", "25")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MediaUserMaxFiles != 42 || cfg.MediaUserMaxBytes != 10<<20 ||
+		cfg.MediaOrphanGrace != 2*time.Hour || cfg.MediaCleanupInterval != 5*time.Minute || cfg.MediaCleanupBatch != 25 {
+		t.Fatalf("media overrides were not loaded: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsUnsafeMediaQuotaAndCleanupValues(t *testing.T) {
+	tests := map[string]string{
+		"MEDIA_USER_MAX_FILES":      "0",
+		"MEDIA_USER_MAX_BYTES":      "1125899906842625",
+		"MEDIA_ORPHAN_GRACE_PERIOD": "59m",
+		"MEDIA_CLEANUP_INTERVAL":    "25h",
+		"MEDIA_CLEANUP_BATCH_SIZE":  "1001",
+	}
+	for name, value := range tests {
+		name, value := name, value
+		t.Run(name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv(name, value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("Load() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsPartialS3AndS3InBootstrap(t *testing.T) {
 	clearAuthEnv(t)
 	setValidLocalYandexAuth(t)
@@ -198,6 +246,64 @@ func TestLoadUsesSafeAIQuotaDefaultsAndAcceptsBoundedOverrides(t *testing.T) {
 	if cfg.AIGlobalConcurrent != 8 || cfg.AIUserConcurrent != 2 || cfg.AIImagePerMinute != 3 ||
 		cfg.AIImagePerDay != 30 || cfg.AIResearchPerMinute != 4 || cfg.AIResearchPerDay != 40 || cfg.AILeaseTTL != 5*time.Minute {
 		t.Fatalf("AI overrides were not loaded: %#v", cfg)
+	}
+}
+
+func TestLoadBillingEnforcementIsExplicitOptIn(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BillingEnforcementEnabled {
+		t.Fatal("billing enforcement must default to observe mode")
+	}
+
+	t.Setenv("BILLING_ENFORCEMENT_ENABLED", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.BillingEnforcementEnabled {
+		t.Fatal("billing enforcement opt-in was ignored")
+	}
+
+	t.Setenv("BILLING_ENFORCEMENT_ENABLED", "sometimes")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "BILLING_ENFORCEMENT_ENABLED") {
+		t.Fatalf("invalid billing enforcement error=%v", err)
+	}
+}
+
+func TestLoadUsesBoundedOwnedTeamWorkspaceLimit(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxOwnedTeamWorkspaces != 5 {
+		t.Fatalf("default owned team workspace limit=%d, want 5", cfg.MaxOwnedTeamWorkspaces)
+	}
+
+	t.Setenv("WORKSPACE_MAX_OWNED_TEAM_WORKSPACES", "17")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxOwnedTeamWorkspaces != 17 {
+		t.Fatalf("owned team workspace limit=%d, want 17", cfg.MaxOwnedTeamWorkspaces)
+	}
+
+	for _, value := range []string{"0", "1001", "many"} {
+		t.Run(value, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv("WORKSPACE_MAX_OWNED_TEAM_WORKSPACES", value)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WORKSPACE_MAX_OWNED_TEAM_WORKSPACES") {
+				t.Fatalf("Load() error=%v, want workspace limit validation", err)
+			}
+		})
 	}
 }
 
@@ -343,10 +449,12 @@ func clearAuthEnv(t *testing.T) {
 		"ADMIN_API_KEY", "YANDEX_CLIENT_ID", "YANDEX_CLIENT_SECRET", "YANDEX_REDIRECT_URI",
 		"YANDEX_ALLOWED_USERS", "OBSERVABILITY_ADMIN_USERS", "AUTH_SESSION_TTL", "ALLOW_INSECURE_NO_AUTH", "AUTH_BOOTSTRAP_MODE", "OAUTH_TRUST_X_REAL_IP",
 		"OAUTH_RATE_LIMIT_AT_EDGE", "AI_GLOBAL_MAX_CONCURRENT", "AI_USER_MAX_CONCURRENT",
+		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
 		"OPENAI_API_KEY", "OPENAI_API_BASE_URL",
 		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
+		"MEDIA_USER_MAX_FILES", "MEDIA_USER_MAX_BYTES", "MEDIA_ORPHAN_GRACE_PERIOD", "MEDIA_CLEANUP_INTERVAL", "MEDIA_CLEANUP_BATCH_SIZE",
 	} {
 		t.Setenv(name, "")
 	}

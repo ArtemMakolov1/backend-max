@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -52,6 +53,15 @@ type ChatInfo struct {
 	Link              string   `json:"link,omitempty"`
 	Icon              ChatIcon `json:"icon,omitempty"`
 	ParticipantsCount int      `json:"participants_count,omitempty"`
+}
+
+// ChatPatch describes the mutable chat metadata accepted by
+// PATCH /chats/{chatId}. MAX lets an administrator bot replace the chat photo
+// and title; the chat description is read-only in the Bot API.
+type ChatPatch struct {
+	// IconToken is an image upload token obtained through UploadImage.
+	IconToken string
+	Title     *string
 }
 
 type Permission string
@@ -119,6 +129,23 @@ type UploadResult struct {
 	Token string
 }
 
+// MediaType is a media kind accepted by MAX message attachments. The generic
+// upload path intentionally starts with the two composable media types; files
+// and audio have different combination rules and are not silently accepted.
+type MediaType string
+
+const (
+	MediaTypeImage MediaType = "image"
+	MediaTypeVideo MediaType = "video"
+)
+
+// MediaToken is an opaque MAX attachment token paired with its media kind.
+// Callers may order these values to control the attachments array sent to MAX.
+type MediaToken struct {
+	Type  MediaType
+	Token string
+}
+
 // Message identifies a post created through Publish.
 type Message struct {
 	MessageID string
@@ -128,25 +155,30 @@ type Message struct {
 	Views     *int64
 }
 
-// PublishRequest describes a new channel post. ImageTokens are tokens returned
-// by UploadImage. DisableLinkPreview is always sent as a query parameter.
+// PublishRequest describes a new channel post. MediaTokens preserve the given
+// image/video order. ImageTokens remains the backwards-compatible image-only
+// input and must not be combined with MediaTokens. DisableLinkPreview is always
+// sent as a query parameter.
 type PublishRequest struct {
 	ChatID             string
 	Text               string
 	Format             Format
+	MediaTokens        []MediaToken
 	ImageTokens        []string
 	LinkButtons        []LinkButton
 	DisableLinkPreview bool
 	Notify             *bool
 }
 
-// EditRequest replaces the editable fields of an existing post. When both
-// attachment slices are nil, MAX attachments are left unchanged. Otherwise the
-// two slices describe the complete desired image + keyboard state.
+// EditRequest replaces the editable fields of an existing post. When all media
+// and button slices are nil, MAX attachments are left unchanged. Otherwise the
+// slices describe the complete desired media + keyboard state. MediaTokens and
+// ImageTokens must not be combined.
 type EditRequest struct {
 	MessageID   string
 	Text        string
 	Format      Format
+	MediaTokens []MediaToken
 	ImageTokens []string
 	LinkButtons []LinkButton
 	Notify      *bool
@@ -263,6 +295,31 @@ func imageAttachments(tokens []string) (*[]attachment, error) {
 		}
 	}
 	return &result, nil
+}
+
+func mediaAttachments(tokens []MediaToken) (*[]attachment, error) {
+	if tokens == nil {
+		return nil, nil
+	}
+
+	result := make([]attachment, len(tokens))
+	for i, media := range tokens {
+		if !validMediaType(media.Type) {
+			return nil, fmt.Errorf("media token %d has unsupported type %q", i, media.Type)
+		}
+		if strings.TrimSpace(media.Token) == "" {
+			return nil, fmt.Errorf("media token %d is empty", i)
+		}
+		result[i] = attachment{
+			Type:    string(media.Type),
+			Payload: attachmentPayload{Token: media.Token},
+		}
+	}
+	return &result, nil
+}
+
+func validMediaType(mediaType MediaType) bool {
+	return mediaType == MediaTypeImage || mediaType == MediaTypeVideo
 }
 
 func validFormat(format Format) bool {

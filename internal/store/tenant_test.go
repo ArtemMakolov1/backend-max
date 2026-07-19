@@ -188,6 +188,294 @@ func TestChannelClaimIsOneTimeOwnerBoundAndConflictsAcrossTenants(t *testing.T) 
 	}
 }
 
+func TestChannelClaimTransfersActorsPersonalChannelIntoTeam(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "channel-claim-personal-transfer.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	const actor = "transfer-actor"
+	if err := storage.UpsertUser(ctx, User{ID: actor, DisplayName: "Transfer Actor"}); err != nil {
+		t.Fatal(err)
+	}
+	personal := requirePersonalWorkspace(t, ctx, storage, actor)
+	team, err := storage.CreateWorkspace(ctx, actor, Workspace{Name: "Transfer Team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	channel, err := storage.CreateChannel(ctx, Channel{
+		UserID: actor, VerifiedMAXOwnerID: "max-transfer-owner", MAXChatID: "transfer-chat",
+		Title: "Personal channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.db.ExecContext(ctx, `INSERT INTO channel_participant_snapshots(
+channel_id,observed_on,captured_at,participants_count) VALUES($1,$2,$3,$4)`,
+		channel.ID, now.Format("2006-01-02"), now, 42); err != nil {
+		t.Fatal(err)
+	}
+
+	// Keep a historical connected personal claim to exercise its composite
+	// (owner_id, channel_id) foreign key during the transfer.
+	personalClaim := verifyChannelClaimForTest(t, ctx, storage, ChannelClaim{
+		ID: "personal-connected-claim", TokenHash: strings.Repeat("a", 64), UserID: actor,
+		WorkspaceID: personal.ID, MAXChatID: channel.MAXChatID, RequestedTitle: channel.Title,
+		RequesterLabel: actor, ComparisonCode: "123456", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+	}, "max-transfer-owner", "b", "c")
+	if _, err := storage.CompleteChannelClaim(ctx, personalClaim, Channel{
+		VerifiedMAXOwnerID: "max-transfer-owner", MAXChatID: channel.MAXChatID,
+		Title: channel.Title, IsChannel: true, Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	teamClaim := verifyChannelClaimForTest(t, ctx, storage, ChannelClaim{
+		ID: "team-transfer-claim", TokenHash: strings.Repeat("d", 64), UserID: actor,
+		WorkspaceID: team.ID, MAXChatID: channel.MAXChatID, RequestedTitle: "Team channel",
+		RequesterLabel: actor, ComparisonCode: "654321", CreatedAt: now.Add(time.Minute),
+		ExpiresAt: now.Add(11 * time.Minute),
+	}, "max-transfer-owner", "e", "f")
+	transferred, err := storage.CompleteChannelClaim(ctx, teamClaim, Channel{
+		VerifiedMAXOwnerID: "max-transfer-owner", MAXChatID: channel.MAXChatID,
+		Title: "Team channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transferred.ID != channel.ID || transferred.WorkspaceID != team.ID ||
+		transferred.UserID != team.CompatOwnerUserID {
+		t.Fatalf("transferred channel = %#v, team = %#v", transferred, team)
+	}
+	if _, err := storage.GetChannelForUser(ctx, actor, channel.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("personal lookup after transfer error = %v, want ErrNotFound", err)
+	}
+	personalClaim, err = storage.GetChannelClaimForUser(ctx, actor, personalClaim.ID, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if personalClaim.Status != ChannelClaimConnected || personalClaim.ChannelID != nil ||
+		personalClaim.WorkspaceID != personal.ID {
+		t.Fatalf("historical personal claim = %#v", personalClaim)
+	}
+	teamClaim, err = storage.GetChannelClaimForUser(ctx, actor, teamClaim.ID, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if teamClaim.Status != ChannelClaimConnected || teamClaim.ChannelID == nil || *teamClaim.ChannelID != channel.ID {
+		t.Fatalf("connected team claim = %#v", teamClaim)
+	}
+	var snapshotCount int
+	if err := storage.db.QueryRowContext(ctx, `SELECT count(*) FROM channel_participant_snapshots
+WHERE channel_id=$1`, channel.ID).Scan(&snapshotCount); err != nil || snapshotCount != 1 {
+		t.Fatalf("participant snapshots after transfer = %d, err=%v", snapshotCount, err)
+	}
+	events, err := storage.ListAuditEvents(ctx, actor, team.ID, 50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundTransfer := false
+	for _, event := range events {
+		if event.Action == "channel.transferred" && event.EntityID == fmt.Sprint(channel.ID) &&
+			strings.Contains(string(event.Metadata), personal.ID) {
+			foundTransfer = true
+			break
+		}
+	}
+	if !foundTransfer {
+		t.Fatalf("team audit does not contain channel.transferred from %q: %#v", personal.ID, events)
+	}
+}
+
+func TestChannelClaimPersonalTransferSafetyChecks(t *testing.T) {
+	t.Parallel()
+	t.Run("linked posts", func(t *testing.T) {
+		ctx := context.Background()
+		storage, err := Open(ctx, filepath.Join(t.TempDir(), "channel-transfer-linked.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = storage.Close() })
+		const actor = "linked-transfer-owner"
+		if err := storage.UpsertUser(ctx, User{ID: actor, DisplayName: actor}); err != nil {
+			t.Fatal(err)
+		}
+		personal := requirePersonalWorkspace(t, ctx, storage, actor)
+		team, err := storage.CreateWorkspace(ctx, actor, Workspace{Name: "Linked Team"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := storage.CreateChannel(ctx, Channel{
+			UserID: actor, VerifiedMAXOwnerID: "max-linked", MAXChatID: "linked-transfer-chat",
+			Title: "Linked", IsChannel: true, Active: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := storage.CreatePost(ctx, Post{
+			UserID: actor, Title: "Linked post", Content: "Body", Format: FormatMarkdown, ChannelID: &channel.ID,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		claim := verifyChannelClaimForTest(t, ctx, storage, ChannelClaim{
+			ID: "linked-transfer-claim", TokenHash: strings.Repeat("a", 64), UserID: actor,
+			WorkspaceID: team.ID, MAXChatID: channel.MAXChatID, RequestedTitle: channel.Title,
+			RequesterLabel: actor, ComparisonCode: "123456", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		}, "max-linked", "b", "c")
+		if _, err := storage.CompleteChannelClaim(ctx, claim, Channel{
+			VerifiedMAXOwnerID: "max-linked", MAXChatID: channel.MAXChatID,
+			Title: channel.Title, IsChannel: true, Active: true,
+		}); !errors.Is(err, ErrConflict) {
+			t.Fatalf("linked channel transfer error = %v, want ErrConflict", err)
+		}
+		stored, err := storage.GetChannel(ctx, channel.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.UserID != actor || stored.WorkspaceID != personal.ID {
+			t.Fatalf("linked channel moved despite conflict: %#v", stored)
+		}
+	})
+
+	t.Run("archived source", func(t *testing.T) {
+		ctx := context.Background()
+		storage, err := Open(ctx, filepath.Join(t.TempDir(), "channel-transfer-archived.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = storage.Close() })
+		const actor = "archived-transfer-owner"
+		if err := storage.UpsertUser(ctx, User{ID: actor, DisplayName: actor}); err != nil {
+			t.Fatal(err)
+		}
+		personal := requirePersonalWorkspace(t, ctx, storage, actor)
+		team, err := storage.CreateWorkspace(ctx, actor, Workspace{Name: "Archive Team"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := storage.CreateChannel(ctx, Channel{
+			UserID: actor, VerifiedMAXOwnerID: "max-archived", MAXChatID: "archived-transfer-chat",
+			Title: "Archived source", IsChannel: true, Active: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		claim := verifyChannelClaimForTest(t, ctx, storage, ChannelClaim{
+			ID: "archived-transfer-claim", TokenHash: strings.Repeat("a", 64), UserID: actor,
+			WorkspaceID: team.ID, MAXChatID: channel.MAXChatID, RequestedTitle: channel.Title,
+			RequesterLabel: actor, ComparisonCode: "123456", CreatedAt: now, ExpiresAt: now.Add(10 * time.Minute),
+		}, "max-archived", "b", "c")
+		if _, err := storage.db.ExecContext(ctx, `UPDATE workspaces SET archived_at=$1 WHERE id=$2`,
+			now.Add(time.Minute), personal.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := storage.CompleteChannelClaim(ctx, claim, Channel{
+			VerifiedMAXOwnerID: "max-archived", MAXChatID: channel.MAXChatID,
+			Title: channel.Title, IsChannel: true, Active: true,
+		}); !errors.Is(err, ErrChannelOwned) {
+			t.Fatalf("archived source transfer error = %v, want ErrChannelOwned", err)
+		}
+		stored, err := storage.GetChannel(ctx, channel.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.UserID != actor || stored.WorkspaceID != personal.ID {
+			t.Fatalf("archived source channel moved: %#v", stored)
+		}
+	})
+
+	t.Run("foreign personal owner", func(t *testing.T) {
+		ctx := context.Background()
+		storage, err := Open(ctx, filepath.Join(t.TempDir(), "channel-transfer-foreign.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = storage.Close() })
+		for _, actor := range []string{"foreign-channel-owner", "foreign-team-owner"} {
+			if err := storage.UpsertUser(ctx, User{ID: actor, DisplayName: actor}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		source := requirePersonalWorkspace(t, ctx, storage, "foreign-channel-owner")
+		team, err := storage.CreateWorkspace(ctx, "foreign-team-owner", Workspace{Name: "Foreign Team"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		channel, err := storage.CreateChannel(ctx, Channel{
+			UserID: "foreign-channel-owner", VerifiedMAXOwnerID: "max-foreign", MAXChatID: "foreign-transfer-chat",
+			Title: "Foreign", IsChannel: true, Active: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		claim := verifyChannelClaimForTest(t, ctx, storage, ChannelClaim{
+			ID: "foreign-transfer-claim", TokenHash: strings.Repeat("a", 64), UserID: "foreign-team-owner",
+			WorkspaceID: team.ID, MAXChatID: channel.MAXChatID, RequestedTitle: channel.Title,
+			RequesterLabel: "foreign-team-owner", ComparisonCode: "123456", CreatedAt: now,
+			ExpiresAt: now.Add(10 * time.Minute),
+		}, "max-foreign", "b", "c")
+		if _, err := storage.CompleteChannelClaim(ctx, claim, Channel{
+			VerifiedMAXOwnerID: "max-foreign", MAXChatID: channel.MAXChatID,
+			Title: channel.Title, IsChannel: true, Active: true,
+		}); !errors.Is(err, ErrChannelOwned) {
+			t.Fatalf("foreign personal transfer error = %v, want ErrChannelOwned", err)
+		}
+		stored, err := storage.GetChannel(ctx, channel.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.UserID != "foreign-channel-owner" || stored.WorkspaceID != source.ID {
+			t.Fatalf("foreign personal channel moved: %#v", stored)
+		}
+	})
+}
+
+func requirePersonalWorkspace(t *testing.T, ctx context.Context, storage *Store, userID string) Workspace {
+	t.Helper()
+	workspaces, err := storage.ListWorkspaces(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, access := range workspaces {
+		if access.Workspace.IsPersonal {
+			return access.Workspace
+		}
+	}
+	t.Fatalf("personal workspace for %q was not found", userID)
+	return Workspace{}
+}
+
+func verifyChannelClaimForTest(
+	t *testing.T,
+	ctx context.Context,
+	storage *Store,
+	claim ChannelClaim,
+	maxUserID, confirmHashDigit, cancelHashDigit string,
+) ChannelClaim {
+	t.Helper()
+	if err := storage.CreateChannelClaim(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	confirmHash := strings.Repeat(confirmHashDigit, 64)
+	cancelHash := strings.Repeat(cancelHashDigit, 64)
+	if _, first, err := storage.StartChannelClaimConfirmation(
+		ctx, claim.TokenHash, maxUserID, confirmHash, cancelHash, claim.CreatedAt.Add(time.Second)); err != nil || !first {
+		t.Fatalf("start channel claim confirmation first=%v err=%v", first, err)
+	}
+	confirmed, err := storage.ConfirmChannelClaim(
+		ctx, confirmHash, maxUserID, true, claim.CreatedAt.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return confirmed
+}
+
 func TestChannelClaimActiveLimitIsAtomic(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

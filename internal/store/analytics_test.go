@@ -203,6 +203,74 @@ VALUES (?, ?, ?, ?)`, userID, 1000+index, now, now); err != nil {
 	}
 }
 
+func TestProductAnalyticsCountsPublishedAttachmentAdoption(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "analytics-media.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+
+	now := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	baseline, err := storage.ProductAnalyticsSnapshot(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const owner = "analytics-media-owner"
+	if err := storage.UpsertUser(ctx, User{ID: owner, DisplayName: owner}); err != nil {
+		t.Fatal(err)
+	}
+	for _, filename := range []string{"single.png", "multi-1.png", "multi-2.png", "video.mp4", "mixed.png", "mixed.mp4"} {
+		reservation, err := storage.ReserveMedia(ctx, owner, filename, 100,
+			MediaLimits{MaxFiles: 20, MaxBytes: 1 << 30}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := storage.CompleteMediaReservation(ctx, reservation, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createPublished := func(title string, attachments []PostAttachment) {
+		t.Helper()
+		publishedAt := now.Add(-time.Hour)
+		post, err := storage.CreatePost(ctx, Post{
+			UserID: owner, Title: title, Status: PostStatusPublished, PublishedAt: &publishedAt,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, attachment := range attachments {
+			if _, err := storage.AddPostAttachmentForUser(ctx, owner, post.ID, attachment); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	image := func(key string) PostAttachment {
+		return PostAttachment{Type: PostAttachmentImage, Position: -1, StorageKey: key, SizeBytes: 100, MIMEType: "image/png"}
+	}
+	video := func(key string) PostAttachment {
+		return PostAttachment{Type: PostAttachmentVideo, Position: -1, StorageKey: key, SizeBytes: 100, MIMEType: "video/mp4"}
+	}
+	createPublished("text only", nil)
+	createPublished("single image", []PostAttachment{image("single.png")})
+	createPublished("gallery", []PostAttachment{image("multi-1.png"), image("multi-2.png")})
+	createPublished("video", []PostAttachment{video("video.mp4")})
+	createPublished("mixed", []PostAttachment{image("mixed.png"), video("mixed.mp4")})
+
+	snapshot, err := storage.ProductAnalyticsSnapshot(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.PublishedPosts != baseline.PublishedPosts+5 ||
+		snapshot.PublishedPostsWithMedia != baseline.PublishedPostsWithMedia+4 ||
+		snapshot.PublishedPostsWithMultiple != baseline.PublishedPostsWithMultiple+2 ||
+		snapshot.PublishedPostsWithVideo != baseline.PublishedPostsWithVideo+2 ||
+		snapshot.PublishedPostsWithMixedMedia != baseline.PublishedPostsWithMixedMedia+1 {
+		t.Fatalf("media adoption snapshot=%#v baseline=%#v", snapshot, baseline)
+	}
+}
+
 func TestProductAnalyticsHonorsContextCancellation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

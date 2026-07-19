@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -132,7 +131,7 @@ func (s *Server) createPost(w http.ResponseWriter, r *http.Request) {
 		}
 		if scheduledAt != nil {
 			if !scheduledAt.After(time.Now().UTC()) {
-				s.writeError(w, errors.New("scheduled_at must be in the future"))
+				s.writeError(w, validationError("scheduled_at must be in the future"))
 				return
 			}
 			post.Status = store.PostStatusScheduled
@@ -193,7 +192,7 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 	if request.ExpectedUpdatedAt != nil {
 		expected, parseErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(*request.ExpectedUpdatedAt))
 		if parseErr != nil {
-			s.writeError(w, errors.New("expected_updated_at must be an RFC3339 timestamp"))
+			s.writeError(w, validationError("expected_updated_at must be an RFC3339 timestamp"))
 			return
 		}
 		if !current.UpdatedAt.Equal(expected) {
@@ -264,7 +263,7 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 		imageURL := ""
 		if string(request.ImageURL) != "null" {
 			if err := json.Unmarshal(request.ImageURL, &imageURL); err != nil {
-				s.writeError(w, errors.New("image_url must be a local media URL or null"))
+				s.writeError(w, validationError("image_url must be a local media URL or null"))
 				return
 			}
 		}
@@ -285,7 +284,7 @@ func (s *Server) updatePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if scheduledAt != nil && !sameInstant(current.ScheduledAt, scheduledAt) && !scheduledAt.After(time.Now().UTC()) {
-			s.writeError(w, errors.New("scheduled_at must be in the future"))
+			s.writeError(w, validationError("scheduled_at must be in the future"))
 			return
 		}
 		changes.ScheduledAt = &scheduledAt
@@ -378,7 +377,7 @@ func (s *Server) schedulePost(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	if post.ChannelID == nil || (strings.TrimSpace(post.Content) == "" && post.ImageURL == "") {
+	if post.ChannelID == nil || (strings.TrimSpace(post.Content) == "" && post.ImageURL == "" && len(post.Attachments) == 0) {
 		s.problem(w, http.StatusBadRequest, "validation_error", "A channel and post content or an image are required before scheduling", nil)
 		return
 	}
@@ -498,7 +497,8 @@ func (s *Server) generateImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationImage, s.now().UTC())
+	release, err := s.aiLimiter.acquireAmount(
+		r.Context(), userID, store.AIOperationImage, imageUsageCredits(request.Quality), s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -506,12 +506,8 @@ func (s *Server) generateImage(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	file, err := s.app.GenerateImage(ctx, request)
+	file, err := s.app.GenerateImageForUser(ctx, userID, request)
 	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	if err := s.app.Store().RegisterMedia(r.Context(), userID, file.Filename, s.now().UTC()); err != nil {
 		s.writeError(w, err)
 		return
 	}
@@ -545,7 +541,8 @@ func (s *Server) generatePostImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationImage, s.now().UTC())
+	release, err := s.aiLimiter.acquireAmount(
+		r.Context(), userID, store.AIOperationImage, imageUsageCredits(request.Quality), s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -553,17 +550,10 @@ func (s *Server) generatePostImage(w http.ResponseWriter, r *http.Request) {
 	defer release()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	post, err := s.app.GeneratePostImage(ctx, id, request)
+	post, err := s.app.GeneratePostImage(ctx, userID, id, request)
 	if err != nil {
 		s.writeError(w, err)
 		return
-	}
-	if post.ImageURL != "" {
-		filename := path.Base(post.ImageURL)
-		if err := s.app.Store().RegisterMedia(r.Context(), userID, filename, s.now().UTC()); err != nil {
-			s.writeError(w, err)
-			return
-		}
 	}
 	s.writeJSON(w, http.StatusOK, post)
 }
@@ -588,13 +578,13 @@ func (s *Server) resolveImageURL(ctx context.Context, userID, imageURL string) (
 
 func validatePostFields(title, content, format string) error {
 	if utf8.RuneCountInString(strings.TrimSpace(title)) > 200 {
-		return errors.New("title must not exceed 200 characters")
+		return validationError("title must not exceed 200 characters")
 	}
 	if !store.ValidFormat(format) {
-		return errors.New("format must be markdown or html")
+		return validationError("format must be markdown or html")
 	}
 	if utf8.RuneCountInString(content) > 100000 {
-		return errors.New("draft content must not exceed 100000 characters")
+		return validationError("draft content must not exceed 100000 characters")
 	}
 	return nil
 }
@@ -606,11 +596,11 @@ func parseFutureTime(value string) (time.Time, error) {
 func parseFutureTimeAt(value string, now time.Time) (time.Time, error) {
 	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(value))
 	if err != nil {
-		return time.Time{}, errors.New("scheduled_at must be an RFC3339 timestamp")
+		return time.Time{}, validationError("scheduled_at must be an RFC3339 timestamp")
 	}
 	parsed = parsed.UTC()
 	if !parsed.After(now.UTC()) {
-		return time.Time{}, errors.New("scheduled_at must be in the future")
+		return time.Time{}, validationError("scheduled_at must be in the future")
 	}
 	return parsed, nil
 }
@@ -621,11 +611,11 @@ func decodeScheduledAt(raw json.RawMessage) (*time.Time, error) {
 	}
 	var value string
 	if err := json.Unmarshal(raw, &value); err != nil || strings.TrimSpace(value) == "" {
-		return nil, errors.New("scheduled_at must be an RFC3339 string or null")
+		return nil, validationError("scheduled_at must be an RFC3339 string or null")
 	}
 	parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(value))
 	if err != nil {
-		return nil, errors.New("scheduled_at must be an RFC3339 timestamp")
+		return nil, validationError("scheduled_at must be an RFC3339 timestamp")
 	}
 	parsed = parsed.UTC()
 	return &parsed, nil
@@ -644,7 +634,7 @@ func decodeNullableInt64(raw json.RawMessage) (*int64, error) {
 	}
 	var value int64
 	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, errors.New("channel_id must be an integer or null")
+		return nil, validationError("channel_id must be an integer or null")
 	}
 	return &value, nil
 }

@@ -37,6 +37,7 @@ func (s *Store) ListPostsDueForStats(ctx context.Context, now time.Time, syncInt
 	rows, err := s.db.QueryContext(ctx, `
 SELECT `+postColumns+` FROM posts
 WHERE owner_id <> ''
+  AND EXISTS(SELECT 1 FROM workspaces w WHERE w.id=posts.workspace_id AND w.archived_at IS NULL)
   AND status = ?
   AND max_message_id <> ''
   AND channel_id IS NOT NULL
@@ -85,7 +86,7 @@ WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND stat
 	if affected, _ := result.RowsAffected(); affected == 1 {
 		return true, nil
 	}
-	if _, err := s.GetPostForUser(ctx, userID, postID); err != nil {
+	if _, err := s.getPostForOwner(ctx, userID, postID); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -145,7 +146,7 @@ INSERT INTO post_view_snapshots(owner_id, post_id, max_message_id, views, captur
 	if err := tx.Commit(); err != nil {
 		return Post{}, fmt.Errorf("commit publication metadata sync: %w", err)
 	}
-	return s.GetPostForUser(ctx, userID, postID)
+	return s.getPostForOwner(ctx, userID, postID)
 }
 
 // MarkMAXPublicationMissingForUser reconciles a post that was published by
@@ -173,9 +174,9 @@ WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND stat
 		return Post{}, fmt.Errorf("mark missing MAX publication: %w", err)
 	}
 	if affected, _ := result.RowsAffected(); affected == 1 {
-		return s.GetPostForUser(ctx, userID, postID)
+		return s.getPostForOwner(ctx, userID, postID)
 	}
-	current, getErr := s.GetPostForUser(ctx, userID, postID)
+	current, getErr := s.getPostForOwner(ctx, userID, postID)
 	if getErr != nil {
 		return Post{}, getErr
 	}
@@ -210,9 +211,9 @@ WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND stat
 		return Post{}, fmt.Errorf("clear MAX publication: %w", err)
 	}
 	if affected, _ := result.RowsAffected(); affected == 1 {
-		return s.GetPostForUser(ctx, userID, postID)
+		return s.getPostForOwner(ctx, userID, postID)
 	}
-	if _, err := s.GetPostForUser(ctx, userID, postID); err != nil {
+	if _, err := s.getPostForOwner(ctx, userID, postID); err != nil {
 		return Post{}, err
 	}
 	return Post{}, fmt.Errorf("%w: MAX publication changed while it was being deleted", ErrConflict)
@@ -255,7 +256,43 @@ WHERE owner_id = ? AND id = ? AND channel_id = ? AND max_message_id = ? AND stat
 	if err := tx.Commit(); err != nil {
 		return Post{}, fmt.Errorf("commit publication pin update: %w", err)
 	}
-	return s.GetPostForUser(ctx, userID, postID)
+	return s.getPostForOwner(ctx, userID, postID)
+}
+
+func (s *Store) ListPostViewSnapshotsForWorkspace(ctx context.Context, actorUserID, workspaceID string, postID int64, before *time.Time, limit int) ([]PostViewSnapshot, error) {
+	if limit <= 0 || limit > 1000 {
+		return nil, errors.New("view history limit must be between 1 and 1000")
+	}
+	if before != nil && before.IsZero() {
+		return nil, errors.New("view history before timestamp must not be zero")
+	}
+	if _, err := s.GetPostForWorkspace(ctx, actorUserID, workspaceID, postID); err != nil {
+		return nil, err
+	}
+	query := `SELECT id,post_id,max_message_id,views,captured_at
+FROM post_view_snapshots WHERE workspace_id=? AND post_id=?`
+	args := []any{workspaceID, postID}
+	if before != nil {
+		query += ` AND captured_at < ?`
+		args = append(args, before.UTC())
+	}
+	query += ` ORDER BY captured_at DESC,id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list workspace MAX view snapshots: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	result := make([]PostViewSnapshot, 0)
+	for rows.Next() {
+		var snapshot PostViewSnapshot
+		if err := rows.Scan(&snapshot.ID, &snapshot.PostID, &snapshot.MAXMessageID, &snapshot.Views, &snapshot.CapturedAt); err != nil {
+			return nil, fmt.Errorf("scan workspace MAX view snapshot: %w", err)
+		}
+		snapshot.CapturedAt = snapshot.CapturedAt.UTC()
+		result = append(result, snapshot)
+	}
+	return result, rows.Err()
 }
 
 func (s *Store) ListPostViewSnapshotsForUser(ctx context.Context, userID string, postID int64, before *time.Time, limit int) ([]PostViewSnapshot, error) {

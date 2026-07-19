@@ -16,6 +16,7 @@ import (
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/maxclient"
+	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/store"
 )
 
@@ -121,6 +122,14 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	workspaceID := strings.TrimSpace(chi.URLParam(r, "workspace_id"))
+	if workspaceID != "" {
+		_, access, allowed := s.requireWorkspaceCapability(w, r, app.CapabilityChannelsManage)
+		if !allowed {
+			return
+		}
+		workspaceID = access.WorkspaceID
+	}
 	var request createChannelRequest
 	if !s.decodeJSON(w, r, &request) {
 		return
@@ -153,7 +162,11 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 	// A previously linked MAX identity is already an explicit ownership proof.
 	// The application method rechecks that identity, the observed channel owner,
 	// current API metadata and bot permissions before the transactional connect.
-	connected, connectErr := s.app.ConnectDiscoverableChannelForUser(ctx, userID, candidate.Info.ChatID)
+	var connected app.ChannelCheck
+	connectErr := store.ErrNotFound
+	if workspaceID == "" {
+		connected, connectErr = s.app.ConnectDiscoverableChannelForUser(ctx, userID, candidate.Info.ChatID)
+	}
 	switch {
 	case connectErr == nil:
 		claimID, tokenErr := randomURLToken(32)
@@ -175,6 +188,11 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existing, getErr := s.app.Store().GetChannelByMAXChatID(r.Context(), candidate.Info.ChatID); getErr == nil {
+		if workspaceID != "" && existing.UserID == userID {
+			// Continue to the explicit owner-proof claim. Completion may move an
+			// actor-owned personal channel into the selected team workspace.
+			goto createClaim
+		}
 		if existing.UserID != userID {
 			s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к другому аккаунту", nil)
 			return
@@ -185,6 +203,8 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, getErr)
 		return
 	}
+
+createClaim:
 	claimID, err := randomURLToken(32)
 	if err != nil {
 		s.writeError(w, err)
@@ -210,7 +230,8 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 	claimTitle := firstNonEmpty(strings.TrimSpace(candidate.Info.Title), request.Title, "MAX "+candidate.Info.ChatID)
 	claim := store.ChannelClaim{
 		ID: claimID, TokenHash: sha256Hex(deepToken), UserID: userID, MAXChatID: candidate.Info.ChatID,
-		PublicLink: candidate.Info.Link, RequestedTitle: claimTitle, Status: store.ChannelClaimPending,
+		WorkspaceID: workspaceID,
+		PublicLink:  candidate.Info.Link, RequestedTitle: claimTitle, Status: store.ChannelClaimPending,
 		RequesterLabel: requesterLabel, ComparisonCode: comparisonCode,
 		CreatedAt: now, ExpiresAt: now.Add(channelClaimTTL), UpdatedAt: now,
 	}
@@ -249,6 +270,14 @@ func (s *Server) getChannelConnect(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
+	workspaceID := strings.TrimSpace(chi.URLParam(r, "workspace_id"))
+	if workspaceID != "" {
+		_, access, allowed := s.requireWorkspaceCapability(w, r, app.CapabilityChannelsManage)
+		if !allowed {
+			return
+		}
+		workspaceID = access.WorkspaceID
+	}
 	claimID := strings.TrimSpace(chi.URLParam(r, "claim_id"))
 	if claimID == "" || len(claimID) > 128 {
 		s.problem(w, http.StatusNotFound, "not_found", "Connection attempt was not found", nil)
@@ -257,6 +286,10 @@ func (s *Server) getChannelConnect(w http.ResponseWriter, r *http.Request) {
 	claim, err := s.app.Store().GetChannelClaimForUser(r.Context(), userID, claimID, s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)
+		return
+	}
+	if workspaceID != "" && claim.WorkspaceID != workspaceID {
+		s.writeError(w, store.ErrNotFound)
 		return
 	}
 	var channel any
@@ -284,7 +317,13 @@ func (s *Server) getChannelConnect(w http.ResponseWriter, r *http.Request) {
 		}
 		channel, diagnostics = connected, checked
 	} else if claim.Status == store.ChannelClaimConnected && claim.ChannelID != nil {
-		connected, getErr := s.app.Store().GetChannelForUser(r.Context(), userID, *claim.ChannelID)
+		var connected store.Channel
+		var getErr error
+		if workspaceID != "" {
+			connected, getErr = s.app.Store().GetChannelForWorkspace(r.Context(), userID, workspaceID, *claim.ChannelID)
+		} else {
+			connected, getErr = s.app.Store().GetChannelForUser(r.Context(), userID, *claim.ChannelID)
+		}
 		if getErr == nil {
 			channel = connected
 		}
@@ -383,8 +422,19 @@ func (s *Server) deleteChannel(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	if err := s.app.Store().DeleteChannelForUser(r.Context(), userID, id); err != nil {
-		s.writeError(w, err)
+	var deleteErr error
+	if r.URL.Query().Get("delete_content") == "true" {
+		deleteErr = s.app.Store().DeleteChannelContentForUser(r.Context(), userID, id)
+	} else {
+		deleteErr = s.app.Store().DeleteChannelForUser(r.Context(), userID, id)
+	}
+	if errors.Is(deleteErr, store.ErrChannelPublicationInProgress) {
+		s.problem(w, http.StatusConflict, "channel_publication_in_progress",
+			"Дождитесь завершения текущей публикации и повторите удаление канала.", nil)
+		return
+	}
+	if deleteErr != nil {
+		s.writeError(w, deleteErr)
 		return
 	}
 	s.writeJSON(w, http.StatusNoContent, nil)
@@ -416,6 +466,88 @@ func (s *Server) testChannel(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"ok": ok, "message": message, "channel": check.Channel, "diagnostics": check.Diagnostics,
 	})
+}
+
+// decodeChannelMAXInfoForm reads the optional title and icon file from a
+// multipart request. On success the returned cleanup releases the upload slot,
+// the opened file and multipart temp files; on failure the response is already
+// written and every acquired resource is released before returning.
+func (s *Server) decodeChannelMAXInfoForm(w http.ResponseWriter, r *http.Request, userID string) (app.ChannelMAXInfoUpdate, func(), bool) {
+	release, acquired := s.mediaUploads.tryAcquire(userID)
+	if !acquired {
+		s.writeError(w, errMediaUploadRateLimited)
+		return app.ChannelMAXInfoUpdate{}, nil, false
+	}
+	cleanups := []func(){release}
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}
+	fail := func() (app.ChannelMAXInfoUpdate, func(), bool) {
+		cleanup()
+		return app.ChannelMAXInfoUpdate{}, nil, false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, media.MaxImageBytes+(1<<20))
+	// #nosec G120 -- MaxBytesReader bounds the entire multipart request before
+	// ParseMultipartForm can allocate memory or spill parts to temporary files.
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		s.problem(w, http.StatusBadRequest, "validation_error", "invalid multipart upload or image is too large", nil)
+		return fail()
+	}
+	if form := r.MultipartForm; form != nil {
+		cleanups = append(cleanups, func() { _ = form.RemoveAll() })
+	}
+	var update app.ChannelMAXInfoUpdate
+	if titles := r.MultipartForm.Value["title"]; len(titles) > 0 {
+		title := strings.TrimSpace(titles[0])
+		if title == "" || utf8.RuneCountInString(title) > 200 {
+			s.problem(w, http.StatusBadRequest, "validation_error", "title must contain 1 to 200 characters", nil)
+			return fail()
+		}
+		update.Title = &title
+	}
+	if header, err := firstFile(r, "file", "icon", "image"); err == nil {
+		upload, openErr := header.Open()
+		if openErr != nil {
+			s.writeError(w, openErr)
+			return fail()
+		}
+		cleanups = append(cleanups, func() { _ = upload.Close() })
+		update.Icon = upload
+		update.IconFilename = header.Filename
+	}
+	if update.Title == nil && update.Icon == nil {
+		s.problem(w, http.StatusBadRequest, "validation_error", "channel title or icon file is required", nil)
+		return fail()
+	}
+	return update, cleanup, true
+}
+
+func (s *Server) updateChannelMAXInfo(w http.ResponseWriter, r *http.Request) {
+	userID, authErr := authenticatedUserID(r)
+	if authErr != nil {
+		s.writeError(w, authErr)
+		return
+	}
+	id, err := parseID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	update, cleanup, ok := s.decodeChannelMAXInfoForm(w, r, userID)
+	if !ok {
+		return
+	}
+	defer cleanup()
+	ctx, cancel := contextWithTimeout(r, time.Minute)
+	defer cancel()
+	channel, err := s.app.UpdateChannelMAXInfoForUser(ctx, userID, id, update)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, channel)
 }
 
 func contextWithTimeout(r *http.Request, timeout time.Duration) (context.Context, context.CancelFunc) {

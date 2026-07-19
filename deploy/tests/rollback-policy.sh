@@ -21,6 +21,14 @@ assert_file_absent() {
   fi
 }
 
+assert_file_present() {
+  local file=$1
+  if [[ ! -f "$file" ]]; then
+    echo "Rollback policy did not preserve required recovery metadata: $file" >&2
+    exit 1
+  fi
+}
+
 prepare_release() {
   local release_dir=$1
   install -d -m 750 "$release_dir"
@@ -88,7 +96,7 @@ run_initial_failure_policy() {
 
   if PATH="$fake_bin:$PATH" \
     TEST_LOG="$sandbox/docker.log" \
-    TEST_SCENARIO=initial-health-fail \
+    TEST_SCENARIO=backup-fail \
     TEST_EMPTY_DIR="$sandbox/empty" \
     TEST_OLD_SHA="$old_sha" \
     "$release_dir/deploy/deploy-production.sh" "$image" >"$output" 2>&1; then
@@ -105,6 +113,44 @@ run_initial_failure_policy() {
   fi
   assert_file_absent "$release_dir/.env.production.next"
   assert_file_absent "$release_dir/.release.next"
+  if [[ -e "$installation_dir/current" ]]; then
+    echo "Initial failed release was incorrectly accepted" >&2
+    rm -rf "$sandbox"
+    exit 1
+  fi
+  rm -rf "$sandbox"
+}
+
+run_initial_post_migration_roll_forward_policy() {
+  local sandbox installation_dir release_dir fake_bin output
+  sandbox=$(mktemp -d)
+  sandbox=$(CDPATH='' cd -- "$sandbox" && pwd -P)
+  installation_dir="$sandbox/backend"
+  release_dir="$installation_dir/releases/$new_sha"
+  fake_bin="$sandbox/bin"
+  output="$sandbox/output.log"
+  install -d "$fake_bin" "$sandbox/empty"
+  prepare_release "$release_dir"
+  render_bootstrap_env "$release_dir/.env.production.next"
+  ln -s "$repo_root/deploy/tests/fake-docker.sh" "$fake_bin/docker"
+  ln -s "$(type -P true)" "$fake_bin/flock"
+
+  if PATH="$fake_bin:$PATH" \
+    TEST_LOG="$sandbox/docker.log" \
+    TEST_SCENARIO=initial-health-fail \
+    TEST_EMPTY_DIR="$sandbox/empty" \
+    TEST_OLD_SHA="$old_sha" \
+    "$release_dir/deploy/deploy-production.sh" "$image" >"$output" 2>&1; then
+    echo "Initial post-migration fixture unexpectedly succeeded" >&2
+    rm -rf "$sandbox"
+    exit 1
+  fi
+
+  grep -F "$release_dir/deploy/compose.production.yaml run --rm --no-deps migrate" "$sandbox/docker.log" >/dev/null
+  grep -F "$release_dir/deploy/compose.production.yaml stop backend grafana prometheus alertmanager postgres-exporter pgbouncer-exporter node-exporter" "$sandbox/docker.log" >/dev/null
+  grep -F "preserving the staged bundle for roll-forward recovery" "$output" >/dev/null
+  assert_file_present "$release_dir/.env.production.next"
+  assert_file_present "$release_dir/.release.next"
   if [[ -e "$installation_dir/current" ]]; then
     echo "Initial failed release was incorrectly accepted" >&2
     rm -rf "$sandbox"
@@ -167,9 +213,9 @@ run_previous_release_recovery_policy() {
   rm -rf "$sandbox"
 }
 
-run_post_migration_recovery_policy() {
+run_post_migration_roll_forward_policy() {
   local scenario=$1
-  local sandbox installation_dir release_dir current_dir fake_bin output restore_line
+  local sandbox installation_dir release_dir current_dir fake_bin output
   sandbox=$(mktemp -d)
   sandbox=$(CDPATH='' cd -- "$sandbox" && pwd -P)
   installation_dir="$sandbox/backend"
@@ -193,37 +239,46 @@ run_post_migration_recovery_policy() {
     TEST_EMPTY_DIR="$sandbox/empty" \
     TEST_OLD_SHA="$old_sha" \
     "$release_dir/deploy/deploy-production.sh" "$image" >"$output" 2>&1; then
-    echo "Post-migration recovery fixture unexpectedly succeeded: $scenario" >&2
+    echo "Post-migration roll-forward fixture unexpectedly succeeded: $scenario" >&2
     rm -rf "$sandbox"
     exit 1
   fi
 
   grep -F "$release_dir/deploy/compose.production.yaml run --rm --no-deps migrate" "$sandbox/docker.log" >/dev/null
   grep -F "$release_dir/deploy/compose.production.yaml up -d --no-deps --force-recreate backend" "$sandbox/docker.log" >/dev/null
-  restore_line=$(grep -nF "$current_dir/deploy/compose.production.yaml up -d --no-deps --force-recreate backend" "$sandbox/docker.log" | tail -1 | cut -d: -f1)
-  if [[ -z "$restore_line" ]]; then
-    echo "Post-migration failure did not restore the accepted backend: $scenario" >&2
+  if grep -F "$current_dir/deploy/compose.production.yaml up -d --no-deps --force-recreate backend" "$sandbox/docker.log" >/dev/null; then
+    echo "Post-migration failure unsafely restarted the retired backend: $scenario" >&2
     rm -rf "$sandbox"
     exit 1
   fi
   if [[ "$scenario" == "monitoring-fail" ]]; then
-    grep -F "$release_dir/deploy/compose.production.yaml stop grafana prometheus postgres-exporter pgbouncer-exporter node-exporter" "$sandbox/docker.log" >/dev/null
+    grep -F "$release_dir/deploy/compose.production.yaml stop grafana prometheus alertmanager postgres-exporter pgbouncer-exporter node-exporter" "$sandbox/docker.log" >/dev/null
     grep -F "$current_dir/deploy/compose.production.yaml up -d --no-deps --force-recreate grafana" "$sandbox/docker.log" >/dev/null
+    grep -F "The healthy new backend remains active; previous monitoring was restored" "$output" >/dev/null
+    assert_file_absent "$release_dir/.env.production.next"
+    assert_file_absent "$release_dir/.release.next"
+    assert_file_present "$release_dir/.env.production"
+    assert_file_present "$release_dir/.release"
+    [[ "$(readlink -f "$installation_dir/current")" == "$release_dir" ]]
+  else
+    grep -F "$release_dir/deploy/compose.production.yaml stop backend" "$sandbox/docker.log" >/dev/null
+    grep -F "Backend is fail-closed; complete a roll-forward deployment" "$output" >/dev/null
+    assert_file_present "$release_dir/.env.production.next"
+    assert_file_present "$release_dir/.release.next"
+    [[ "$(readlink -f "$installation_dir/current")" == "$current_dir" ]]
   fi
   if grep -F 'missing-env:' "$sandbox/docker.log" >/dev/null; then
-    echo "Post-migration rollback lost required env metadata: $scenario" >&2
+    echo "Post-migration roll-forward lost required env metadata: $scenario" >&2
     rm -rf "$sandbox"
     exit 1
   fi
-  assert_file_absent "$release_dir/.env.production.next"
-  assert_file_absent "$release_dir/.release.next"
-  [[ "$(readlink -f "$installation_dir/current")" == "$current_dir" ]]
   rm -rf "$sandbox"
 }
 
 run_bootstrap_skips_installed_offsite_hook
 run_initial_failure_policy
+run_initial_post_migration_roll_forward_policy
 run_previous_release_recovery_policy
-run_post_migration_recovery_policy new-backend-health-fail
-run_post_migration_recovery_policy monitoring-fail
+run_post_migration_roll_forward_policy new-backend-health-fail
+run_post_migration_roll_forward_policy monitoring-fail
 echo "Deployment rollback policy tests passed."

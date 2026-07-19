@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="ru" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>Добро пожаловать в MaxPosty</title>
+</head>
+<body style="margin:0; padding:0; width:100%; background-color:#f4f4f7;">
+  <div style="display:none; max-height:0; overflow:hidden; mso-hide:all; font-size:1px; line-height:1px; color:#f4f4f7;">Ваш канал MAX готов — создайте первый пост за пару минут.</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f4f7;">
+    <tr>
+      <td align="center" style="padding:32px 16px;">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%; max-width:600px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,'Helvetica Neue',Arial,sans-serif;">
+          <tr>
+            <td style="padding:0 4px 24px 4px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="vertical-align:middle;">
+                    <span style="display:inline-block; width:36px; height:36px; background-color:#5838e8; border-radius:8px; color:#ffffff; font-size:22px; font-weight:700; line-height:36px; text-align:center; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;">M</span>
+                  </td>
+                  <td style="vertical-align:middle; padding-left:10px;">
+                    <span style="font-size:20px; font-weight:700; color:#1b1b28;">MaxPosty</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="background-color:#ffffff; border-radius:14px; padding:40px 40px 32px 40px;">
+              <h1 style="margin:0 0 20px 0; font-size:24px; line-height:30px; font-weight:700; color:#1b1b28;">Добро пожаловать в MaxPosty!</h1>
+              <p style="margin:0 0 16px 0; font-size:16px; line-height:24px; color:#3a3a4a;">{{if .DisplayName}}Привет, {{.DisplayName}}!{{else}}Привет!{{end}}</p>
+              <p style="margin:0 0 24px 0; font-size:16px; line-height:24px; color:#3a3a4a;">Вы на борту. MaxPosty берёт на себя рутину ведения канала в MAX: планирование постов, оформление, картинки и аналитику — всё в одном окне.</p>
+              <p style="margin:0 0 12px 0; font-size:16px; line-height:24px; font-weight:600; color:#1b1b28;">С чего начать:</p>
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 28px 0;">
+                <tr><td style="padding:0 0 8px 0; font-size:16px; line-height:24px; color:#3a3a4a;">&bull;&nbsp;&nbsp;Подключите канал MAX</td></tr>
+                <tr><td style="padding:0 0 8px 0; font-size:16px; line-height:24px; color:#3a3a4a;">&bull;&nbsp;&nbsp;Напишите первый пост в редакторе с живым предпросмотром</td></tr>
+                <tr><td style="padding:0; font-size:16px; line-height:24px; color:#3a3a4a;">&bull;&nbsp;&nbsp;Поставьте его в расписание — сервис опубликует сам</td></tr>
+              </table>
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="border-radius:10px; background-color:#5838e8;">
+                    <a href="{{.AppURL}}" style="display:inline-block; padding:14px 30px; font-size:16px; line-height:20px; font-weight:600; color:#ffffff; text-decoration:none; border-radius:10px;">Создать первый пост</a>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:28px 0 0 0; font-size:15px; line-height:23px; color:#3a3a4a;">Если что-то не получается — просто ответьте на это письмо, мы читаем всё.</p>
+              <p style="margin:16px 0 0 0; font-size:15px; line-height:23px; color:#3a3a4a;">— Команда MaxPosty</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 24px 0 24px;">
+              <p style="margin:0; font-size:13px; line-height:20px; color:#9797a8;">MaxPosty — сервис для ведения каналов в MAX. <a href="{{.SiteURL}}" style="color:#5838e8; text-decoration:none;">{{.SiteURL}}</a> &middot; Вы получили это письмо, потому что зарегистрировались на MaxPosty.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

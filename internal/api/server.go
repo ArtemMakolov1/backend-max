@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"maxpilot/backend/internal/app"
+	"maxpilot/backend/internal/email"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/openaiimg"
@@ -32,37 +33,48 @@ type YandexOAuthClient interface {
 }
 
 type AuthOptions struct {
-	YandexClient        YandexOAuthClient
-	RedirectURI         string
-	AllowedUsers        []string
-	ObservabilityAdmins []string
-	SessionTTL          time.Duration
-	SecureCookies       bool
-	TrustXRealIP        bool
-	RateLimitAtEdge     bool
-	AILimits            *AILimitOptions
-	Metrics             *observability.Metrics
+	YandexClient           YandexOAuthClient
+	RedirectURI            string
+	AllowedUsers           []string
+	ObservabilityAdmins    []string
+	SessionTTL             time.Duration
+	SecureCookies          bool
+	TrustXRealIP           bool
+	RateLimitAtEdge        bool
+	AILimits               *AILimitOptions
+	Metrics                *observability.Metrics
+	MaxOwnedTeamWorkspaces int
+	// WelcomeSender delivers the first-sign-in welcome email. When nil the
+	// server falls back to a NoopSender so sign-in never depends on SMTP.
+	WelcomeSender email.Sender
 }
 
 type Server struct {
-	app                 *app.App
-	logger              *slog.Logger
-	frontendOrigin      string
-	webhookSecret       string
-	yandexClient        YandexOAuthClient
-	yandexRedirect      string
-	yandexAllowed       map[string]struct{}
-	observabilityAdmins map[string]struct{}
-	sessionTTL          time.Duration
-	secureCookies       bool
-	oauthStartLimiter   *keyedWindowLimiter
-	aiLimiter           *aiRequestLimiter
-	trustXRealIP        bool
-	now                 func() time.Time
-	metrics             *observability.Metrics
-	activityMu          sync.Mutex
-	activityDay         string
-	activityUsers       map[string]struct{}
+	app                    *app.App
+	logger                 *slog.Logger
+	frontendOrigin         string
+	webhookSecret          string
+	yandexClient           YandexOAuthClient
+	yandexRedirect         string
+	yandexAllowed          map[string]struct{}
+	observabilityAdmins    map[string]struct{}
+	sessionTTL             time.Duration
+	secureCookies          bool
+	oauthStartLimiter      *keyedWindowLimiter
+	aiLimiter              *aiRequestLimiter
+	mediaUploads           *mediaUploadGate
+	trustXRealIP           bool
+	now                    func() time.Time
+	metrics                *observability.Metrics
+	activityMu             sync.Mutex
+	activityDay            string
+	activityUsers          map[string]struct{}
+	maxOwnedTeamWorkspaces int
+	welcomeSender          email.Sender
+	// welcomeEmailDispatch runs the welcome-email delivery closure. Production
+	// spawns a detached goroutine so it never blocks the OAuth redirect; tests
+	// override it to run synchronously for deterministic assertions.
+	welcomeEmailDispatch func(func())
 }
 
 type principalContextKey struct{}
@@ -78,7 +90,11 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		frontendOrigin: strings.TrimRight(frontendOrigin, "/"), webhookSecret: webhookSecret,
 		sessionTTL:        12 * time.Hour,
 		oauthStartLimiter: newKeyedWindowLimiter(12, 600, time.Minute, 4096), now: time.Now,
+		mediaUploads:        newMediaUploadGate(8, 2),
 		observabilityAdmins: make(map[string]struct{}), activityUsers: make(map[string]struct{}),
+		maxOwnedTeamWorkspaces: 5,
+		welcomeSender:          email.NewNoopSender(logger),
+		welcomeEmailDispatch:   func(deliver func()) { go deliver() },
 	}
 	if len(authOptions) != 0 {
 		options := authOptions[0]
@@ -109,6 +125,12 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		if options.Metrics != nil {
 			metrics = options.Metrics
 		}
+		if options.MaxOwnedTeamWorkspaces > 0 {
+			server.maxOwnedTeamWorkspaces = options.MaxOwnedTeamWorkspaces
+		}
+		if options.WelcomeSender != nil {
+			server.welcomeSender = options.WelcomeSender
+		}
 	}
 	server.metrics = metrics
 	server.aiLimiter = newAIRequestLimiter(application.Store(), logger, aiLimits)
@@ -127,6 +149,7 @@ func (s *Server) Handler() http.Handler {
 	router.With(s.requireSession).Get("/media/{filename}", s.serveMedia)
 	router.Route("/api/v1", func(r chi.Router) {
 		r.Get("/health", s.health)
+		r.Get("/plans", s.listPublicBillingPlans)
 		r.Post("/webhooks/max", s.maxWebhook)
 		r.Get("/auth/session", s.authSession)
 		r.Post("/auth/yandex/start", s.startYandexAuth)
@@ -140,6 +163,78 @@ func (s *Server) Handler() http.Handler {
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireSession)
 
+			r.Get("/workspaces", s.listWorkspaces)
+			r.Post("/workspaces", s.createWorkspace)
+			r.Post("/workspace-invitations/{token}/accept", s.acceptWorkspaceInvitation)
+			r.Route("/workspaces/{workspace_id}", func(r chi.Router) {
+				r.Get("/", s.getWorkspace)
+				r.Get("/billing", s.getWorkspaceBilling)
+				r.Patch("/", s.updateWorkspace)
+				r.Delete("/", s.deleteWorkspace)
+				s.RegisterWorkspaceBrandRoutes(r)
+				s.RegisterAnalyticsContentRoutes(r)
+				s.registerCampaignRoutes(r)
+				r.Post("/transfer-ownership", s.transferWorkspaceOwnership)
+				r.Get("/members", s.listWorkspaceMembers)
+				r.Post("/members", s.addWorkspaceMember)
+				r.Patch("/members/{user_id}", s.updateWorkspaceMember)
+				r.Delete("/members/{user_id}", s.removeWorkspaceMember)
+				r.Get("/invitations", s.listWorkspaceInvitations)
+				r.Post("/invitations", s.createWorkspaceInvitation)
+				r.Delete("/invitations/{invitation_id}", s.revokeWorkspaceInvitation)
+				r.Get("/audit", s.listWorkspaceAudit)
+				r.Get("/channels", s.listWorkspaceChannels)
+				r.Post("/channels", s.startChannelConnect)
+				r.Post("/channels/connect/start", s.startChannelConnect)
+				r.Get("/channels/connect/{claim_id}", s.getChannelConnect)
+				r.Get("/channels/{channel_id}", s.getWorkspaceChannel)
+				r.Patch("/channels/{channel_id}", s.updateWorkspaceChannel)
+				r.Post("/channels/{channel_id}/max-info", s.updateWorkspaceChannelMAXInfo)
+				r.Delete("/channels/{channel_id}", s.deleteWorkspaceChannel)
+				r.Get("/posts", s.listWorkspacePosts)
+				r.Post("/posts", s.createWorkspacePost)
+				r.Post("/posts/format-content", s.formatWorkspacePostContent)
+				r.Post("/posts/suggest-image-prompt", s.suggestWorkspaceImagePrompt)
+				r.Post("/research/generate", s.generateWorkspaceResearch)
+				r.Post("/images/generate", s.generateWorkspaceImage)
+				r.Post("/media", s.uploadWorkspaceMedia)
+				r.Get("/media/{filename}", s.serveWorkspaceMedia)
+				r.Get("/posts/{post_id}", s.getWorkspacePost)
+				r.Patch("/posts/{post_id}", s.updateWorkspacePost)
+				r.Put("/posts/{post_id}", s.updateWorkspacePost)
+				r.Delete("/posts/{post_id}", s.deleteWorkspacePost)
+				r.Post("/posts/{post_id}/duplicate", s.duplicateWorkspacePost)
+				r.Post("/posts/{post_id}/schedule", s.scheduleWorkspacePost)
+				r.Delete("/posts/{post_id}/schedule", s.cancelWorkspaceSchedule)
+				r.Post("/posts/{post_id}/publish", s.publishWorkspacePost)
+				r.Post("/posts/{post_id}/update-published", s.updateWorkspacePublishedPost)
+				r.Post("/posts/{post_id}/sync-max", s.syncWorkspaceMAXPublication)
+				r.Post("/posts/{post_id}/pin", s.pinWorkspacePost)
+				r.Delete("/posts/{post_id}/pin", s.unpinWorkspacePost)
+				r.Delete("/posts/{post_id}/publication", s.deleteWorkspacePublication)
+				r.Get("/posts/{post_id}/view-history", s.getWorkspacePostViewHistory)
+				r.Post("/posts/{post_id}/image", s.uploadWorkspacePostImage)
+				r.Post("/posts/{post_id}/generate-image", s.generateWorkspacePostImage)
+				r.Post("/posts/{post_id}/attachments", s.uploadWorkspacePostAttachment)
+				r.Put("/posts/{post_id}/attachments/{attachment_id}", s.replaceWorkspacePostAttachment)
+				r.Patch("/posts/{post_id}/attachments/order", s.reorderWorkspacePostAttachments)
+				r.Delete("/posts/{post_id}/attachments/{attachment_id}", s.deleteWorkspacePostAttachment)
+				r.Get("/posts/{post_id}/revisions", s.listPostRevisions)
+				r.Get("/posts/{post_id}/reviews", s.listPostReviews)
+				r.Post("/posts/{post_id}/review", s.submitPostReview)
+				r.Post("/posts/{post_id}/review/submit", s.submitPostReview)
+				r.Post("/posts/{post_id}/review/approve", s.approvePostReview)
+				r.Post("/posts/{post_id}/review/request-changes", s.requestPostChanges)
+				r.Post("/posts/{post_id}/reviews/{revision_id}/decision", s.decidePostReview)
+				r.Get("/posts/{post_id}/comments", s.listPostComments)
+				r.Post("/posts/{post_id}/comments", s.createPostComment)
+				r.Patch("/posts/{post_id}/comments/{comment_id}", s.resolvePostComment)
+				r.Delete("/posts/{post_id}/comments/{comment_id}", s.deletePostComment)
+			})
+			r.Get("/notifications", s.listNotifications)
+			r.Patch("/notifications", s.markAllNotificationsRead)
+			r.Patch("/notifications/{notification_id}", s.markNotificationRead)
+
 			r.Get("/channels", s.listChannels)
 			r.Get("/channels/discoverable", s.listDiscoverableChannels)
 			r.Post("/channels/discoverable/refresh", s.refreshDiscoverableChannels)
@@ -150,6 +245,7 @@ func (s *Server) Handler() http.Handler {
 			r.Patch("/channels/{id}", s.updateChannel)
 			r.Put("/channels/{id}", s.updateChannel)
 			r.Delete("/channels/{id}", s.deleteChannel)
+			r.Post("/channels/{id}/max-info", s.updateChannelMAXInfo)
 			r.Post("/channels/{id}/test", s.testChannel)
 			r.Get("/channels/{id}/participant-history", s.getChannelParticipantHistory)
 			r.Get("/analytics", s.getAnalytics)
@@ -157,12 +253,17 @@ func (s *Server) Handler() http.Handler {
 			r.Get("/posts", s.listPosts)
 			r.Post("/posts", s.createPost)
 			r.Post("/posts/format-content", s.formatPostContent)
+			r.Post("/posts/suggest-image-prompt", s.suggestImagePrompt)
 			r.Get("/posts/{id}", s.getPost)
 			r.Patch("/posts/{id}", s.updatePost)
 			r.Put("/posts/{id}", s.updatePost)
 			r.Delete("/posts/{id}", s.deletePost)
 			r.Post("/posts/{id}/duplicate", s.duplicatePost)
 			r.Post("/posts/{id}/image", s.uploadPostImage)
+			r.Post("/posts/{id}/attachments", s.uploadPostAttachment)
+			r.Put("/posts/{id}/attachments/{attachment_id}", s.replacePostAttachment)
+			r.Patch("/posts/{id}/attachments/order", s.reorderPostAttachments)
+			r.Delete("/posts/{id}/attachments/{attachment_id}", s.deletePostAttachment)
 			r.Post("/posts/{id}/generate-image", s.generatePostImage)
 			r.Post("/posts/{id}/schedule", s.schedulePost)
 			r.Put("/posts/{id}/schedule", s.schedulePost)
@@ -414,6 +515,13 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	if err == nil {
 		return
 	}
+	var planInactiveErr *store.WorkspacePlanInactiveError
+	if errors.As(err, &planInactiveErr) {
+		w.Header().Set("Cache-Control", "no-store")
+		s.problem(w, http.StatusForbidden, "plan_inactive",
+			"Workspace plan is inactive.", map[string]any{"status": planInactiveErr.Status})
+		return
+	}
 	var aiLimitErr *store.AILimitError
 	if errors.As(err, &aiLimitErr) {
 		retryAfter := retryAfterSeconds(aiLimitErr.RetryAfter)
@@ -445,6 +553,26 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, app.ErrApprovalRequired):
+		s.problem(w, http.StatusConflict, "post_approval_required",
+			"The current post revision must be approved before scheduling or publishing.", nil)
+	case errors.Is(err, app.ErrNotEnoughPostsForBrandKit):
+		s.problem(w, http.StatusConflict, "not_enough_posts",
+			"Недостаточно постов с текстом для автозаполнения Brand Kit. Создайте хотя бы 3 поста с текстом и попробуйте ещё раз.", nil)
+	case errors.Is(err, errMediaUploadRateLimited):
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		s.problem(w, http.StatusTooManyRequests, "media_upload_busy",
+			"Другая загрузка изображения ещё выполняется. Повторите через несколько секунд.", nil)
+	case errors.Is(err, store.ErrMediaQuotaExceeded):
+		s.problem(w, http.StatusRequestEntityTooLarge, "media_quota_exceeded",
+			"Хранилище изображений заполнено. Удалите ненужные черновики с изображениями и попробуйте ещё раз.", nil)
+	case errors.Is(err, store.ErrMediaUploadBusy):
+		s.problem(w, http.StatusConflict, "media_upload_in_progress",
+			"Это изображение уже загружается. Подождите несколько секунд и попробуйте ещё раз.", nil)
+	case errors.Is(err, store.ErrOwnedTeamWorkspaceLimit):
+		s.problem(w, http.StatusConflict, "workspace_owner_limit_reached",
+			"Team workspace ownership limit reached. Transfer ownership before creating or accepting another workspace; archived workspaces still retain their storage.", nil)
 	case errors.Is(err, store.ErrNotFound):
 		s.problem(w, http.StatusNotFound, "not_found", "Запрошенные данные не найдены.", nil)
 	case errors.Is(err, store.ErrConflict):
@@ -506,7 +634,7 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 				"Исследование с ИИ сейчас недоступно. Попробуйте позже.", nil)
 			return
 		}
-		if isValidationError(err) {
+		if errors.Is(err, errValidation) || isValidationError(err) {
 			s.logger.Info("request validation failed", "error", err)
 			s.problem(w, http.StatusBadRequest, "validation_error",
 				"Проверьте заполнение полей и попробуйте ещё раз.", nil)
@@ -533,9 +661,27 @@ func storeConflictMessage(err error) string {
 func parseID(r *http.Request) (int64, error) {
 	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 	if err != nil || id <= 0 {
-		return 0, errors.New("id must be a positive integer")
+		return 0, validationError("id must be a positive integer")
 	}
 	return id, nil
+}
+
+// errValidation is a typed sentinel for client-facing validation failures.
+// Handlers wrap human-readable messages with validationError so writeError
+// classifies them as HTTP 400 validation_error via errors.Is instead of the
+// legacy substring heuristic in isValidationError, which remains a fallback
+// for errors produced by lower layers.
+var errValidation = errors.New("request validation failed")
+
+type validationFailure struct{ message string }
+
+func (e validationFailure) Error() string { return e.message }
+
+func (validationFailure) Is(target error) bool { return target == errValidation }
+
+// validationError marks message as a request validation failure.
+func validationError(message string) error {
+	return validationFailure{message: message}
 }
 
 func isValidationError(err error) bool {

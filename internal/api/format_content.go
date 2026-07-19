@@ -26,7 +26,9 @@ func (s *Server) formatPostContent(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, app.ErrResearchNotConfigured)
 		return
 	}
-	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationResearch, s.now().UTC())
+	release, err := s.aiLimiter.acquireMetric(
+		r.Context(), userID, store.AIOperationResearch,
+		store.UsageMetricAIFormatRequests, 1, s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)
 		return

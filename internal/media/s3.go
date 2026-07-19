@@ -270,8 +270,56 @@ func (b *s3Backend) Open(ctx context.Context, key string) (Object, error) {
 	}
 	return Object{
 		Body: result.Body, Filename: key, MIMEType: aws.ToString(result.ContentType),
-		Size: aws.ToInt64(result.ContentLength), LastModified: aws.ToTime(result.LastModified),
+		Size: aws.ToInt64(result.ContentLength), TotalSize: aws.ToInt64(result.ContentLength),
+		LastModified: aws.ToTime(result.LastModified),
 	}, nil
+}
+
+func (b *s3Backend) OpenRange(ctx context.Context, key string, start, end int64) (Object, error) {
+	if !validFilename(key) {
+		return Object{}, errors.New("invalid media filename")
+	}
+	info, err := b.Head(ctx, key)
+	if err != nil {
+		return Object{}, err
+	}
+	if start < 0 || start >= info.Size || end < start {
+		return Object{}, ErrRangeNotSatisfiable
+	}
+	if end >= info.Size {
+		end = info.Size - 1
+	}
+	result, err := b.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(b.bucket), Key: aws.String(key), Range: aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+	})
+	if err != nil {
+		if isS3NotFound(err) {
+			return Object{}, os.ErrNotExist
+		}
+		if isS3RangeNotSatisfiable(err) {
+			return Object{}, ErrRangeNotSatisfiable
+		}
+		return Object{}, fmt.Errorf("get S3 object range: %w", err)
+	}
+	length := end - start + 1
+	return Object{
+		Body: result.Body, Filename: key, MIMEType: strings.TrimSpace(aws.ToString(result.ContentType)),
+		Size: length, TotalSize: info.Size, LastModified: info.LastModified,
+	}, nil
+}
+
+func (b *s3Backend) Delete(ctx context.Context, key string) error {
+	if !validFilename(key) {
+		return errors.New("invalid media filename")
+	}
+	_, err := b.client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(b.bucket), Key: aws.String(key)})
+	if err != nil {
+		if isS3NotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete S3 object: %w", err)
+	}
+	return nil
 }
 
 func isS3NotFound(err error) bool {
@@ -284,6 +332,17 @@ func isS3NotFound(err error) bool {
 	if errors.As(err, &apiError) {
 		switch strings.ToLower(apiError.ErrorCode()) {
 		case "nosuchkey", "notfound", "404":
+			return true
+		}
+	}
+	return false
+}
+
+func isS3RangeNotSatisfiable(err error) bool {
+	var apiError smithy.APIError
+	if errors.As(err, &apiError) {
+		switch strings.ToLower(apiError.ErrorCode()) {
+		case "invalidrange", "requestedrangenotsatisfiable", "416":
 			return true
 		}
 	}

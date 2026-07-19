@@ -17,6 +17,7 @@ const (
 
 	AILimitReasonMinute      = "minute"
 	AILimitReasonDay         = "day"
+	AILimitReasonMonthly     = "monthly"
 	AILimitReasonConcurrency = "concurrency"
 	AILimitReasonGlobal      = "global_concurrency"
 
@@ -61,10 +62,11 @@ func (l AILimits) Validate() error {
 }
 
 type AILease struct {
-	ID        string
-	UserID    string
-	Operation string
-	ExpiresAt time.Time
+	ID          string
+	UserID      string
+	WorkspaceID string
+	Operation   string
+	ExpiresAt   time.Time
 }
 
 // AILimitError is safe to expose as an HTTP 429. RetryAfter is the earliest
@@ -86,6 +88,24 @@ func (e *AILimitError) Error() string {
 // lock serializes one user+operation across server replicas and is compatible
 // with PgBouncer transaction pooling.
 func (s *Store) AcquireAILease(ctx context.Context, userID, operation string, limits AILimits, now time.Time) (AILease, error) {
+	return s.acquireAILease(ctx, userID, operation, "", 1, false, limits, now)
+}
+
+// AcquireAILeaseWithMonthlyUsage preserves the legacy per-user minute/day
+// buckets while charging the user's personal workspace monthly ledger in the
+// same transaction. This is used by both legacy and nested personal routes so
+// switching URL families cannot bypass plan accounting.
+func (s *Store) AcquireAILeaseWithMonthlyUsage(
+	ctx context.Context, userID, operation, monthlyMetric string,
+	amount int64, enforceMonthly bool, limits AILimits, now time.Time,
+) (AILease, error) {
+	return s.acquireAILease(ctx, userID, operation, monthlyMetric, amount, enforceMonthly, limits, now)
+}
+
+func (s *Store) acquireAILease(
+	ctx context.Context, userID, operation, monthlyMetric string,
+	amount int64, enforceMonthly bool, limits AILimits, now time.Time,
+) (AILease, error) {
 	if s == nil || s.db == nil {
 		return AILease{}, errors.New("store is required")
 	}
@@ -100,6 +120,9 @@ func (s *Store) AcquireAILease(ctx context.Context, userID, operation string, li
 	}
 	if now.IsZero() {
 		return AILease{}, errors.New("AI lease time is required")
+	}
+	if amount <= 0 {
+		return AILease{}, errors.New("AI monthly usage amount must be positive")
 	}
 
 	leaseID, err := randomAILeaseID()
@@ -157,6 +180,27 @@ WHERE owner_id = $1 AND operation = $2 AND expires_at > $3`, userID, operation, 
 	}
 	if minuteUsed >= limits.PerMinute {
 		return AILease{}, &AILimitError{Reason: AILimitReasonMinute, RetryAfter: positiveRetryAfter(minuteStart.Add(time.Minute).Sub(now))}
+	}
+
+	var workspaceID string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM workspaces
+WHERE owner_user_id=$1 AND is_personal=TRUE AND archived_at IS NULL`, userID).Scan(&workspaceID); err != nil {
+		return AILease{}, fmt.Errorf("resolve personal workspace for AI usage: %w", err)
+	}
+	if monthlyMetric == "" {
+		monthlyMetric, err = monthlyUsageMetricForAIOperation(operation)
+		if err != nil {
+			return AILease{}, err
+		}
+	}
+	if _, err := chargeWorkspaceMonthlyUsageTx(
+		ctx, tx, workspaceID, monthlyMetric, amount, enforceMonthly, now,
+	); err != nil {
+		var usageLimit *WorkspaceUsageLimitError
+		if errors.As(err, &usageLimit) {
+			return AILease{}, &AILimitError{Reason: AILimitReasonMonthly, RetryAfter: usageLimit.RetryAfter}
+		}
+		return AILease{}, fmt.Errorf("charge personal workspace monthly AI usage: %w", err)
 	}
 
 	if err := writeAIUsageBucket(ctx, tx, userID, operation, "day", dayStart, dayUsed+1, now); err != nil {

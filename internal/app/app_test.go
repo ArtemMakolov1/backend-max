@@ -72,6 +72,7 @@ type fakeMAX struct {
 	lastPublishRequest maxclient.PublishRequest
 	lastEditRequest    maxclient.EditRequest
 	publishMessage     maxclient.Message
+	publishFn          func(context.Context, maxclient.PublishRequest) (maxclient.Message, error)
 	message            maxclient.Message
 	pinnedMessage      *maxclient.Message
 	getMessageErr      error
@@ -79,10 +80,15 @@ type fakeMAX struct {
 	getPinnedErr       error
 	editErr            error
 	deleteErr          error
+	uploadImageFn      func(context.Context, string, io.Reader) (maxclient.UploadResult, error)
 	getMessageCalls    int
 	getPinnedCalls     int
 	pinCalls           int
 	unpinCalls         int
+	editChatCalls      int
+	editChatErr        error
+	lastEditChatID     string
+	lastChatPatch      maxclient.ChatPatch
 }
 
 type blockingRefreshMAX struct {
@@ -146,6 +152,8 @@ func (m *recordingMetrics) ObserveSchedulerCycle(time.Duration, time.Time) {
 
 func (m *recordingMetrics) AddRecoveredPublications(int64) {}
 
+func (m *recordingMetrics) ObserveMediaOperation(string, string) {}
+
 func (f *fakeMAX) GetMe(context.Context) (maxclient.BotInfo, error) {
 	return maxclient.BotInfo{UserID: 1, Username: "studio_bot", IsBot: true}, nil
 }
@@ -161,6 +169,26 @@ func (f *fakeMAX) GetChat(_ context.Context, chatID string) (maxclient.ChatInfo,
 	if chat.OwnerID == "" {
 		chat.OwnerID = "test-max-owner"
 	}
+	return chat, nil
+}
+func (f *fakeMAX) EditChat(_ context.Context, chatID string, patch maxclient.ChatPatch) (maxclient.ChatInfo, error) {
+	f.editChatCalls++
+	f.lastEditChatID = chatID
+	f.lastChatPatch = patch
+	if f.editChatErr != nil {
+		return maxclient.ChatInfo{}, f.editChatErr
+	}
+	chat := f.chat
+	if chat.OwnerID == "" {
+		chat.OwnerID = "test-max-owner"
+	}
+	if patch.Title != nil {
+		chat.Title = *patch.Title
+	}
+	if patch.IconToken != "" {
+		chat.Icon = maxclient.ChatIcon{URL: "https://cdn.max.ru/icons/" + patch.IconToken + ".png"}
+	}
+	f.chat = chat
 	return chat, nil
 }
 func (f *fakeMAX) GetChatAdmins(context.Context, string) ([]maxclient.ChatMember, error) {
@@ -210,13 +238,19 @@ func (f *fakeMAX) SendClaimConfirmation(context.Context, string, string, string,
 	return nil
 }
 func (f *fakeMAX) AnswerCallback(context.Context, string, string, string) error { return nil }
-func (f *fakeMAX) UploadImage(context.Context, string, io.Reader) (maxclient.UploadResult, error) {
+func (f *fakeMAX) UploadImage(ctx context.Context, filename string, content io.Reader) (maxclient.UploadResult, error) {
 	f.uploadCalls++
+	if f.uploadImageFn != nil {
+		return f.uploadImageFn(ctx, filename, content)
+	}
 	return maxclient.UploadResult{Token: "image-token"}, nil
 }
-func (f *fakeMAX) Publish(_ context.Context, request maxclient.PublishRequest) (maxclient.Message, error) {
+func (f *fakeMAX) Publish(ctx context.Context, request maxclient.PublishRequest) (maxclient.Message, error) {
 	f.publishCalls++
 	f.lastPublishRequest = request
+	if f.publishFn != nil {
+		return f.publishFn(ctx, request)
+	}
 	if f.publishMessage.MessageID != "" {
 		return f.publishMessage, nil
 	}
@@ -394,6 +428,40 @@ func TestChannelParticipantStatsWorkerRefreshesAndBacksOffWithoutMembershipLooku
 	stored, err = storage.GetChannel(context.Background(), channel.ID)
 	if err != nil || stored.ParticipantsCount != 88 {
 		t.Fatalf("ownership mismatch changed participant count: %#v, %v", stored, err)
+	}
+}
+
+func TestChannelParticipantStatsWorkerRefreshesTeamWorkspace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2041, time.September, 3, 10, 0, 0, 0, time.UTC)
+	fake := &fakeMAX{chat: maxclient.ChatInfo{
+		ChatID: "-team-125", OwnerID: "team-max-owner", Type: "channel", Status: "active", Title: "Team channel",
+		Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/channels/team-worker.png"}, ParticipantsCount: 144,
+	}}
+	application, storage := newTestApp(t, fake)
+	application.now = func() time.Time { return now }
+	if err := storage.UpsertUser(ctx, store.User{ID: "participants-team-owner", DisplayName: "Team owner"}); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := storage.CreateWorkspace(ctx, "participants-team-owner", store.Workspace{Name: "Participants team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, err := storage.CreateChannelForWorkspace(ctx, "participants-team-owner", workspace.ID, store.Channel{
+		VerifiedMAXOwnerID: fake.chat.OwnerID, MAXChatID: fake.chat.ChatID, Title: fake.chat.Title,
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application.syncDueChannelParticipantStats(ctx, now)
+	stored, err := storage.GetChannelForWorkspace(ctx, "participants-team-owner", workspace.ID, channel.ID)
+	if err != nil || stored.ParticipantsCount != fake.chat.ParticipantsCount || stored.IconURL != fake.chat.Icon.URL {
+		t.Fatalf("team participant worker channel = %#v, %v", stored, err)
+	}
+	if fake.getChatCalls != 1 {
+		t.Fatalf("team participant worker MAX calls = %d", fake.getChatCalls)
 	}
 }
 
@@ -1187,6 +1255,234 @@ func TestSelectedCalendarPostSkippedAfterPostponeOrCancel(t *testing.T) {
 	}
 }
 
+func TestScheduledPublicationCanceledBeforeSendReturnsToCalendar(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "91", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{
+			IsAdmin:     true,
+			Permissions: []maxclient.Permission{maxclient.PermissionReadAllMessages, maxclient.PermissionWrite},
+		},
+	}
+	// The cancellation lands during the channel preflight, before the message
+	// request is handed to MAX, so an automatic retry cannot duplicate it.
+	fake.getChatFn = func(string) (maxclient.ChatInfo, error) {
+		return maxclient.ChatInfo{}, context.Canceled
+	}
+	application, storage := newTestApp(t, fake)
+	now := time.Date(2035, time.March, 4, 10, 0, 0, 0, time.UTC)
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{
+		MAXChatID: "91", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(context.Background(), store.Post{
+		Title: "Interrupted", Content: "body", Format: store.FormatMarkdown, ChannelID: &channel.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err = storage.SetPostScheduled(context.Background(), post.ID, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalSlot := *post.ScheduledAt
+
+	published, err := application.publishScheduledPost(context.Background(), post.ID, now)
+	if published || !errors.Is(err, context.Canceled) {
+		t.Fatalf("publishScheduledPost() = %v, %v; want canceled publication", published, err)
+	}
+	if fake.publishCalls != 0 {
+		t.Fatalf("interrupted preflight reached MAX: publish calls = %d", fake.publishCalls)
+	}
+	post, err = storage.GetPost(context.Background(), post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.Status != store.PostStatusScheduled || post.ScheduledAt == nil ||
+		!post.ScheduledAt.Equal(originalSlot) || post.LastError != "" {
+		t.Fatalf("post after interrupted publication = %#v", post)
+	}
+}
+
+func TestScheduledPublicationCanceledAfterSendStaysFailed(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "93", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{
+			IsAdmin:     true,
+			Permissions: []maxclient.Permission{maxclient.PermissionReadAllMessages, maxclient.PermissionWrite},
+		},
+	}
+	// The cancellation lands after the message request went out, so the post
+	// may already be in the channel. Restoring the schedule here would retry
+	// automatically and could duplicate the publication; the post must stay
+	// failed with last_error for a human to resolve.
+	fake.publishFn = func(context.Context, maxclient.PublishRequest) (maxclient.Message, error) {
+		return maxclient.Message{}, context.Canceled
+	}
+	application, storage := newTestApp(t, fake)
+	now := time.Date(2035, time.March, 4, 10, 0, 0, 0, time.UTC)
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{
+		MAXChatID: "93", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(context.Background(), store.Post{
+		Title: "Interrupted send", Content: "body", Format: store.FormatMarkdown, ChannelID: &channel.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.SetPostScheduled(context.Background(), post.ID, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	published, err := application.publishScheduledPost(context.Background(), post.ID, now)
+	if published || !errors.Is(err, context.Canceled) {
+		t.Fatalf("publishScheduledPost() = %v, %v; want canceled publication", published, err)
+	}
+	if fake.publishCalls != 1 {
+		t.Fatalf("MAX publish calls = %d, want 1", fake.publishCalls)
+	}
+	post, err = storage.GetPost(context.Background(), post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if post.Status != store.PostStatusFailed || post.ScheduledAt != nil || post.LastError == "" {
+		t.Fatalf("post after interrupted send = %#v", post)
+	}
+}
+
+func TestPublishDueAtCompletesInFlightPublicationAfterStopSignal(t *testing.T) {
+	t.Parallel()
+	fake := &fakeMAX{
+		chat: maxclient.ChatInfo{ChatID: "92", Type: "channel", Status: "active", Title: "Channel"},
+		membership: maxclient.Membership{
+			IsAdmin:     true,
+			Permissions: []maxclient.Permission{maxclient.PermissionReadAllMessages, maxclient.PermissionWrite},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fake.publishFn = func(publishCtx context.Context, _ maxclient.PublishRequest) (maxclient.Message, error) {
+		// A stop signal arrives while the message is in flight. The
+		// publication context must stay alive so the post is not aborted
+		// halfway and marked failed (or duplicated after a manual retry).
+		cancel()
+		if err := publishCtx.Err(); err != nil {
+			return maxclient.Message{}, err
+		}
+		return maxclient.Message{MessageID: "mid-shutdown"}, nil
+	}
+	application, storage := newTestApp(t, fake)
+	now := time.Date(2035, time.April, 5, 11, 0, 0, 0, time.UTC)
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{
+		MAXChatID: "92", Title: "Channel", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePost(context.Background(), store.Post{
+		Title: "Deploy window", Content: "body", Format: store.FormatMarkdown, ChannelID: &channel.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.SetPostScheduled(context.Background(), post.ID, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	application.publishDueAt(ctx, now)
+
+	published, err := storage.GetPost(context.Background(), post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.Status != store.PostStatusPublished || published.MAXMessageID != "mid-shutdown" {
+		t.Fatalf("post after stop mid-publication = %#v", published)
+	}
+	if fake.publishCalls != 1 {
+		t.Fatalf("MAX publish calls = %d, want 1", fake.publishCalls)
+	}
+}
+
+func TestScheduledPostWithRevokedApprovalLeavesCalendar(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fake := &fakeMAX{}
+	application, storage := newTestApp(t, fake)
+	for _, user := range []store.User{
+		{ID: "revoked-owner", Email: "revoked-owner@example.test", DisplayName: "Owner"},
+		{ID: "revoked-reviewer", Email: "revoked-reviewer@example.test", DisplayName: "Reviewer"},
+	} {
+		if err := storage.UpsertUser(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspace, err := storage.CreateWorkspace(ctx, "revoked-owner", store.Workspace{Name: "Approval calendar"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.AddWorkspaceMember(ctx, "revoked-owner", store.WorkspaceMember{
+		WorkspaceID: workspace.ID, UserID: "revoked-reviewer", Role: store.WorkspaceRoleApprover,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePostForWorkspace(ctx, "revoked-owner", workspace.ID, store.Post{
+		Title: "Due without approval", Content: "Original", Format: store.FormatMarkdown,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := storage.SubmitPostForReview(ctx, "revoked-owner", workspace.ID, post.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.DecidePostReview(ctx, "revoked-reviewer", workspace.ID, post.ID, revision.ID,
+		store.ReviewDecisionApproved, "OK", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	approved, err := storage.GetPostForWorkspace(ctx, "revoked-owner", workspace.ID, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := "Edited after approval"
+	if _, err := storage.UpdatePostForWorkspaceIfUnchanged(ctx, "revoked-owner", workspace.ID, approved,
+		store.PostChanges{Content: &changed}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := storage.SetPostScheduled(ctx, post.ID, now.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	published, err := application.publishScheduledPost(ctx, post.ID, now)
+	if published || !errors.Is(err, ErrApprovalRequired) {
+		t.Fatalf("publishScheduledPost() = %v, %v; want ErrApprovalRequired", published, err)
+	}
+	unscheduled, err := storage.GetPost(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unscheduled.Status != store.PostStatusFailed || unscheduled.ScheduledAt != nil ||
+		!strings.Contains(unscheduled.LastError, "Согласование") {
+		t.Fatalf("unapproved due post = %#v", unscheduled)
+	}
+	due, err := storage.DuePostIDs(ctx, now.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("unapproved post is still selected for publication: %v", due)
+	}
+	if fake.publishCalls != 0 {
+		t.Fatalf("unapproved post reached MAX: %d publish calls", fake.publishCalls)
+	}
+}
+
 func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	t.Parallel()
 	fake := &fakeMAX{
@@ -1251,6 +1547,63 @@ func TestPublishAndEditCarryLinkButtonsWithReuploadedImage(t *testing.T) {
 	}
 	if fake.lastEditRequest.Notify != nil {
 		t.Fatalf("edit Notify = %#v, want omitted for channel publication", fake.lastEditRequest.Notify)
+	}
+}
+
+func TestPublishClaimRechecksApprovalAfterConcurrentEdit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fake := &fakeMAX{}
+	application, storage := newTestApp(t, fake)
+	for _, user := range []store.User{
+		{ID: "approval-owner", Email: "owner@example.test", DisplayName: "Owner"},
+		{ID: "approval-reviewer", Email: "reviewer@example.test", DisplayName: "Reviewer"},
+	} {
+		if err := storage.UpsertUser(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workspace, err := storage.CreateWorkspace(ctx, "approval-owner", store.Workspace{Name: "Approval team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.AddWorkspaceMember(ctx, "approval-owner", store.WorkspaceMember{
+		WorkspaceID: workspace.ID, UserID: "approval-reviewer", Role: store.WorkspaceRoleApprover,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	post, err := storage.CreatePostForWorkspace(ctx, "approval-owner", workspace.ID, store.Post{
+		Title: "Approved payload", Content: "Original", Format: store.FormatMarkdown,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := storage.SubmitPostForReview(ctx, "approval-owner", workspace.ID, post.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.DecidePostReview(ctx, "approval-reviewer", workspace.ID, post.ID, revision.ID,
+		store.ReviewDecisionApproved, "OK", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	approved, err := storage.GetPostForWorkspace(ctx, "approval-owner", workspace.ID, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := "Changed in the approval/claim window"
+	if _, err := storage.UpdatePostForWorkspaceIfUnchanged(ctx, "approval-owner", workspace.ID, approved,
+		store.PostChanges{Content: &changed}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := storage.ClaimForPublishing(ctx, post.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.publishClaimedPost(ctx, claimed, nil); !errors.Is(err, ErrApprovalRequired) {
+		t.Fatalf("publishClaimedPost() error = %v, want ErrApprovalRequired", err)
+	}
+	if fake.publishCalls != 0 {
+		t.Fatalf("stale approval reached MAX: publish calls = %d", fake.publishCalls)
 	}
 }
 
