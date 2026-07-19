@@ -5,6 +5,11 @@ repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 sandbox=$(mktemp -d)
 trap 'rm -rf "$sandbox"' EXIT
 
+for smtp_key in SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL SMTP_FROM_NAME; do
+  grep -F "          $smtp_key: \${{ secrets.$smtp_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+  grep -F "      $smtp_key: \${$smtp_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
+
 render_production() {
   local output=$1
   shift
@@ -46,7 +51,44 @@ grep -Fx 'MEDIA_CLEANUP_INTERVAL=15m' "$production_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=50' "$production_env" >/dev/null
 grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=5' "$production_env" >/dev/null
 grep -Fx 'BILLING_ENFORCEMENT_ENABLED=false' "$production_env" >/dev/null
+grep -Fx 'SMTP_HOST=' "$production_env" >/dev/null
+grep -Fx 'SMTP_PORT=587' "$production_env" >/dev/null
+grep -Fx 'SMTP_USERNAME=' "$production_env" >/dev/null
+grep -Fx 'SMTP_PASSWORD=' "$production_env" >/dev/null
+grep -Fx 'SMTP_FROM_EMAIL=' "$production_env" >/dev/null
+grep -Fx 'SMTP_FROM_NAME=MaxPosty' "$production_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$production_env"
+
+configured_smtp_env="$sandbox/configured-smtp.env"
+render_production "$configured_smtp_env" \
+  SMTP_HOST=smtp.example.test \
+  SMTP_PORT=587 \
+  SMTP_USERNAME=mailer@example.test \
+  SMTP_PASSWORD=test-smtp-password \
+  SMTP_FROM_EMAIL=noreply@example.test \
+  SMTP_FROM_NAME=MaxPosty
+grep -Fx 'SMTP_HOST=smtp.example.test' "$configured_smtp_env" >/dev/null
+grep -Fx 'SMTP_PORT=587' "$configured_smtp_env" >/dev/null
+grep -Fx 'SMTP_USERNAME=mailer@example.test' "$configured_smtp_env" >/dev/null
+grep -Fx 'SMTP_PASSWORD=test-smtp-password' "$configured_smtp_env" >/dev/null
+grep -Fx 'SMTP_FROM_EMAIL=noreply@example.test' "$configured_smtp_env" >/dev/null
+grep -Fx 'SMTP_FROM_NAME=MaxPosty' "$configured_smtp_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_smtp_env"
+
+if render_production "$sandbox/partial-smtp.env" SMTP_HOST=smtp.example.test >/dev/null 2>&1; then
+  echo "Production render accepted a partial SMTP configuration" >&2
+  exit 1
+fi
+
+if render_production "$sandbox/invalid-smtp-port.env" \
+  SMTP_HOST=smtp.example.test \
+  SMTP_PORT=70000 \
+  SMTP_USERNAME=mailer@example.test \
+  SMTP_PASSWORD=test-smtp-password \
+  SMTP_FROM_EMAIL=noreply@example.test >/dev/null 2>&1; then
+  echo "Production render accepted an invalid SMTP port" >&2
+  exit 1
+fi
 
 configured_s3_env="$sandbox/configured-s3.env"
 render_production "$configured_s3_env" S3_BUCKET=media.maxposty.ru S3_REGION=ru-1
@@ -206,9 +248,13 @@ env \
   S3_BUCKET=must-not-leak \
   S3_REGION=must-not-leak \
   OPENAI_API_KEY=must-not-leak \
+  SMTP_HOST=must-not-leak \
+  SMTP_USERNAME=must-not-leak \
+  SMTP_PASSWORD=must-not-leak \
+  SMTP_FROM_EMAIL=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY; do
+for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

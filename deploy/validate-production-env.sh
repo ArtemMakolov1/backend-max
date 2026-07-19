@@ -67,6 +67,7 @@ required_keys=(
   OPENAI_API_KEY OPENAI_API_BASE_URL OPENAI_IMAGE_MODEL
   OPENAI_RESEARCH_MODEL AI_GLOBAL_MAX_CONCURRENT AI_USER_MAX_CONCURRENT AI_IMAGE_PER_MINUTE AI_IMAGE_PER_DAY
   AI_RESEARCH_PER_MINUTE AI_RESEARCH_PER_DAY AI_LEASE_TTL BILLING_ENFORCEMENT_ENABLED SCHEDULER_INTERVAL BACKUP_RETENTION_DAYS PITR_RETENTION_DAYS
+  SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL SMTP_FROM_NAME
 )
 for key in "${required_keys[@]}"; do
   if ! has_key "$key"; then
@@ -201,6 +202,38 @@ if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]]; then
   exit 1
 fi
 
+smtp_port=$(env_value SMTP_PORT)
+if [[ ! "$smtp_port" =~ ^[1-9][0-9]*$ ]] || ((smtp_port > 65535)); then
+  echo "SMTP_PORT must be an integer between 1 and 65535" >&2
+  exit 1
+fi
+
+smtp_configured=false
+for key in SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+  if [[ -n "$(env_value "$key")" ]]; then
+    smtp_configured=true
+    break
+  fi
+done
+if [[ "$smtp_configured" == true ]]; then
+  for key in SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+    if [[ -z "$(env_value "$key")" ]]; then
+      echo "$key must not be empty when SMTP delivery is configured" >&2
+      exit 1
+    fi
+  done
+  smtp_host=$(env_value SMTP_HOST)
+  if [[ ! "$smtp_host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])$ ]] || [[ "$smtp_host" == *..* ]]; then
+    echo "SMTP_HOST must be a valid hostname" >&2
+    exit 1
+  fi
+  smtp_from_email=$(env_value SMTP_FROM_EMAIL)
+  if [[ ! "$smtp_from_email" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+    echo "SMTP_FROM_EMAIL must be a valid email address" >&2
+    exit 1
+  fi
+fi
+
 expect_exact() {
   local key=$1
   local expected=$2
@@ -229,7 +262,7 @@ case "$bootstrap_mode" in
     expect_exact PUBLIC_BASE_URL "http://178.159.94.83"
     expect_exact FRONTEND_ORIGIN "http://178.159.94.83"
     expect_exact GRAFANA_ROOT_URL "http://178.159.94.83/monitoring/"
-    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY; do
+    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
       if [[ -n "$(env_value "$key")" ]]; then
         echo "$key must be empty in fail-closed bootstrap mode" >&2
         exit 1
