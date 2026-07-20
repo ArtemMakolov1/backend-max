@@ -167,7 +167,9 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 		t.Fatalf("variation bypassed draft workflow: %#v", variationPayload.Post)
 	}
 
-	plannedAt := now.Add(7 * 24 * time.Hour).Format(time.RFC3339)
+	repeatNow := time.Now().UTC().Truncate(time.Second)
+	server.now = func() time.Time { return repeatNow }
+	plannedAt := repeatNow.Add(7 * 24 * time.Hour).Format(time.RFC3339)
 	repeat := performJSONRequest(editor, http.MethodPost,
 		base+"/analytics/content/posts/"+postID(primaryPost.ID)+"/repeat",
 		`{"planned_at":"`+plannedAt+`"}`)
@@ -186,7 +188,7 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 		t.Fatal(err)
 	}
 	if repeatPayload.Post.Status != store.PostStatusDraft || repeatPayload.Post.ScheduledAt != nil ||
-		!repeatPayload.RequiresApproval || !repeatPayload.PlannedAt.Equal(now.Add(7*24*time.Hour)) ||
+		!repeatPayload.RequiresApproval || !repeatPayload.PlannedAt.Equal(repeatNow.Add(7*24*time.Hour)) ||
 		repeatPayload.CampaignID == "" || repeatPayload.VariantID == "" ||
 		len(repeatPayload.Campaign.Variants) != 1 || repeatPayload.Campaign.Variants[0].PostID == nil ||
 		*repeatPayload.Campaign.Variants[0].PostID != repeatPayload.Post.ID {
@@ -196,7 +198,7 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 		t.Context(), "ws-editor", fixture.workspace.ID, repeatPayload.CampaignID,
 	)
 	if err != nil || len(persisted.Variants) != 1 ||
-		!persisted.Variants[0].PlannedAt.Equal(now.Add(7*24*time.Hour)) {
+		!persisted.Variants[0].PlannedAt.Equal(repeatNow.Add(7*24*time.Hour)) {
 		t.Fatalf("durable repeat plan = %#v err=%v", persisted, err)
 	}
 }

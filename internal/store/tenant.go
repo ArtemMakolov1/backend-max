@@ -18,6 +18,61 @@ public_link, requested_title, status, max_user_id, channel_id, error_code,
 requester_label, comparison_code, created_at, expires_at, consumed_at, updated_at`
 )
 
+// TouchObservedBotChat persists the authenticated lifecycle fact before any
+// MAX metadata enrichment is attempted. A bot_added event can arrive while the
+// bot is still only a subscriber, so owner/admin lookups are not guaranteed to
+// work yet. Existing verified metadata is deliberately preserved.
+func (s *Store) TouchObservedBotChat(ctx context.Context, maxChatID string, seenAt time.Time) error {
+	maxChatID = strings.TrimSpace(maxChatID)
+	if maxChatID == "" || seenAt.IsZero() {
+		return errors.New("observed MAX chat id and seen_at are required")
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO observed_bot_chats(max_chat_id, active, last_seen_at, removed_at)
+VALUES ($1,TRUE,$2,NULL)
+ON CONFLICT(max_chat_id) DO UPDATE SET active=TRUE,last_seen_at=excluded.last_seen_at,removed_at=NULL,
+max_owner_id=CASE WHEN observed_bot_chats.active THEN observed_bot_chats.max_owner_id ELSE '' END
+WHERE excluded.last_seen_at > observed_bot_chats.last_seen_at`, maxChatID, seenAt.UTC())
+	if err != nil {
+		return fmt.Errorf("touch observed MAX chat: %w", err)
+	}
+	return nil
+}
+
+// RefreshObservedBotChatMetadata enriches only a currently active lifecycle
+// row. In particular, an in-flight refresh that started before bot_removed must
+// never resurrect the channel after that removal has been stored.
+func (s *Store) RefreshObservedBotChatMetadata(ctx context.Context, chat ObservedBotChat) error {
+	if strings.TrimSpace(chat.MAXChatID) == "" || chat.LastSeenAt.IsZero() {
+		return errors.New("observed MAX chat id and last_seen_at are required")
+	}
+	_, err := s.db.ExecContext(ctx, `WITH refreshed_chat AS (
+UPDATE observed_bot_chats SET
+public_link=CASE WHEN trim($1)<>'' THEN $1 ELSE public_link END,
+title=CASE WHEN trim($2)<>'' THEN $2 ELSE title END,
+max_owner_id=CASE WHEN trim($3)<>'' THEN $3 ELSE max_owner_id END,
+icon_url=CASE WHEN trim($4)<>'' THEN $4 ELSE icon_url END,
+participants_count=CASE WHEN $5>0 THEN $5 ELSE participants_count END,
+last_seen_at=GREATEST(last_seen_at,$6)
+WHERE max_chat_id=$7 AND active AND $6>=last_seen_at
+RETURNING max_chat_id,public_link,title,max_owner_id,icon_url,participants_count,last_seen_at
+)
+UPDATE channels AS connected SET
+title=CASE WHEN trim(refreshed_chat.title)<>'' THEN refreshed_chat.title ELSE connected.title END,
+public_link=CASE WHEN trim(refreshed_chat.public_link)<>'' THEN refreshed_chat.public_link ELSE connected.public_link END,
+icon_url=refreshed_chat.icon_url,
+participants_count=refreshed_chat.participants_count,
+updated_at=refreshed_chat.last_seen_at
+FROM refreshed_chat
+WHERE connected.max_chat_id=refreshed_chat.max_chat_id
+  AND connected.verified_max_owner_id=refreshed_chat.max_owner_id
+  AND connected.updated_at<=refreshed_chat.last_seen_at`, chat.PublicLink, chat.Title, chat.MAXOwnerID,
+		chat.IconURL, chat.ParticipantsCount, chat.LastSeenAt.UTC(), chat.MAXChatID)
+	if err != nil {
+		return fmt.Errorf("refresh observed MAX chat metadata: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) UpsertObservedBotChat(ctx context.Context, chat ObservedBotChat) error {
 	if strings.TrimSpace(chat.MAXChatID) == "" || chat.LastSeenAt.IsZero() {
 		return errors.New("observed MAX chat id and last_seen_at are required")
@@ -34,6 +89,8 @@ ON CONFLICT(max_chat_id) DO UPDATE SET public_link=excluded.public_link, title=e
 max_owner_id=excluded.max_owner_id, icon_url=excluded.icon_url, participants_count=excluded.participants_count,
 active=excluded.active, last_seen_at=excluded.last_seen_at, removed_at=excluded.removed_at
 WHERE excluded.last_seen_at > observed_bot_chats.last_seen_at
+   OR (excluded.last_seen_at = observed_bot_chats.last_seen_at
+       AND observed_bot_chats.active AND observed_bot_chats.removed_at IS NULL)
 RETURNING max_chat_id, public_link, title, max_owner_id, icon_url, participants_count, last_seen_at
 )
 UPDATE channels AS connected SET

@@ -402,6 +402,13 @@ func (a *App) ObserveMAXChat(ctx context.Context, maxChatID string, active bool,
 	if !active {
 		return a.store.MarkObservedBotChatRemoved(ctx, maxChatID, now)
 	}
+	// Persist the authenticated bot_added/message_created lifecycle fact before
+	// enriching it. MAX may omit owner_id and refuse the administrators lookup
+	// until the helper is promoted from subscriber to administrator. Keeping the
+	// chat id lets a later refresh recover that normal two-step setup flow.
+	if err := a.store.TouchObservedBotChat(ctx, maxChatID, now); err != nil {
+		return err
+	}
 	info, err := a.max.GetChat(ctx, maxChatID)
 	if err != nil {
 		return err
@@ -552,7 +559,7 @@ func (a *App) RefreshDiscoverableChannelsForUser(ctx context.Context, userID str
 			}
 			return
 		}
-		if upsertErr := a.store.UpsertObservedBotChat(ctx, observed); upsertErr != nil {
+		if upsertErr := a.store.RefreshObservedBotChatMetadata(ctx, observed); upsertErr != nil {
 			if requesterOwned {
 				result.Failed++
 				if firstOwnedErr == nil {

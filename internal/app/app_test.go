@@ -626,15 +626,11 @@ func TestObserveMAXChatRejectsIncompleteOwnerAndMessageRetriesExistingIncomplete
 	if err := application.ObserveMAXChat(ctx, "100", true, eventAt); !errors.Is(err, ErrMAXChannelMetadataIncomplete) {
 		t.Fatalf("ObserveMAXChat() error = %v, want incomplete metadata", err)
 	}
-	if _, err := storage.GetActiveObservedBotChat(ctx, "", "100"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("incomplete lifecycle event entered inventory: %v", err)
+	observed, err := storage.GetActiveObservedBotChat(ctx, "", "100")
+	if err != nil || observed.MAXOwnerID != "" || !observed.Active {
+		t.Fatalf("incomplete lifecycle fact was not preserved: %#v, %v", observed, err)
 	}
 
-	if err := storage.UpsertObservedBotChat(ctx, store.ObservedBotChat{
-		MAXChatID: "100", Title: "Старое название", Active: true, LastSeenAt: eventAt,
-	}); err != nil {
-		t.Fatal(err)
-	}
 	fake.getChatFn = func(chatID string) (maxclient.ChatInfo, error) {
 		return maxclient.ChatInfo{
 			ChatID: chatID, OwnerID: "777", Type: "channel", Status: "active", Title: "Новое название",
@@ -644,12 +640,53 @@ func TestObserveMAXChatRejectsIncompleteOwnerAndMessageRetriesExistingIncomplete
 	if err := application.DiscoverMAXChatFromMessage(ctx, "100", eventAt.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	observed, err := storage.GetActiveObservedBotChat(ctx, "", "100")
+	observed, err = storage.GetActiveObservedBotChat(ctx, "", "100")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if observed.MAXOwnerID != "777" || observed.Title != "Новое название" || observed.IconURL != "https://cdn.max.ru/new.png" {
 		t.Fatalf("retried incomplete observation = %#v", observed)
+	}
+}
+
+func TestBotAddedAsSubscriberBeforeIdentityLinkIsRecoveredByRefresh(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	eventAt := time.Now().UTC().Truncate(time.Microsecond)
+	fake := &fakeMAX{
+		getChatFn: func(chatID string) (maxclient.ChatInfo, error) {
+			return maxclient.ChatInfo{
+				ChatID: chatID, Type: "channel", Status: "active", Title: "Новый канал",
+				Link: "https://max.ru/recoverable", ParticipantsCount: 7,
+			}, nil
+		},
+		getAdminsErr: &maxclient.Error{StatusCode: http.StatusForbidden, Code: "access.denied", Message: "bot is not an administrator"},
+	}
+	application, storage := newTestApp(t, fake)
+	application.now = func() time.Time { return eventAt.Add(time.Minute) }
+
+	if err := application.ObserveMAXChat(ctx, "-700", true, eventAt); err == nil {
+		t.Fatal("subscriber bot_added unexpectedly completed metadata enrichment")
+	}
+	raw, err := storage.GetActiveObservedBotChat(ctx, "", "-700")
+	if err != nil || raw.MAXOwnerID != "" || !raw.Active {
+		t.Fatalf("subscriber bot_added chat id was not retained: %#v, %v", raw, err)
+	}
+
+	linkMAXIdentityForAppTest(t, storage, "test-owner", "777", eventAt.Add(10*time.Second))
+	fake.getAdminsErr = nil
+	fake.admins = []maxclient.ChatMember{{UserID: 777, IsOwner: true, IsAdmin: true}}
+	result, err := application.RefreshDiscoverableChannelsForUser(ctx, "test-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Refreshed != 1 || result.Failed != 0 || len(result.Channels) != 1 ||
+		result.Channels[0].MAXChatID != "-700" || !result.Channels[0].OwnerVerified {
+		t.Fatalf("recoverable channel refresh = %#v", result)
+	}
+	refreshed, err := storage.GetActiveObservedBotChat(ctx, "", "-700")
+	if err != nil || refreshed.MAXOwnerID != "777" || refreshed.Title != "Новый канал" {
+		t.Fatalf("recovered inventory metadata = %#v, %v", refreshed, err)
 	}
 }
 
