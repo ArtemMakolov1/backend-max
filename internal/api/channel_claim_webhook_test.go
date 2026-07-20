@@ -420,9 +420,52 @@ func TestStartChannelConnectMapsMAXChatNotFoundToActionableEventError(t *testing
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	const wantMessage = "MAX не передал ID этого уже подключённого канала. Опубликуйте в канале любой новый пост, затем нажмите „Обновить список“."
+	const wantMessage = "MAX ещё не передал канал помощнику. Добавьте помощника администратором канала, опубликуйте новый пост и нажмите «Обновить список»."
 	if payload.Error.Code != "max_channel_event_required" || payload.Error.Message != wantMessage ||
-		payload.Error.Details.Action != "publish_post_and_refresh" {
+		payload.Error.Details.Action != "add_helper_publish_and_refresh" {
+		t.Fatalf("problem contract = %#v", payload.Error)
+	}
+}
+
+func TestStartChannelConnectMapsMAXAccessFailureToBotAdminAction(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := store.Open(ctx, filepath.Join(t.TempDir(), "channel-bot-admin-required.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	fake := &claimWebhookMAX{getLinkErr: &maxclient.Error{
+		StatusCode: http.StatusForbidden,
+		Code:       "access.denied",
+		Message:    "Bot is not a channel administrator",
+	}}
+	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := New(app.New(storage, mediaStore, fake, nil, nil, logger), logger,
+		"http://localhost:4321", "webhook-secret", AuthOptions{YandexClient: &fakeYandexOAuth{}})
+	handler := withTestSession(t, storage, server.Handler(), "tenant-a")
+
+	response := performJSONRequest(handler, http.MethodPost, "/api/v1/channels/connect/start",
+		`{"public_link":"https://max.ru/se13549123_biz"}`)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("connect start = %d %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Error struct {
+			Code    string `json:"code"`
+			Details struct {
+				Action string `json:"action"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Error.Code != "bot_not_channel_admin" || payload.Error.Details.Action != "add_helper_as_admin" {
 		t.Fatalf("problem contract = %#v", payload.Error)
 	}
 }
