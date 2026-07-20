@@ -363,8 +363,9 @@ func TestMAXBotAddedAcceptsOnlyLinkedOwnerFromAdmins(t *testing.T) {
 	if response.Code == http.StatusOK {
 		t.Fatalf("ordinary linked admin was accepted as owner: %d %s", response.Code, response.Body.String())
 	}
-	if _, err := storage.GetActiveObservedBotChat(ctx, "", "-13549123"); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("incomplete bot_added entered inventory: %v", err)
+	raw, err := storage.GetActiveObservedBotChat(ctx, "", "-13549123")
+	if err != nil || !raw.Active || raw.MAXOwnerID != "" {
+		t.Fatalf("incomplete bot_added lifecycle was not preserved safely: %#v, %v", raw, err)
 	}
 
 	fake.admins = append(fake.admins, maxclient.ChatMember{UserID: 777, IsOwner: true, IsAdmin: true})
