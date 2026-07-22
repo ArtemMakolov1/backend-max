@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/url"
@@ -21,7 +22,7 @@ const (
 	defaultPort                      = "8080"
 	defaultMediaDir                  = "./media"
 	defaultMediaUserMaxFiles         = int64(500)
-	defaultMediaUserMaxBytes         = int64(1 << 30)
+	defaultMediaUserMaxBytes         = int64(10 << 30)
 	defaultMediaOrphanGrace          = 24 * time.Hour
 	defaultMediaCleanupPeriod        = 15 * time.Minute
 	defaultMediaCleanupBatch         = 50
@@ -94,6 +95,12 @@ type Config struct {
 	AIResearchPerDay          int
 	AILeaseTTL                time.Duration
 	BillingEnforcementEnabled bool
+	BillingLiveEnabled        bool
+	YooKassaReceiptsConfirmed bool
+	YooKassaShopID            string
+	YooKassaSecretKey         string
+	YooKassaDataKey           []byte
+	YooKassaReturnURL         string
 	SchedulerInterval         time.Duration
 	SMTPHost                  string
 	SMTPPort                  int
@@ -191,6 +198,16 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("BILLING_ENFORCEMENT_ENABLED must be true or false: %q", billingEnforcementText)
 	}
+	billingLiveText := env("BILLING_LIVE_ENABLED", "false")
+	billingLiveEnabled, err := strconv.ParseBool(billingLiveText)
+	if err != nil {
+		return Config{}, fmt.Errorf("BILLING_LIVE_ENABLED must be true or false: %q", billingLiveText)
+	}
+	receiptsConfirmedText := env("YOOKASSA_RECEIPTS_CONFIRMED", "false")
+	receiptsConfirmed, err := strconv.ParseBool(receiptsConfirmedText)
+	if err != nil {
+		return Config{}, fmt.Errorf("YOOKASSA_RECEIPTS_CONFIRMED must be true or false: %q", receiptsConfirmedText)
+	}
 	smtpPortText := env("SMTP_PORT", "587")
 	smtpPort, err := strconv.Atoi(smtpPortText)
 	if err != nil || smtpPort <= 0 || smtpPort > 65535 {
@@ -240,6 +257,12 @@ func Load() (Config, error) {
 		AIResearchPerDay:          aiResearchPerDay,
 		AILeaseTTL:                aiLeaseTTL,
 		BillingEnforcementEnabled: billingEnforcementEnabled,
+		BillingLiveEnabled:        billingLiveEnabled,
+		YooKassaReceiptsConfirmed: receiptsConfirmed,
+		YooKassaShopID:            strings.TrimSpace(os.Getenv("YOOKASSA_SHOP_ID")),
+		YooKassaSecretKey:         os.Getenv("YOOKASSA_SECRET_KEY"),
+		YooKassaDataKey:           nil,
+		YooKassaReturnURL:         strings.TrimSpace(os.Getenv("YOOKASSA_RETURN_URL")),
 		SchedulerInterval:         interval,
 		SMTPHost:                  strings.TrimSpace(os.Getenv("SMTP_HOST")),
 		SMTPPort:                  smtpPort,
@@ -251,6 +274,46 @@ func Load() (Config, error) {
 
 	if cfg.Host == "" || cfg.Port == "" || cfg.DatabaseURL == "" || cfg.MediaDir == "" || cfg.PublicBaseURL == "" {
 		return Config{}, fmt.Errorf("HOST, PORT, DATABASE_URL, MEDIA_DIR and PUBLIC_BASE_URL must not be empty")
+	}
+	yooValues := []string{cfg.YooKassaShopID, cfg.YooKassaSecretKey, strings.TrimSpace(os.Getenv("YOOKASSA_DATA_KEY"))}
+	yooParts := 0
+	for _, value := range yooValues {
+		if value != "" {
+			yooParts++
+		}
+	}
+	if yooParts != 0 && yooParts != len(yooValues) {
+		return Config{}, fmt.Errorf("YOOKASSA_SHOP_ID, YOOKASSA_SECRET_KEY and YOOKASSA_DATA_KEY must be configured together")
+	}
+	if yooParts == 0 && cfg.YooKassaReturnURL != "" {
+		return Config{}, fmt.Errorf("YOOKASSA_RETURN_URL requires YooKassa credentials")
+	}
+	if yooParts != 0 {
+		if !regexp.MustCompile(`^[0-9]{1,64}$`).MatchString(cfg.YooKassaShopID) {
+			return Config{}, fmt.Errorf("YOOKASSA_SHOP_ID must contain 1 to 64 digits")
+		}
+		decodedKey, decodeErr := base64.StdEncoding.DecodeString(yooValues[2])
+		if decodeErr != nil || len(decodedKey) != 32 {
+			return Config{}, fmt.Errorf("YOOKASSA_DATA_KEY must be standard base64 encoding of exactly 32 random bytes")
+		}
+		cfg.YooKassaDataKey = decodedKey
+		if cfg.YooKassaReturnURL == "" {
+			cfg.YooKassaReturnURL = cfg.PublicBaseURL + "/app/?billing=pending#/workspace/settings/plan"
+		}
+		if err := validateYooKassaReturnURL(cfg.PublicBaseURL, cfg.YooKassaReturnURL); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.BillingLiveEnabled {
+		if !cfg.BillingEnforcementEnabled {
+			return Config{}, fmt.Errorf("BILLING_LIVE_ENABLED requires BILLING_ENFORCEMENT_ENABLED=true")
+		}
+		if !cfg.YooKassaReceiptsConfirmed {
+			return Config{}, fmt.Errorf("BILLING_LIVE_ENABLED requires YOOKASSA_RECEIPTS_CONFIRMED=true")
+		}
+		if !cfg.YooKassaConfigured() {
+			return Config{}, fmt.Errorf("BILLING_LIVE_ENABLED requires complete YooKassa credentials")
+		}
 	}
 	if err := validateMAXAPIBaseURL(cfg.MAXAPIBaseURL); err != nil {
 		return Config{}, err
@@ -291,7 +354,7 @@ func Load() (Config, error) {
 		if oauthParts != 0 || len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
 		}
-		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" {
+		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.YooKassaConfigured() {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX and OpenAI integrations to be disabled")
 		}
 		if s3Parts != 0 || cfg.S3Bucket != "" || cfg.S3Region != "" {
@@ -332,6 +395,27 @@ func (c Config) YandexAuthEnabled() bool {
 
 func (c Config) S3Enabled() bool {
 	return c.S3Host != "" && c.S3AccessKey != "" && c.S3SecretKey != ""
+}
+
+func (c Config) YooKassaConfigured() bool {
+	return c.YooKassaShopID != "" && c.YooKassaSecretKey != "" && len(c.YooKassaDataKey) == 32
+}
+
+func (c Config) YooKassaEnabled() bool {
+	return c.BillingLiveEnabled && c.BillingEnforcementEnabled && c.YooKassaReceiptsConfirmed && c.YooKassaConfigured()
+}
+
+func validateYooKassaReturnURL(publicBaseURL, raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || !parsed.IsAbs() || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Port() != "" && parsed.Port() != "443") {
+		return fmt.Errorf("YOOKASSA_RETURN_URL must be an absolute HTTPS URL on the default port without credentials")
+	}
+	publicURL, err := url.Parse(publicBaseURL)
+	if err != nil || !strings.EqualFold(parsed.Scheme, publicURL.Scheme) || !strings.EqualFold(parsed.Host, publicURL.Host) {
+		return fmt.Errorf("YOOKASSA_RETURN_URL must use the PUBLIC_BASE_URL origin")
+	}
+	return nil
 }
 
 // SMTPConfigured reports whether transactional email delivery is enabled. Host

@@ -316,13 +316,12 @@ AI_RESEARCH_PER_DAY=20
 AI_LEASE_TTL=4m
 ```
 
-### Billing foundation (pre-launch)
+### Workspace billing
 
-`GET /api/v1/plans` exposes only catalog versions with `public=true` and
-`available=true`; today that is Free. Solo, Pro and Agency are versioned
-internal price/entitlement snapshots and are deliberately unavailable until a
-payment and subscription lifecycle exists. An authorized workspace member can
-read the current subscription and tenant-scoped usage at
+`GET /api/v1/plans` exposes the public Free, Author and Team v2 snapshots,
+including checkout capability and the authoritative recurring-consent copy.
+An authorized workspace member reads subscription, tenant-scoped usage,
+feature gates, contract and owner actions at
 `GET /api/v1/workspaces/{workspace_id}/billing`.
 
 Monthly AI usage is always recorded in PostgreSQL before an upstream call.
@@ -330,23 +329,19 @@ Image usage is cost weighted: low=1 credit, medium/default=9 and high=36.
 Research and formatting have separate monthly
 metrics even though their minute/day safety bucket remains shared.
 
-`BILLING_ENFORCEMENT_ENABLED=false` is the safe default and means observe-only:
-usage can exceed the catalog allowance while telemetry is collected. Setting
-it to `true` enables only monthly AI hard limits; the existing minute/day AI
-safety limits still apply independently. Channel, seat and storage
-entitlements currently have `hard_limit=false` and are display-only; media
-writes still use `MEDIA_USER_MAX_*`.
+Free permanently denies every AI feature in both observe and enforcement
+modes. Channel, seat and storage limits are enforced in PostgreSQL across all
+write paths. Paid AI usage is attributed to immutable provider-aligned
+subscription periods; Free usage uses UTC calendar months. Existing over-limit
+Free v1 workspaces stay on the hidden legacy snapshot: existing posts keep
+working and cleanup is allowed, while new resource growth is capped at 1
+channel, 1 seat and 1GB.
 
-Allowances are workspace-scoped. A personal workspace and each owned team
-workspace therefore have separate Free counters. Before paid plans become
-available, implement static-resource enforcement and an explicit anti-abuse or
-account-level policy for multiple Free team workspaces.
-
-The current ledger uses UTC calendar months and does not snapshot the plan
-version onto each usage row. Before a paid launch, replace or extend it with
-provider-aligned subscription periods and immutable plan-version attribution.
-Paused and canceled subscriptions already fail AI requests with HTTP 403
-`plan_inactive` in both observe and enforcement modes, before usage is charged.
+Allowances are workspace-scoped. `BILLING_LIVE_ENABLED=false`,
+`YOOKASSA_RECEIPTS_CONFIRMED=false` and `BILLING_ENFORCEMENT_ENABLED=false` are
+the safe production defaults. Real checkout/renewal is fail-closed unless all
+three flags and the complete YooKassa credential set are present. See
+`docs/yookassa-activation.md` before changing them.
 
 `AI_LEASE_TTL` должен быть больше таймаута AI-обработчика `3m`. Нулевые,
 отрицательные и чрезмерные значения отклоняются при запуске.

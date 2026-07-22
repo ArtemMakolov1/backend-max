@@ -238,13 +238,18 @@ jobs:
           S3_BUCKET: ${{ vars.S3_BUCKET }}
           S3_REGION: ${{ vars.S3_REGION }}
           MEDIA_USER_MAX_FILES: ${{ vars.MEDIA_USER_MAX_FILES || '500' }}
-          MEDIA_USER_MAX_BYTES: ${{ vars.MEDIA_USER_MAX_BYTES || '1073741824' }}
+          MEDIA_USER_MAX_BYTES: ${{ vars.MEDIA_USER_MAX_BYTES || '10737418240' }}
           MEDIA_ORPHAN_GRACE_PERIOD: ${{ vars.MEDIA_ORPHAN_GRACE_PERIOD || '24h' }}
           MEDIA_CLEANUP_INTERVAL: ${{ vars.MEDIA_CLEANUP_INTERVAL || '15m' }}
           MEDIA_CLEANUP_BATCH_SIZE: ${{ vars.MEDIA_CLEANUP_BATCH_SIZE || '50' }}
           WORKSPACE_MAX_OWNED_TEAM_WORKSPACES: ${{ vars.WORKSPACE_MAX_OWNED_TEAM_WORKSPACES || '5' }}
           BILLING_ENFORCEMENT_ENABLED: ${{ vars.BILLING_ENFORCEMENT_ENABLED || 'false' }}
+          BILLING_LIVE_ENABLED: ${{ vars.BILLING_LIVE_ENABLED || 'false' }}
+          YOOKASSA_RECEIPTS_CONFIRMED: ${{ vars.YOOKASSA_RECEIPTS_CONFIRMED || 'false' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          YOOKASSA_SHOP_ID: ${{ secrets.YOOKASSA_SHOP_ID }}
+          YOOKASSA_SECRET_KEY: ${{ secrets.YOOKASSA_SECRET_KEY }}
+          YOOKASSA_DATA_KEY: ${{ secrets.YOOKASSA_DATA_KEY }}
           # Welcome-email SMTP (optional; unset leaves emails disabled).
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
