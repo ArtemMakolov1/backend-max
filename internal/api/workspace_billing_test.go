@@ -11,9 +11,9 @@ import (
 	"maxpilot/backend/internal/store"
 )
 
-func TestPublicPlansExposeOnlyFreeWhileWorkspaceBillingIsTenantScoped(t *testing.T) {
+func TestPublicPlansExposeThreeCurrentPlansWhileWorkspaceBillingIsTenantScoped(t *testing.T) {
 	options := testAILimitOptions()
-	_, storage, rawHandler := newAIQuotaTestServer(
+	_, storage, rawHandler := newFreeAIQuotaTestServer(
 		t, nil, nil, options, "plans-member", "plans-outsider")
 	public := performJSONRequest(rawHandler, http.MethodGet, "/api/v1/plans", "")
 	if public.Code != http.StatusOK || !strings.Contains(public.Header().Get("Cache-Control"), "public") {
@@ -23,9 +23,17 @@ func TestPublicPlansExposeOnlyFreeWhileWorkspaceBillingIsTenantScoped(t *testing
 	if err := json.Unmarshal(public.Body.Bytes(), &catalog); err != nil {
 		t.Fatal(err)
 	}
-	if len(catalog) != 1 || catalog[0].Plan.Code != "free" ||
-		strings.Contains(public.Body.String(), "solo") || strings.Contains(public.Body.String(), "agency") {
-		t.Fatalf("public catalog leaked internal plans: %s", public.Body.String())
+	if len(catalog) != 3 || catalog[0].Plan.Code != "free" ||
+		catalog[1].Plan.Code != "solo" || catalog[2].Plan.Code != "pro" ||
+		strings.Contains(public.Body.String(), "agency") {
+		t.Fatalf("public catalog does not match the current offer: %s", public.Body.String())
+	}
+	wantPrices := []int64{0, 99000, 249000}
+	for index, entry := range catalog {
+		if entry.Plan.Version != 2 || entry.Plan.MonthlyPriceMinor != wantPrices[index] ||
+			!entry.Plan.Public || !entry.Plan.Available || entry.CheckoutEnabled {
+			t.Fatalf("public plan %d is not the disabled-live v2 offer: %#v", index, entry)
+		}
 	}
 
 	workspace, err := storage.CreateWorkspace(t.Context(), "plans-member", store.Workspace{Name: "Plans"})
@@ -106,9 +114,9 @@ func TestMonthlyImageCreditsEnforcementRejectsBeforeUpstreamWithoutRouteBypass(t
 	}
 	for index, path := range paths {
 		response := performJSONRequest(handler, http.MethodPost, path,
-			`{"prompt":"medium `+formatInt64(int64(index))+`","quality":"medium"}`)
+			`{"prompt":"high `+formatInt64(int64(index))+`","quality":"high"}`)
 		if response.Code != http.StatusCreated {
-			t.Fatalf("medium image %d = %d %s", index, response.Code, response.Body.String())
+			t.Fatalf("high image %d = %d %s", index, response.Code, response.Body.String())
 		}
 	}
 	response := performJSONRequest(handler, http.MethodPost,
@@ -123,7 +131,7 @@ func TestMonthlyImageCreditsEnforcementRejectsBeforeUpstreamWithoutRouteBypass(t
 	}
 	billing := readWorkspaceBillingForTest(t, handler, workspaceID)
 	if !billing.MonthlyEnforcementEnabled ||
-		billingUsageQuantity(t, billing.Usage, store.UsageMetricAIImageCredits) != 27 {
+		billingUsageQuantity(t, billing.Usage, store.UsageMetricAIImageCredits) != 108 {
 		t.Fatalf("enforced billing = %#v", billing)
 	}
 }

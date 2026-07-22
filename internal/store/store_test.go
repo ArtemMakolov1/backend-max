@@ -241,6 +241,9 @@ func TestPublishingStateCASAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, channel.WorkspaceID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-publishing-state-method")
 	post, err := storage.CreatePost(ctx, Post{
 		Title: "Post", Content: "body", Format: FormatMarkdown, Status: PostStatusDraft, ChannelID: &channel.ID,
 	})

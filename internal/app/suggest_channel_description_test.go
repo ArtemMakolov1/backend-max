@@ -91,6 +91,7 @@ func TestSuggestChannelDescriptionUsesAuthoritativeChannelAndEightNewestPosts(t 
 		},
 	}}
 	application, storage, workspace := newChannelDescriptionFixture(t, fake)
+	activatePaidWorkspaceForTest(t, storage, "description-owner", workspace.ID)
 	channel, err := storage.CreateChannel(context.Background(), store.Channel{
 		UserID: "description-owner", WorkspaceID: workspace.ID, VerifiedMAXOwnerID: "100",
 		MAXChatID: "-100", Title: "Авторитетное название", Description: "Описание из MAX",

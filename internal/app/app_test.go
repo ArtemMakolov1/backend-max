@@ -1611,6 +1611,7 @@ func TestScheduledPostWithRevokedApprovalLeavesCalendar(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	activatePaidWorkspaceForTest(t, storage, "revoked-owner", workspace.ID)
 	if _, err := storage.AddWorkspaceMember(ctx, "revoked-owner", store.WorkspaceMember{
 		WorkspaceID: workspace.ID, UserID: "revoked-reviewer", Role: store.WorkspaceRoleApprover,
 	}); err != nil {
@@ -1752,6 +1753,7 @@ func TestPublishClaimRechecksApprovalAfterConcurrentEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	activatePaidWorkspaceForTest(t, storage, "approval-owner", workspace.ID)
 	if _, err := storage.AddWorkspaceMember(ctx, "approval-owner", store.WorkspaceMember{
 		WorkspaceID: workspace.ID, UserID: "approval-reviewer", Role: store.WorkspaceRoleApprover,
 	}); err != nil {

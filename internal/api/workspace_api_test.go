@@ -341,6 +341,7 @@ func newWorkspaceAPIFixture(t *testing.T) workspaceAPIFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	activatePaidWorkspaceForAPITest(t, storage, "ws-owner", workspace.ID, "pro")
 	for userID, role := range map[string]string{
 		"ws-editor": store.WorkspaceRoleEditor, "ws-approver": store.WorkspaceRoleApprover, "ws-viewer": store.WorkspaceRoleViewer,
 	} {
