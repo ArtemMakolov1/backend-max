@@ -53,7 +53,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "019_workspace_plans.sql"
+const RequiredSchemaVersion = "020_channel_max_profile.sql"
 
 type schemaMigration struct {
 	version        string
@@ -518,8 +518,9 @@ func bindSQL(query string) string {
 
 func nowText() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-const channelColumns = `id, owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url,
-participants_count, is_channel, active, created_at, updated_at`
+const channelColumns = `id, owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, description, public_link, icon_url,
+participants_count, is_public, messages_count, has_pinned_message, max_last_event_time, max_info_synced_at,
+is_channel, active, created_at, updated_at`
 
 func (s *Store) CreateChannel(ctx context.Context, channel Channel) (Channel, error) {
 	if channel.UserID == "" {
@@ -534,9 +535,14 @@ func (s *Store) CreateChannel(ctx context.Context, channel Channel) (Channel, er
 	now := nowText()
 	var id int64
 	err := s.db.QueryRowContext(ctx, `
-INSERT INTO channels(owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES (?, NULLIF(?,''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, channel.UserID, channel.WorkspaceID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title,
-		channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsChannel, channel.Active, now, now).Scan(&id)
+INSERT INTO channels(owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, description, public_link, icon_url,
+participants_count, is_public, messages_count, has_pinned_message, max_last_event_time, max_info_synced_at,
+is_channel, active, created_at, updated_at)
+VALUES (?, NULLIF(?,''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+		channel.UserID, channel.WorkspaceID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title,
+		channel.Description, channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsPublic,
+		channel.MessagesCount, channel.HasPinnedMessage, channel.MAXLastEventTime, channel.MAXInfoSyncedAt,
+		channel.IsChannel, channel.Active, now, now).Scan(&id)
 	if err != nil {
 		return Channel{}, fmt.Errorf("create channel: %w", err)
 	}
@@ -555,17 +561,27 @@ func (s *Store) UpsertConnectedChannel(ctx context.Context, channel Channel) (Ch
 	}
 	now := nowText()
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO channels(owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES (?, NULLIF(?,''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO channels(owner_id, workspace_id, verified_max_owner_id, max_chat_id, title, description, public_link, icon_url,
+participants_count, is_public, messages_count, has_pinned_message, max_last_event_time, max_info_synced_at,
+is_channel, active, created_at, updated_at)
+VALUES (?, NULLIF(?,''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(max_chat_id) DO UPDATE SET
 	title = excluded.title,
+	description = excluded.description,
 	public_link = excluded.public_link,
 	icon_url = excluded.icon_url,
 	participants_count = excluded.participants_count,
+	is_public = excluded.is_public,
+	messages_count = excluded.messages_count,
+	has_pinned_message = excluded.has_pinned_message,
+	max_last_event_time = excluded.max_last_event_time,
+	max_info_synced_at = excluded.max_info_synced_at,
 	is_channel = excluded.is_channel,
 	active = excluded.active,
 	updated_at = excluded.updated_at`,
-		channel.UserID, channel.WorkspaceID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
+		channel.UserID, channel.WorkspaceID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title,
+		channel.Description, channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsPublic,
+		channel.MessagesCount, channel.HasPinnedMessage, channel.MAXLastEventTime, channel.MAXInfoSyncedAt,
 		channel.IsChannel, channel.Active, now, now)
 	if err != nil {
 		return Channel{}, fmt.Errorf("connect channel: %w", err)
@@ -675,8 +691,11 @@ func (s *Store) UpdateChannel(ctx context.Context, id int64, maxChatID, title *s
 		current.Active = *active
 	}
 	result, err := s.db.ExecContext(ctx, `
-UPDATE channels SET max_chat_id = ?, title = ?, public_link = ?, icon_url = ?, participants_count = ?, active = ?, updated_at = ? WHERE id = ?`,
-		current.MAXChatID, current.Title, current.PublicLink, current.IconURL, current.ParticipantsCount,
+UPDATE channels SET max_chat_id = ?, title = ?, description = ?, public_link = ?, icon_url = ?, participants_count = ?,
+is_public = ?, messages_count = ?, has_pinned_message = ?, max_last_event_time = ?, max_info_synced_at = ?,
+active = ?, updated_at = ? WHERE id = ?`,
+		current.MAXChatID, current.Title, current.Description, current.PublicLink, current.IconURL, current.ParticipantsCount,
+		current.IsPublic, current.MessagesCount, current.HasPinnedMessage, current.MAXLastEventTime, current.MAXInfoSyncedAt,
 		current.Active, nowText(), id)
 	if err != nil {
 		return Channel{}, fmt.Errorf("update channel: %w", err)
@@ -1422,8 +1441,10 @@ type scanner interface {
 
 func scanChannel(row scanner) (Channel, error) {
 	var channel Channel
+	var maxLastEventTime, maxInfoSyncedAt sql.NullTime
 	if err := row.Scan(&channel.ID, &channel.UserID, &channel.WorkspaceID, &channel.VerifiedMAXOwnerID, &channel.MAXChatID, &channel.Title,
-		&channel.PublicLink, &channel.IconURL, &channel.ParticipantsCount, &channel.IsChannel, &channel.Active,
+		&channel.Description, &channel.PublicLink, &channel.IconURL, &channel.ParticipantsCount, &channel.IsPublic,
+		&channel.MessagesCount, &channel.HasPinnedMessage, &maxLastEventTime, &maxInfoSyncedAt, &channel.IsChannel, &channel.Active,
 		&channel.CreatedAt, &channel.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Channel{}, ErrNotFound
@@ -1432,6 +1453,8 @@ func scanChannel(row scanner) (Channel, error) {
 	}
 	channel.CreatedAt = channel.CreatedAt.UTC()
 	channel.UpdatedAt = channel.UpdatedAt.UTC()
+	channel.MAXLastEventTime = parseNullableTime(maxLastEventTime)
+	channel.MAXInfoSyncedAt = parseNullableTime(maxInfoSyncedAt)
 	return channel, nil
 }
 

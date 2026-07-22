@@ -52,21 +52,35 @@ title=CASE WHEN trim($2)<>'' THEN $2 ELSE title END,
 max_owner_id=CASE WHEN trim($3)<>'' THEN $3 ELSE max_owner_id END,
 icon_url=CASE WHEN trim($4)<>'' THEN $4 ELSE icon_url END,
 participants_count=CASE WHEN $5>0 THEN $5 ELSE participants_count END,
-last_seen_at=GREATEST(last_seen_at,$6)
-WHERE max_chat_id=$7 AND active AND $6>=last_seen_at
-RETURNING max_chat_id,public_link,title,max_owner_id,icon_url,participants_count,last_seen_at
+description=CASE WHEN $6::timestamptz IS NOT NULL AND (max_info_synced_at IS NULL OR $6>=max_info_synced_at) THEN $7 ELSE description END,
+is_public=CASE WHEN $6::timestamptz IS NOT NULL AND (max_info_synced_at IS NULL OR $6>=max_info_synced_at) THEN $8 ELSE is_public END,
+messages_count=CASE WHEN $6::timestamptz IS NOT NULL AND (max_info_synced_at IS NULL OR $6>=max_info_synced_at) THEN $9 ELSE messages_count END,
+has_pinned_message=CASE WHEN $6::timestamptz IS NOT NULL AND (max_info_synced_at IS NULL OR $6>=max_info_synced_at) THEN $10 ELSE has_pinned_message END,
+max_last_event_time=CASE WHEN $6::timestamptz IS NOT NULL AND (max_info_synced_at IS NULL OR $6>=max_info_synced_at) THEN $11 ELSE max_last_event_time END,
+max_info_synced_at=CASE WHEN $6::timestamptz IS NOT NULL AND (max_info_synced_at IS NULL OR $6>=max_info_synced_at) THEN $6 ELSE max_info_synced_at END,
+last_seen_at=GREATEST(last_seen_at,$12)
+WHERE max_chat_id=$13 AND active AND $12>=last_seen_at
+RETURNING max_chat_id,public_link,title,description,max_owner_id,icon_url,participants_count,is_public,messages_count,
+has_pinned_message,max_last_event_time,max_info_synced_at,last_seen_at
 )
 UPDATE channels AS connected SET
 title=CASE WHEN trim(refreshed_chat.title)<>'' THEN refreshed_chat.title ELSE connected.title END,
 public_link=CASE WHEN trim(refreshed_chat.public_link)<>'' THEN refreshed_chat.public_link ELSE connected.public_link END,
 icon_url=refreshed_chat.icon_url,
 participants_count=refreshed_chat.participants_count,
+description=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.description ELSE connected.description END,
+is_public=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.is_public ELSE connected.is_public END,
+messages_count=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.messages_count ELSE connected.messages_count END,
+has_pinned_message=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.has_pinned_message ELSE connected.has_pinned_message END,
+max_last_event_time=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.max_last_event_time ELSE connected.max_last_event_time END,
+max_info_synced_at=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.max_info_synced_at ELSE connected.max_info_synced_at END,
 updated_at=refreshed_chat.last_seen_at
 FROM refreshed_chat
 WHERE connected.max_chat_id=refreshed_chat.max_chat_id
   AND connected.verified_max_owner_id=refreshed_chat.max_owner_id
   AND connected.updated_at<=refreshed_chat.last_seen_at`, chat.PublicLink, chat.Title, chat.MAXOwnerID,
-		chat.IconURL, chat.ParticipantsCount, chat.LastSeenAt.UTC(), chat.MAXChatID)
+		chat.IconURL, chat.ParticipantsCount, chat.MAXInfoSyncedAt, chat.Description, chat.IsPublic,
+		chat.MessagesCount, chat.HasPinnedMessage, chat.MAXLastEventTime, chat.LastSeenAt.UTC(), chat.MAXChatID)
 	if err != nil {
 		return fmt.Errorf("refresh observed MAX chat metadata: %w", err)
 	}
@@ -83,27 +97,55 @@ func (s *Store) UpsertObservedBotChat(ctx context.Context, chat ObservedBotChat)
 	}
 	_, err := s.db.ExecContext(ctx, `WITH refreshed_chat AS (
 INSERT INTO observed_bot_chats(
-max_chat_id, public_link, title, max_owner_id, icon_url, participants_count, active, last_seen_at, removed_at)
-VALUES (?,?,?,?,?,?,?,?,?)
+max_chat_id, public_link, title, description, max_owner_id, icon_url, participants_count, is_public, messages_count,
+has_pinned_message, max_last_event_time, max_info_synced_at, active, last_seen_at, removed_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(max_chat_id) DO UPDATE SET public_link=excluded.public_link, title=excluded.title,
 max_owner_id=excluded.max_owner_id, icon_url=excluded.icon_url, participants_count=excluded.participants_count,
+description=CASE WHEN excluded.max_info_synced_at IS NOT NULL
+                      AND (observed_bot_chats.max_info_synced_at IS NULL OR excluded.max_info_synced_at>=observed_bot_chats.max_info_synced_at)
+                 THEN excluded.description ELSE observed_bot_chats.description END,
+is_public=CASE WHEN excluded.max_info_synced_at IS NOT NULL
+                   AND (observed_bot_chats.max_info_synced_at IS NULL OR excluded.max_info_synced_at>=observed_bot_chats.max_info_synced_at)
+              THEN excluded.is_public ELSE observed_bot_chats.is_public END,
+messages_count=CASE WHEN excluded.max_info_synced_at IS NOT NULL
+                         AND (observed_bot_chats.max_info_synced_at IS NULL OR excluded.max_info_synced_at>=observed_bot_chats.max_info_synced_at)
+                    THEN excluded.messages_count ELSE observed_bot_chats.messages_count END,
+has_pinned_message=CASE WHEN excluded.max_info_synced_at IS NOT NULL
+                             AND (observed_bot_chats.max_info_synced_at IS NULL OR excluded.max_info_synced_at>=observed_bot_chats.max_info_synced_at)
+                        THEN excluded.has_pinned_message ELSE observed_bot_chats.has_pinned_message END,
+max_last_event_time=CASE WHEN excluded.max_info_synced_at IS NOT NULL
+                              AND (observed_bot_chats.max_info_synced_at IS NULL OR excluded.max_info_synced_at>=observed_bot_chats.max_info_synced_at)
+                         THEN excluded.max_last_event_time ELSE observed_bot_chats.max_last_event_time END,
+max_info_synced_at=CASE WHEN excluded.max_info_synced_at IS NOT NULL
+                             AND (observed_bot_chats.max_info_synced_at IS NULL OR excluded.max_info_synced_at>=observed_bot_chats.max_info_synced_at)
+                        THEN excluded.max_info_synced_at ELSE observed_bot_chats.max_info_synced_at END,
 active=excluded.active, last_seen_at=excluded.last_seen_at, removed_at=excluded.removed_at
 WHERE excluded.last_seen_at > observed_bot_chats.last_seen_at
    OR (excluded.last_seen_at = observed_bot_chats.last_seen_at
        AND observed_bot_chats.active AND observed_bot_chats.removed_at IS NULL)
-RETURNING max_chat_id, public_link, title, max_owner_id, icon_url, participants_count, last_seen_at
+RETURNING max_chat_id, public_link, title, description, max_owner_id, icon_url, participants_count, is_public,
+messages_count, has_pinned_message, max_last_event_time, max_info_synced_at, last_seen_at
 )
 UPDATE channels AS connected SET
 title=CASE WHEN trim(refreshed_chat.title)<>'' THEN refreshed_chat.title ELSE connected.title END,
 public_link=CASE WHEN trim(refreshed_chat.public_link)<>'' THEN refreshed_chat.public_link ELSE connected.public_link END,
 icon_url=refreshed_chat.icon_url,
 participants_count=refreshed_chat.participants_count,
+description=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.description ELSE connected.description END,
+is_public=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.is_public ELSE connected.is_public END,
+messages_count=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.messages_count ELSE connected.messages_count END,
+has_pinned_message=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.has_pinned_message ELSE connected.has_pinned_message END,
+max_last_event_time=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.max_last_event_time ELSE connected.max_last_event_time END,
+max_info_synced_at=CASE WHEN refreshed_chat.max_info_synced_at IS NOT NULL THEN refreshed_chat.max_info_synced_at ELSE connected.max_info_synced_at END,
 updated_at=refreshed_chat.last_seen_at
 FROM refreshed_chat
 WHERE connected.max_chat_id=refreshed_chat.max_chat_id
   AND connected.verified_max_owner_id=refreshed_chat.max_owner_id
-  AND connected.updated_at<=refreshed_chat.last_seen_at`, chat.MAXChatID, chat.PublicLink, chat.Title, chat.MAXOwnerID,
-		chat.IconURL, chat.ParticipantsCount, chat.Active, chat.LastSeenAt.UTC(), removedAt)
+  AND connected.updated_at<=refreshed_chat.last_seen_at`, chat.MAXChatID, chat.PublicLink, chat.Title,
+		chat.Description, chat.MAXOwnerID, chat.IconURL, chat.ParticipantsCount, chat.IsPublic,
+		chat.MessagesCount, chat.HasPinnedMessage, chat.MAXLastEventTime, chat.MAXInfoSyncedAt,
+		chat.Active, chat.LastSeenAt.UTC(), removedAt)
 	if err != nil {
 		return fmt.Errorf("upsert observed MAX chat: %w", err)
 	}
@@ -135,22 +177,28 @@ RETURNING 1`, maxChatID, now.UTC()).Scan(&applied)
 }
 
 func (s *Store) GetActiveObservedBotChat(ctx context.Context, publicLink, maxChatID string) (ObservedBotChat, error) {
-	query, value := `SELECT max_chat_id, public_link, title, max_owner_id, COALESCE(icon_url,''), COALESCE(participants_count,0), active, last_seen_at, removed_at
+	query, value := `SELECT max_chat_id, public_link, title, description, max_owner_id, COALESCE(icon_url,''), COALESCE(participants_count,0),
+is_public, messages_count, has_pinned_message, max_last_event_time, max_info_synced_at, active, last_seen_at, removed_at
 FROM observed_bot_chats WHERE active AND max_chat_id = ?`, maxChatID
 	if strings.TrimSpace(publicLink) != "" {
-		query, value = `SELECT max_chat_id, public_link, title, max_owner_id, COALESCE(icon_url,''), COALESCE(participants_count,0), active, last_seen_at, removed_at
+		query, value = `SELECT max_chat_id, public_link, title, description, max_owner_id, COALESCE(icon_url,''), COALESCE(participants_count,0),
+is_public, messages_count, has_pinned_message, max_last_event_time, max_info_synced_at, active, last_seen_at, removed_at
 FROM observed_bot_chats WHERE active AND lower(public_link) = lower(?)`, strings.TrimRight(strings.TrimSpace(publicLink), "/")
 	}
 	var chat ObservedBotChat
-	var removed sql.NullTime
+	var maxLastEventTime, maxInfoSyncedAt, removed sql.NullTime
 	if err := s.db.QueryRowContext(ctx, query, value).Scan(&chat.MAXChatID, &chat.PublicLink, &chat.Title,
-		&chat.MAXOwnerID, &chat.IconURL, &chat.ParticipantsCount, &chat.Active, &chat.LastSeenAt, &removed); err != nil {
+		&chat.Description, &chat.MAXOwnerID, &chat.IconURL, &chat.ParticipantsCount, &chat.IsPublic,
+		&chat.MessagesCount, &chat.HasPinnedMessage, &maxLastEventTime, &maxInfoSyncedAt,
+		&chat.Active, &chat.LastSeenAt, &removed); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ObservedBotChat{}, ErrNotFound
 		}
 		return ObservedBotChat{}, fmt.Errorf("get observed MAX chat: %w", err)
 	}
 	chat.LastSeenAt = chat.LastSeenAt.UTC()
+	chat.MAXLastEventTime = parseNullableTime(maxLastEventTime)
+	chat.MAXInfoSyncedAt = parseNullableTime(maxInfoSyncedAt)
 	if removed.Valid {
 		value := removed.Time.UTC()
 		chat.RemovedAt = &value
@@ -426,12 +474,14 @@ WHERE workspace_id=$2 AND owner_id=$3 AND channel_id=$4`,
 			return Channel{}, fmt.Errorf("detach personal channel claims: %w", err)
 		}
 		result, updateErr := tx.ExecContext(ctx, `UPDATE channels SET owner_id=$1,workspace_id=$2,
-verified_max_owner_id=$3,title=$4,public_link=$5,icon_url=$6,participants_count=$7,
-is_channel=$8,active=TRUE,updated_at=$9
-WHERE id=$10 AND owner_id=$11 AND workspace_id=$12`,
+verified_max_owner_id=$3,title=$4,description=$5,public_link=$6,icon_url=$7,participants_count=$8,
+is_public=$9,messages_count=$10,has_pinned_message=$11,max_last_event_time=$12,max_info_synced_at=$13,
+is_channel=$14,active=TRUE,updated_at=$15
+WHERE id=$16 AND owner_id=$17 AND workspace_id=$18`,
 			locked.UserID, locked.WorkspaceID, channel.VerifiedMAXOwnerID, channel.Title,
-			channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsChannel,
-			completedAt, existingID, existingOwner, existingWorkspace)
+			channel.Description, channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsPublic,
+			channel.MessagesCount, channel.HasPinnedMessage, channel.MAXLastEventTime, channel.MAXInfoSyncedAt,
+			channel.IsChannel, completedAt, existingID, existingOwner, existingWorkspace)
 		if updateErr != nil {
 			return Channel{}, fmt.Errorf("transfer personal channel: %w", updateErr)
 		}
@@ -443,16 +493,22 @@ WHERE id=$10 AND owner_id=$11 AND workspace_id=$12`,
 		if existingWorkspace != locked.WorkspaceID {
 			return Channel{}, ErrChannelOwned
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE channels SET verified_max_owner_id=$1, title=$2, public_link=$3,
-icon_url=$4, participants_count=$5, is_channel=$6, active=TRUE,workspace_id=$7,updated_at=$8
-WHERE id=$9 AND owner_id=$10`,
-			channel.VerifiedMAXOwnerID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
-			channel.IsChannel, locked.WorkspaceID, completedAt, existingID, locked.UserID)
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET verified_max_owner_id=$1, title=$2, description=$3, public_link=$4,
+icon_url=$5, participants_count=$6, is_public=$7, messages_count=$8, has_pinned_message=$9,
+max_last_event_time=$10, max_info_synced_at=$11, is_channel=$12, active=TRUE,workspace_id=$13,updated_at=$14
+WHERE id=$15 AND owner_id=$16`,
+			channel.VerifiedMAXOwnerID, channel.Title, channel.Description, channel.PublicLink, channel.IconURL,
+			channel.ParticipantsCount, channel.IsPublic, channel.MessagesCount, channel.HasPinnedMessage,
+			channel.MAXLastEventTime, channel.MAXInfoSyncedAt, channel.IsChannel, locked.WorkspaceID,
+			completedAt, existingID, locked.UserID)
 	case errors.Is(lookupErr, sql.ErrNoRows):
 		err = tx.QueryRowContext(ctx, `INSERT INTO channels(owner_id,workspace_id,verified_max_owner_id,max_chat_id,title,
-public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$10) RETURNING id`, locked.UserID, locked.WorkspaceID, channel.VerifiedMAXOwnerID,
-			channel.MAXChatID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
+description, public_link, icon_url, participants_count, is_public, messages_count, has_pinned_message,
+max_last_event_time, max_info_synced_at, is_channel, active, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE,$16,$16) RETURNING id`,
+			locked.UserID, locked.WorkspaceID, channel.VerifiedMAXOwnerID, channel.MAXChatID, channel.Title,
+			channel.Description, channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsPublic,
+			channel.MessagesCount, channel.HasPinnedMessage, channel.MAXLastEventTime, channel.MAXInfoSyncedAt,
 			channel.IsChannel, completedAt).Scan(&existingID)
 	default:
 		return Channel{}, fmt.Errorf("lookup channel ownership: %w", lookupErr)

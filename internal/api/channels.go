@@ -522,6 +522,17 @@ func (s *Server) decodeChannelMAXInfoForm(w http.ResponseWriter, r *http.Request
 		cleanups = append(cleanups, func() { _ = form.RemoveAll() })
 	}
 	var update app.ChannelMAXInfoUpdate
+	if values := r.MultipartForm.Value["notify"]; len(values) > 0 {
+		switch strings.ToLower(strings.TrimSpace(values[0])) {
+		case "true":
+			update.Notify = true
+		case "false", "":
+			update.Notify = false
+		default:
+			s.problem(w, http.StatusBadRequest, "validation_error", "notify must be true or false", nil)
+			return fail()
+		}
+	}
 	if titles := r.MultipartForm.Value["title"]; len(titles) > 0 {
 		title := strings.TrimSpace(titles[0])
 		if title == "" || utf8.RuneCountInString(title) > 200 {

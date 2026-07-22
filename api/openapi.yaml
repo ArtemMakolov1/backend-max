@@ -339,6 +339,10 @@ paths:
               properties:
                 title: {type: string, minLength: 1, maxLength: 200}
                 file: {type: string, format: binary}
+                notify:
+                  type: boolean
+                  default: false
+                  description: Send a MAX system notification about the title or photo change.
       responses:
         '200':
           description: Updated channel
@@ -346,6 +350,33 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Channel'
+        default:
+          $ref: '#/components/responses/Problem'
+  /channels/{id}/description/suggest:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Channels, AI]
+      operationId: suggestChannelDescription
+      summary: Suggest three channel description variants
+      description: >-
+        Uses the channel profile and up to eight recent published posts as
+        untrusted editorial context. Nothing is saved or pushed to MAX.
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChannelDescriptionSuggestionInput'
+      responses:
+        '200':
+          description: Suggested descriptions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChannelDescriptionSuggestions'
         default:
           $ref: '#/components/responses/Problem'
   /analytics:
@@ -1204,8 +1235,52 @@ paths:
               properties:
                 title: {type: string, minLength: 1, maxLength: 200}
                 file: {type: string, format: binary}
+                notify:
+                  type: boolean
+                  default: false
+                  description: Send a MAX system notification about the title or photo change.
       responses:
         '200': {$ref: '#/components/responses/Channel'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels/{channel_id}/description/suggest:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/ChannelId'}
+    post:
+      tags: [Channels, AI]
+      operationId: suggestWorkspaceChannelDescription
+      summary: Suggest three channel description variants
+      description: >-
+        Uses the workspace channel profile and up to eight recent published
+        posts as untrusted editorial context. Nothing is saved or pushed to MAX.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ChannelDescriptionSuggestionInput'}
+      responses:
+        '200':
+          description: Suggested descriptions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ChannelDescriptionSuggestions'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels/{channel_id}/test:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/ChannelId'}
+    post:
+      tags: [Channels]
+      operationId: testWorkspaceChannel
+      summary: Refresh MAX channel metadata and verify bot permissions
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TestResult'}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/posts:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
@@ -2838,6 +2913,42 @@ components:
       properties:
         content: {type: string, minLength: 1, maxLength: 4000}
         format: {$ref: '#/components/schemas/PostFormat'}
+    ChannelDescriptionSuggestionInput:
+      type: object
+      properties:
+        context:
+          type: string
+          maxLength: 1000
+          description: Optional verified facts or editorial guidance supplied by the user.
+        current_description:
+          type: string
+          maxLength: 4000
+          description: Optional draft to improve instead of starting from the synchronized MAX description.
+    ChannelDescriptionSuggestion:
+      type: object
+      required: [style, label, text]
+      properties:
+        style:
+          type: string
+          enum: [concise, expert, promotional]
+        label:
+          type: string
+          minLength: 1
+          maxLength: 50
+        text:
+          type: string
+          minLength: 1
+          maxLength: 500
+    ChannelDescriptionSuggestions:
+      type: object
+      required: [suggestions]
+      properties:
+        suggestions:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            $ref: '#/components/schemas/ChannelDescriptionSuggestion'
     SuggestedImagePrompt:
       type: object
       required: [prompt]
@@ -2994,7 +3105,11 @@ components:
         - id
         - max_chat_id
         - title
+        - description
         - participants_count
+        - is_public
+        - messages_count
+        - has_pinned_message
         - is_channel
         - active
       properties:
@@ -3007,6 +3122,8 @@ components:
           type: string
         title:
           type: string
+        description:
+          type: string
         public_link:
           type: string
           format: uri
@@ -3015,6 +3132,19 @@ components:
         participants_count:
           type: integer
           minimum: 0
+        is_public:
+          type: boolean
+        messages_count:
+          type: integer
+          minimum: 0
+        has_pinned_message:
+          type: boolean
+        max_last_event_time:
+          type: string
+          format: date-time
+        max_info_synced_at:
+          type: string
+          format: date-time
         is_channel:
           type: boolean
         active:
@@ -3073,6 +3203,8 @@ components:
         - can_publish
         - can_edit
         - can_delete
+        - can_pin
+        - can_change_info
         - missing_required_permissions
       properties:
         chat_id:
@@ -3092,6 +3224,10 @@ components:
         can_edit:
           type: boolean
         can_delete:
+          type: boolean
+        can_pin:
+          type: boolean
+        can_change_info:
           type: boolean
         missing_required_permissions:
           type: array
