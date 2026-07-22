@@ -198,6 +198,11 @@ func TestWorkspaceOwnerLimitReturnsDedicatedConflict(t *testing.T) {
 	response := performJSONRequest(handler, http.MethodPost, "/api/v1/workspaces", `{"name":"Over the limit"}`)
 	assertProblemCode(t, response, http.StatusConflict, "workspace_owner_limit_reached")
 
+	if err := fixture.storage.DetachBillingPaymentMethod(
+		t.Context(), "ws-owner", fixture.workspace.ID, time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
 	response = performJSONRequest(handler, http.MethodPost,
 		"/api/v1/workspaces/"+fixture.workspace.ID+"/transfer-ownership",
 		`{"new_owner_user_id":"ws-editor"}`)

@@ -134,6 +134,9 @@ WHERE owner_user_id=$1 AND is_personal`, workspace.CompatOwnerUserID).Scan(&synt
 	if err != nil || member.Role != WorkspaceRoleEditor {
 		t.Fatalf("add editor=%#v err=%v", member, err)
 	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "test-owner", workspace.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := storage.TransferWorkspaceOwnership(ctx, "test-owner", workspace.ID, "editor"); err != nil {
 		t.Fatal(err)
 	}
@@ -193,6 +196,9 @@ func TestWorkspaceOwnershipTransferSerializesConcurrentRequests(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "test-owner", workspace.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
 
 	results := make(chan error, 2)
 	for _, userID := range []string{"transfer-first", "transfer-second"} {
@@ -248,6 +254,9 @@ func TestOwnedTeamWorkspaceLimitSerializesCreateAndTransfer(t *testing.T) {
 	if _, err := storage.AddWorkspaceMember(ctx, "quota-source", WorkspaceMember{
 		WorkspaceID: incoming.ID, UserID: "quota-candidate", Role: WorkspaceRoleEditor,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "quota-source", incoming.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -322,8 +331,9 @@ func TestWorkspaceReviewInvalidationCommentsAndArchiveAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 	billingNow := time.Now().UTC()
+	billingEnd := billingNow.AddDate(0, 1, 0)
 	seedBillingContract(t, storage, workspace.ID, "pro",
-		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-review-team-method")
+		billingNow.AddDate(0, -1, 0), billingEnd, "sealed-review-team-method")
 	for userID, role := range map[string]string{"editor": WorkspaceRoleEditor, "approver": WorkspaceRoleApprover} {
 		if _, err := storage.AddWorkspaceMember(ctx, "test-owner", WorkspaceMember{WorkspaceID: workspace.ID, UserID: userID, Role: role}); err != nil {
 			t.Fatal(err)
@@ -484,6 +494,14 @@ VALUES($1,$2,$3,'image',0,'attachment.png',10,'image/png')`,
 	}
 	if err := storage.DeleteChannel(ctx, channel.ID); err != nil {
 		t.Fatal(err)
+	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "test-owner", workspace.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if attempt, downgraded, err := storage.PrepareBillingRenewal(
+		ctx, workspace.ID, billingEnd.Add(time.Second),
+	); err != nil || attempt != nil || !downgraded {
+		t.Fatalf("end paid fixture before archive: attempt=%#v downgraded=%v err=%v", attempt, downgraded, err)
 	}
 	archiveTokenHash := strings.Repeat("f", 64)
 	archiveInvite, err := storage.CreateWorkspaceInvitation(ctx, "test-owner", WorkspaceInvitation{
