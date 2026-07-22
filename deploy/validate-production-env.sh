@@ -36,7 +36,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     MEDIA_USER_MAX_FILES|MEDIA_USER_MAX_BYTES|MEDIA_ORPHAN_GRACE_PERIOD|MEDIA_CLEANUP_INTERVAL|MEDIA_CLEANUP_BATCH_SIZE|\
     OPENAI_API_KEY|OPENAI_API_BASE_URL|OPENAI_IMAGE_MODEL|\
     OPENAI_RESEARCH_MODEL|AI_GLOBAL_MAX_CONCURRENT|AI_USER_MAX_CONCURRENT|AI_IMAGE_PER_MINUTE|AI_IMAGE_PER_DAY|\
-    AI_RESEARCH_PER_MINUTE|AI_RESEARCH_PER_DAY|AI_LEASE_TTL|BILLING_ENFORCEMENT_ENABLED|SCHEDULER_INTERVAL|BACKUP_RETENTION_DAYS|PITR_RETENTION_DAYS|\
+    AI_RESEARCH_PER_MINUTE|AI_RESEARCH_PER_DAY|AI_LEASE_TTL|BILLING_ENFORCEMENT_ENABLED|BILLING_LIVE_ENABLED|YOOKASSA_RECEIPTS_CONFIRMED|YOOKASSA_SHOP_ID|YOOKASSA_SECRET_KEY|YOOKASSA_DATA_KEY|YOOKASSA_RETURN_URL|SCHEDULER_INTERVAL|BACKUP_RETENTION_DAYS|PITR_RETENTION_DAYS|\
     SMTP_HOST|SMTP_PORT|SMTP_USERNAME|SMTP_PASSWORD|SMTP_FROM_EMAIL|SMTP_FROM_NAME)
       ;;
     *)
@@ -66,7 +66,7 @@ required_keys=(
   MEDIA_USER_MAX_FILES MEDIA_USER_MAX_BYTES MEDIA_ORPHAN_GRACE_PERIOD MEDIA_CLEANUP_INTERVAL MEDIA_CLEANUP_BATCH_SIZE
   OPENAI_API_KEY OPENAI_API_BASE_URL OPENAI_IMAGE_MODEL
   OPENAI_RESEARCH_MODEL AI_GLOBAL_MAX_CONCURRENT AI_USER_MAX_CONCURRENT AI_IMAGE_PER_MINUTE AI_IMAGE_PER_DAY
-  AI_RESEARCH_PER_MINUTE AI_RESEARCH_PER_DAY AI_LEASE_TTL BILLING_ENFORCEMENT_ENABLED SCHEDULER_INTERVAL BACKUP_RETENTION_DAYS PITR_RETENTION_DAYS
+  AI_RESEARCH_PER_MINUTE AI_RESEARCH_PER_DAY AI_LEASE_TTL BILLING_ENFORCEMENT_ENABLED BILLING_LIVE_ENABLED YOOKASSA_RECEIPTS_CONFIRMED YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY YOOKASSA_RETURN_URL SCHEDULER_INTERVAL BACKUP_RETENTION_DAYS PITR_RETENTION_DAYS
   SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL SMTP_FROM_NAME
 )
 for key in "${required_keys[@]}"; do
@@ -132,6 +132,17 @@ value=$(env_value MAX_WEBHOOK_SECRET)
 if [[ -n "$value" && (${#value} -lt 32 || ${#value} -gt 256 || ! "$value" =~ ^[A-Za-z0-9_-]+$) ]]; then
   echo "MAX_WEBHOOK_SECRET must contain 32-256 URL-safe characters" >&2
   exit 1
+fi
+
+yookassa_shop_id=$(env_value YOOKASSA_SHOP_ID)
+yookassa_secret_key=$(env_value YOOKASSA_SECRET_KEY)
+yookassa_data_key=$(env_value YOOKASSA_DATA_KEY)
+yookassa_return_url=$(env_value YOOKASSA_RETURN_URL)
+if [[ -n "$yookassa_shop_id" || -n "$yookassa_secret_key" || -n "$yookassa_data_key" || -n "$yookassa_return_url" ]]; then
+  [[ "$yookassa_shop_id" =~ ^[0-9]{1,64}$ ]] || { echo "YOOKASSA_SHOP_ID must contain 1-64 digits" >&2; exit 1; }
+  [[ -n "$yookassa_secret_key" && ${#yookassa_secret_key} -le 512 && "$yookassa_secret_key" =~ ^[A-Za-z0-9._~-]+$ ]] || { echo "YOOKASSA_SECRET_KEY contains unsupported characters" >&2; exit 1; }
+  [[ "$yookassa_data_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo "YOOKASSA_DATA_KEY must be standard base64 for 32 bytes" >&2; exit 1; }
+  [[ "$yookassa_return_url" == "https://maxposty.ru/app/?billing=pending#/workspace/settings/plan" ]] || { echo "YOOKASSA_RETURN_URL must be the MaxPosty plan settings callback" >&2; exit 1; }
 fi
 
 value=$(env_value ALERTMANAGER_WEBHOOK_URL)
@@ -256,13 +267,27 @@ case "$(env_value BILLING_ENFORCEMENT_ENABLED)" in
     ;;
 esac
 
+case "$(env_value BILLING_LIVE_ENABLED)" in
+  true|false) ;;
+  *) echo "BILLING_LIVE_ENABLED must be true or false" >&2; exit 1 ;;
+esac
+case "$(env_value YOOKASSA_RECEIPTS_CONFIRMED)" in
+  true|false) ;;
+  *) echo "YOOKASSA_RECEIPTS_CONFIRMED must be true or false" >&2; exit 1 ;;
+esac
+if [[ "$(env_value BILLING_LIVE_ENABLED)" == "true" ]]; then
+  [[ "$(env_value BILLING_ENFORCEMENT_ENABLED)" == "true" ]] || { echo "BILLING_LIVE_ENABLED requires BILLING_ENFORCEMENT_ENABLED=true" >&2; exit 1; }
+  [[ "$(env_value YOOKASSA_RECEIPTS_CONFIRMED)" == "true" ]] || { echo "BILLING_LIVE_ENABLED requires YOOKASSA_RECEIPTS_CONFIRMED=true" >&2; exit 1; }
+  [[ -n "$yookassa_shop_id" && -n "$yookassa_secret_key" && -n "$yookassa_data_key" && -n "$yookassa_return_url" ]] || { echo "BILLING_LIVE_ENABLED requires complete YooKassa configuration" >&2; exit 1; }
+fi
+
 bootstrap_mode=$(env_value AUTH_BOOTSTRAP_MODE)
 case "$bootstrap_mode" in
   true)
     expect_exact PUBLIC_BASE_URL "http://178.159.94.83"
     expect_exact FRONTEND_ORIGIN "http://178.159.94.83"
     expect_exact GRAFANA_ROOT_URL "http://178.159.94.83/monitoring/"
-    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY YOOKASSA_RETURN_URL SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
       if [[ -n "$(env_value "$key")" ]]; then
         echo "$key must be empty in fail-closed bootstrap mode" >&2
         exit 1
@@ -274,7 +299,7 @@ case "$bootstrap_mode" in
     expect_exact FRONTEND_ORIGIN "https://maxposty.ru"
     expect_exact GRAFANA_ROOT_URL "https://maxposty.ru/monitoring/"
     expect_exact YANDEX_REDIRECT_URI "https://maxposty.ru/api/v1/auth/yandex/callback"
-    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY; do
+    for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY YOOKASSA_RETURN_URL; do
       if [[ -z "$(env_value "$key")" ]]; then
         echo "$key must not be empty in production mode" >&2
         exit 1
@@ -313,6 +338,10 @@ fi
 value=$(env_value MEDIA_USER_MAX_BYTES)
 if (( value > 1125899906842624 )); then
   echo "MEDIA_USER_MAX_BYTES must not exceed 1125899906842624" >&2
+  exit 1
+fi
+if (( value < 10737418240 )); then
+  echo "MEDIA_USER_MAX_BYTES must be at least 10737418240 for the current paid plans" >&2
   exit 1
 fi
 value=$(env_value MEDIA_CLEANUP_BATCH_SIZE)

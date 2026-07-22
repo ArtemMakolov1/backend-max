@@ -9,6 +9,14 @@ for smtp_key in SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL 
   grep -F "          $smtp_key: \${{ secrets.$smtp_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $smtp_key: \${$smtp_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
+for billing_key in YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY; do
+  grep -F "          $billing_key: \${{ secrets.$billing_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+  grep -F "      $billing_key: \${$billing_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
+for billing_flag in BILLING_LIVE_ENABLED YOOKASSA_RECEIPTS_CONFIRMED; do
+  grep -F "          $billing_flag: \${{ vars.$billing_flag || 'false' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+  grep -F "      $billing_flag: \${$billing_flag}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
 
 render_production() {
   local output=$1
@@ -29,6 +37,12 @@ render_production() {
     S3_HOST=https://s3.example.test \
     S3_ACCESS_KEY=test-access-key \
     S3_SECRET_KEY=test-secret-key+/= \
+    YOOKASSA_SHOP_ID=123456 \
+    YOOKASSA_SECRET_KEY=test_live_secret_key \
+    YOOKASSA_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+    BILLING_ENFORCEMENT_ENABLED=false \
+    BILLING_LIVE_ENABLED=false \
+    YOOKASSA_RECEIPTS_CONFIRMED=false \
     OPENAI_API_KEY= \
     "$@" \
     "$repo_root/deploy/render-production-env.sh" "$output"
@@ -45,12 +59,18 @@ grep -Fx 'S3_HOST=https://s3.example.test' "$production_env" >/dev/null
 grep -Fx 'S3_BUCKET=' "$production_env" >/dev/null
 grep -Fx 'S3_REGION=' "$production_env" >/dev/null
 grep -Fx 'MEDIA_USER_MAX_FILES=500' "$production_env" >/dev/null
-grep -Fx 'MEDIA_USER_MAX_BYTES=1073741824' "$production_env" >/dev/null
+grep -Fx 'MEDIA_USER_MAX_BYTES=10737418240' "$production_env" >/dev/null
 grep -Fx 'MEDIA_ORPHAN_GRACE_PERIOD=24h' "$production_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_INTERVAL=15m' "$production_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=50' "$production_env" >/dev/null
 grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=5' "$production_env" >/dev/null
 grep -Fx 'BILLING_ENFORCEMENT_ENABLED=false' "$production_env" >/dev/null
+grep -Fx 'BILLING_LIVE_ENABLED=false' "$production_env" >/dev/null
+grep -Fx 'YOOKASSA_RECEIPTS_CONFIRMED=false' "$production_env" >/dev/null
+grep -Fx 'YOOKASSA_SHOP_ID=123456' "$production_env" >/dev/null
+grep -Fx 'YOOKASSA_SECRET_KEY=test_live_secret_key' "$production_env" >/dev/null
+grep -Fx 'YOOKASSA_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' "$production_env" >/dev/null
+grep -Fx 'YOOKASSA_RETURN_URL=https://maxposty.ru/app/?billing=pending#/workspace/settings/plan' "$production_env" >/dev/null
 grep -Fx 'SMTP_HOST=' "$production_env" >/dev/null
 grep -Fx 'SMTP_PORT=587' "$production_env" >/dev/null
 grep -Fx 'SMTP_USERNAME=' "$production_env" >/dev/null
@@ -99,12 +119,12 @@ grep -Fx 'S3_REGION=ru-1' "$configured_s3_env" >/dev/null
 configured_media_env="$sandbox/configured-media.env"
 render_production "$configured_media_env" \
   MEDIA_USER_MAX_FILES=750 \
-  MEDIA_USER_MAX_BYTES=2147483648 \
+  MEDIA_USER_MAX_BYTES=21474836480 \
   MEDIA_ORPHAN_GRACE_PERIOD=48h \
   MEDIA_CLEANUP_INTERVAL=30m \
   MEDIA_CLEANUP_BATCH_SIZE=75
 grep -Fx 'MEDIA_USER_MAX_FILES=750' "$configured_media_env" >/dev/null
-grep -Fx 'MEDIA_USER_MAX_BYTES=2147483648' "$configured_media_env" >/dev/null
+grep -Fx 'MEDIA_USER_MAX_BYTES=21474836480' "$configured_media_env" >/dev/null
 grep -Fx 'MEDIA_ORPHAN_GRACE_PERIOD=48h' "$configured_media_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_INTERVAL=30m' "$configured_media_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=75' "$configured_media_env" >/dev/null
@@ -116,9 +136,20 @@ grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=25' "$configured_workspace_env" >/
 "$repo_root/deploy/validate-production-env.sh" "$configured_workspace_env"
 
 configured_billing_env="$sandbox/configured-billing.env"
-render_production "$configured_billing_env" BILLING_ENFORCEMENT_ENABLED=true
+render_production "$configured_billing_env" \
+  BILLING_ENFORCEMENT_ENABLED=true \
+  BILLING_LIVE_ENABLED=true \
+  YOOKASSA_RECEIPTS_CONFIRMED=true
 grep -Fx 'BILLING_ENFORCEMENT_ENABLED=true' "$configured_billing_env" >/dev/null
+grep -Fx 'BILLING_LIVE_ENABLED=true' "$configured_billing_env" >/dev/null
+grep -Fx 'YOOKASSA_RECEIPTS_CONFIRMED=true' "$configured_billing_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_billing_env"
+
+if render_production "$sandbox/unsafe-live.env" \
+  BILLING_LIVE_ENABLED=true BILLING_ENFORCEMENT_ENABLED=true >/dev/null 2>&1; then
+  echo "Production render accepted live billing without receipt confirmation" >&2
+  exit 1
+fi
 
 awk -F= '$1 == "BILLING_ENFORCEMENT_ENABLED" { print "BILLING_ENFORCEMENT_ENABLED=sometimes"; next } { print }' \
   "$production_env" >"$sandbox/invalid-billing-enforcement.env"
@@ -191,6 +222,7 @@ fi
 for media_override in \
   'MEDIA_USER_MAX_FILES=0' \
   'MEDIA_USER_MAX_BYTES=0' \
+  'MEDIA_USER_MAX_BYTES=1073741824' \
   'MEDIA_ORPHAN_GRACE_PERIOD=30m' \
   'MEDIA_CLEANUP_INTERVAL=30s' \
   'MEDIA_CLEANUP_BATCH_SIZE=1001'; do

@@ -209,6 +209,14 @@ func newResearchTestHandler(t *testing.T, research app.ResearchClient, _ string)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.UpsertUser(context.Background(), store.User{
+		ID: "research-user", DisplayName: "Research User",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activatePaidWorkspaceForAPITest(
+		t, storage, "research-user", personalWorkspaceIDForTest(t, storage, "research-user"), "pro",
+	)
 	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
 	if err != nil {
 		t.Fatal(err)

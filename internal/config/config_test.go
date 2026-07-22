@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -158,7 +159,7 @@ func TestLoadUsesBoundedMediaQuotaAndCleanupDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MediaUserMaxFiles != 500 || cfg.MediaUserMaxBytes != 1<<30 ||
+	if cfg.MediaUserMaxFiles != 500 || cfg.MediaUserMaxBytes != 10<<30 ||
 		cfg.MediaOrphanGrace != 24*time.Hour || cfg.MediaCleanupInterval != 15*time.Minute || cfg.MediaCleanupBatch != 50 {
 		t.Fatalf("unexpected media defaults: %#v", cfg)
 	}
@@ -175,6 +176,94 @@ func TestLoadUsesBoundedMediaQuotaAndCleanupDefaults(t *testing.T) {
 	if cfg.MediaUserMaxFiles != 42 || cfg.MediaUserMaxBytes != 10<<20 ||
 		cfg.MediaOrphanGrace != 2*time.Hour || cfg.MediaCleanupInterval != 5*time.Minute || cfg.MediaCleanupBatch != 25 {
 		t.Fatalf("media overrides were not loaded: %#v", cfg)
+	}
+}
+
+func TestLoadAcceptsCompleteEncryptedYooKassaConfiguration(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("PUBLIC_BASE_URL", "https://maxposty.ru")
+	t.Setenv("FRONTEND_ORIGIN", "https://maxposty.ru")
+	t.Setenv("YOOKASSA_SHOP_ID", "123456")
+	t.Setenv("YOOKASSA_SECRET_KEY", "live_secret_without_spaces")
+	t.Setenv("YOOKASSA_DATA_KEY", base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.YooKassaConfigured() || cfg.YooKassaEnabled() ||
+		cfg.YooKassaReturnURL != "https://maxposty.ru/app/?billing=pending#/workspace/settings/plan" ||
+		len(cfg.YooKassaDataKey) != 32 {
+		t.Fatalf("unexpected YooKassa config: configured=%v enabled=%v return=%q key_bytes=%d",
+			cfg.YooKassaConfigured(), cfg.YooKassaEnabled(), cfg.YooKassaReturnURL, len(cfg.YooKassaDataKey))
+	}
+
+	t.Setenv("BILLING_ENFORCEMENT_ENABLED", "true")
+	t.Setenv("BILLING_LIVE_ENABLED", "true")
+	t.Setenv("YOOKASSA_RECEIPTS_CONFIRMED", "true")
+	cfg, err = Load()
+	if err != nil || !cfg.YooKassaEnabled() {
+		t.Fatalf("live YooKassa config enabled=%v error=%v", cfg.YooKassaEnabled(), err)
+	}
+}
+
+func TestLoadRejectsUnsafeBillingLiveActivation(t *testing.T) {
+	tests := []struct {
+		name  string
+		envs  map[string]string
+		match string
+	}{
+		{name: "without enforcement", envs: map[string]string{"BILLING_LIVE_ENABLED": "true", "YOOKASSA_RECEIPTS_CONFIRMED": "true"}, match: "BILLING_ENFORCEMENT_ENABLED"},
+		{name: "without receipt confirmation", envs: map[string]string{"BILLING_LIVE_ENABLED": "true", "BILLING_ENFORCEMENT_ENABLED": "true"}, match: "YOOKASSA_RECEIPTS_CONFIRMED"},
+		{name: "without credentials", envs: map[string]string{"BILLING_LIVE_ENABLED": "true", "BILLING_ENFORCEMENT_ENABLED": "true", "YOOKASSA_RECEIPTS_CONFIRMED": "true"}, match: "complete YooKassa credentials"},
+		{name: "invalid live flag", envs: map[string]string{"BILLING_LIVE_ENABLED": "sometimes"}, match: "BILLING_LIVE_ENABLED"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			for name, value := range test.envs {
+				t.Setenv(name, value)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.match) {
+				t.Fatalf("Load() error=%v, want %q", err, test.match)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsIncompleteOrUnsafeYooKassaConfiguration(t *testing.T) {
+	tests := []struct {
+		name  string
+		envs  map[string]string
+		match string
+	}{
+		{name: "partial", envs: map[string]string{"YOOKASSA_SHOP_ID": "123"}, match: "configured together"},
+		{name: "bad shop", envs: map[string]string{
+			"YOOKASSA_SHOP_ID": "shop", "YOOKASSA_SECRET_KEY": "secret", "YOOKASSA_DATA_KEY": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		}, match: "YOOKASSA_SHOP_ID"},
+		{name: "short data key", envs: map[string]string{
+			"YOOKASSA_SHOP_ID": "123", "YOOKASSA_SECRET_KEY": "secret", "YOOKASSA_DATA_KEY": base64.StdEncoding.EncodeToString(make([]byte, 16)),
+		}, match: "YOOKASSA_DATA_KEY"},
+		{name: "foreign return", envs: map[string]string{
+			"YOOKASSA_SHOP_ID": "123", "YOOKASSA_SECRET_KEY": "secret", "YOOKASSA_DATA_KEY": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+			"YOOKASSA_RETURN_URL": "https://evil.example/app/",
+		}, match: "PUBLIC_BASE_URL origin"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv("PUBLIC_BASE_URL", "https://maxposty.ru")
+			t.Setenv("FRONTEND_ORIGIN", "https://maxposty.ru")
+			for name, value := range test.envs {
+				t.Setenv(name, value)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), test.match) {
+				t.Fatalf("Load() error=%v, want %q", err, test.match)
+			}
+		})
 	}
 }
 
@@ -455,6 +544,8 @@ func clearAuthEnv(t *testing.T) {
 		"OPENAI_API_KEY", "OPENAI_API_BASE_URL",
 		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
 		"MEDIA_USER_MAX_FILES", "MEDIA_USER_MAX_BYTES", "MEDIA_ORPHAN_GRACE_PERIOD", "MEDIA_CLEANUP_INTERVAL", "MEDIA_CLEANUP_BATCH_SIZE",
+		"BILLING_ENFORCEMENT_ENABLED", "BILLING_LIVE_ENABLED", "YOOKASSA_RECEIPTS_CONFIRMED",
+		"YOOKASSA_SHOP_ID", "YOOKASSA_SECRET_KEY", "YOOKASSA_DATA_KEY", "YOOKASSA_RETURN_URL",
 	} {
 		t.Setenv(name, "")
 	}

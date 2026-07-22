@@ -32,6 +32,8 @@ var (
 	ErrConflict                     = errors.New("resource state conflict")
 	ErrApprovalRequired             = errors.New("the current post revision must be approved before scheduling or publishing")
 	ErrNotEnoughPostsForBrandKit    = errors.New("not enough posts with text to suggest a brand kit")
+	ErrBillingNotConfigured         = errors.New("billing integration is not configured")
+	ErrPaymentProvider              = errors.New("payment provider request failed")
 )
 
 const (
@@ -42,7 +44,7 @@ const (
 	discoverableUnknownRefreshLimit = 2
 	incompleteObservedChatWindow    = 7 * 24 * time.Hour
 	defaultMediaMaxFiles            = int64(500)
-	defaultMediaMaxBytes            = int64(1 << 30)
+	defaultMediaMaxBytes            = int64(10 << 30)
 	defaultMediaOrphanGrace         = 24 * time.Hour
 	defaultMediaCleanupInterval     = 15 * time.Minute
 	defaultMediaCleanupBatch        = 50
@@ -208,6 +210,13 @@ type App struct {
 	mediaPolicy                  MediaPolicy
 	mediaCleanupMu               sync.Mutex
 	lastMediaCleanup             time.Time
+	billing                      BillingClient
+	billingReturnURL             string
+	billingCipher                *billingMethodCipher
+	billingLiveEnabled           bool
+	billingManualReviewMu        sync.Mutex
+	billingManualReviewLastCount int
+	billingManualReviewLastLog   time.Time
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {
@@ -2056,6 +2065,7 @@ func (a *App) runSchedulerCycle(ctx context.Context, now time.Time) {
 		a.syncDueChannelParticipantStats(ctx, now)
 	}
 	a.cleanupDueMedia(ctx, now)
+	a.runBillingCycle(ctx, now)
 	if err := a.store.PurgeExpiredMAXAuthAttempts(ctx, now.UTC()); err != nil {
 		a.logger.Error("scheduler could not purge expired MAX auth attempts", "error", err)
 	}

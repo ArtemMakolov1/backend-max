@@ -26,8 +26,8 @@ const (
 	sessionCookieName   = "maxstudio_session"
 	stateCookieName     = "maxstudio_oauth_state"
 	oauthStateTTL       = 10 * time.Minute
-	termsVersion        = "2026-07-15"
-	personalDataVersion = "2026-07-15"
+	termsVersion        = "2026-07-22"
+	personalDataVersion = "2026-07-22"
 )
 
 type authUser struct {

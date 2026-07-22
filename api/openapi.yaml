@@ -45,12 +45,47 @@ paths:
       description: Internal or unavailable future plans are never returned.
       responses:
         '200':
-          description: Public plan catalog; currently contains only Free
+          description: Public Free, Author and Team plan catalog
           content:
             application/json:
               schema:
                 type: array
                 items: {$ref: '#/components/schemas/BillingCatalogEntry'}
+        default: {$ref: '#/components/responses/Problem'}
+  /webhooks/yookassa:
+    post:
+      tags: [Billing]
+      operationId: receiveYooKassaWebhook
+      summary: Receive a YooKassa payment status notification
+      description: The payment object is always fetched canonically from YooKassa before reconciliation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event, object]
+              properties:
+                event:
+                  type: string
+                  enum: [payment.succeeded, payment.canceled, payment.waiting_for_capture]
+                object:
+                  type: object
+                  required: [id]
+                  properties:
+                    id: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'}
+      responses:
+        '200':
+          description: Notification acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok]
+                properties:
+                  ok: {type: boolean}
+        '400': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/Problem'}
         default: {$ref: '#/components/responses/Problem'}
   /auth/yandex/start:
     post:
@@ -1241,6 +1276,91 @@ paths:
                   description: Send a MAX system notification about the title or photo change.
       responses:
         '200': {$ref: '#/components/responses/Channel'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/billing/checkout:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Billing]
+      operationId: createWorkspaceBillingCheckout
+      summary: Start an owner-authorized recurring subscription checkout
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BillingCheckoutRequest'}
+      responses:
+        '201':
+          description: YooKassa hosted checkout
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingCheckout'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/billing/cancellation-intent:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Billing]
+      operationId: createWorkspaceBillingCancellationIntent
+      summary: Create the first exact-cancellation confirmation and one-period retention offer
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Short-lived cancellation intent
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BillingCancellationIntent'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/billing/retention-offer:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Billing]
+      operationId: acceptWorkspaceBillingRetentionOffer
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BillingIntentRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceBilling'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/billing/cancel-confirm:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Billing]
+      operationId: confirmWorkspaceBillingCancellation
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BillingIntentRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceBilling'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/billing/resume:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Billing]
+      operationId: resumeWorkspaceBillingSubscription
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceBilling'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/billing/payment-method/detach:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Billing]
+      operationId: detachWorkspaceBillingPaymentMethod
+      summary: Irreversibly forget the saved payment method and disable renewal
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BillingDetachPaymentMethodRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/WorkspaceBilling'}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/channels/{channel_id}/description/suggest:
     parameters:
@@ -2451,6 +2571,9 @@ components:
     WorkspaceEnvelope:
       description: Workspace and authoritative access context
       content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceEnvelope'}}}
+    WorkspaceBilling:
+      description: Workspace billing state with owner-scoped actions
+      content: {application/json: {schema: {$ref: '#/components/schemas/WorkspaceBilling'}}}
     WorkspaceList:
       description: Available workspaces
       content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/WorkspaceEnvelope'}}}}
@@ -2752,9 +2875,31 @@ components:
         hard_limit: {type: boolean}
     BillingCatalogEntry:
       type: object
-      required: [plan, entitlements]
+      required:
+        - plan
+        - entitlements
+        - checkout_enabled
+        - recurring_consent_text
+        - recurring_consent_version
+        - recurring_consent_terms_version
+        - recurring_consent_terms_url
       properties:
         plan: {$ref: '#/components/schemas/BillingPlan'}
+        checkout_enabled:
+          type: boolean
+          description: Default-off server capability; false keeps pricing visible without accepting payments.
+        recurring_consent_text:
+          type: string
+          description: Authoritative text that must be shown verbatim before a paid recurring checkout; empty for Free.
+        recurring_consent_version:
+          type: string
+          description: Must be echoed in BillingCheckoutRequest; empty for Free.
+        recurring_consent_terms_version:
+          type: string
+          description: Version of the linked terms used as consent evidence; empty for Free.
+        recurring_consent_terms_url:
+          type: string
+          description: Absolute terms URL used as consent evidence; empty for Free.
         entitlements:
           type: array
           items: {$ref: '#/components/schemas/BillingEntitlement'}
@@ -2788,6 +2933,101 @@ components:
         low: {type: integer, format: int64, minimum: 1}
         medium: {type: integer, format: int64, minimum: 1}
         high: {type: integer, format: int64, minimum: 1}
+    BillingFeatures:
+      type: object
+      required: [ai_images, ai_research, ai_format, ai_channel_description, ai_brand_kit]
+      properties:
+        ai_images: {type: boolean}
+        ai_research: {type: boolean}
+        ai_format: {type: boolean}
+        ai_channel_description: {type: boolean}
+        ai_brand_kit: {type: boolean}
+    BillingActions:
+      type: object
+      required: [can_checkout, can_cancel, can_resume, can_detach_payment_method]
+      description: All fields are false for non-owners; live-dependent actions are false while checkout is disabled.
+      properties:
+        can_checkout: {type: boolean}
+        can_cancel: {type: boolean}
+        can_resume: {type: boolean}
+        can_detach_payment_method: {type: boolean}
+    BillingPaymentMethod:
+      type: object
+      required: [saved]
+      properties:
+        saved: {type: boolean}
+    BillingContract:
+      type: object
+      required:
+        - status
+        - current_period_start
+        - current_period_end
+        - cancel_at_period_end
+        - next_charge_at
+        - retention_offer_used
+        - next_period_discount_percent
+        - payment_method
+      properties:
+        status: {type: string, enum: [active, past_due, ended]}
+        current_period_start: {type: [string, 'null'], format: date-time}
+        current_period_end: {type: [string, 'null'], format: date-time}
+        cancel_at_period_end: {type: boolean}
+        next_charge_at: {type: [string, 'null'], format: date-time}
+        grace_until: {type: [string, 'null'], format: date-time}
+        retention_offer_used: {type: boolean}
+        next_period_discount_percent: {type: integer, minimum: 0, maximum: 50}
+        payment_method: {$ref: '#/components/schemas/BillingPaymentMethod'}
+    BillingCheckoutRequest:
+      type: object
+      additionalProperties: false
+      required: [plan_code, recurring_consent, recurring_consent_version]
+      properties:
+        plan_code: {type: string, enum: [solo, pro]}
+        recurring_consent:
+          type: boolean
+          const: true
+        recurring_consent_version:
+          type: string
+          const: yookassa-recurring-v2
+    BillingCheckout:
+      type: object
+      required: [checkout_id, status]
+      properties:
+        checkout_id: {type: string, pattern: '^[0-9a-f]{32}$'}
+        status: {type: string, enum: [prepared, pending, succeeded, canceled, failed, manual_review]}
+        confirmation_url:
+          type: string
+          format: uri
+          description: Present only when the checkout requires a browser redirect.
+    BillingIntentRequest:
+      type: object
+      additionalProperties: false
+      required: [intent_token]
+      properties:
+        intent_token: {type: string, pattern: '^[0-9a-f]{64}$'}
+    BillingRetentionOffer:
+      type: object
+      required: [eligible, discount_percent, applies_to_periods, regular_price_resumes_at, expires_at]
+      properties:
+        eligible: {type: boolean}
+        discount_percent: {type: integer, const: 50}
+        applies_to_periods: {type: integer, const: 1}
+        regular_price_resumes_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+    BillingCancellationIntent:
+      type: object
+      required: [intent_token, current_period_end, retention_offer]
+      properties:
+        intent_token: {type: string, pattern: '^[0-9a-f]{64}$'}
+        current_period_end: {type: string, format: date-time}
+        retention_offer: {$ref: '#/components/schemas/BillingRetentionOffer'}
+    BillingDetachPaymentMethodRequest:
+      type: object
+      additionalProperties: false
+      required: [disable_autorenewal, confirmation]
+      properties:
+        disable_autorenewal: {type: boolean, const: true}
+        confirmation: {type: boolean, const: true}
     WorkspaceBilling:
       type: object
       required:
@@ -2795,7 +3035,11 @@ components:
         - subscription
         - entitlements
         - usage
+        - features
+        - contract
+        - billing_actions
         - monthly_enforcement_enabled
+        - checkout_enabled
         - image_credit_costs
       properties:
         workspace_id: {type: string}
@@ -2806,9 +3050,16 @@ components:
         usage:
           type: array
           items: {$ref: '#/components/schemas/WorkspaceUsageMetric'}
+        features: {$ref: '#/components/schemas/BillingFeatures'}
+        contract:
+          oneOf:
+            - {$ref: '#/components/schemas/BillingContract'}
+            - {type: 'null'}
+        billing_actions: {$ref: '#/components/schemas/BillingActions'}
         monthly_enforcement_enabled:
           type: boolean
           description: False means observe-only; usage still increments atomically.
+        checkout_enabled: {type: boolean}
         image_credit_costs: {$ref: '#/components/schemas/ImageCreditCosts'}
     WorkspaceCreate:
       type: object
