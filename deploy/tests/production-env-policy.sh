@@ -40,6 +40,9 @@ render_production() {
     YOOKASSA_SHOP_ID=123456 \
     YOOKASSA_SECRET_KEY=test_live_secret_key \
     YOOKASSA_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+    BILLING_ENFORCEMENT_ENABLED=false \
+    BILLING_LIVE_ENABLED=false \
+    YOOKASSA_RECEIPTS_CONFIRMED=false \
     OPENAI_API_KEY= \
     "$@" \
     "$repo_root/deploy/render-production-env.sh" "$output"

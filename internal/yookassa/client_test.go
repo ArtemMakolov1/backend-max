@@ -368,6 +368,8 @@ func TestGetPaymentValidatesIDAndResponseMatch(t *testing.T) {
 
 func TestClientRejectsNilContext(t *testing.T) {
 	client := testClient(t, "http://127.0.0.1:1")
+	// Intentionally pass nil to verify the public client's defensive contract.
+	//nolint:staticcheck // SA1012: nil is the input under test.
 	if _, err := client.CreatePayment(nil, "nil-context", validRedirectRequest()); err == nil || !strings.Contains(err.Error(), "nil context") {
 		t.Fatalf("CreatePayment(nil) error = %v", err)
 	}

@@ -157,7 +157,7 @@ func (a *App) ReconcileYooKassaPayment(
 	}
 	payment, err := a.billing.GetPayment(ctx, providerPaymentID)
 	if err != nil {
-		return false, fmt.Errorf("%w: %v", ErrPaymentProvider, err)
+		return false, fmt.Errorf("%w: %w", ErrPaymentProvider, err)
 	}
 	now := a.now().UTC()
 	processed, err := a.reconcileProviderPayment(ctx, eventType, payment, now)
@@ -269,9 +269,9 @@ func (a *App) processBillingAttempt(ctx context.Context, attempt store.BillingPa
 	if err != nil {
 		next := billingStatusRetryAt(attempt, now)
 		if deferErr := a.store.DeferBillingAttempt(ctx, attempt.ID, "provider_status_unavailable", next); deferErr != nil {
-			return errors.Join(fmt.Errorf("%w: %v", ErrPaymentProvider, err), deferErr)
+			return errors.Join(fmt.Errorf("%w: %w", ErrPaymentProvider, err), deferErr)
 		}
-		return fmt.Errorf("%w: %v", ErrPaymentProvider, err)
+		return fmt.Errorf("%w: %w", ErrPaymentProvider, err)
 	}
 	_, err = a.reconcileProviderPayment(ctx, "payment.status.checked", payment, now)
 	if errors.Is(err, store.ErrBillingIntegrity) {
@@ -331,9 +331,9 @@ func (a *App) createProviderPaymentAt(
 	payment, err := a.billing.CreatePayment(ctx, attempt.IdempotencyKey, request)
 	if err != nil {
 		if stateErr := a.recordBillingCreateFailure(ctx, attempt, err, now); stateErr != nil {
-			return store.BillingPaymentAttempt{}, errors.Join(fmt.Errorf("%w: %v", ErrPaymentProvider, err), stateErr)
+			return store.BillingPaymentAttempt{}, errors.Join(fmt.Errorf("%w: %w", ErrPaymentProvider, err), stateErr)
 		}
-		return store.BillingPaymentAttempt{}, fmt.Errorf("%w: %v", ErrPaymentProvider, err)
+		return store.BillingPaymentAttempt{}, fmt.Errorf("%w: %w", ErrPaymentProvider, err)
 	}
 	canonical, err := a.canonicalBillingPayment(payment)
 	if err != nil || canonical.Test || canonical.MetadataAttemptID != attempt.ID ||
@@ -345,9 +345,9 @@ func (a *App) createProviderPaymentAt(
 			err = errors.New("YooKassa create response does not match the local payment attempt")
 		}
 		if stateErr != nil {
-			return store.BillingPaymentAttempt{}, errors.Join(fmt.Errorf("%w: %v", ErrPaymentProvider, err), stateErr)
+			return store.BillingPaymentAttempt{}, errors.Join(fmt.Errorf("%w: %w", ErrPaymentProvider, err), stateErr)
 		}
-		return store.BillingPaymentAttempt{}, fmt.Errorf("%w: %v", ErrPaymentProvider, err)
+		return store.BillingPaymentAttempt{}, fmt.Errorf("%w: %w", ErrPaymentProvider, err)
 	}
 	confirmationURL := ""
 	if payment.Confirmation != nil {
