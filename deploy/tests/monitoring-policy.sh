@@ -66,8 +66,12 @@ grep -F 'GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST: prometheus:9090' "$production_
 grep -F 'ipv4_address: 172.29.42.20' "$production_compose" >/dev/null
 grep -F 'name: maxposty-monitoring-edge' "$production_compose" >/dev/null
 grep -F '127.0.0.1:${GRAFANA_PORT:-3000}:3000' "$local_compose" >/dev/null
-grep -F "grep -Eq '^pg_up 1" "$repo_root/deploy/deploy-production.sh" >/dev/null
-grep -F "grep -Eq '^pgbouncer_up 1" "$repo_root/deploy/deploy-production.sh" >/dev/null
+grep -F "grep -E '^pg_up 1(\\.0)?$' >/dev/null" "$repo_root/deploy/deploy-production.sh" >/dev/null
+grep -F "grep -E '^pgbouncer_up 1(\\.0)?$' >/dev/null" "$repo_root/deploy/deploy-production.sh" >/dev/null
+if grep -E "grep -E?q .*\^(pg|pgbouncer)_up" "$repo_root/deploy/deploy-production.sh" >/dev/null; then
+  echo "Exporter connection gates must consume the complete metrics stream under pipefail" >&2
+  exit 1
+fi
 grep -F 'wait_for_prometheus_target' "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F 'wait_for_prometheus_alertmanager' "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F 'wait_for_grafana_provisioning' "$repo_root/deploy/deploy-production.sh" >/dev/null
