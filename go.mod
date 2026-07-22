@@ -37,6 +37,6 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/sync v0.22.0
 	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/text v0.39.0 // indirect
 	google.golang.org/protobuf v1.36.8 // indirect
 )
