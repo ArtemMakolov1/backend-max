@@ -77,6 +77,7 @@ type ChannelDiagnostics struct {
 	CanEdit                    bool     `json:"can_edit"`
 	CanDelete                  bool     `json:"can_delete"`
 	CanPin                     bool     `json:"can_pin"`
+	CanChangeInfo              bool     `json:"can_change_info"`
 	MissingRequiredPermissions []string `json:"missing_required_permissions"`
 }
 
@@ -149,6 +150,10 @@ type ImagePromptSuggester interface {
 
 type BrandKitSuggester interface {
 	SuggestBrandKit(context.Context, openairesearch.SuggestBrandKitRequest) (openairesearch.SuggestBrandKitResult, error)
+}
+
+type ChannelDescriptionSuggester interface {
+	SuggestChannelDescription(context.Context, openairesearch.SuggestChannelDescriptionRequest) (openairesearch.SuggestChannelDescriptionResult, error)
 }
 
 // Metrics receives only bounded operational dimensions. Implementations must
@@ -265,6 +270,11 @@ func (a *App) BrandKitSuggestionConfigured() bool {
 	return a.research != nil && ok
 }
 
+func (a *App) ChannelDescriptionSuggestionConfigured() bool {
+	_, ok := a.research.(ChannelDescriptionSuggester)
+	return a.research != nil && ok
+}
+
 // ValidateImageRequest applies the public API policy before an API handler
 // reserves quota, then lets the configured client enforce its model's exact
 // upstream rules. Alternative clients still receive the common validation.
@@ -302,6 +312,7 @@ func normalizeObservedMAXChat(requestedID string, info maxclient.ChatInfo, fallb
 	info.Type = strings.TrimSpace(info.Type)
 	info.Status = strings.TrimSpace(info.Status)
 	info.Title = strings.TrimSpace(info.Title)
+	info.Description = strings.TrimSpace(info.Description)
 	if info.ChatID == "" || (requestedID != "" && info.ChatID != requestedID) {
 		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: chat id is missing or mismatched", ErrMAXChannelMetadataIncomplete)
 	}
@@ -313,6 +324,9 @@ func normalizeObservedMAXChat(requestedID string, info maxclient.ChatInfo, fallb
 	}
 	if info.ParticipantsCount < 0 {
 		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: participants count is invalid", ErrMAXChannelMetadataIncomplete)
+	}
+	if info.MessagesCount < 0 {
+		return maxclient.ChatInfo{}, store.ObservedBotChat{}, fmt.Errorf("%w: messages count is invalid", ErrMAXChannelMetadataIncomplete)
 	}
 
 	canonicalLink := strings.TrimRight(strings.TrimSpace(info.Link), "/")
@@ -333,9 +347,49 @@ func normalizeObservedMAXChat(requestedID string, info maxclient.ChatInfo, fallb
 	info.Link = canonicalLink
 	info.Icon.URL = iconURL
 	return info, store.ObservedBotChat{
-		MAXChatID: info.ChatID, PublicLink: canonicalLink, Title: info.Title, MAXOwnerID: info.OwnerID,
-		IconURL: iconURL, ParticipantsCount: info.ParticipantsCount, Active: true, LastSeenAt: observedAt.UTC(),
+		MAXChatID: info.ChatID, PublicLink: canonicalLink, Title: info.Title, Description: info.Description,
+		MAXOwnerID: info.OwnerID, IconURL: iconURL, ParticipantsCount: info.ParticipantsCount,
+		IsPublic: info.IsPublic, MessagesCount: info.MessagesCount, HasPinnedMessage: info.HasPinnedMessage,
+		MAXLastEventTime: maxLastEventTime(info.LastEventTime), MAXInfoSyncedAt: timePointer(observedAt),
+		Active: true, LastSeenAt: observedAt.UTC(),
 	}, nil
+}
+
+func timePointer(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	value = value.UTC()
+	return &value
+}
+
+func maxLastEventTime(timestamp int64) *time.Time {
+	if timestamp <= 0 {
+		return nil
+	}
+	value := time.UnixMilli(timestamp).UTC()
+	return &value
+}
+
+func channelMetadataFromMAX(info maxclient.ChatInfo, syncedAt time.Time) store.Channel {
+	return store.Channel{
+		MAXChatID: info.ChatID, VerifiedMAXOwnerID: info.OwnerID,
+		Title: strings.TrimSpace(info.Title), Description: strings.TrimSpace(info.Description),
+		PublicLink: strings.TrimSpace(info.Link), IconURL: maxclient.SafeAssetURL(info.Icon.URL),
+		ParticipantsCount: info.ParticipantsCount, IsPublic: info.IsPublic, MessagesCount: info.MessagesCount,
+		HasPinnedMessage: info.HasPinnedMessage, MAXLastEventTime: maxLastEventTime(info.LastEventTime),
+		MAXInfoSyncedAt: timePointer(syncedAt),
+		IsChannel:       info.Type == "channel", Active: info.Status == "active",
+	}
+}
+
+func (a *App) syncChannelMAXInfoForUser(
+	ctx context.Context, userID string, channelID int64, expectedMAXChatID string, info maxclient.ChatInfo,
+	capturedAt time.Time,
+) (store.Channel, error) {
+	return a.store.SyncChannelMAXInfoForUser(
+		ctx, userID, channelID, expectedMAXChatID,
+		channelMetadataFromMAX(info, capturedAt), capturedAt)
 }
 
 // resolveMAXChatOwner fills the nullable owner_id from the official
@@ -631,10 +685,10 @@ func (a *App) ConnectChannel(ctx context.Context, publicLink, maxChatID, request
 			canonicalLink = "https://max.ru/" + strings.TrimPrefix(slug, "@")
 		}
 	}
-	channel, err := a.store.UpsertConnectedChannel(ctx, store.Channel{
-		VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title, PublicLink: canonicalLink, IconURL: maxclient.SafeAssetURL(info.Icon.URL),
-		ParticipantsCount: info.ParticipantsCount, IsChannel: true, Active: true,
-	})
+	metadata := channelMetadataFromMAX(info, a.now().UTC())
+	metadata.Title = title
+	metadata.PublicLink = canonicalLink
+	channel, err := a.store.UpsertConnectedChannel(ctx, metadata)
 	if err != nil {
 		return ChannelCheck{}, err
 	}
@@ -773,11 +827,10 @@ func (a *App) CompleteChannelClaim(ctx context.Context, claim store.ChannelClaim
 	if title == "" {
 		title = strings.TrimSpace(claim.RequestedTitle)
 	}
-	channel, err := a.store.CompleteChannelClaim(ctx, claim, store.Channel{
-		UserID: claim.UserID, VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title,
-		PublicLink: strings.TrimSpace(info.Link), IconURL: maxclient.SafeAssetURL(info.Icon.URL), ParticipantsCount: info.ParticipantsCount,
-		IsChannel: true, Active: true,
-	})
+	metadata := channelMetadataFromMAX(info, a.now().UTC())
+	metadata.UserID = claim.UserID
+	metadata.Title = title
+	channel, err := a.store.CompleteChannelClaim(ctx, claim, metadata)
 	return channel, diagnostics, err
 }
 
@@ -877,11 +930,10 @@ func (a *App) ConnectDiscoverableChannelForUser(ctx context.Context, userID, max
 	if title == "" {
 		title = "MAX " + info.ChatID
 	}
-	channel, err := a.store.ConnectDiscoverableChannelForUser(ctx, userID, maxChatID, store.Channel{
-		UserID: userID, VerifiedMAXOwnerID: info.OwnerID, MAXChatID: info.ChatID, Title: title,
-		PublicLink: strings.TrimSpace(info.Link), IconURL: maxclient.SafeAssetURL(info.Icon.URL), ParticipantsCount: info.ParticipantsCount,
-		IsChannel: true, Active: true,
-	})
+	metadata := channelMetadataFromMAX(info, a.now().UTC())
+	metadata.UserID = userID
+	metadata.Title = title
+	channel, err := a.store.ConnectDiscoverableChannelForUser(ctx, userID, maxChatID, metadata)
 	if err != nil {
 		return ChannelCheck{}, err
 	}
@@ -903,7 +955,15 @@ func (a *App) TestChannel(ctx context.Context, channelID int64) (ChannelCheck, e
 	if err != nil {
 		return ChannelCheck{}, err
 	}
+	// Date the snapshot when its upstream read starts. Otherwise an older,
+	// slower GET can finish after a newer one and overwrite fresher metadata.
+	capturedAt := a.now().UTC()
 	info, membership, err := a.inspectChannel(ctx, channel)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	channel, err = a.syncChannelMAXInfoForUser(
+		ctx, channel.UserID, channel.ID, channel.MAXChatID, info, capturedAt)
 	if err != nil {
 		return ChannelCheck{}, err
 	}
@@ -913,6 +973,7 @@ func (a *App) TestChannel(ctx context.Context, channelID int64) (ChannelCheck, e
 		diagnostics.CanEdit = false
 		diagnostics.CanDelete = false
 		diagnostics.CanPin = false
+		diagnostics.CanChangeInfo = false
 	}
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
@@ -925,6 +986,7 @@ func (a *App) TestChannelForUser(ctx context.Context, userID string, channelID i
 	if a.max == nil {
 		return ChannelCheck{}, ErrMAXNotConfigured
 	}
+	capturedAt := a.now().UTC()
 	info, membership, err := a.inspectChannel(ctx, channel)
 	if err != nil {
 		return ChannelCheck{}, err
@@ -932,14 +994,44 @@ func (a *App) TestChannelForUser(ctx context.Context, userID string, channelID i
 	if err := validateChannelParticipantInfo(channel, info); err != nil {
 		return ChannelCheck{}, err
 	}
-	channel, err = a.store.SyncChannelParticipantStatsForUser(ctx, userID, channel.ID, channel.MAXChatID,
-		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount, a.now().UTC())
+	channel, err = a.syncChannelMAXInfoForUser(
+		ctx, userID, channel.ID, channel.MAXChatID, info, capturedAt)
 	if err != nil {
 		return ChannelCheck{}, err
 	}
 	diagnostics := channelDiagnostics(info, membership)
 	if !channel.Active {
-		diagnostics.CanPublish, diagnostics.CanEdit, diagnostics.CanDelete, diagnostics.CanPin = false, false, false, false
+		diagnostics.CanPublish, diagnostics.CanEdit, diagnostics.CanDelete, diagnostics.CanPin, diagnostics.CanChangeInfo = false, false, false, false, false
+	}
+	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
+}
+
+func (a *App) TestChannelForWorkspace(
+	ctx context.Context, actorUserID, workspaceID string, channelID int64,
+) (ChannelCheck, error) {
+	channel, err := a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, channelID)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	if a.max == nil {
+		return ChannelCheck{}, ErrMAXNotConfigured
+	}
+	capturedAt := a.now().UTC()
+	info, membership, err := a.inspectChannel(ctx, channel)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	if err := validateChannelParticipantInfo(channel, info); err != nil {
+		return ChannelCheck{}, err
+	}
+	channel, err = a.syncChannelMAXInfoForUser(
+		ctx, channel.UserID, channel.ID, channel.MAXChatID, info, capturedAt)
+	if err != nil {
+		return ChannelCheck{}, err
+	}
+	diagnostics := channelDiagnostics(info, membership)
+	if !channel.Active {
+		diagnostics.CanPublish, diagnostics.CanEdit, diagnostics.CanDelete, diagnostics.CanPin, diagnostics.CanChangeInfo = false, false, false, false, false
 	}
 	return ChannelCheck{Channel: channel, Diagnostics: diagnostics}, nil
 }
@@ -951,6 +1043,7 @@ type ChannelMAXInfoUpdate struct {
 	Title        *string
 	IconFilename string
 	Icon         io.Reader
+	Notify       bool
 }
 
 // pushChannelMAXInfo re-verifies channel ownership and bot admin rights, then
@@ -967,11 +1060,12 @@ func (a *App) pushChannelMAXInfo(ctx context.Context, channel store.Channel, upd
 		return maxclient.ChatInfo{}, err
 	}
 	diagnostics := channelDiagnostics(info, membership)
-	if !channel.Active || !membership.IsAdmin {
+	if !channel.Active || !diagnostics.CanChangeInfo {
 		return maxclient.ChatInfo{}, &ChannelAccessError{Diagnostics: diagnostics,
-			Message: "The shared bot must administer an active channel to change its title or photo"}
+			Message: "The shared bot needs change_chat_info permission to change the channel title or photo"}
 	}
-	patch := maxclient.ChatPatch{Title: update.Title}
+	notify := update.Notify
+	patch := maxclient.ChatPatch{Title: update.Title, Notify: &notify}
 	if update.Icon != nil {
 		upload, uploadErr := a.max.UploadImage(ctx, update.IconFilename, update.Icon)
 		if uploadErr != nil {
@@ -996,8 +1090,8 @@ func (a *App) UpdateChannelMAXInfoForUser(ctx context.Context, userID string, ch
 			return store.Channel{}, err
 		}
 	}
-	return a.store.SyncChannelParticipantStatsForUser(ctx, userID, channelID, channel.MAXChatID,
-		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount, a.now().UTC())
+	return a.syncChannelMAXInfoForUser(
+		ctx, userID, channelID, channel.MAXChatID, info, a.now().UTC())
 }
 
 func (a *App) UpdateChannelMAXInfoForWorkspace(ctx context.Context, actorUserID, workspaceID string, channelID int64, update ChannelMAXInfoUpdate) (store.Channel, error) {
@@ -1019,8 +1113,9 @@ func (a *App) UpdateChannelMAXInfoForWorkspace(ctx context.Context, actorUserID,
 	}); err != nil {
 		return store.Channel{}, err
 	}
-	if _, err := a.store.SyncChannelParticipantStatsForUser(ctx, channel.UserID, channelID, channel.MAXChatID,
-		maxclient.SafeAssetURL(info.Icon.URL), info.ParticipantsCount, a.now().UTC()); err != nil {
+	if _, err := a.syncChannelMAXInfoForUser(
+		ctx, channel.UserID, channelID, channel.MAXChatID, info, a.now().UTC(),
+	); err != nil {
 		return store.Channel{}, err
 	}
 	return a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, channelID)
@@ -1227,6 +1322,80 @@ func (a *App) SuggestBrandKit(ctx context.Context, actorUserID, workspaceID stri
 		Posts:  samples,
 		Images: a.collectBrandKitImages(ctx, selected),
 	})
+}
+
+// SuggestChannelDescriptionForUser builds an AI request exclusively from the
+// authenticated user's channel and its newest non-empty posts. The caller's
+// context and draft stay separate from authoritative MAX metadata so neither
+// can replace the saved title or description.
+func (a *App) SuggestChannelDescriptionForUser(
+	ctx context.Context, userID string, channelID int64, input openairesearch.SuggestChannelDescriptionRequest,
+) (openairesearch.SuggestChannelDescriptionResult, error) {
+	if err := openairesearch.ValidateSuggestChannelDescriptionInput(input); err != nil {
+		return openairesearch.SuggestChannelDescriptionResult{}, err
+	}
+	channel, err := a.store.GetChannelForUser(ctx, userID, channelID)
+	if err != nil {
+		return openairesearch.SuggestChannelDescriptionResult{}, err
+	}
+	posts, err := a.store.ListPostsForUser(ctx, userID, store.PostStatusPublished, &channelID)
+	if err != nil {
+		return openairesearch.SuggestChannelDescriptionResult{}, err
+	}
+	return a.suggestChannelDescription(ctx, channel, posts, input)
+}
+
+func (a *App) SuggestChannelDescriptionForWorkspace(
+	ctx context.Context, actorUserID, workspaceID string, channelID int64,
+	input openairesearch.SuggestChannelDescriptionRequest,
+) (openairesearch.SuggestChannelDescriptionResult, error) {
+	if err := openairesearch.ValidateSuggestChannelDescriptionInput(input); err != nil {
+		return openairesearch.SuggestChannelDescriptionResult{}, err
+	}
+	channel, err := a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, channelID)
+	if err != nil {
+		return openairesearch.SuggestChannelDescriptionResult{}, err
+	}
+	posts, err := a.store.ListPostsForWorkspace(ctx, actorUserID, workspaceID, store.PostStatusPublished, &channelID)
+	if err != nil {
+		return openairesearch.SuggestChannelDescriptionResult{}, err
+	}
+	return a.suggestChannelDescription(ctx, channel, posts, input)
+}
+
+func (a *App) suggestChannelDescription(
+	ctx context.Context, channel store.Channel, posts []store.Post,
+	input openairesearch.SuggestChannelDescriptionRequest,
+) (openairesearch.SuggestChannelDescriptionResult, error) {
+	suggester, ok := a.research.(ChannelDescriptionSuggester)
+	if a.research == nil || !ok {
+		return openairesearch.SuggestChannelDescriptionResult{}, ErrResearchNotConfigured
+	}
+	input.ChannelTitle = channel.Title
+	input.ChannelDescription = channel.Description
+	input.Posts = make([]openairesearch.PostSample, 0, openairesearch.MaxSuggestChannelDescriptionPosts)
+	remaining := openairesearch.MaxSuggestChannelDescriptionTotalRunes
+	for _, post := range posts {
+		if len(input.Posts) == openairesearch.MaxSuggestChannelDescriptionPosts || remaining <= 0 {
+			break
+		}
+		text := strings.TrimSpace(post.Content)
+		if text == "" {
+			continue
+		}
+		if runes := []rune(text); len(runes) > remaining {
+			text = strings.TrimSpace(string(runes[:remaining]))
+			if text == "" {
+				break
+			}
+		}
+		remaining -= utf8.RuneCountInString(text)
+		input.Posts = append(input.Posts, openairesearch.PostSample{Text: text, Format: post.Format})
+	}
+	if err := openairesearch.ValidateSuggestChannelDescriptionRequest(input); err != nil {
+		return openairesearch.SuggestChannelDescriptionResult{}, err
+	}
+	return suggester.SuggestChannelDescription(ctx, input)
 }
 
 // collectBrandKitImages loads up to MaxSuggestBrandKitImages cover images from
@@ -2343,6 +2512,7 @@ func channelDiagnostics(info maxclient.ChatInfo, membership maxclient.Membership
 	hasEdit := membership.HasPermission(maxclient.PermissionEdit)
 	hasDelete := membership.HasPermission(maxclient.PermissionDelete)
 	hasPin := membership.HasPermission(maxclient.PermissionPinMessage)
+	hasChangeInfo := membership.HasPermission(maxclient.PermissionChangeChatInfo)
 	if !hasEdit {
 		missing = append(missing, string(maxclient.PermissionEdit))
 	}
@@ -2357,6 +2527,7 @@ func channelDiagnostics(info maxclient.ChatInfo, membership maxclient.Membership
 		CanEdit:                    activeChannel && membership.IsAdmin && hasRead && hasEdit,
 		CanDelete:                  activeChannel && membership.IsAdmin && hasRead && hasDelete,
 		CanPin:                     activeChannel && membership.IsAdmin && hasPin,
+		CanChangeInfo:              activeChannel && membership.IsAdmin && hasChangeInfo,
 		MissingRequiredPermissions: missing,
 	}
 }

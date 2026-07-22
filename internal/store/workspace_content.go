@@ -48,15 +48,21 @@ WHERE max_chat_id=$1 FOR UPDATE`, maxChatID).Scan(&id, &ownerID, &existingWorksp
 			}
 		}
 		_, err = tx.ExecContext(ctx, `UPDATE channels SET workspace_id=$1,verified_max_owner_id=$2,title=$3,
-public_link=$4,icon_url=$5,participants_count=$6,is_channel=$7,active=TRUE,updated_at=$8 WHERE id=$9`,
-			workspaceID, channel.VerifiedMAXOwnerID, channel.Title, channel.PublicLink, channel.IconURL,
-			channel.ParticipantsCount, channel.IsChannel, now, id)
+description=$4,public_link=$5,icon_url=$6,participants_count=$7,is_public=$8,messages_count=$9,
+has_pinned_message=$10,max_last_event_time=$11,max_info_synced_at=$12,is_channel=$13,active=TRUE,
+updated_at=$14 WHERE id=$15`,
+			workspaceID, channel.VerifiedMAXOwnerID, channel.Title, channel.Description, channel.PublicLink,
+			channel.IconURL, channel.ParticipantsCount, channel.IsPublic, channel.MessagesCount,
+			channel.HasPinnedMessage, channel.MAXLastEventTime, channel.MAXInfoSyncedAt, channel.IsChannel, now, id)
 	case errors.Is(lookupErr, sql.ErrNoRows):
 		err = tx.QueryRowContext(ctx, `INSERT INTO channels(owner_id,workspace_id,verified_max_owner_id,
-max_chat_id,title,public_link,icon_url,participants_count,is_channel,active,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,TRUE,$10,$10) RETURNING id`,
+max_chat_id,title,description,public_link,icon_url,participants_count,is_public,messages_count,has_pinned_message,
+max_last_event_time,max_info_synced_at,is_channel,active,created_at,updated_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,TRUE,$16,$16) RETURNING id`,
 			access.Workspace.CompatOwnerUserID, workspaceID, channel.VerifiedMAXOwnerID, maxChatID,
-			channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount, channel.IsChannel, now).Scan(&id)
+			channel.Title, channel.Description, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
+			channel.IsPublic, channel.MessagesCount, channel.HasPinnedMessage, channel.MAXLastEventTime,
+			channel.MAXInfoSyncedAt, channel.IsChannel, now).Scan(&id)
 	default:
 		return Channel{}, lookupErr
 	}

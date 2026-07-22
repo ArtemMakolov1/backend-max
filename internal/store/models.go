@@ -62,19 +62,25 @@ type PostAttachment struct {
 }
 
 type Channel struct {
-	ID                 int64     `json:"id"`
-	UserID             string    `json:"-"`
-	WorkspaceID        string    `json:"workspace_id,omitempty"`
-	VerifiedMAXOwnerID string    `json:"-"`
-	MAXChatID          string    `json:"max_chat_id"`
-	Title              string    `json:"title"`
-	PublicLink         string    `json:"public_link,omitempty"`
-	IconURL            string    `json:"icon_url,omitempty"`
-	ParticipantsCount  int       `json:"participants_count"`
-	IsChannel          bool      `json:"is_channel"`
-	Active             bool      `json:"active"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 int64      `json:"id"`
+	UserID             string     `json:"-"`
+	WorkspaceID        string     `json:"workspace_id,omitempty"`
+	VerifiedMAXOwnerID string     `json:"-"`
+	MAXChatID          string     `json:"max_chat_id"`
+	Title              string     `json:"title"`
+	Description        string     `json:"description"`
+	PublicLink         string     `json:"public_link,omitempty"`
+	IconURL            string     `json:"icon_url,omitempty"`
+	ParticipantsCount  int        `json:"participants_count"`
+	IsPublic           bool       `json:"is_public"`
+	MessagesCount      int        `json:"messages_count"`
+	HasPinnedMessage   bool       `json:"has_pinned_message"`
+	MAXLastEventTime   *time.Time `json:"max_last_event_time,omitempty"`
+	MAXInfoSyncedAt    *time.Time `json:"max_info_synced_at,omitempty"`
+	IsChannel          bool       `json:"is_channel"`
+	Active             bool       `json:"active"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
 }
 
 // ObservedBotChat is inventory learned from authenticated MAX bot lifecycle
@@ -83,9 +89,15 @@ type ObservedBotChat struct {
 	MAXChatID         string
 	PublicLink        string
 	Title             string
+	Description       string
 	MAXOwnerID        string
 	IconURL           string
 	ParticipantsCount int
+	IsPublic          bool
+	MessagesCount     int
+	HasPinnedMessage  bool
+	MAXLastEventTime  *time.Time
+	MAXInfoSyncedAt   *time.Time
 	Active            bool
 	LastSeenAt        time.Time
 	RemovedAt         *time.Time

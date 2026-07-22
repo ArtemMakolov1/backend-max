@@ -114,6 +114,38 @@ func (f *blockingRefreshMAX) GetChat(ctx context.Context, chatID string) (maxcli
 	return chat, nil
 }
 
+// reorderedRefreshMAX lets the second profile read finish before the first.
+// It models the exact ordering that used to let a slow, stale MAX response
+// replace metadata returned by a newer request.
+type reorderedRefreshMAX struct {
+	*fakeMAX
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	first        maxclient.ChatInfo
+	second       maxclient.ChatInfo
+	calls        atomic.Int32
+}
+
+func (f *reorderedRefreshMAX) GetChat(ctx context.Context, chatID string) (maxclient.ChatInfo, error) {
+	var info maxclient.ChatInfo
+	switch f.calls.Add(1) {
+	case 1:
+		close(f.firstStarted)
+		select {
+		case <-ctx.Done():
+			return maxclient.ChatInfo{}, context.Cause(ctx)
+		case <-f.releaseFirst:
+		}
+		info = f.first
+	default:
+		info = f.second
+	}
+	if info.ChatID == "" {
+		info.ChatID = chatID
+	}
+	return info, nil
+}
+
 type recordingMetrics struct {
 	mu          sync.Mutex
 	publication map[string]int
@@ -271,12 +303,14 @@ func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
 	fake := &fakeMAX{
 		chat: maxclient.ChatInfo{
 			ChatID: "-123", Type: "channel", Status: "active", Title: "Official", Link: "https://max.ru/official",
-			Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/official.png"}, ParticipantsCount: 3210,
+			Description: "Описание из MAX", Icon: maxclient.ChatIcon{URL: "https://cdn.max.ru/official.png"},
+			ParticipantsCount: 3210, IsPublic: true, MessagesCount: 55, LastEventTime: 1700000000123, HasPinnedMessage: true,
 		},
 		membership: maxclient.Membership{
 			IsAdmin: true,
 			Permissions: []maxclient.Permission{
-				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionEdit, maxclient.PermissionDelete,
+				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionEdit,
+				maxclient.PermissionDelete, maxclient.PermissionChangeChatInfo,
 			},
 		},
 	}
@@ -287,16 +321,31 @@ func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if check.Channel.MAXChatID != "-123" || check.Channel.Title != "Official" || check.Channel.PublicLink != "https://max.ru/official" ||
-		check.Channel.IconURL != "https://cdn.max.ru/official.png" || check.Channel.ParticipantsCount != 3210 {
+		check.Channel.IconURL != "https://cdn.max.ru/official.png" || check.Channel.ParticipantsCount != 3210 ||
+		check.Channel.Description != "Описание из MAX" || !check.Channel.IsPublic || check.Channel.MessagesCount != 55 ||
+		!check.Channel.HasPinnedMessage || check.Channel.MAXLastEventTime == nil || check.Channel.MAXInfoSyncedAt == nil {
 		t.Fatalf("unexpected channel: %#v", check.Channel)
 	}
-	if !check.Diagnostics.CanPublish || !check.Diagnostics.CanEdit || !check.Diagnostics.CanDelete {
+	if !check.Diagnostics.CanPublish || !check.Diagnostics.CanEdit || !check.Diagnostics.CanDelete || !check.Diagnostics.CanChangeInfo {
 		t.Fatalf("unexpected diagnostics: %#v", check.Diagnostics)
 	}
 	if fake.resolveCalls != 0 || fake.getChatCalls != 1 || fake.memberCalls != 1 || fake.publishCalls != 0 {
 		t.Fatalf("unexpected MAX calls: %#v", fake)
 	}
 
+	requestStartedAt := time.Date(2042, time.January, 2, 3, 4, 5, 0, time.UTC)
+	requestFinishedAt := requestStartedAt.Add(time.Hour)
+	clock := requestStartedAt
+	application.now = func() time.Time { return clock }
+	fake.getChatFn = func(chatID string) (maxclient.ChatInfo, error) {
+		// Simulate an old GET that completes much later. The stored snapshot must
+		// retain the request-start timestamp so it cannot beat a newer request.
+		clock = requestFinishedAt
+		chat := fake.chat
+		chat.ChatID = chatID
+		chat.OwnerID = "test-max-owner"
+		return chat, nil
+	}
 	readOnlyCheck, err := application.TestChannel(context.Background(), check.Channel.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -305,7 +354,8 @@ func TestConnectChannelAndDiagnosticsAreReadOnly(t *testing.T) {
 		t.Fatalf("test channel was not read-only: check=%#v fake=%#v", readOnlyCheck, fake)
 	}
 	stored, err := storage.GetChannel(context.Background(), check.Channel.ID)
-	if err != nil || stored.PublicLink == "" || stored.IconURL != "https://cdn.max.ru/official.png" || stored.ParticipantsCount != 3210 {
+	if err != nil || stored.PublicLink == "" || stored.IconURL != "https://cdn.max.ru/official.png" || stored.ParticipantsCount != 3210 ||
+		stored.MAXInfoSyncedAt == nil || !stored.MAXInfoSyncedAt.Equal(requestStartedAt) {
 		t.Fatalf("stored channel = %#v, %v", stored, err)
 	}
 }
@@ -339,18 +389,23 @@ func TestConnectedChannelIconIsSanitizedAndRefreshedForItsTenant(t *testing.T) {
 
 	fake.chat.Icon.URL = "https://cdn.max.ru/channels/official.png?size=256"
 	fake.chat.ParticipantsCount = 73
+	fake.chat.Description = "Обновлённое описание"
+	fake.chat.MessagesCount = 91
+	fake.chat.HasPinnedMessage = true
 	checked, err := application.TestChannelForUser(context.Background(), connected.Channel.UserID, connected.Channel.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if checked.Channel.IconURL != fake.chat.Icon.URL || checked.Channel.ParticipantsCount != 73 {
+	if checked.Channel.IconURL != fake.chat.Icon.URL || checked.Channel.ParticipantsCount != 73 ||
+		checked.Channel.Description != fake.chat.Description || checked.Channel.MessagesCount != 91 || !checked.Channel.HasPinnedMessage {
 		t.Fatalf("checked channel visual metadata = %#v", checked.Channel)
 	}
 	stored, err := storage.GetChannelForUser(context.Background(), connected.Channel.UserID, connected.Channel.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stored.IconURL != fake.chat.Icon.URL || stored.ParticipantsCount != 73 {
+	if stored.IconURL != fake.chat.Icon.URL || stored.ParticipantsCount != 73 ||
+		stored.Description != fake.chat.Description || stored.MessagesCount != 91 || !stored.HasPinnedMessage {
 		t.Fatalf("stored channel visual metadata = %#v", stored)
 	}
 	history, err := storage.ListChannelParticipantSnapshotsForUser(context.Background(), connected.Channel.UserID,
@@ -367,6 +422,99 @@ func TestConnectedChannelIconIsSanitizedAndRefreshedForItsTenant(t *testing.T) {
 	stored, err = storage.GetChannelForUser(context.Background(), connected.Channel.UserID, connected.Channel.ID)
 	if err != nil || stored.ParticipantsCount != 73 {
 		t.Fatalf("mismatched manual refresh changed channel = %#v, %v", stored, err)
+	}
+}
+
+func TestConcurrentChannelRefreshKeepsTheNewerMAXProfile(t *testing.T) {
+	ctx := context.Background()
+	chatID := "-126"
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+	})
+	max := &reorderedRefreshMAX{
+		fakeMAX: &fakeMAX{membership: maxclient.Membership{
+			IsAdmin: true,
+			Permissions: []maxclient.Permission{
+				maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+			},
+		}},
+		firstStarted: firstStarted,
+		releaseFirst: releaseFirst,
+		first: maxclient.ChatInfo{
+			ChatID: chatID, OwnerID: "test-max-owner", Type: "channel", Status: "active",
+			Title: "Old profile", Description: "Old description", ParticipantsCount: 10, MessagesCount: 20,
+		},
+		second: maxclient.ChatInfo{
+			ChatID: chatID, OwnerID: "test-max-owner", Type: "channel", Status: "active",
+			Title: "New profile", Description: "New description", ParticipantsCount: 30, MessagesCount: 40,
+		},
+	}
+	application, storage := newTestApp(t, max)
+	channel, err := storage.CreateChannel(ctx, store.Channel{
+		VerifiedMAXOwnerID: "test-max-owner", MAXChatID: chatID, Title: "Initial",
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	startedAt := time.Date(2042, time.February, 3, 4, 5, 6, 0, time.UTC)
+	var clockCalls atomic.Int32
+	application.now = func() time.Time {
+		return startedAt.Add(time.Duration(clockCalls.Add(1)-1) * time.Second)
+	}
+
+	type refreshResult struct {
+		check ChannelCheck
+		err   error
+	}
+	firstResult := make(chan refreshResult, 1)
+	go func() {
+		check, refreshErr := application.TestChannelForUser(ctx, channel.UserID, channel.ID)
+		firstResult <- refreshResult{check: check, err: refreshErr}
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first MAX profile request did not start")
+	}
+
+	newer, err := application.TestChannelForUser(ctx, channel.UserID, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newer.Channel.Title != "New profile" {
+		t.Fatalf("newer refresh returned %#v", newer.Channel)
+	}
+	close(releaseFirst)
+
+	var older refreshResult
+	select {
+	case older = <-firstResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("older MAX profile request did not finish")
+	}
+	if older.err != nil {
+		t.Fatal(older.err)
+	}
+	if older.check.Channel.Title != "New profile" {
+		t.Fatalf("older response replaced the newer profile: %#v", older.check.Channel)
+	}
+	stored, err := storage.GetChannelForUser(ctx, channel.UserID, channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSyncedAt := startedAt.Add(time.Second)
+	if stored.Title != "New profile" || stored.Description != "New description" ||
+		stored.ParticipantsCount != 30 || stored.MessagesCount != 40 ||
+		stored.MAXInfoSyncedAt == nil || !stored.MAXInfoSyncedAt.Equal(wantSyncedAt) {
+		t.Fatalf("stored channel profile = %#v, want the newer MAX response", stored)
 	}
 }
 

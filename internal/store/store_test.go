@@ -18,14 +18,21 @@ func TestChannelVisualMetadataPersistsAcrossOperations(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = storage.Close() })
 
+	initialEvent := time.Date(2040, time.January, 2, 3, 4, 5, 0, time.UTC)
+	initialSync := initialEvent.Add(time.Minute)
 	channel, err := storage.CreateChannel(ctx, Channel{
 		MAXChatID: "visual-1", Title: "Visual", PublicLink: "https://max.ru/visual",
-		IconURL: "https://cdn.max.ru/visual.png", ParticipantsCount: 1250, IsChannel: true, Active: true,
+		Description: "Initial description", IconURL: "https://cdn.max.ru/visual.png", ParticipantsCount: 1250,
+		IsPublic: true, MessagesCount: 91, HasPinnedMessage: true, MAXLastEventTime: &initialEvent,
+		MAXInfoSyncedAt: &initialSync, IsChannel: true, Active: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if channel.IconURL != "https://cdn.max.ru/visual.png" || channel.ParticipantsCount != 1250 {
+	if channel.IconURL != "https://cdn.max.ru/visual.png" || channel.ParticipantsCount != 1250 ||
+		channel.Description != "Initial description" || !channel.IsPublic || channel.MessagesCount != 91 ||
+		!channel.HasPinnedMessage || channel.MAXLastEventTime == nil || !channel.MAXLastEventTime.Equal(initialEvent) ||
+		channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(initialSync) {
 		t.Fatalf("created channel = %#v", channel)
 	}
 
@@ -35,18 +42,27 @@ func TestChannelVisualMetadataPersistsAcrossOperations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if channel.IconURL != "https://cdn.max.ru/visual.png" || channel.ParticipantsCount != 1250 {
+	if channel.IconURL != "https://cdn.max.ru/visual.png" || channel.ParticipantsCount != 1250 ||
+		channel.Description != "Initial description" || !channel.IsPublic || channel.MessagesCount != 91 ||
+		!channel.HasPinnedMessage || channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(initialSync) {
 		t.Fatalf("manual update lost visual metadata: %#v", channel)
 	}
 
+	newEvent := initialEvent.Add(time.Hour)
+	newSync := initialSync.Add(time.Hour)
 	channel, err = storage.UpsertConnectedChannel(ctx, Channel{
 		MAXChatID: "visual-1", Title: "Fresh MAX metadata", PublicLink: "https://max.ru/visual",
-		IconURL: "https://cdn.max.ru/visual-new.png", ParticipantsCount: 1301, IsChannel: true, Active: true,
+		Description: "Fresh description", IconURL: "https://cdn.max.ru/visual-new.png", ParticipantsCount: 1301,
+		IsPublic: false, MessagesCount: 102, HasPinnedMessage: false, MAXLastEventTime: &newEvent,
+		MAXInfoSyncedAt: &newSync, IsChannel: true, Active: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if channel.IconURL != "https://cdn.max.ru/visual-new.png" || channel.ParticipantsCount != 1301 {
+	if channel.IconURL != "https://cdn.max.ru/visual-new.png" || channel.ParticipantsCount != 1301 ||
+		channel.Description != "Fresh description" || channel.IsPublic || channel.MessagesCount != 102 ||
+		channel.HasPinnedMessage || channel.MAXLastEventTime == nil || !channel.MAXLastEventTime.Equal(newEvent) ||
+		channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(newSync) {
 		t.Fatalf("connected upsert did not refresh visual metadata: %#v", channel)
 	}
 
@@ -54,7 +70,9 @@ func TestChannelVisualMetadataPersistsAcrossOperations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if channel.IconURL != "https://cdn.max.ru/visual-new.png" || channel.ParticipantsCount != 1301 {
+	if channel.IconURL != "https://cdn.max.ru/visual-new.png" || channel.ParticipantsCount != 1301 ||
+		channel.Description != "Fresh description" || channel.MessagesCount != 102 ||
+		channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(newSync) {
 		t.Fatalf("webhook upsert lost visual metadata: %#v", channel)
 	}
 
@@ -62,7 +80,9 @@ func TestChannelVisualMetadataPersistsAcrossOperations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(channels) != 1 || channels[0].IconURL != channel.IconURL || channels[0].ParticipantsCount != channel.ParticipantsCount {
+	if len(channels) != 1 || channels[0].IconURL != channel.IconURL || channels[0].ParticipantsCount != channel.ParticipantsCount ||
+		channels[0].Description != channel.Description || channels[0].MessagesCount != channel.MessagesCount ||
+		channels[0].MAXInfoSyncedAt == nil || !channels[0].MAXInfoSyncedAt.Equal(newSync) {
 		t.Fatalf("listed channels = %#v", channels)
 	}
 }
@@ -84,10 +104,14 @@ func TestObservedChatRefreshesConnectedChannelVisualMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	observedAt := time.Now().UTC().Truncate(time.Microsecond)
+	maxEventAt := observedAt.Add(-time.Minute)
+	maxInfoSyncedAt := observedAt
 	if err := storage.UpsertObservedBotChat(ctx, ObservedBotChat{
 		MAXChatID: "visual-refresh-1", Title: "Fresh title", PublicLink: "https://max.ru/fresh",
-		MAXOwnerID: channel.VerifiedMAXOwnerID, IconURL: "https://cdn.max.ru/fresh.png", ParticipantsCount: 42,
-		Active: true, LastSeenAt: observedAt,
+		Description: "Fresh description", MAXOwnerID: channel.VerifiedMAXOwnerID,
+		IconURL: "https://cdn.max.ru/fresh.png", ParticipantsCount: 42, IsPublic: true,
+		MessagesCount: 73, HasPinnedMessage: true, MAXLastEventTime: &maxEventAt,
+		MAXInfoSyncedAt: &maxInfoSyncedAt, Active: true, LastSeenAt: observedAt,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +121,10 @@ func TestObservedChatRefreshesConnectedChannelVisualMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	if channel.Title != "Fresh title" || channel.PublicLink != "https://max.ru/fresh" ||
-		channel.IconURL != "https://cdn.max.ru/fresh.png" || channel.ParticipantsCount != 42 {
+		channel.IconURL != "https://cdn.max.ru/fresh.png" || channel.ParticipantsCount != 42 ||
+		channel.Description != "Fresh description" || !channel.IsPublic || channel.MessagesCount != 73 ||
+		!channel.HasPinnedMessage || channel.MAXLastEventTime == nil || !channel.MAXLastEventTime.Equal(maxEventAt) ||
+		channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(maxInfoSyncedAt) {
 		t.Fatalf("connected channel was not refreshed from its observed MAX chat: %#v", channel)
 	}
 

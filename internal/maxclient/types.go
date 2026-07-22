@@ -50,9 +50,14 @@ type ChatInfo struct {
 	Type              string   `json:"type"`
 	Status            string   `json:"status"`
 	Title             string   `json:"title"`
+	Description       string   `json:"description,omitempty"`
 	Link              string   `json:"link,omitempty"`
 	Icon              ChatIcon `json:"icon,omitempty"`
 	ParticipantsCount int      `json:"participants_count,omitempty"`
+	IsPublic          bool     `json:"is_public"`
+	MessagesCount     int      `json:"messages_count,omitempty"`
+	LastEventTime     int64    `json:"last_event_time,omitempty"`
+	HasPinnedMessage  bool     `json:"has_pinned_message"`
 }
 
 // ChatPatch describes the mutable chat metadata accepted by
@@ -62,6 +67,9 @@ type ChatPatch struct {
 	// IconToken is an image upload token obtained through UploadImage.
 	IconToken string
 	Title     *string
+	// Notify controls the system notification sent by MAX for this change.
+	// MAX defaults it to true when the field is omitted.
+	Notify *bool
 }
 
 type Permission string
@@ -72,6 +80,7 @@ const (
 	PermissionEdit            Permission = "edit"
 	PermissionDelete          Permission = "delete"
 	PermissionPinMessage      Permission = "pin_message"
+	PermissionChangeChatInfo  Permission = "change_chat_info"
 )
 
 // Membership is the read-only result of GET /chats/{chatId}/members/me.

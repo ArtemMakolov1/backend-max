@@ -181,6 +181,8 @@ services:
     image: ${BACKEND_IMAGE}
     restart: unless-stopped
     init: true
+    extra_hosts:
+      - "api.openai.com=${OPENAI_EGRESS_IPV4:-172.18.255.254}"
     environment:
       HOST: 0.0.0.0
       PORT: "8080"
