@@ -251,7 +251,7 @@ func TestDirectErrorConnectionCanBeRevokedAndReauthorized(t *testing.T) {
 	campaign = acceptDirectTestCampaign(t, ctx, storage, owner, workspace.ID, campaign, now)
 	if _, err := storage.GrantDirectAutoLaunchConsent(
 		ctx, owner, workspace.ID, campaign.ID, DirectConsentRequest{
-			Confirmation: "РђР’РўРћР—РђРџРЈРЎРљ", ExpectedVersion: campaign.Version,
+			Confirmation: "АВТОЗАПУСК", ExpectedVersion: campaign.Version,
 			ExpectedConnectionID: connection.ID, ExpectedAccountID: connection.AccountID,
 			ExpectedCampaignName: campaign.Name, ExpectedProviderID: *campaign.ProviderCampaignID,
 			WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
