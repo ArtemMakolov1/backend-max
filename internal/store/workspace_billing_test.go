@@ -140,10 +140,11 @@ owner_id,document,version,accepted_at,source) VALUES
 	if err != nil {
 		t.Fatal(err)
 	}
-	var storedVersion, storedText, storedTermsVersion, storedTermsURL string
-	if err := storage.db.QueryRowContext(ctx, `SELECT consent_version,consent_text,terms_version,terms_url
+	var storedVersion, storedText, storedTermsVersion, acceptedTermsVersion, effectiveTermsVersion, storedTermsURL string
+	if err := storage.db.QueryRowContext(ctx, `SELECT consent_version,consent_text,terms_version,
+accepted_terms_version,COALESCE(accepted_terms_version,terms_version),terms_url
 FROM billing_recurring_consents WHERE payment_attempt_id=$1`, attempt.ID).Scan(
-		&storedVersion, &storedText, &storedTermsVersion, &storedTermsURL,
+		&storedVersion, &storedText, &storedTermsVersion, &acceptedTermsVersion, &effectiveTermsVersion, &storedTermsURL,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -154,9 +155,12 @@ FROM billing_recurring_consents WHERE payment_attempt_id=$1`, attempt.ID).Scan(
 		}
 	}
 	if storedVersion != BillingRecurringConsentVersion || storedText != soloConsent ||
-		storedTermsVersion != BillingRecurringTermsVersion || storedTermsURL != BillingRecurringTermsURL {
-		t.Fatalf("stored consent does not match catalog: version=%q text=%q terms=%q url=%q",
-			storedVersion, storedText, storedTermsVersion, storedTermsURL)
+		storedTermsVersion != billingRecurringLegacyTermsVersion ||
+		acceptedTermsVersion != BillingRecurringTermsVersion ||
+		effectiveTermsVersion != BillingRecurringTermsVersion ||
+		storedTermsURL != BillingRecurringTermsURL {
+		t.Fatalf("stored consent does not match catalog: version=%q text=%q legacy_terms=%q accepted_terms=%q effective_terms=%q url=%q",
+			storedVersion, storedText, storedTermsVersion, acceptedTermsVersion, effectiveTermsVersion, storedTermsURL)
 	}
 	if _, err := storage.GetWorkspaceBillingState(ctx, "billing-outsider", workspace.ID, time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("outsider billing error=%v, want ErrNotFound", err)

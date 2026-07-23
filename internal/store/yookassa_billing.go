@@ -15,17 +15,18 @@ import (
 )
 
 const (
-	billingCheckoutTTL             = 30 * time.Minute
-	billingRetentionTTL            = 30 * time.Minute
-	billingRenewalRetry            = 24 * time.Hour
-	billingRenewalGrace            = 3 * 24 * time.Hour
-	billingMaxRenewalTrials        = 3
-	billingRetentionBPS            = 5000
-	billingProviderCreateWindow    = 23 * time.Hour
-	billingWorkerLease             = 2 * time.Minute
-	BillingRecurringConsentVersion = "yookassa-recurring-v2"
-	BillingRecurringTermsVersion   = legal.CurrentTermsVersion
-	BillingRecurringTermsURL       = "https://maxposty.ru/terms/"
+	billingCheckoutTTL                 = 30 * time.Minute
+	billingRetentionTTL                = 30 * time.Minute
+	billingRenewalRetry                = 24 * time.Hour
+	billingRenewalGrace                = 3 * 24 * time.Hour
+	billingMaxRenewalTrials            = 3
+	billingRetentionBPS                = 5000
+	billingProviderCreateWindow        = 23 * time.Hour
+	billingWorkerLease                 = 2 * time.Minute
+	billingRecurringLegacyTermsVersion = "2026-07-22"
+	BillingRecurringConsentVersion     = "yookassa-recurring-v2"
+	BillingRecurringTermsVersion       = legal.CurrentTermsVersion
+	BillingRecurringTermsURL           = "https://maxposty.ru/terms/"
 )
 
 var (
@@ -227,7 +228,7 @@ AND a.status IN ('prepared','pending','manual_review') FOR UPDATE`, workspaceID)
 		var acceptedConsentVersion, acceptedTermsVersion, acceptedCurrencyCode string
 		var acceptedPlanVersion int
 		var acceptedMonthlyPriceMinor int64
-		err = tx.QueryRowContext(ctx, `SELECT consent_version,terms_version,plan_version,
+		err = tx.QueryRowContext(ctx, `SELECT consent_version,COALESCE(accepted_terms_version,terms_version),plan_version,
 monthly_price_minor,currency_code FROM billing_recurring_consents WHERE payment_attempt_id=$1`,
 			openAttempt.ID).Scan(&acceptedConsentVersion, &acceptedTermsVersion, &acceptedPlanVersion,
 			&acceptedMonthlyPriceMinor, &acceptedCurrencyCode)
@@ -266,10 +267,10 @@ monthly_price_minor,currency_code FROM billing_recurring_consents WHERE payment_
 		return BillingPaymentAttempt{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO billing_recurring_consents(
-payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,terms_url,
-plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, attempt.ID, workspaceID, actorUserID,
-		consent.Version, consent.Text, consent.TermsVersion, consent.TermsURL,
+payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,
+accepted_terms_version,terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, attempt.ID, workspaceID, actorUserID,
+		consent.Version, consent.Text, billingRecurringLegacyTermsVersion, consent.TermsVersion, consent.TermsURL,
 		plan.Code, plan.Version, plan.MonthlyPriceMinor, plan.CurrencyCode, now); err != nil {
 		return BillingPaymentAttempt{}, fmt.Errorf("record recurring payment consent: %w", err)
 	}

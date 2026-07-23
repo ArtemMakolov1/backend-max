@@ -319,31 +319,85 @@ VALUES($1,$2,'terms-migration-owner','yookassa-recurring-v2','Immutable consent'
 	if _, err := db.ExecContext(ctx, string(migrations[termsIndex].contents)); err != nil {
 		t.Fatalf("apply recurring terms migration: %v", err)
 	}
-	var preservedVersion string
-	if err := db.QueryRowContext(ctx, `SELECT terms_version FROM billing_recurring_consents
-WHERE payment_attempt_id=$1`, oldAttemptID).Scan(&preservedVersion); err != nil {
+	var preservedVersion, effectivePreservedVersion string
+	var acceptedVersionIsNull bool
+	if err := db.QueryRowContext(ctx, `SELECT terms_version,accepted_terms_version IS NULL,
+COALESCE(accepted_terms_version,terms_version) FROM billing_recurring_consents
+WHERE payment_attempt_id=$1`, oldAttemptID).Scan(
+		&preservedVersion, &acceptedVersionIsNull, &effectivePreservedVersion,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if preservedVersion != "2026-07-22" {
-		t.Fatalf("prior consent version=%q, want preserved 2026-07-22", preservedVersion)
+	if preservedVersion != "2026-07-22" || !acceptedVersionIsNull || effectivePreservedVersion != "2026-07-22" {
+		t.Fatalf("prior consent legacy=%q accepted_is_null=%t effective=%q, want 2026-07-22/true/2026-07-22",
+			preservedVersion, acceptedVersionIsNull, effectivePreservedVersion)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE billing_recurring_consents
+SET accepted_terms_version='2026-07-23' WHERE payment_attempt_id=$1`, oldAttemptID); err == nil {
+		t.Fatal("prior immutable consent accepted an effective terms version rewrite")
 	}
 	currentAttemptID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	insertAttempt(currentAttemptID, "22222222-2222-2222-2222-222222222222", "pro", 249000)
-	if err := insertConsent(currentAttemptID, "2026-07-23", "pro", 249000); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO billing_recurring_consents(
+payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,
+accepted_terms_version,terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
+VALUES($1,$2,'terms-migration-owner','yookassa-recurring-v2','Immutable consent','2026-07-22',
+'2026-07-23','https://maxposty.ru/terms/','pro',2,249000,'RUB',CURRENT_TIMESTAMP)`,
+		currentAttemptID, workspaceID); err != nil {
 		t.Fatalf("insert current consent: %v", err)
+	}
+	var currentLegacyVersion, currentAcceptedVersion, effectiveCurrentVersion string
+	if err := db.QueryRowContext(ctx, `SELECT terms_version,accepted_terms_version,
+COALESCE(accepted_terms_version,terms_version) FROM billing_recurring_consents
+WHERE payment_attempt_id=$1`, currentAttemptID).Scan(
+		&currentLegacyVersion, &currentAcceptedVersion, &effectiveCurrentVersion,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if currentLegacyVersion != "2026-07-22" || currentAcceptedVersion != "2026-07-23" ||
+		effectiveCurrentVersion != "2026-07-23" {
+		t.Fatalf("current consent legacy=%q accepted=%q effective=%q, want 2026-07-22/2026-07-23/2026-07-23",
+			currentLegacyVersion, currentAcceptedVersion, effectiveCurrentVersion)
 	}
 	invalidAttemptID := "cccccccccccccccccccccccccccccccc"
 	insertAttempt(invalidAttemptID, "33333333-3333-3333-3333-333333333333", "solo", 99000)
-	if err := insertConsent(invalidAttemptID, "2026-07-24", "solo", 99000); err == nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO billing_recurring_consents(
+payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,
+accepted_terms_version,terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
+VALUES($1,$2,'terms-migration-owner','yookassa-recurring-v2','Immutable consent','2026-07-22',
+'2026-07-24','https://maxposty.ru/terms/','solo',2,99000,'RUB',CURRENT_TIMESTAMP)`,
+		invalidAttemptID, workspaceID); err == nil {
 		t.Fatal("future unknown recurring terms version passed the migrated CHECK")
 	}
-	var validated bool
-	if err := db.QueryRowContext(ctx, `SELECT convalidated FROM pg_constraint
-WHERE conrelid='billing_recurring_consents'::regclass
-  AND conname='billing_recurring_consents_terms_version_check'`).Scan(&validated); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO billing_recurring_consents(
+payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,
+accepted_terms_version,terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
+VALUES($1,$2,'terms-migration-owner','yookassa-recurring-v2','Immutable consent','2026-07-23',
+'2026-07-23','https://maxposty.ru/terms/','solo',2,99000,'RUB',CURRENT_TIMESTAMP)`,
+		invalidAttemptID, workspaceID); err == nil {
+		t.Fatal("legacy terms_version CHECK was widened by the additive migration")
+	}
+	var nullable string
+	if err := db.QueryRowContext(ctx, `SELECT is_nullable FROM information_schema.columns
+WHERE table_schema=current_schema() AND table_name='billing_recurring_consents'
+  AND column_name='accepted_terms_version'`).Scan(&nullable); err != nil {
 		t.Fatal(err)
 	}
-	if !validated {
-		t.Fatal("recurring terms CHECK is not validated")
+	if nullable != "YES" {
+		t.Fatalf("accepted_terms_version nullable=%q, want YES for prior immutable evidence", nullable)
+	}
+	var legacyValidated, acceptedValidated bool
+	if err := db.QueryRowContext(ctx, `SELECT
+COALESCE(bool_or(conname='billing_recurring_consents_terms_version_check' AND convalidated),FALSE),
+COALESCE(bool_or(conname='billing_recurring_consents_accepted_terms_version_check' AND convalidated),FALSE)
+FROM pg_constraint
+WHERE conrelid='billing_recurring_consents'::regclass`).Scan(
+		&legacyValidated, &acceptedValidated,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !legacyValidated || !acceptedValidated {
+		t.Fatalf("recurring terms checks validated: legacy=%t accepted=%t, want true/true",
+			legacyValidated, acceptedValidated)
 	}
 }
