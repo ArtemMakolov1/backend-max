@@ -39,9 +39,10 @@ type authUser struct {
 }
 
 type authPrincipal struct {
-	Method    string
-	User      *authUser
-	ExpiresAt *time.Time
+	Method         string
+	User           *authUser
+	ExpiresAt      *time.Time
+	SessionBinding string
 }
 
 type authStatusPayload struct {
@@ -90,10 +91,11 @@ func (s *Server) authenticate(r *http.Request) (authPrincipal, bool) {
 			if method == "yandex" {
 				fallbackName = "Пользователь Яндекса"
 			}
-			return authPrincipal{Method: method, ExpiresAt: &expiresAt, User: &authUser{
-				ID: session.OwnerID, Provider: method, Login: session.Login,
-				DisplayName: firstNonEmpty(session.DisplayName, session.Login, fallbackName), AvatarURL: session.AvatarURL,
-			}}, true
+			return authPrincipal{
+				Method: method, ExpiresAt: &expiresAt, SessionBinding: tokenHash, User: &authUser{
+					ID: session.OwnerID, Provider: method, Login: session.Login,
+					DisplayName: firstNonEmpty(session.DisplayName, session.Login, fallbackName), AvatarURL: session.AvatarURL,
+				}}, true
 		}
 		if !errors.Is(err, store.ErrNotFound) {
 			s.logger.Warn("auth session lookup failed", "error", err)

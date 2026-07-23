@@ -173,11 +173,34 @@ render_production "$configured_direct_env" \
   DIRECT_OAUTH_CLIENT_SECRET=direct-client-secret \
   DIRECT_OAUTH_REDIRECT_URI=https://maxposty.ru/api/v1/advertising/direct/oauth/callback \
   DIRECT_TOKEN_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+  DIRECT_SANDBOX=false \
   DIRECT_WRITES_ENABLED=true \
   DIRECT_AUTO_LAUNCH_ENABLED=true
+grep -Fx 'DIRECT_SANDBOX=false' "$configured_direct_env" >/dev/null
 grep -Fx 'DIRECT_WRITES_ENABLED=true' "$configured_direct_env" >/dev/null
 grep -Fx 'DIRECT_AUTO_LAUNCH_ENABLED=true' "$configured_direct_env" >/dev/null
+grep -Fx 'DIRECT_API_BASE_URL=https://api.direct.yandex.com/json/v501' \
+  "$configured_direct_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_direct_env"
+
+configured_direct_verification_env="$sandbox/configured-direct-verification.env"
+render_production "$configured_direct_verification_env" \
+  DIRECT_OAUTH_CLIENT_ID=direct-client-id \
+  DIRECT_OAUTH_CLIENT_SECRET=direct-client-secret \
+  DIRECT_OAUTH_REDIRECT_URI=https://oauth.yandex.ru/verification_code \
+  DIRECT_TOKEN_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=
+grep -Fx 'DIRECT_OAUTH_REDIRECT_URI=https://oauth.yandex.ru/verification_code' \
+  "$configured_direct_verification_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_direct_verification_env"
+
+if render_production "$sandbox/unsafe-direct-redirect.env" \
+  DIRECT_OAUTH_CLIENT_ID=direct-client-id \
+  DIRECT_OAUTH_CLIENT_SECRET=direct-client-secret \
+  DIRECT_OAUTH_REDIRECT_URI=https://evil.example/api/v1/advertising/direct/oauth/callback \
+  DIRECT_TOKEN_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= >/dev/null 2>&1; then
+  echo "Production render accepted an unapproved Yandex Direct redirect" >&2
+  exit 1
+fi
 
 if render_production "$sandbox/partial-direct.env" \
   DIRECT_OAUTH_CLIENT_ID=direct-client-id >/dev/null 2>&1; then

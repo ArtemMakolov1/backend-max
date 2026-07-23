@@ -11,40 +11,70 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
-const DirectAutoLaunchConsentVersion = "yandex-direct-auto-launch-v1"
+const DirectAutoLaunchConsentVersion = "yandex-direct-auto-launch-v2"
+
+const (
+	// DirectMaxCampaignWeeklyBudgetMinor is 10,000 RUB. This is a hard
+	// product safety ceiling, independent of the provider's much larger
+	// monetary range.
+	DirectMaxCampaignWeeklyBudgetMinor int64 = 1_000_000
+	// DirectMaxWorkspaceWeeklyBudgetMinor caps the sum of MaxPosty-managed
+	// campaigns that are active or have a durable launch claim at 30,000 RUB.
+	DirectMaxWorkspaceWeeklyBudgetMinor int64 = 3_000_000
+)
 
 const directLaunchRecoveryLease = 2 * time.Minute
 const directProviderPollLease = time.Minute
+const directOAuthCompletionRetention = 5 * time.Minute
+const directTokenRefreshLease = 2 * time.Minute
 
 var directIdentifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+var directOAuthStateHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var (
-	ErrDirectConnectionRequired   = errors.New("direct connection is required")
-	ErrDirectCampaignNotDraft     = errors.New("direct campaign is not a draft")
-	ErrDirectCampaignNotAccepted  = errors.New("direct campaign is not accepted")
-	ErrDirectConsentRequired      = errors.New("active direct auto-launch consent is required")
-	ErrDirectConsentMismatch      = errors.New("direct auto-launch consent does not match the campaign")
-	ErrDirectLaunchAlreadyClaimed = errors.New("direct launch was already claimed")
-	ErrDirectLaunchRetryExhausted = errors.New("direct launch retry is exhausted; reconciliation is still required")
-	ErrDirectValidation           = errors.New("invalid Yandex Direct campaign")
+	ErrDirectConnectionRequired     = errors.New("direct connection is required")
+	ErrDirectCampaignNotDraft       = errors.New("direct campaign is not a draft")
+	ErrDirectCampaignNotAccepted    = errors.New("direct campaign is not accepted")
+	ErrDirectConsentRequired        = errors.New("active direct auto-launch consent is required")
+	ErrDirectConsentMismatch        = errors.New("direct auto-launch consent does not match the campaign")
+	ErrDirectLaunchAlreadyClaimed   = errors.New("direct launch was already claimed")
+	ErrDirectLaunchRetryExhausted   = errors.New("direct launch retry is exhausted; reconciliation is still required")
+	ErrDirectBudgetCapExceeded      = errors.New("direct budget safety cap is exceeded")
+	ErrDirectTokenRefreshBusy       = errors.New("direct token refresh is already in progress")
+	ErrDirectGraphUnverified        = errors.New("direct provider graph is not verified")
+	ErrDirectModerationNotReady     = errors.New("direct provider graph moderation is not accepted")
+	ErrDirectProviderOperationBusy  = errors.New("direct provider operation is already in progress")
+	ErrDirectProviderOperationStale = errors.New("direct provider operation lease is stale")
+	ErrDirectValidation             = errors.New("invalid Yandex Direct campaign")
 )
 
 const directConnectionColumns = `id,workspace_id,account_id,client_login,account_name,currency_code,
 timezone,read_only,token_ciphertext,token_key_version,status,connected_by,last_verified_at,error_code,
-created_at,updated_at,revoked_at`
+created_at,updated_at,revoked_at,token_refresh_claimed_at`
 
 const directCampaignColumns = `id,workspace_id,connection_id,provider_campaign_id,name,
 objective,landing_url,brief,regions,weekly_budget_minor,currency_code,starts_at,ends_at,
 status,provider_status,provider_state,provider_next_check_at,auto_launch_next_attempt_at,
 version,created_by,submitted_at,launch_claimed_at,
 launch_state,launch_mode,launch_attempt_count,launch_reconcile_after,launched_at,
-launch_failed_at,launch_failure_code,created_at,updated_at`
+launch_failed_at,launch_failure_code,created_at,updated_at,
+titles,texts,keywords,negative_keywords,provider_ad_group_id,provider_ad_id,
+provider_keyword_ids,provider_keyword_mappings,provider_warnings,
+COALESCE(submission_operation_id,''),submission_stage,submission_operation_marker,
+submission_claimed_at,submission_lease_expires_at,submission_failure_code,
+submission_failure_clarification,provider_graph_hash,
+COALESCE(provider_revision_id,''),graph_verified_at,moderation_status,
+moderation_clarification,campaign_moderation,ad_group_moderation,ad_moderation,
+keyword_moderation`
 
 const directConsentColumns = `id,workspace_id,campaign_id,connection_id,actor_user_id,
 consent_version,confirmation,campaign_version,account_id,provider_campaign_id,
-campaign_name,weekly_budget_minor,currency_code,starts_at,ends_at,authorized_at,revoked_at,
+campaign_name,weekly_budget_minor,currency_code,starts_at,ends_at,
+expected_graph_hash,COALESCE(expected_revision_id,''),authorized_at,revoked_at,
 invalidated_at,invalid_reason,consumed_at`
 
 type DirectOAuthState struct {
@@ -60,58 +90,84 @@ type DirectOAuthState struct {
 }
 
 type DirectConnection struct {
-	ID              string     `json:"id"`
-	WorkspaceID     string     `json:"workspace_id"`
-	AccountID       string     `json:"account_id"`
-	ClientLogin     string     `json:"client_login,omitempty"`
-	AccountName     string     `json:"account_name,omitempty"`
-	CurrencyCode    string     `json:"currency_code"`
-	Timezone        string     `json:"timezone"`
-	ReadOnly        bool       `json:"read_only"`
-	TokenCiphertext string     `json:"-"`
-	TokenKeyVersion int        `json:"-"`
-	Status          string     `json:"status"`
-	ConnectedBy     string     `json:"connected_by"`
-	LastVerifiedAt  *time.Time `json:"last_verified_at,omitempty"`
-	ErrorCode       string     `json:"error_code,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
-	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
+	ID                    string     `json:"id"`
+	WorkspaceID           string     `json:"workspace_id"`
+	AccountID             string     `json:"account_id"`
+	ClientLogin           string     `json:"client_login,omitempty"`
+	AccountName           string     `json:"account_name,omitempty"`
+	CurrencyCode          string     `json:"currency_code"`
+	Timezone              string     `json:"timezone"`
+	ReadOnly              bool       `json:"read_only"`
+	TokenCiphertext       string     `json:"-"`
+	TokenKeyVersion       int        `json:"-"`
+	Status                string     `json:"status"`
+	ConnectedBy           string     `json:"connected_by"`
+	LastVerifiedAt        *time.Time `json:"last_verified_at,omitempty"`
+	ErrorCode             string     `json:"error_code,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at"`
+	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
+	TokenRefreshClaimedAt *time.Time `json:"-"`
 }
 
 type DirectCampaign struct {
-	ID                      string                  `json:"id"`
-	WorkspaceID             string                  `json:"workspace_id"`
-	ConnectionID            string                  `json:"connection_id"`
-	ProviderCampaignID      *int64                  `json:"provider_campaign_id,omitempty"`
-	Name                    string                  `json:"name"`
-	Objective               string                  `json:"objective"`
-	LandingURL              string                  `json:"landing_url"`
-	Brief                   string                  `json:"brief"`
-	Regions                 []string                `json:"regions"`
-	WeeklyBudgetMinor       int64                   `json:"weekly_budget_minor"`
-	CurrencyCode            string                  `json:"currency_code"`
-	StartsAt                time.Time               `json:"starts_at"`
-	EndsAt                  time.Time               `json:"ends_at"`
-	Status                  string                  `json:"status"`
-	ProviderStatus          string                  `json:"provider_status,omitempty"`
-	ProviderState           string                  `json:"provider_state,omitempty"`
-	ProviderNextCheckAt     time.Time               `json:"-"`
-	AutoLaunchNextAttemptAt time.Time               `json:"-"`
-	Version                 int64                   `json:"version"`
-	CreatedBy               string                  `json:"created_by"`
-	SubmittedAt             *time.Time              `json:"submitted_at,omitempty"`
-	LaunchClaimedAt         *time.Time              `json:"-"`
-	LaunchState             string                  `json:"-"`
-	LaunchMode              string                  `json:"-"`
-	LaunchAttemptCount      int                     `json:"-"`
-	LaunchReconcileAfter    *time.Time              `json:"-"`
-	LaunchedAt              *time.Time              `json:"launched_at,omitempty"`
-	LaunchFailedAt          *time.Time              `json:"-"`
-	LaunchFailureCode       string                  `json:"launch_failure_code,omitempty"`
-	CreatedAt               time.Time               `json:"created_at"`
-	UpdatedAt               time.Time               `json:"updated_at"`
-	AutoLaunch              DirectAutoLaunchSummary `json:"auto_launch"`
+	ID                             string                   `json:"id"`
+	WorkspaceID                    string                   `json:"workspace_id"`
+	ConnectionID                   string                   `json:"connection_id"`
+	ProviderCampaignID             *int64                   `json:"provider_campaign_id,omitempty"`
+	Name                           string                   `json:"name"`
+	Objective                      string                   `json:"objective"`
+	LandingURL                     string                   `json:"landing_url"`
+	Brief                          string                   `json:"brief"`
+	Regions                        []string                 `json:"regions"`
+	Titles                         []string                 `json:"titles"`
+	Texts                          []string                 `json:"texts"`
+	Keywords                       []string                 `json:"keywords"`
+	NegativeKeywords               []string                 `json:"negative_keywords"`
+	WeeklyBudgetMinor              int64                    `json:"weekly_budget_minor"`
+	CurrencyCode                   string                   `json:"currency_code"`
+	StartsAt                       time.Time                `json:"starts_at"`
+	EndsAt                         time.Time                `json:"ends_at"`
+	Status                         string                   `json:"status"`
+	ProviderStatus                 string                   `json:"provider_status,omitempty"`
+	ProviderState                  string                   `json:"provider_state,omitempty"`
+	ProviderNextCheckAt            time.Time                `json:"-"`
+	AutoLaunchNextAttemptAt        time.Time                `json:"-"`
+	Version                        int64                    `json:"version"`
+	CreatedBy                      string                   `json:"created_by"`
+	SubmittedAt                    *time.Time               `json:"submitted_at,omitempty"`
+	LaunchClaimedAt                *time.Time               `json:"-"`
+	LaunchState                    string                   `json:"-"`
+	LaunchMode                     string                   `json:"-"`
+	LaunchAttemptCount             int                      `json:"-"`
+	LaunchReconcileAfter           *time.Time               `json:"-"`
+	LaunchedAt                     *time.Time               `json:"launched_at,omitempty"`
+	LaunchFailedAt                 *time.Time               `json:"-"`
+	LaunchFailureCode              string                   `json:"launch_failure_code,omitempty"`
+	ProviderAdGroupID              *int64                   `json:"provider_ad_group_id,omitempty"`
+	ProviderAdID                   *int64                   `json:"provider_ad_id,omitempty"`
+	ProviderKeywordIDs             []int64                  `json:"provider_keyword_ids"`
+	ProviderKeywordMappings        []DirectKeywordMapping   `json:"provider_keyword_mappings"`
+	ProviderWarnings               []DirectProviderIssue    `json:"provider_warnings"`
+	SubmissionOperationID          string                   `json:"submission_operation_id,omitempty"`
+	SubmissionStage                string                   `json:"submission_stage"`
+	SubmissionOperationMarker      string                   `json:"submission_operation_marker,omitempty"`
+	SubmissionClaimedAt            *time.Time               `json:"-"`
+	SubmissionLeaseExpiresAt       *time.Time               `json:"-"`
+	SubmissionFailureCode          string                   `json:"submission_failure_code,omitempty"`
+	SubmissionFailureClarification string                   `json:"submission_failure_clarification,omitempty"`
+	ProviderGraphHash              string                   `json:"provider_graph_hash,omitempty"`
+	ProviderRevisionID             string                   `json:"provider_revision_id,omitempty"`
+	GraphVerifiedAt                *time.Time               `json:"graph_verified_at,omitempty"`
+	ModerationStatus               string                   `json:"moderation_status,omitempty"`
+	ModerationClarification        string                   `json:"moderation_clarification,omitempty"`
+	CampaignModeration             DirectModerationSnapshot `json:"campaign_moderation"`
+	AdGroupModeration              DirectModerationSnapshot `json:"ad_group_moderation"`
+	AdModeration                   DirectModerationSnapshot `json:"ad_moderation"`
+	KeywordModeration              []DirectKeywordMapping   `json:"keyword_moderation"`
+	CreatedAt                      time.Time                `json:"created_at"`
+	UpdatedAt                      time.Time                `json:"updated_at"`
+	AutoLaunch                     DirectAutoLaunchSummary  `json:"auto_launch"`
 }
 
 type DirectCampaignChanges struct {
@@ -120,6 +176,10 @@ type DirectCampaignChanges struct {
 	LandingURL        *string
 	Brief             *string
 	Regions           *[]string
+	Titles            *[]string
+	Texts             *[]string
+	Keywords          *[]string
+	NegativeKeywords  *[]string
 	WeeklyBudgetMinor *int64
 	StartsAt          *time.Time
 	EndsAt            *time.Time
@@ -142,6 +202,8 @@ type DirectAutoLaunchConsent struct {
 	CurrencyCode       string     `json:"currency_code"`
 	StartsAt           time.Time  `json:"starts_at"`
 	EndsAt             time.Time  `json:"ends_at"`
+	ExpectedGraphHash  string     `json:"expected_graph_hash,omitempty"`
+	ExpectedRevisionID string     `json:"expected_revision_id,omitempty"`
 	AuthorizedAt       time.Time  `json:"authorized_at"`
 	RevokedAt          *time.Time `json:"revoked_at,omitempty"`
 	InvalidatedAt      *time.Time `json:"invalidated_at,omitempty"`
@@ -167,6 +229,8 @@ type DirectConsentRequest struct {
 	ExpectedAccountID    string
 	ExpectedCampaignName string
 	ExpectedProviderID   int64
+	ExpectedGraphHash    string
+	ExpectedRevisionID   string
 	WeeklyBudgetMinor    int64
 	StartsAt             time.Time
 	EndsAt               time.Time
@@ -208,6 +272,23 @@ func (s *Store) CreateDirectOAuthState(
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner); err != nil {
 		return err
 	}
+	// Serialize restarts for this workspace. Without the row lock, two empty
+	// DELETE snapshots could both insert an active state and leave an older tab
+	// able to win after the newer authorization.
+	var lockedWorkspaceID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID,
+	).Scan(&lockedWorkspaceID); err != nil {
+		return mapWorkspaceWriteError("lock workspace for Direct OAuth", err)
+	}
+	// A restart is authoritative for this actor and workspace. Removing the
+	// previous active attempt in the same transaction prevents an older tab
+	// from replacing the connection after a newer authorization was started.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM direct_oauth_states
+WHERE actor_user_id=$1 AND workspace_id=$2 AND expires_at>$3 AND consumed_at IS NULL`,
+		actorUserID, workspaceID, state.CreatedAt.UTC()); err != nil {
+		return err
+	}
 	var activeStates int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM direct_oauth_states
 WHERE actor_user_id=$1 AND expires_at>$2 AND consumed_at IS NULL`,
@@ -224,11 +305,35 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, state.StateHash, workspaceID, actorUserID,
 	if err != nil {
 		return mapWorkspaceWriteError("create Direct OAuth state", err)
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO direct_oauth_latest_attempts(
+workspace_id,state_hash,actor_user_id,created_at)
+VALUES($1,$2,$3,$4)
+ON CONFLICT(workspace_id) DO UPDATE SET
+state_hash=EXCLUDED.state_hash,actor_user_id=EXCLUDED.actor_user_id,created_at=EXCLUDED.created_at`,
+		workspaceID, state.StateHash, actorUserID, state.CreatedAt.UTC()); err != nil {
+		return mapWorkspaceWriteError("record latest Direct OAuth attempt", err)
+	}
 	return tx.Commit()
 }
 
 func (s *Store) ConsumeDirectOAuthState(
 	ctx context.Context, actorUserID, stateHash string, now time.Time,
+) (DirectOAuthState, error) {
+	return s.consumeDirectOAuthState(ctx, actorUserID, "", stateHash, now)
+}
+
+func (s *Store) ConsumeDirectOAuthStateForWorkspace(
+	ctx context.Context, actorUserID, workspaceID, stateHash string, now time.Time,
+) (DirectOAuthState, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return DirectOAuthState{}, ErrNotFound
+	}
+	return s.consumeDirectOAuthState(ctx, actorUserID, workspaceID, stateHash, now)
+}
+
+func (s *Store) consumeDirectOAuthState(
+	ctx context.Context, actorUserID, workspaceID, stateHash string, now time.Time,
 ) (DirectOAuthState, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -236,10 +341,17 @@ func (s *Store) ConsumeDirectOAuthState(
 	}
 	defer func() { _ = tx.Rollback() }()
 	var state DirectOAuthState
-	err = tx.QueryRowContext(ctx, `SELECT state_hash,workspace_id,actor_user_id,pkce_verifier,
+	query := `SELECT state_hash,workspace_id,actor_user_id,pkce_verifier,
 client_login,return_to,created_at,expires_at,consumed_at
-FROM direct_oauth_states WHERE state_hash=$1 AND actor_user_id=$2 FOR UPDATE`,
-		stateHash, actorUserID).Scan(&state.StateHash, &state.WorkspaceID, &state.ActorUserID,
+FROM direct_oauth_states WHERE state_hash=$1 AND actor_user_id=$2`
+	args := []any{stateHash, actorUserID}
+	if workspaceID != "" {
+		query += ` AND workspace_id=$3`
+		args = append(args, workspaceID)
+	}
+	query += ` FOR UPDATE`
+	err = tx.QueryRowContext(ctx, query, args...).Scan(
+		&state.StateHash, &state.WorkspaceID, &state.ActorUserID,
 		&state.PKCEVerifier, &state.ClientLogin, &state.ReturnTo, &state.CreatedAt,
 		&state.ExpiresAt, &state.ConsumedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -254,9 +366,25 @@ FROM direct_oauth_states WHERE state_hash=$1 AND actor_user_id=$2 FOR UPDATE`,
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, state.WorkspaceID, WorkspaceRoleOwner); err != nil {
 		return DirectOAuthState{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM direct_oauth_states
-WHERE state_hash=$1 AND actor_user_id=$2`, stateHash, actorUserID); err != nil {
+	var latest bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM direct_oauth_latest_attempts
+WHERE workspace_id=$1 AND state_hash=$2 AND actor_user_id=$3
+)`, state.WorkspaceID, stateHash, actorUserID).Scan(&latest); err != nil {
 		return DirectOAuthState{}, err
+	}
+	if !latest {
+		return DirectOAuthState{}, ErrConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE direct_oauth_states
+SET consumed_at=$1
+WHERE state_hash=$2 AND actor_user_id=$3 AND consumed_at IS NULL`,
+		now.UTC(), stateHash, actorUserID)
+	if err != nil {
+		return DirectOAuthState{}, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return DirectOAuthState{}, ErrConflict
 	}
 	if err := tx.Commit(); err != nil {
 		return DirectOAuthState{}, err
@@ -276,14 +404,16 @@ func (s *Store) PurgeExpiredDirectOAuthStates(
 	result, err := s.db.ExecContext(ctx, `WITH expired AS (
     SELECT state_hash
     FROM direct_oauth_states
-    WHERE expires_at <= $1 OR consumed_at IS NOT NULL
-    ORDER BY expires_at,state_hash
+    WHERE (consumed_at IS NULL AND expires_at <= $1)
+       OR (consumed_at IS NOT NULL AND consumed_at <= $2)
+    ORDER BY COALESCE(consumed_at,expires_at),state_hash
     FOR UPDATE SKIP LOCKED
-    LIMIT $2
+    LIMIT $3
 )
 DELETE FROM direct_oauth_states s
 USING expired e
-WHERE s.state_hash=e.state_hash`, now.UTC(), limit)
+WHERE s.state_hash=e.state_hash`,
+		now.UTC(), now.UTC().Add(-directOAuthCompletionRetention), limit)
 	if err != nil {
 		return 0, err
 	}
@@ -292,6 +422,26 @@ WHERE s.state_hash=e.state_hash`, now.UTC(), limit)
 
 func (s *Store) ReplaceDirectConnection(
 	ctx context.Context, actorUserID, workspaceID string, connection DirectConnection,
+) (DirectConnection, error) {
+	return s.replaceDirectConnection(ctx, actorUserID, workspaceID, "", connection)
+}
+
+func (s *Store) ReplaceDirectConnectionFromOAuthAttempt(
+	ctx context.Context, actorUserID, workspaceID, expectedStateHash string,
+	connection DirectConnection,
+) (DirectConnection, error) {
+	expectedStateHash = strings.TrimSpace(expectedStateHash)
+	if !directOAuthStateHashPattern.MatchString(expectedStateHash) {
+		return DirectConnection{}, ErrConflict
+	}
+	return s.replaceDirectConnection(
+		ctx, actorUserID, workspaceID, expectedStateHash, connection,
+	)
+}
+
+func (s *Store) replaceDirectConnection(
+	ctx context.Context, actorUserID, workspaceID, expectedStateHash string,
+	connection DirectConnection,
 ) (DirectConnection, error) {
 	connection.AccountID = strings.TrimSpace(connection.AccountID)
 	connection.ClientLogin = strings.TrimSpace(connection.ClientLogin)
@@ -322,6 +472,38 @@ func (s *Store) ReplaceDirectConnection(
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner); err != nil {
 		return DirectConnection{}, err
 	}
+	var lockedWorkspaceID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID,
+	).Scan(&lockedWorkspaceID); err != nil {
+		return DirectConnection{}, mapWorkspaceWriteError("lock workspace for Direct connection", err)
+	}
+	if expectedStateHash != "" {
+		var currentAttemptStateHash string
+		err := tx.QueryRowContext(ctx, `SELECT a.state_hash
+FROM direct_oauth_latest_attempts a
+JOIN direct_oauth_states s ON s.state_hash=a.state_hash
+WHERE a.workspace_id=$1 AND a.actor_user_id=$2 AND a.state_hash=$3
+  AND s.workspace_id=a.workspace_id AND s.actor_user_id=a.actor_user_id
+  AND s.consumed_at IS NOT NULL
+FOR UPDATE`, workspaceID, actorUserID, expectedStateHash).Scan(&currentAttemptStateHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return DirectConnection{}, ErrConflict
+		}
+		if err != nil {
+			return DirectConnection{}, err
+		}
+	} else {
+		var oauthAttemptPending bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM direct_oauth_latest_attempts WHERE workspace_id=$1
+)`, workspaceID).Scan(&oauthAttemptPending); err != nil {
+			return DirectConnection{}, err
+		}
+		if oauthAttemptPending {
+			return DirectConnection{}, ErrConflict
+		}
+	}
 	var currentConnectionID string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM direct_connections
 WHERE workspace_id=$1 AND revoked_at IS NULL FOR UPDATE`, workspaceID).Scan(&currentConnectionID)
@@ -337,9 +519,13 @@ WHERE workspace_id=$1 AND connection_id=$2
     OR launch_state='failed'
     OR (
       provider_campaign_id IS NOT NULL
-      AND status IN ('provider_draft','moderation','accepted','active','suspended')
+      AND status IN ('provider_draft','moderation','accepted','rejected','active','suspended')
     )
   )
+) OR EXISTS(
+SELECT 1 FROM direct_provider_operations
+WHERE workspace_id=$1 AND connection_id=$2
+  AND completed_at IS NULL AND stage NOT IN ('completed','failed')
 )`, workspaceID, currentConnectionID).Scan(&launchInFlight); err != nil {
 		return DirectConnection{}, err
 	}
@@ -349,11 +535,12 @@ WHERE workspace_id=$1 AND connection_id=$2
 		return DirectConnection{}, ErrConflict
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE direct_connections
-SET status='revoked',token_ciphertext='',revoked_at=$1,updated_at=$1,error_code=''
+SET status='revoked',token_ciphertext='',token_refresh_claimed_at=NULL,
+    revoked_at=$1,updated_at=$1,error_code=''
 WHERE workspace_id=$2 AND revoked_at IS NULL`, now, workspaceID); err != nil {
 		return DirectConnection{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents
+	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
 SET invalidated_at=$1,invalid_reason='connection_replaced'
 WHERE workspace_id=$2 AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
 		now, workspaceID); err != nil {
@@ -378,6 +565,17 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11,$12,$12,$12)`,
 		}), CreatedAt: now,
 	}); err != nil {
 		return DirectConnection{}, err
+	}
+	if expectedStateHash != "" {
+		result, err := tx.ExecContext(ctx, `DELETE FROM direct_oauth_states
+WHERE state_hash=$1 AND workspace_id=$2 AND actor_user_id=$3 AND consumed_at IS NOT NULL`,
+			expectedStateHash, workspaceID, actorUserID)
+		if err != nil {
+			return DirectConnection{}, err
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			return DirectConnection{}, ErrConflict
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return DirectConnection{}, err
@@ -404,6 +602,126 @@ FROM direct_connections WHERE workspace_id=$1 AND id=$2 AND revoked_at IS NULL`,
 		workspaceID, connectionID))
 }
 
+// GetDirectConnectionTokenMaterial is worker-scoped token material. Public API
+// responses must continue to use GetDirectConnection, whose callers strip the
+// ciphertext before serialization.
+func (s *Store) GetDirectConnectionTokenMaterial(
+	ctx context.Context, workspaceID, connectionID string,
+) (DirectConnection, error) {
+	return s.getDirectConnectionForWorker(ctx, workspaceID, connectionID)
+}
+
+func (s *Store) ClaimDirectConnectionTokenRefresh(
+	ctx context.Context, workspaceID, connectionID, expectedCiphertext string, now time.Time,
+) (DirectConnection, error) {
+	if strings.TrimSpace(expectedCiphertext) == "" {
+		return DirectConnection{}, ErrConflict
+	}
+	now = now.UTC()
+	connection, err := scanDirectConnection(s.db.QueryRowContext(ctx, `UPDATE direct_connections
+SET token_refresh_claimed_at=$1,updated_at=$1
+WHERE workspace_id=$2 AND id=$3 AND status='active' AND revoked_at IS NULL
+  AND token_ciphertext=$4
+  AND (token_refresh_claimed_at IS NULL OR token_refresh_claimed_at <= $5)
+RETURNING `+directConnectionColumns,
+		now, workspaceID, connectionID, expectedCiphertext, now.Add(-directTokenRefreshLease)))
+	if err == nil {
+		return connection, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return DirectConnection{}, err
+	}
+	current, currentErr := s.getDirectConnectionForWorker(ctx, workspaceID, connectionID)
+	if currentErr != nil {
+		return DirectConnection{}, currentErr
+	}
+	if current.TokenCiphertext == expectedCiphertext &&
+		current.TokenRefreshClaimedAt != nil &&
+		current.TokenRefreshClaimedAt.After(now.Add(-directTokenRefreshLease)) {
+		return DirectConnection{}, ErrDirectTokenRefreshBusy
+	}
+	return DirectConnection{}, ErrConflict
+}
+
+func (s *Store) CompleteDirectConnectionTokenRefresh(
+	ctx context.Context, workspaceID, connectionID, expectedCiphertext string,
+	claimedAt time.Time, replacementCiphertext string, now time.Time,
+) (DirectConnection, error) {
+	if expectedCiphertext == "" || replacementCiphertext == "" || claimedAt.IsZero() {
+		return DirectConnection{}, ErrConflict
+	}
+	connection, err := scanDirectConnection(s.db.QueryRowContext(ctx, `UPDATE direct_connections
+SET token_ciphertext=$1,token_refresh_claimed_at=NULL,last_verified_at=$2,
+    status='active',error_code='',updated_at=$2
+WHERE workspace_id=$3 AND id=$4 AND status='active' AND revoked_at IS NULL
+  AND token_ciphertext=$5 AND token_refresh_claimed_at=$6
+RETURNING `+directConnectionColumns,
+		replacementCiphertext, now.UTC(), workspaceID, connectionID,
+		expectedCiphertext, claimedAt.UTC()))
+	if errors.Is(err, ErrNotFound) {
+		return DirectConnection{}, ErrConflict
+	}
+	return connection, err
+}
+
+func (s *Store) ReleaseDirectConnectionTokenRefresh(
+	ctx context.Context, workspaceID, connectionID, expectedCiphertext string,
+	claimedAt, now time.Time,
+) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE direct_connections
+SET token_refresh_claimed_at=NULL,updated_at=$1
+WHERE workspace_id=$2 AND id=$3 AND status='active' AND revoked_at IS NULL
+  AND token_ciphertext=$4 AND token_refresh_claimed_at=$5`,
+		now.UTC(), workspaceID, connectionID, expectedCiphertext, claimedAt.UTC())
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (s *Store) MarkDirectConnectionRefreshAuthorizationRequired(
+	ctx context.Context, workspaceID, connectionID, expectedCiphertext string,
+	claimedAt, now time.Time,
+) (bool, error) {
+	now = now.UTC()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `UPDATE direct_connections
+SET status='error',error_code='authorization_required',
+    token_refresh_claimed_at=NULL,updated_at=$1
+WHERE workspace_id=$2 AND id=$3 AND status='active' AND revoked_at IS NULL
+  AND token_ciphertext=$4 AND token_refresh_claimed_at=$5`,
+		now, workspaceID, connectionID, expectedCiphertext, claimedAt.UTC())
+	if err != nil {
+		return false, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return false, tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
+SET invalidated_at=$1,invalid_reason='connection_authorization_required'
+WHERE workspace_id=$2 AND connection_id=$3
+  AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
+		now, workspaceID, connectionID); err != nil {
+		return false, err
+	}
+	if err := appendAuditEventTx(ctx, tx, AuditEvent{
+		WorkspaceID: workspaceID, Action: "direct.connection.authorization_required",
+		EntityType: "direct_connection", EntityID: connectionID,
+		Metadata:  mustJSON(map[string]any{"error_code": "authorization_required"}),
+		CreatedAt: now,
+	}); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
 func (s *Store) MarkDirectConnectionAuthorizationRequired(
 	ctx context.Context, workspaceID, connectionID string, now time.Time,
 ) error {
@@ -414,7 +732,8 @@ func (s *Store) MarkDirectConnectionAuthorizationRequired(
 	}
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `UPDATE direct_connections
-SET status='error',error_code='authorization_required',updated_at=$1
+SET status='error',error_code='authorization_required',
+    token_refresh_claimed_at=NULL,updated_at=$1
 WHERE workspace_id=$2 AND id=$3 AND status IN ('active','error') AND revoked_at IS NULL`,
 		now, workspaceID, connectionID)
 	if err != nil {
@@ -423,7 +742,7 @@ WHERE workspace_id=$2 AND id=$3 AND status IN ('active','error') AND revoked_at 
 	if affected, _ := result.RowsAffected(); affected != 1 {
 		return ErrNotFound
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents
+	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
 SET invalidated_at=$1,invalid_reason='connection_authorization_required'
 WHERE workspace_id=$2 AND connection_id=$3
   AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
@@ -466,6 +785,10 @@ WHERE workspace_id=$1 AND revoked_at IS NULL FOR UPDATE`, workspaceID).Scan(&con
 SELECT 1 FROM direct_campaigns
 WHERE workspace_id=$1 AND connection_id=$2
   AND launch_state IN ('launching','reconciling','failed')
+) OR EXISTS(
+SELECT 1 FROM direct_provider_operations
+WHERE workspace_id=$1 AND connection_id=$2
+  AND completed_at IS NULL AND stage NOT IN ('completed','failed')
 )`, workspaceID, connectionID).Scan(&launchInFlight); err != nil {
 		return err
 	}
@@ -476,11 +799,12 @@ WHERE workspace_id=$1 AND connection_id=$2
 	}
 	now = now.UTC()
 	if _, err := tx.ExecContext(ctx, `UPDATE direct_connections
-SET status='revoked',token_ciphertext='',revoked_at=$1,updated_at=$1,error_code=''
+SET status='revoked',token_ciphertext='',token_refresh_claimed_at=NULL,
+    revoked_at=$1,updated_at=$1,error_code=''
 WHERE workspace_id=$2 AND id=$3`, now, workspaceID, connectionID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents
+	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
 SET invalidated_at=$1,invalid_reason='connection_revoked'
 WHERE workspace_id=$2 AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
 		now, workspaceID); err != nil {
@@ -539,13 +863,21 @@ FROM direct_connections WHERE workspace_id=$1 AND revoked_at IS NULL FOR SHARE`,
 	if err != nil {
 		return DirectCampaign{}, err
 	}
+	titlesJSON, textsJSON, keywordsJSON, negativeKeywordsJSON, err :=
+		marshalDirectCampaignDesiredLists(campaign)
+	if err != nil {
+		return DirectCampaign{}, err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO direct_campaigns(
-id,workspace_id,connection_id,name,objective,landing_url,brief,regions,
-weekly_budget_minor,currency_code,starts_at,ends_at,
-status,provider_status,provider_state,version,created_by,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'draft','','',1,$13,$14,$14)`,
+	id,workspace_id,connection_id,name,objective,landing_url,brief,regions,
+	titles,texts,keywords,negative_keywords,weekly_budget_minor,currency_code,
+	starts_at,ends_at,status,provider_status,provider_state,version,created_by,
+	created_at,updated_at)
+	VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+	'draft','','',1,$17,$18,$18)`,
 		campaign.ID, workspaceID, connection.ID, campaign.Name, campaign.Objective,
-		campaign.LandingURL, campaign.Brief, string(regionsJSON), campaign.WeeklyBudgetMinor,
+		campaign.LandingURL, campaign.Brief, string(regionsJSON), titlesJSON, textsJSON,
+		keywordsJSON, negativeKeywordsJSON, campaign.WeeklyBudgetMinor,
 		campaign.CurrencyCode, dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
 		actorUserID, now)
 	if err != nil {
@@ -646,6 +978,18 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 	if changes.Regions != nil {
 		campaign.Regions = append([]string(nil), (*changes.Regions)...)
 	}
+	if changes.Titles != nil {
+		campaign.Titles = append([]string(nil), (*changes.Titles)...)
+	}
+	if changes.Texts != nil {
+		campaign.Texts = append([]string(nil), (*changes.Texts)...)
+	}
+	if changes.Keywords != nil {
+		campaign.Keywords = append([]string(nil), (*changes.Keywords)...)
+	}
+	if changes.NegativeKeywords != nil {
+		campaign.NegativeKeywords = append([]string(nil), (*changes.NegativeKeywords)...)
+	}
 	if changes.WeeklyBudgetMinor != nil {
 		campaign.WeeklyBudgetMinor = *changes.WeeklyBudgetMinor
 	}
@@ -663,11 +1007,18 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 	if err != nil {
 		return DirectCampaign{}, err
 	}
+	titlesJSON, textsJSON, keywordsJSON, negativeKeywordsJSON, err :=
+		marshalDirectCampaignDesiredLists(campaign)
+	if err != nil {
+		return DirectCampaign{}, err
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
-SET name=$1,objective=$2,landing_url=$3,brief=$4,regions=$5,
-weekly_budget_minor=$6,starts_at=$7,ends_at=$8,version=version+1,updated_at=$9
-WHERE workspace_id=$10 AND id=$11 AND version=$12 AND status='draft'`,
+SET name=$1,objective=$2,landing_url=$3,brief=$4,regions=$5,titles=$6,
+    texts=$7,keywords=$8,negative_keywords=$9,weekly_budget_minor=$10,
+    starts_at=$11,ends_at=$12,version=version+1,updated_at=$13
+WHERE workspace_id=$14 AND id=$15 AND version=$16 AND status='draft'`,
 		campaign.Name, campaign.Objective, campaign.LandingURL, campaign.Brief, string(regionsJSON),
+		titlesJSON, textsJSON, keywordsJSON, negativeKeywordsJSON,
 		campaign.WeeklyBudgetMinor, dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
 		now, workspaceID, campaignID, changes.ExpectedVersion)
 	if err != nil {
@@ -840,6 +1191,33 @@ func (s *Store) SyncDirectCampaignProviderStatus(
 	ctx context.Context, workspaceID, campaignID string, providerCampaignID int64,
 	providerStatus, providerState string, now time.Time,
 ) (DirectCampaign, error) {
+	return s.syncDirectCampaignProviderStatus(
+		ctx, workspaceID, campaignID, providerCampaignID,
+		providerStatus, providerState, nil, now,
+	)
+}
+
+// SyncDirectCampaignProviderStatusForLaunch fences provider truth observed by a
+// launch worker against the exact durable launch generation it owns.
+func (s *Store) SyncDirectCampaignProviderStatusForLaunch(
+	ctx context.Context, workspaceID, campaignID string, providerCampaignID int64,
+	providerStatus, providerState string, expectedLaunchClaimedAt, now time.Time,
+) (DirectCampaign, error) {
+	expectedLaunchClaimedAt = expectedLaunchClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedLaunchClaimedAt.IsZero() {
+		return DirectCampaign{}, ErrConflict
+	}
+	return s.syncDirectCampaignProviderStatus(
+		ctx, workspaceID, campaignID, providerCampaignID,
+		providerStatus, providerState, &expectedLaunchClaimedAt, now,
+	)
+}
+
+func (s *Store) syncDirectCampaignProviderStatus(
+	ctx context.Context, workspaceID, campaignID string, providerCampaignID int64,
+	providerStatus, providerState string, expectedLaunchClaimedAt *time.Time,
+	now time.Time,
+) (DirectCampaign, error) {
 	providerStatus = normalizeDirectProviderStatus(providerStatus)
 	providerState = strings.ToUpper(strings.TrimSpace(providerState))
 	status := directCampaignStatusFromProviderLifecycle(providerStatus, providerState)
@@ -849,15 +1227,30 @@ func (s *Store) SyncDirectCampaignProviderStatus(
 	}
 	defer func() { _ = tx.Rollback() }()
 	var currentStatus, currentProviderStatus, currentProviderState, currentLaunchState string
-	err = tx.QueryRowContext(ctx, `SELECT status,provider_status,provider_state,launch_state
+	var currentLaunchClaimedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `SELECT status,provider_status,provider_state,launch_state,
+       launch_claimed_at
 FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 AND provider_campaign_id=$3 FOR UPDATE`,
 		workspaceID, campaignID, providerCampaignID).Scan(
-		&currentStatus, &currentProviderStatus, &currentProviderState, &currentLaunchState)
+		&currentStatus, &currentProviderStatus, &currentProviderState, &currentLaunchState,
+		&currentLaunchClaimedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DirectCampaign{}, ErrNotFound
 	}
 	if err != nil {
 		return DirectCampaign{}, err
+	}
+	if expectedLaunchClaimedAt != nil {
+		if !currentLaunchClaimedAt.Valid ||
+			!currentLaunchClaimedAt.Time.UTC().Truncate(time.Microsecond).
+				Equal(*expectedLaunchClaimedAt) {
+			return DirectCampaign{}, ErrConflict
+		}
+	} else if currentLaunchState == "launching" ||
+		currentLaunchState == "reconciling" {
+		// Launch workers must use the fenced entry point. Ordinary lifecycle
+		// polling never owns an in-flight launch transition.
+		return DirectCampaign{}, ErrConflict
 	}
 	if providerStatus == "ACCEPTED" && providerState == "OFF" &&
 		(currentStatus == "active" || currentStatus == "suspended") {
@@ -940,6 +1333,8 @@ func (s *Store) GrantDirectAutoLaunchConsent(
 		strings.TrimSpace(request.ExpectedAccountID) == "" ||
 		strings.TrimSpace(request.ExpectedCampaignName) == "" ||
 		request.ExpectedProviderID <= 0 ||
+		!directGraphHashPattern.MatchString(strings.TrimSpace(request.ExpectedGraphHash)) ||
+		strings.TrimSpace(request.ExpectedRevisionID) == "" ||
 		request.WeeklyBudgetMinor <= 0 || request.StartsAt.IsZero() || request.EndsAt.IsZero() {
 		return DirectAutoLaunchConsent{}, ErrDirectConsentMismatch
 	}
@@ -959,8 +1354,10 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 	if err != nil {
 		return DirectAutoLaunchConsent{}, err
 	}
-	if campaign.Status != "accepted" || campaign.ProviderStatus != "ACCEPTED" ||
-		campaign.ProviderCampaignID == nil || campaign.LaunchState != "idle" {
+	if err := directCampaignGraphLaunchReady(campaign); err != nil {
+		return DirectAutoLaunchConsent{}, err
+	}
+	if campaign.LaunchState != "idle" {
 		return DirectAutoLaunchConsent{}, ErrDirectConsentMismatch
 	}
 	connection, err := scanDirectConnection(tx.QueryRowContext(ctx, `SELECT `+directConnectionColumns+`
@@ -976,12 +1373,14 @@ WHERE workspace_id=$1 AND id=$2 AND status='active' AND read_only=FALSE
 		connection.AccountID != strings.TrimSpace(request.ExpectedAccountID) ||
 		campaign.Name != strings.TrimSpace(request.ExpectedCampaignName) ||
 		*campaign.ProviderCampaignID != request.ExpectedProviderID ||
+		campaign.ProviderGraphHash != strings.TrimSpace(request.ExpectedGraphHash) ||
+		campaign.ProviderRevisionID != strings.TrimSpace(request.ExpectedRevisionID) ||
 		campaign.WeeklyBudgetMinor != request.WeeklyBudgetMinor ||
 		!sameDate(campaign.StartsAt, request.StartsAt) || !sameDate(campaign.EndsAt, request.EndsAt) {
 		return DirectAutoLaunchConsent{}, ErrDirectConsentMismatch
 	}
 	existing, existingErr := scanDirectConsent(tx.QueryRowContext(ctx, `SELECT `+directConsentColumns+`
-FROM direct_auto_launch_consents
+	FROM direct_auto_launch_consents_v2
 WHERE workspace_id=$1 AND campaign_id=$2
   AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL
 FOR UPDATE`, workspaceID, campaignID))
@@ -1003,18 +1402,21 @@ FOR UPDATE`, workspaceID, campaignID))
 		CampaignName:       campaign.Name,
 		WeeklyBudgetMinor:  campaign.WeeklyBudgetMinor, CurrencyCode: campaign.CurrencyCode,
 		StartsAt: dateOnly(campaign.StartsAt), EndsAt: dateOnly(campaign.EndsAt),
-		AuthorizedAt: request.AuthorizedAt.UTC(),
+		ExpectedGraphHash:  campaign.ProviderGraphHash,
+		ExpectedRevisionID: campaign.ProviderRevisionID,
+		AuthorizedAt:       request.AuthorizedAt.UTC(),
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO direct_auto_launch_consents(
+	_, err = tx.ExecContext(ctx, `INSERT INTO direct_auto_launch_consents_v2(
 id,workspace_id,campaign_id,connection_id,actor_user_id,consent_version,confirmation,
 campaign_version,account_id,provider_campaign_id,weekly_budget_minor,currency_code,
-campaign_name,starts_at,ends_at,authorized_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+campaign_name,starts_at,ends_at,expected_graph_hash,expected_revision_id,authorized_at)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 		consent.ID, consent.WorkspaceID, consent.CampaignID, consent.ConnectionID,
 		consent.ActorUserID, consent.ConsentVersion, consent.Confirmation,
 		consent.CampaignVersion, consent.AccountID, consent.ProviderCampaignID,
 		consent.WeeklyBudgetMinor, consent.CurrencyCode, consent.CampaignName,
-		consent.StartsAt, consent.EndsAt, consent.AuthorizedAt)
+		consent.StartsAt, consent.EndsAt, consent.ExpectedGraphHash,
+		consent.ExpectedRevisionID, consent.AuthorizedAt)
 	if err != nil {
 		return DirectAutoLaunchConsent{}, mapWorkspaceWriteError("grant Direct auto-launch consent", err)
 	}
@@ -1027,6 +1429,7 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 			"account_id":    consent.AccountID, "provider_campaign_id": consent.ProviderCampaignID,
 			"weekly_budget_minor": consent.WeeklyBudgetMinor, "currency_code": consent.CurrencyCode,
 			"starts_at": consent.StartsAt.Format(time.DateOnly), "ends_at": consent.EndsAt.Format(time.DateOnly),
+			"graph_hash": consent.ExpectedGraphHash, "revision_id": consent.ExpectedRevisionID,
 		}), CreatedAt: consent.AuthorizedAt,
 	}); err != nil {
 		return DirectAutoLaunchConsent{}, err
@@ -1048,7 +1451,7 @@ func (s *Store) RevokeDirectAutoLaunchConsent(
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents
+	result, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
 SET revoked_at=$1
 WHERE workspace_id=$2 AND campaign_id=$3
   AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
@@ -1079,7 +1482,7 @@ func (s *Store) InvalidateDirectAutoLaunchConsent(
 	if len(reason) > 128 {
 		reason = reason[:128]
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE direct_auto_launch_consents
+	result, err := s.db.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
 SET invalidated_at=$1,invalid_reason=$2
 WHERE workspace_id=$3 AND campaign_id=$4
   AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
@@ -1096,11 +1499,59 @@ WHERE workspace_id=$3 AND campaign_id=$4
 func (s *Store) SetDirectCampaignProviderSnapshotMismatch(
 	ctx context.Context, workspaceID, campaignID string, mismatch bool, now time.Time,
 ) error {
+	return s.setDirectCampaignProviderSnapshotMismatch(
+		ctx, workspaceID, campaignID, mismatch, nil, now,
+	)
+}
+
+// SetDirectCampaignProviderSnapshotMismatchForLaunch fences snapshot evidence
+// written by a launch worker against the exact durable launch generation it
+// owns.
+func (s *Store) SetDirectCampaignProviderSnapshotMismatchForLaunch(
+	ctx context.Context, workspaceID, campaignID string, mismatch bool,
+	expectedLaunchClaimedAt, now time.Time,
+) error {
+	expectedLaunchClaimedAt = expectedLaunchClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedLaunchClaimedAt.IsZero() {
+		return ErrConflict
+	}
+	return s.setDirectCampaignProviderSnapshotMismatch(
+		ctx, workspaceID, campaignID, mismatch, &expectedLaunchClaimedAt, now,
+	)
+}
+
+func (s *Store) setDirectCampaignProviderSnapshotMismatch(
+	ctx context.Context, workspaceID, campaignID string, mismatch bool,
+	expectedLaunchClaimedAt *time.Time, now time.Time,
+) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var launchState string
+	var launchClaimedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `SELECT launch_state,launch_claimed_at
+FROM direct_campaigns
+WHERE workspace_id=$1 AND id=$2
+FOR UPDATE`, workspaceID, campaignID).Scan(&launchState, &launchClaimedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if expectedLaunchClaimedAt != nil {
+		if !launchClaimedAt.Valid ||
+			!launchClaimedAt.Time.UTC().Truncate(time.Microsecond).
+				Equal(*expectedLaunchClaimedAt) {
+			return ErrConflict
+		}
+	} else if launchState == "launching" || launchState == "reconciling" {
+		// Launch workers must use the fenced entry point. Ordinary lifecycle
+		// polling never owns an in-flight launch transition.
+		return ErrConflict
+	}
 	if mismatch {
 		if _, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
 SET launch_failure_code=CASE
@@ -1112,7 +1563,7 @@ WHERE workspace_id=$2 AND id=$3 AND provider_campaign_id IS NOT NULL`,
 			now.UTC(), workspaceID, campaignID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents
+		if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
 SET invalidated_at=$1,invalid_reason='provider_snapshot_changed'
 WHERE workspace_id=$2 AND campaign_id=$3
   AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
@@ -1144,16 +1595,23 @@ func (s *Store) ClaimDirectAutoLaunchCandidates(
     JOIN workspaces w ON w.id=c.workspace_id AND w.archived_at IS NULL
     JOIN direct_connections cn
       ON cn.workspace_id=c.workspace_id AND cn.id=c.connection_id
-    JOIN direct_auto_launch_consents ac
+    JOIN direct_auto_launch_consents_v2 ac
       ON ac.workspace_id=c.workspace_id AND ac.campaign_id=c.id
     WHERE c.status = 'accepted'
       AND c.launch_state = 'idle'
       AND c.provider_status = 'ACCEPTED'
       AND c.provider_campaign_id IS NOT NULL
+      AND c.graph_verified_at IS NOT NULL
+      AND c.provider_graph_hash <> ''
+      AND c.provider_revision_id IS NOT NULL
+      AND c.moderation_status = 'ACCEPTED'
       AND c.auto_launch_next_attempt_at <= $1
-      AND c.starts_at <= $1::date AND c.ends_at >= $1::date
+      AND c.starts_at <= ($1 AT TIME ZONE 'Europe/Moscow')::date
+      AND c.ends_at >= ($1 AT TIME ZONE 'Europe/Moscow')::date
       AND cn.status='active' AND cn.read_only=FALSE AND cn.revoked_at IS NULL
       AND ac.revoked_at IS NULL AND ac.invalidated_at IS NULL AND ac.consumed_at IS NULL
+      AND ac.expected_graph_hash = c.provider_graph_hash
+      AND ac.expected_revision_id = c.provider_revision_id
     ORDER BY CASE WHEN c.status='accepted' THEN 0 ELSE 1 END,
              c.auto_launch_next_attempt_at,ac.authorized_at,c.id
     FOR UPDATE OF c SKIP LOCKED
@@ -1192,7 +1650,7 @@ func (s *Store) ClaimDirectProviderSyncCandidates(
     JOIN workspaces w ON w.id=c.workspace_id AND w.archived_at IS NULL
     JOIN direct_connections cn
       ON cn.workspace_id=c.workspace_id AND cn.id=c.connection_id
-    WHERE c.status IN ('provider_draft','moderation','accepted','active','suspended')
+    WHERE c.status IN ('provider_draft','moderation','accepted','rejected','active','suspended')
       AND c.launch_state NOT IN ('launching','reconciling')
       AND c.provider_campaign_id IS NOT NULL
       AND c.provider_next_check_at <= $1
@@ -1227,7 +1685,7 @@ func (s *Store) ClaimDirectLaunchRecoveryCandidates(
 	if limit <= 0 || limit > 100 {
 		limit = 10
 	}
-	now = now.UTC()
+	now = now.UTC().Truncate(time.Microsecond)
 	rows, err := s.db.QueryContext(ctx, `WITH candidates AS (
     SELECT workspace_id,id
     FROM direct_campaigns
@@ -1238,7 +1696,11 @@ func (s *Store) ClaimDirectLaunchRecoveryCandidates(
     LIMIT $2
 )
 UPDATE direct_campaigns c
-SET launch_reconcile_after=$3,updated_at=$1
+SET launch_claimed_at=GREATEST(
+        $1,
+        c.launch_claimed_at + INTERVAL '1 microsecond'
+    ),
+    launch_reconcile_after=$3,updated_at=$1
 FROM candidates x
 WHERE c.workspace_id=x.workspace_id AND c.id=x.id
 RETURNING c.workspace_id,c.id`, now, limit, now.Add(directLaunchRecoveryLease))
@@ -1274,7 +1736,7 @@ FROM direct_campaigns WHERE id=$1`, campaignID))
 		return material, ErrDirectConnectionRequired
 	}
 	consent, err := scanDirectConsent(s.db.QueryRowContext(ctx, `SELECT `+directConsentColumns+`
-FROM direct_auto_launch_consents
+FROM direct_auto_launch_consents_v2
 WHERE workspace_id=$1 AND campaign_id=$2
   AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL`,
 		campaign.WorkspaceID, campaign.ID))
@@ -1347,7 +1809,7 @@ func (s *Store) GetDirectLifecycleMaterial(
 	campaign, err := scanDirectCampaign(s.db.QueryRowContext(ctx, `SELECT `+directCampaignColumns+`
 FROM direct_campaigns
 WHERE workspace_id=$1 AND id=$2
-  AND status IN ('provider_draft','moderation','accepted','active','suspended')
+  AND status IN ('provider_draft','moderation','accepted','rejected','active','suspended')
   AND provider_campaign_id IS NOT NULL`, workspaceID, campaignID))
 	if err != nil {
 		return DirectLaunchMaterial{}, err
@@ -1365,24 +1827,26 @@ WHERE workspace_id=$1 AND id=$2
 func (s *Store) ClaimDirectAutoCampaignLaunch(
 	ctx context.Context, workspaceID, campaignID string, expectedCampaignVersion int64,
 	expectedProviderCampaignID int64, expectedAccountID string, expectedBudgetMinor int64,
-	expectedStartsAt, expectedEndsAt time.Time, now time.Time,
+	expectedStartsAt, expectedEndsAt time.Time, expectedGraphHash, expectedRevisionID string,
+	now time.Time,
 ) (DirectLaunchMaterial, error) {
 	return s.claimDirectCampaignLaunch(
 		ctx, "", workspaceID, campaignID, "auto", true, expectedCampaignVersion,
 		expectedProviderCampaignID, expectedAccountID, expectedBudgetMinor,
-		expectedStartsAt, expectedEndsAt, now,
+		expectedStartsAt, expectedEndsAt, expectedGraphHash, expectedRevisionID, now,
 	)
 }
 
 func (s *Store) ClaimDirectManualCampaignLaunch(
 	ctx context.Context, actorUserID, workspaceID, campaignID string, expectedCampaignVersion int64,
 	expectedProviderCampaignID int64, expectedAccountID string, expectedBudgetMinor int64,
-	expectedStartsAt, expectedEndsAt time.Time, now time.Time,
+	expectedStartsAt, expectedEndsAt time.Time, expectedGraphHash, expectedRevisionID string,
+	now time.Time,
 ) (DirectLaunchMaterial, error) {
 	return s.claimDirectCampaignLaunch(
 		ctx, actorUserID, workspaceID, campaignID, "manual", false, expectedCampaignVersion,
 		expectedProviderCampaignID, expectedAccountID, expectedBudgetMinor,
-		expectedStartsAt, expectedEndsAt, now,
+		expectedStartsAt, expectedEndsAt, expectedGraphHash, expectedRevisionID, now,
 	)
 }
 
@@ -1394,16 +1858,29 @@ func (s *Store) claimDirectCampaignLaunch(
 	ctx context.Context, actorUserID, workspaceID, campaignID, launchMode string,
 	requireConsent bool, expectedCampaignVersion int64,
 	expectedProviderCampaignID int64, expectedAccountID string, expectedBudgetMinor int64,
-	expectedStartsAt, expectedEndsAt time.Time, now time.Time,
+	expectedStartsAt, expectedEndsAt time.Time, expectedGraphHash, expectedRevisionID string,
+	now time.Time,
 ) (DirectLaunchMaterial, error) {
 	if launchMode != "manual" && launchMode != "auto" {
 		return DirectLaunchMaterial{}, errors.New("invalid Direct launch mode")
+	}
+	now = now.UTC().Truncate(time.Microsecond)
+	if now.IsZero() {
+		now = time.Now().UTC().Truncate(time.Microsecond)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return DirectLaunchMaterial{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var lockedWorkspaceID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID,
+	).Scan(&lockedWorkspaceID); err != nil {
+		return DirectLaunchMaterial{}, mapWorkspaceWriteError(
+			"lock workspace for Direct budget", err,
+		)
+	}
 	campaign, err := scanDirectCampaign(tx.QueryRowContext(ctx, `SELECT `+directCampaignColumns+`
 FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, campaignID))
 	if err != nil {
@@ -1419,11 +1896,32 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 	if !canClaim || campaign.Status == "active" || campaign.LaunchedAt != nil {
 		return DirectLaunchMaterial{}, ErrDirectLaunchAlreadyClaimed
 	}
+	if err := directCampaignGraphLaunchReady(campaign); err != nil {
+		return DirectLaunchMaterial{}, err
+	}
 	if campaign.Status != "accepted" || campaign.ProviderStatus != "ACCEPTED" ||
 		campaign.ProviderCampaignID == nil || *campaign.ProviderCampaignID != expectedProviderCampaignID ||
 		campaign.Version != expectedCampaignVersion || campaign.WeeklyBudgetMinor != expectedBudgetMinor ||
+		campaign.ProviderGraphHash != strings.TrimSpace(expectedGraphHash) ||
+		campaign.ProviderRevisionID != strings.TrimSpace(expectedRevisionID) ||
 		!sameDate(campaign.StartsAt, expectedStartsAt) || !sameDate(campaign.EndsAt, expectedEndsAt) {
 		return DirectLaunchMaterial{}, ErrDirectConsentMismatch
+	}
+	if campaign.WeeklyBudgetMinor > DirectMaxCampaignWeeklyBudgetMinor {
+		return DirectLaunchMaterial{}, ErrDirectBudgetCapExceeded
+	}
+	var committedWeeklyBudgetMinor int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(weekly_budget_minor),0)
+FROM direct_campaigns
+WHERE workspace_id=$1 AND id<>$2
+  AND (
+    status IN ('active','suspended')
+    OR launch_state IN ('launching','reconciling','confirmed','failed')
+  )`, workspaceID, campaignID).Scan(&committedWeeklyBudgetMinor); err != nil {
+		return DirectLaunchMaterial{}, err
+	}
+	if committedWeeklyBudgetMinor > DirectMaxWorkspaceWeeklyBudgetMinor-campaign.WeeklyBudgetMinor {
+		return DirectLaunchMaterial{}, ErrDirectBudgetCapExceeded
 	}
 	connection, err := scanDirectConnection(tx.QueryRowContext(ctx, `SELECT `+directConnectionColumns+`
 FROM direct_connections WHERE workspace_id=$1 AND id=$2 AND status='active' AND revoked_at IS NULL FOR SHARE`,
@@ -1437,7 +1935,7 @@ FROM direct_connections WHERE workspace_id=$1 AND id=$2 AND status='active' AND 
 	var consent DirectAutoLaunchConsent
 	if requireConsent {
 		consent, err = scanDirectConsent(tx.QueryRowContext(ctx, `SELECT `+directConsentColumns+`
-FROM direct_auto_launch_consents
+FROM direct_auto_launch_consents_v2
 WHERE workspace_id=$1 AND campaign_id=$2
   AND revoked_at IS NULL AND invalidated_at IS NULL AND consumed_at IS NULL
 FOR UPDATE`, campaign.WorkspaceID, campaign.ID))
@@ -1448,12 +1946,17 @@ FOR UPDATE`, campaign.WorkspaceID, campaign.ID))
 			return DirectLaunchMaterial{}, ErrDirectConsentMismatch
 		}
 	}
-	now = now.UTC()
 	if requireConsent {
-		if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents SET consumed_at=$1
+		if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2 SET consumed_at=$1
 WHERE id=$2 AND consumed_at IS NULL`, now, consent.ID); err != nil {
 			return DirectLaunchMaterial{}, err
 		}
+	}
+	launchClaimedAt := now
+	if campaign.LaunchClaimedAt != nil &&
+		!launchClaimedAt.After(campaign.LaunchClaimedAt.UTC()) {
+		launchClaimedAt = campaign.LaunchClaimedAt.UTC().
+			Truncate(time.Microsecond).Add(time.Microsecond)
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
 SET launch_claimed_at=$1,launch_state='launching',launch_mode=$2,
@@ -1461,7 +1964,8 @@ SET launch_claimed_at=$1,launch_state='launching',launch_mode=$2,
     launch_failure_code='',updated_at=$1
 WHERE workspace_id=$4 AND id=$5 AND status='accepted'
   AND (launch_state='idle' OR (launch_state='failed' AND $2='manual'))`,
-		now, launchMode, now.Add(directLaunchRecoveryLease), campaign.WorkspaceID, campaign.ID)
+		launchClaimedAt, launchMode, now.Add(directLaunchRecoveryLease),
+		campaign.WorkspaceID, campaign.ID)
 	if err != nil {
 		return DirectLaunchMaterial{}, err
 	}
@@ -1490,7 +1994,7 @@ WHERE workspace_id=$4 AND id=$5 AND status='accepted'
 	if requireConsent {
 		consent.ConsumedAt = &consumed
 	}
-	campaign.LaunchClaimedAt = &now
+	campaign.LaunchClaimedAt = &launchClaimedAt
 	campaign.LaunchState = "launching"
 	campaign.LaunchMode = launchMode
 	campaign.LaunchAttemptCount = 0
@@ -1504,14 +2008,21 @@ WHERE workspace_id=$4 AND id=$5 AND status='accepted'
 }
 
 func (s *Store) MarkDirectCampaignLaunchAttempt(
-	ctx context.Context, workspaceID, campaignID string, now time.Time,
+	ctx context.Context, workspaceID, campaignID string,
+	expectedLaunchClaimedAt, now time.Time,
 ) error {
+	expectedLaunchClaimedAt = expectedLaunchClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedLaunchClaimedAt.IsZero() {
+		return ErrConflict
+	}
 	result, err := s.db.ExecContext(ctx, `UPDATE direct_campaigns
 SET launch_state='launching',launch_attempt_count=launch_attempt_count+1,
     launch_reconcile_after=$2,launch_failure_code='',updated_at=$1
 WHERE workspace_id=$3 AND id=$4
-  AND launch_state IN ('launching','reconciling') AND launch_attempt_count<2`,
-		now.UTC(), now.UTC().Add(directLaunchRecoveryLease), workspaceID, campaignID)
+  AND launch_state IN ('launching','reconciling') AND launch_attempt_count<2
+  AND launch_claimed_at=$5`,
+		now.UTC(), now.UTC().Add(directLaunchRecoveryLease), workspaceID, campaignID,
+		expectedLaunchClaimedAt)
 	if err != nil {
 		return err
 	}
@@ -1522,8 +2033,13 @@ WHERE workspace_id=$3 AND id=$4
 }
 
 func (s *Store) MarkDirectCampaignLaunchReconciling(
-	ctx context.Context, workspaceID, campaignID, failureCode string, now time.Time,
+	ctx context.Context, workspaceID, campaignID string,
+	expectedLaunchClaimedAt time.Time, failureCode string, now time.Time,
 ) error {
+	expectedLaunchClaimedAt = expectedLaunchClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedLaunchClaimedAt.IsZero() {
+		return ErrConflict
+	}
 	failureCode = strings.TrimSpace(failureCode)
 	if len(failureCode) > 128 {
 		failureCode = failureCode[:128]
@@ -1531,8 +2047,9 @@ func (s *Store) MarkDirectCampaignLaunchReconciling(
 	result, err := s.db.ExecContext(ctx, `UPDATE direct_campaigns
 SET launch_state='reconciling',launch_failure_code=$1,
     launch_reconcile_after=$2,updated_at=$2
-WHERE workspace_id=$3 AND id=$4 AND launch_state IN ('launching','reconciling')`,
-		failureCode, now.UTC(), workspaceID, campaignID)
+WHERE workspace_id=$3 AND id=$4 AND launch_state IN ('launching','reconciling')
+  AND launch_claimed_at=$5`,
+		failureCode, now.UTC(), workspaceID, campaignID, expectedLaunchClaimedAt)
 	if err != nil {
 		return err
 	}
@@ -1543,9 +2060,14 @@ WHERE workspace_id=$3 AND id=$4 AND launch_state IN ('launching','reconciling')`
 }
 
 func (s *Store) AbortDirectCampaignLaunchForAuthorization(
-	ctx context.Context, workspaceID, campaignID string, now time.Time,
+	ctx context.Context, workspaceID, campaignID string,
+	expectedLaunchClaimedAt, now time.Time,
 ) error {
 	now = now.UTC()
+	expectedLaunchClaimedAt = expectedLaunchClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedLaunchClaimedAt.IsZero() {
+		return ErrConflict
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1556,8 +2078,9 @@ SET launch_state='idle',launch_mode='',launch_claimed_at=NULL,
     launch_attempt_count=0,launch_reconcile_after=NULL,launch_failed_at=NULL,
     launched_at=NULL,launch_failure_code='authorization_required',updated_at=$1
 WHERE workspace_id=$2 AND id=$3 AND status='accepted'
-  AND launch_state IN ('launching','reconciling')`,
-		now, workspaceID, campaignID)
+  AND launch_state IN ('launching','reconciling')
+  AND launch_claimed_at=$4`,
+		now, workspaceID, campaignID, expectedLaunchClaimedAt)
 	if err != nil {
 		return err
 	}
@@ -1576,8 +2099,13 @@ WHERE workspace_id=$2 AND id=$3 AND status='accepted'
 }
 
 func (s *Store) FailDirectCampaignLaunch(
-	ctx context.Context, workspaceID, campaignID, failureCode string, now time.Time,
+	ctx context.Context, workspaceID, campaignID string,
+	expectedLaunchClaimedAt time.Time, failureCode string, now time.Time,
 ) error {
+	expectedLaunchClaimedAt = expectedLaunchClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedLaunchClaimedAt.IsZero() {
+		return ErrConflict
+	}
 	failureCode = strings.TrimSpace(failureCode)
 	if failureCode == "" {
 		failureCode = "provider_off_after_retries"
@@ -1594,8 +2122,9 @@ func (s *Store) FailDirectCampaignLaunch(
 SET launch_state='failed',launch_reconcile_after=NULL,
     launch_failed_at=$2,launch_failure_code=$1,updated_at=$2
 WHERE workspace_id=$3 AND id=$4 AND status='accepted'
-  AND launch_state IN ('launching','reconciling') AND launch_attempt_count=2`,
-		failureCode, now.UTC(), workspaceID, campaignID)
+  AND launch_state IN ('launching','reconciling') AND launch_attempt_count=2
+  AND launch_claimed_at=$5`,
+		failureCode, now.UTC(), workspaceID, campaignID, expectedLaunchClaimedAt)
 	if err != nil {
 		return err
 	}
@@ -1613,8 +2142,13 @@ WHERE workspace_id=$3 AND id=$4 AND status='accepted'
 }
 
 func (s *Store) CompleteDirectCampaignLaunch(
-	ctx context.Context, workspaceID, campaignID string, now time.Time,
+	ctx context.Context, workspaceID, campaignID string,
+	expectedLaunchClaimedAt, now time.Time,
 ) error {
+	expectedLaunchClaimedAt = expectedLaunchClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedLaunchClaimedAt.IsZero() {
+		return ErrConflict
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1625,8 +2159,8 @@ SET status='active',provider_status='ACCEPTED',provider_state='ON',
     launch_state='confirmed',launched_at=$1,
     launch_reconcile_after=NULL,launch_failed_at=NULL,launch_failure_code='',updated_at=$1
 WHERE workspace_id=$2 AND id=$3 AND status IN ('accepted','active')
-  AND launch_state IN ('launching','reconciling') AND launch_claimed_at IS NOT NULL`,
-		now.UTC(), workspaceID, campaignID)
+  AND launch_state IN ('launching','reconciling') AND launch_claimed_at=$4`,
+		now.UTC(), workspaceID, campaignID, expectedLaunchClaimedAt)
 	if err != nil {
 		return err
 	}
@@ -1647,8 +2181,10 @@ func (s *Store) getDirectAutoLaunchSummary(
 	ctx context.Context, workspaceID string, campaign DirectCampaign,
 ) (DirectAutoLaunchSummary, error) {
 	consent, err := scanDirectConsent(s.db.QueryRowContext(ctx, `SELECT `+directConsentColumns+`
-FROM direct_auto_launch_consents WHERE workspace_id=$1 AND campaign_id=$2
-ORDER BY authorized_at DESC,id DESC LIMIT 1`, workspaceID, campaign.ID))
+FROM direct_auto_launch_consent_evidence WHERE workspace_id=$1 AND campaign_id=$2
+ORDER BY (consent_version='yandex-direct-auto-launch-v2') DESC,
+         authorized_at DESC,id DESC
+LIMIT 1`, workspaceID, campaign.ID))
 	if errors.Is(err, ErrNotFound) {
 		return DirectAutoLaunchSummary{}, nil
 	}
@@ -1659,7 +2195,11 @@ ORDER BY authorized_at DESC,id DESC LIMIT 1`, workspaceID, campaign.ID))
 		Enabled:      consent.RevokedAt == nil && consent.ConsumedAt == nil,
 		CampaignID:   consent.CampaignID,
 		CampaignName: consent.CampaignName,
-		WarningCode:  "provider_creatives_not_snapshotted",
+	}
+	if consent.ConsentVersion != DirectAutoLaunchConsentVersion {
+		summary.WarningCode = "legacy_consent_version"
+	} else if campaign.GraphVerifiedAt == nil {
+		summary.WarningCode = "provider_graph_unverified"
 	}
 	if consent.ProviderCampaignID != nil {
 		summary.ProviderCampaignID = fmt.Sprintf("%d", *consent.ProviderCampaignID)
@@ -1727,13 +2267,13 @@ func validateDirectCampaignDraft(campaign *DirectCampaign) error {
 	seenRegions := make(map[string]struct{}, len(campaign.Regions))
 	normalizedRegions := make([]string, 0, len(campaign.Regions))
 	for _, region := range campaign.Regions {
-		region = strings.TrimSpace(region)
+		region = norm.NFC.String(strings.TrimSpace(region))
 		if region == "" || utf8.RuneCountInString(region) > 120 {
 			return errors.New("direct campaign region is invalid")
 		}
-		key := strings.ToLower(region)
+		key := directGraphDuplicateKey(region)
 		if _, duplicate := seenRegions[key]; duplicate {
-			continue
+			return errors.New("direct campaign regions must not contain duplicates")
 		}
 		seenRegions[key] = struct{}{}
 		normalizedRegions = append(normalizedRegions, region)
@@ -1742,11 +2282,17 @@ func validateDirectCampaignDraft(campaign *DirectCampaign) error {
 		return errors.New("direct campaign must contain at least one region")
 	}
 	campaign.Regions = normalizedRegions
+	if err := validateDirectCampaignGraphDraft(campaign); err != nil {
+		return err
+	}
 	if campaign.CurrencyCode != "" && campaign.CurrencyCode != "RUB" {
 		return errors.New("currency_code must be RUB")
 	}
 	if campaign.WeeklyBudgetMinor < 30_000 {
 		return errors.New("weekly_budget_minor must be at least 30000")
+	}
+	if campaign.WeeklyBudgetMinor > DirectMaxCampaignWeeklyBudgetMinor {
+		return ErrDirectBudgetCapExceeded
 	}
 	if campaign.StartsAt.IsZero() || campaign.EndsAt.IsZero() || campaign.EndsAt.Before(campaign.StartsAt) {
 		return errors.New("direct campaign dates are invalid")
@@ -1831,6 +2377,10 @@ func directConsentMatches(
 		campaign.ProviderCampaignID != nil &&
 		*consent.ProviderCampaignID == *campaign.ProviderCampaignID
 	return consent.ConsentVersion == DirectAutoLaunchConsentVersion &&
+		directCampaignGraphLaunchReady(campaign) == nil &&
+		consent.ExpectedGraphHash == campaign.ProviderGraphHash &&
+		consent.ExpectedRevisionID == campaign.ProviderRevisionID &&
+		campaign.ModerationStatus == "ACCEPTED" &&
 		connection.Status == "active" && connection.RevokedAt == nil && !connection.ReadOnly &&
 		consent.CampaignVersion == campaign.Version &&
 		consent.ConnectionID == campaign.ConnectionID &&
@@ -1870,7 +2420,8 @@ func scanDirectConnection(row scanner) (DirectConnection, error) {
 		&connection.ClientLogin, &connection.AccountName, &connection.CurrencyCode,
 		&connection.Timezone, &connection.ReadOnly, &connection.TokenCiphertext, &connection.TokenKeyVersion, &connection.Status,
 		&connection.ConnectedBy, &connection.LastVerifiedAt, &connection.ErrorCode,
-		&connection.CreatedAt, &connection.UpdatedAt, &connection.RevokedAt)
+		&connection.CreatedAt, &connection.UpdatedAt, &connection.RevokedAt,
+		&connection.TokenRefreshClaimedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DirectConnection{}, ErrNotFound
 	}
@@ -1883,8 +2434,10 @@ func scanDirectConnection(row scanner) (DirectConnection, error) {
 
 func scanDirectCampaign(row scanner) (DirectCampaign, error) {
 	var campaign DirectCampaign
-	var providerCampaignID sql.NullInt64
-	var regionsJSON []byte
+	var providerCampaignID, providerAdGroupID, providerAdID sql.NullInt64
+	var regionsJSON, titlesJSON, textsJSON, keywordsJSON, negativeKeywordsJSON []byte
+	var providerKeywordIDsJSON, providerKeywordMappingsJSON, providerWarningsJSON []byte
+	var campaignModerationJSON, adGroupModerationJSON, adModerationJSON, keywordModerationJSON []byte
 	err := row.Scan(&campaign.ID, &campaign.WorkspaceID, &campaign.ConnectionID,
 		&providerCampaignID, &campaign.Name, &campaign.Objective, &campaign.LandingURL,
 		&campaign.Brief, &regionsJSON, &campaign.WeeklyBudgetMinor,
@@ -1896,7 +2449,17 @@ func scanDirectCampaign(row scanner) (DirectCampaign, error) {
 		&campaign.LaunchState, &campaign.LaunchMode, &campaign.LaunchAttemptCount,
 		&campaign.LaunchReconcileAfter, &campaign.LaunchedAt, &campaign.LaunchFailedAt,
 		&campaign.LaunchFailureCode, &campaign.CreatedAt,
-		&campaign.UpdatedAt)
+		&campaign.UpdatedAt, &titlesJSON, &textsJSON, &keywordsJSON,
+		&negativeKeywordsJSON, &providerAdGroupID, &providerAdID,
+		&providerKeywordIDsJSON, &providerKeywordMappingsJSON, &providerWarningsJSON,
+		&campaign.SubmissionOperationID, &campaign.SubmissionStage,
+		&campaign.SubmissionOperationMarker, &campaign.SubmissionClaimedAt,
+		&campaign.SubmissionLeaseExpiresAt, &campaign.SubmissionFailureCode,
+		&campaign.SubmissionFailureClarification, &campaign.ProviderGraphHash,
+		&campaign.ProviderRevisionID, &campaign.GraphVerifiedAt,
+		&campaign.ModerationStatus, &campaign.ModerationClarification,
+		&campaignModerationJSON, &adGroupModerationJSON, &adModerationJSON,
+		&keywordModerationJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DirectCampaign{}, ErrNotFound
 	}
@@ -1907,8 +2470,39 @@ func scanDirectCampaign(row scanner) (DirectCampaign, error) {
 		value := providerCampaignID.Int64
 		campaign.ProviderCampaignID = &value
 	}
+	if providerAdGroupID.Valid {
+		value := providerAdGroupID.Int64
+		campaign.ProviderAdGroupID = &value
+	}
+	if providerAdID.Valid {
+		value := providerAdID.Int64
+		campaign.ProviderAdID = &value
+	}
 	if err := json.Unmarshal(regionsJSON, &campaign.Regions); err != nil {
 		return DirectCampaign{}, fmt.Errorf("decode Direct campaign regions: %w", err)
+	}
+	for _, item := range []struct {
+		name    string
+		payload []byte
+		target  any
+	}{
+		{"titles", titlesJSON, &campaign.Titles},
+		{"texts", textsJSON, &campaign.Texts},
+		{"keywords", keywordsJSON, &campaign.Keywords},
+		{"negative_keywords", negativeKeywordsJSON, &campaign.NegativeKeywords},
+		{"provider_keyword_ids", providerKeywordIDsJSON, &campaign.ProviderKeywordIDs},
+		{"provider_keyword_mappings", providerKeywordMappingsJSON, &campaign.ProviderKeywordMappings},
+		{"provider_warnings", providerWarningsJSON, &campaign.ProviderWarnings},
+		{"campaign_moderation", campaignModerationJSON, &campaign.CampaignModeration},
+		{"ad_group_moderation", adGroupModerationJSON, &campaign.AdGroupModeration},
+		{"ad_moderation", adModerationJSON, &campaign.AdModeration},
+		{"keyword_moderation", keywordModerationJSON, &campaign.KeywordModeration},
+	} {
+		if err := json.Unmarshal(item.payload, item.target); err != nil {
+			return DirectCampaign{}, fmt.Errorf(
+				"decode Direct campaign %s: %w", item.name, err,
+			)
+		}
 	}
 	normalizeDirectCampaign(&campaign)
 	return campaign, nil
@@ -1922,7 +2516,8 @@ func scanDirectConsent(row scanner) (DirectAutoLaunchConsent, error) {
 		&consent.Confirmation, &consent.CampaignVersion, &consent.AccountID,
 		&providerCampaignID, &consent.CampaignName,
 		&consent.WeeklyBudgetMinor, &consent.CurrencyCode,
-		&consent.StartsAt, &consent.EndsAt, &consent.AuthorizedAt,
+		&consent.StartsAt, &consent.EndsAt, &consent.ExpectedGraphHash,
+		&consent.ExpectedRevisionID, &consent.AuthorizedAt,
 		&consent.RevokedAt, &consent.InvalidatedAt, &consent.InvalidReason,
 		&consent.ConsumedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1959,6 +2554,10 @@ func normalizeDirectConnection(connection *DirectConnection) {
 		value := connection.RevokedAt.UTC()
 		connection.RevokedAt = &value
 	}
+	if connection.TokenRefreshClaimedAt != nil {
+		value := connection.TokenRefreshClaimedAt.UTC()
+		connection.TokenRefreshClaimedAt = &value
+	}
 }
 
 func normalizeDirectCampaign(campaign *DirectCampaign) {
@@ -1987,6 +2586,18 @@ func normalizeDirectCampaign(campaign *DirectCampaign) {
 	if campaign.LaunchedAt != nil {
 		value := campaign.LaunchedAt.UTC()
 		campaign.LaunchedAt = &value
+	}
+	if campaign.SubmissionClaimedAt != nil {
+		value := campaign.SubmissionClaimedAt.UTC()
+		campaign.SubmissionClaimedAt = &value
+	}
+	if campaign.SubmissionLeaseExpiresAt != nil {
+		value := campaign.SubmissionLeaseExpiresAt.UTC()
+		campaign.SubmissionLeaseExpiresAt = &value
+	}
+	if campaign.GraphVerifiedAt != nil {
+		value := campaign.GraphVerifiedAt.UTC()
+		campaign.GraphVerifiedAt = &value
 	}
 }
 

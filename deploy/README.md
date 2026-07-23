@@ -382,9 +382,24 @@ remain display-only until their write paths are integrated with the catalog.
 
 The Yandex OAuth application and the connected advertiser account must have
 approved access to the Yandex Direct API before this integration is enabled.
-Register this exact production callback in the OAuth application:
+For an API/debugging OAuth application use Yandex's fixed verification-code
+redirect:
+
+`https://oauth.yandex.ru/verification_code`
+
+The backend also retains the browser-callback flow for a web OAuth application,
+but accepts only this exact callback:
 
 `https://maxposty.ru/api/v1/advertising/direct/oauth/callback`
+
+No other Direct OAuth redirect host or path is accepted. In verification-code
+mode `connect/start` returns a session-, actor-, workspace- and flow-bound
+one-time state. The browser sends the seven-digit code shown by Yandex and that
+state to the authenticated `connect/complete` endpoint. Starting again
+invalidates the previous active attempt for that actor and workspace. A durable
+latest-attempt marker is checked in the same transaction that stores the
+connection, so an older completion already waiting on Yandex cannot overwrite
+the connection after a restart.
 
 Store `DIRECT_OAUTH_CLIENT_ID`, `DIRECT_OAUTH_CLIENT_SECRET`, and
 `DIRECT_TOKEN_DATA_KEY` as production Environment secrets. The token data key
@@ -393,7 +408,7 @@ example, generated once with `openssl rand -base64 32`); rotating or losing it
 without a token re-encryption procedure makes existing connections unreadable.
 Set these production Environment variables:
 
-- `DIRECT_OAUTH_REDIRECT_URI=https://maxposty.ru/api/v1/advertising/direct/oauth/callback`
+- `DIRECT_OAUTH_REDIRECT_URI=https://oauth.yandex.ru/verification_code`
 - `DIRECT_SANDBOX=true`
 - `DIRECT_API_BASE_URL=https://api-sandbox.direct.yandex.com/json/v5`
 - `DIRECT_WRITES_ENABLED=false`
@@ -408,11 +423,13 @@ Use this staged rollout:
    auto-launch disabled, and verify campaign creation, manual launch, provider
    status polling, and ambiguous-launch recovery.
 3. Switch together to `DIRECT_SANDBOX=false` and
-   `DIRECT_API_BASE_URL=https://api.direct.yandex.com/json/v501`, initially
-   keeping auto-launch disabled while the live account and manual workflow are
-   verified.
-4. Enable `DIRECT_AUTO_LAUNCH_ENABLED=true` only in another deliberate
-   deployment after the recovery test has passed; auto-launch requires writes.
+    `DIRECT_API_BASE_URL=https://api.direct.yandex.com/json/v501`, initially
+    keeping auto-launch disabled while the live account and manual workflow are
+    verified.
+4. Leave `DIRECT_AUTO_LAUNCH_ENABLED=false`. The runtime additionally keeps the
+   effective value false until the provider campaign graph (groups, ads,
+   creatives, keywords and moderation state) is stored and verified. Turning on
+   only the environment flag cannot bypass this fail-closed guard.
 
 Do not point a production OAuth credential at an unapproved custom API origin.
 Disabling write flags is an emergency kill switch for provider mutations;
@@ -422,9 +439,21 @@ still be observed and recorded safely.
 Auto-launch consent snapshots the provider campaign ID, campaign name, weekly
 budget, dates, account, and local version, but it cannot snapshot every ad and
 creative edited directly in Yandex Direct. The owner must review the actual
-provider-side ads immediately before consent. Keep
-`DIRECT_AUTO_LAUNCH_ENABLED=false` until creative-level verification is
-implemented and separately approved.
+provider-side ads immediately before consent. Campaign API responses expose
+`setup_warning_code=provider_graph_unverified` while that gap remains. Keep
+`DIRECT_AUTO_LAUNCH_ENABLED=false` until provider-graph verification is
+implemented, tested and separately approved.
+
+The backend enforces two non-configurable safety limits in minor currency units:
+
+- no MaxPosty campaign draft may exceed `1_000_000` (10,000 RUB) per week;
+- the aggregate weekly budget of spend-capable MaxPosty campaigns in one
+  workspace may not exceed `3_000_000` (30,000 RUB).
+
+The aggregate limit is checked atomically in the shared manual/automatic launch
+claim, including ambiguous or in-progress launches, so concurrent launch
+requests cannot oversubscribe it. A rejected request returns
+`direct_budget_cap_exceeded`; operators must not bypass the database guard.
 
 Revoking the OAuth connection does not stop, pause, delete, or rebind campaigns
 that already exist in Yandex Direct. The UI must require an explicit second
@@ -442,22 +471,25 @@ recovery action once quiescence is proven. That reset action is not part of
 this rollout, so support must not delete the token or bypass the database
 guard.
 
-Provider token revocation/401 does not currently have a refresh-token flow or
-token-expiry metadata: the current OAuth response handler stores only the access
-token actually returned by Yandex. On an HTTP 401 or the documented Direct API
-invalid-token error 53, the backend marks the connection `error` with the safe
-code `authorization_required`, invalidates outstanding auto-launch consent, and
-stops scheduling work for that connection.
-The owner must use the explicit disconnect confirmation and complete OAuth
-again. There is no background token refresh. Keep production writes and
-auto-launch disabled until this reconnect path has been verified with a live
-token expiry/revocation. Do not invent, synthesize, or persist a refresh token
-or expiry that Yandex did not return. If an authorization error occurs while
-reconciling an earlier ambiguous launch, the launch remains blocked for
-operator recovery because the earlier provider write may still have succeeded.
-Campaigns remain tied to the old connection and are not silently rebound after
-OAuth; an unlaunched campaign must be recreated or handled directly in Yandex
-after reconnecting.
+New OAuth completions persist a versioned, AAD-bound encrypted token bundle with
+the access token, rotating refresh token, expiry, and refresh schedule. Refresh
+starts five minutes before expiry or at least once every 90 days. An in-process
+singleflight plus a two-minute database lease and ciphertext compare-and-swap
+ensure that concurrent workers cannot overwrite a rotated refresh token. A
+transient refresh failure may use the old access token only while it has more
+than 30 seconds of validity remaining.
+
+The refresh response must contain a new access token, refresh token and positive
+`expires_in`; the backend never synthesizes missing OAuth data. `invalid_grant`,
+HTTP 401, or the documented Direct API invalid-token error 53 marks the
+connection `error` with `authorization_required`, invalidates outstanding
+auto-launch consent, and stops scheduling work for that connection. The owner
+must complete OAuth again. Legacy version-one access-token-only ciphertext stays
+readable for compatibility but cannot be refreshed and should be reauthorized.
+If an authorization error occurs while reconciling an earlier ambiguous launch,
+the launch remains blocked for operator recovery because the earlier provider
+write may still have succeeded. Campaigns remain tied to the old connection and
+are not silently rebound after OAuth.
 
 This MVP supports direct advertiser accounts only; it does not implement
 `AgencyClients` enumeration or client selection. Agency accounts, unknown

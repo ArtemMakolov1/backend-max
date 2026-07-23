@@ -624,6 +624,128 @@ WHERE conname = ANY($1)
 	}
 }
 
+func TestDirectGraphMigrationBackfillsArchivedCampaignWithoutFalseEvidence(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphIndex := -1
+	for index, migration := range migrations {
+		if migration.version == "025_direct_campaign_graph.sql" {
+			graphIndex = index
+			break
+		}
+	}
+	if graphIndex <= 0 {
+		t.Fatal("025_direct_campaign_graph.sql not found")
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:graphIndex]); err != nil {
+		t.Fatalf("apply Direct graph prerequisites: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if _, err := db.ExecContext(ctx, `INSERT INTO users(
+id,display_name,created_at,updated_at
+) VALUES('direct-archive-owner','Owner',$1,$1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO workspaces(
+id,name,owner_user_id,compat_owner_user_id,is_personal,created_by,
+created_at,updated_at
+) VALUES(
+'direct-archive-workspace','Archived Direct',
+'direct-archive-owner','direct-archive-owner',FALSE,'direct-archive-owner',$1,$1
+)`, now); err != nil {
+		t.Fatal(err)
+	}
+	connectionID := "dcon_" + strings.Repeat("a", 32)
+	campaignID := "dcmp_" + strings.Repeat("b", 32)
+	consentID := "dcons_" + strings.Repeat("c", 32)
+	if _, err := db.ExecContext(ctx, `INSERT INTO direct_connections(
+id,workspace_id,account_id,currency_code,timezone,token_ciphertext,
+token_key_version,status,connected_by,created_at,updated_at
+) VALUES($1,'direct-archive-workspace','account','RUB','Europe/Moscow',
+'v1.secret',1,'active','direct-archive-owner',$2,$2)`,
+		connectionID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO direct_campaigns(
+id,workspace_id,connection_id,provider_campaign_id,name,objective,
+landing_url,brief,regions,weekly_budget_minor,currency_code,starts_at,ends_at,
+status,provider_status,provider_state,created_by,created_at,updated_at
+) VALUES(
+$1,'direct-archive-workspace',$2,101,'Legacy campaign','traffic',
+'https://maxposty.ru/','Legacy brief','["225"]'::jsonb,30000,'RUB',
+$3::date,$4::date,'accepted','ACCEPTED','OFF','direct-archive-owner',$5,$5
+)`, campaignID, connectionID, now, now.AddDate(0, 1, 0), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO direct_auto_launch_consents(
+id,workspace_id,campaign_id,connection_id,actor_user_id,consent_version,
+confirmation,campaign_version,account_id,provider_campaign_id,campaign_name,
+weekly_budget_minor,currency_code,starts_at,ends_at,authorized_at
+) VALUES(
+$1,'direct-archive-workspace',$2,$3,'direct-archive-owner',
+'yandex-direct-auto-launch-v1','АВТОЗАПУСК',1,'account',101,
+'Legacy campaign',30000,'RUB',$4::date,$5::date,$6
+)`, consentID, campaignID, connectionID, now, now.AddDate(0, 1, 0), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE workspaces
+SET archived_at=$1,updated_at=$1 WHERE id='direct-archive-workspace'`,
+		now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := runMigrationSet(
+		ctx, testURL, migrations[:graphIndex+1],
+	); err != nil {
+		t.Fatalf("apply Direct graph migration over archived campaign: %v", err)
+	}
+	var title, textValue, keyword, graphHash string
+	var revisionID sql.NullString
+	var verifiedAt sql.NullTime
+	if err := db.QueryRowContext(ctx, `SELECT
+titles->>0,texts->>0,keywords->>0,provider_graph_hash,
+provider_revision_id,graph_verified_at
+FROM direct_campaigns WHERE id=$1`, campaignID).Scan(
+		&title, &textValue, &keyword, &graphHash, &revisionID, &verifiedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Черновик объявления" ||
+		textValue != "Проверьте текст объявления" || keyword != "черновик" ||
+		graphHash != "" || revisionID.Valid || verifiedAt.Valid {
+		t.Fatalf(
+			"archived campaign graph backfill title=%q text=%q keyword=%q hash=%q revision=%#v verified=%#v",
+			title, textValue, keyword, graphHash, revisionID, verifiedAt,
+		)
+	}
+	var storedInvalidated, evidenceInvalidated sql.NullTime
+	var evidenceReason string
+	if err := db.QueryRowContext(ctx, `SELECT invalidated_at
+FROM direct_auto_launch_consents WHERE id=$1`, consentID).Scan(
+		&storedInvalidated,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT invalidated_at,invalid_reason
+FROM direct_auto_launch_consent_evidence WHERE id=$1`, consentID).Scan(
+		&evidenceInvalidated, &evidenceReason,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if storedInvalidated.Valid || !evidenceInvalidated.Valid ||
+		evidenceReason != "legacy_consent_version" {
+		t.Fatalf(
+			"legacy archived consent stored=%#v evidence=%#v reason=%q",
+			storedInvalidated, evidenceInvalidated, evidenceReason,
+		)
+	}
+}
+
 func TestChannelIconBackfillAcceptsOnlyOfficialMAXAssets(t *testing.T) {
 	ctx := context.Background()
 	testURL, db := newMigrationTestSchema(t)

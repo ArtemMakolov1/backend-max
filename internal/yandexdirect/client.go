@@ -14,23 +14,35 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	DefaultAPIBaseURL        = "https://api.direct.yandex.com/json/v501"
-	DefaultSandboxAPIBaseURL = "https://api-sandbox.direct.yandex.com/json/v5"
-	oauthAuthorizeURL        = "https://oauth.yandex.ru/authorize"
-	oauthExchangeEndpoint    = "https://oauth.yandex.ru/token"
+	DefaultAPIBaseURL           = "https://api.direct.yandex.com/json/v501"
+	DefaultSandboxAPIBaseURL    = "https://api-sandbox.direct.yandex.com/json/v5"
+	CallbackRedirectURI         = "https://maxposty.ru/api/v1/advertising/direct/oauth/callback"
+	VerificationCodeRedirectURI = "https://oauth.yandex.ru/verification_code"
+	oauthAuthorizeURL           = "https://oauth.yandex.ru/authorize"
+	oauthExchangeEndpoint       = "https://oauth.yandex.ru/token"
+)
+
+type OAuthFlow string
+
+const (
+	OAuthFlowCallback         OAuthFlow = "callback"
+	OAuthFlowVerificationCode OAuthFlow = "verification_code"
 )
 
 type Client struct {
-	baseURL      *url.URL
-	clientID     string
-	clientSecret string
-	redirectURI  string
-	http         *http.Client
-	sandbox      bool
-	unified      bool
+	baseURL       *url.URL
+	clientID      string
+	clientSecret  string
+	redirectURI   string
+	oauthFlow     OAuthFlow
+	http          *http.Client
+	sandbox       bool
+	unified       bool
+	oauthTokenURL string
 }
 
 type Error struct {
@@ -60,11 +72,19 @@ type Account struct {
 	ReadOnly     bool
 }
 
+type OAuthToken struct {
+	AccessToken      string
+	RefreshToken     string
+	ExpiresInSeconds int64
+}
+
 type CampaignDraft struct {
 	Name              string
 	WeeklyBudgetMinor int64
 	StartsAt          time.Time
 	EndsAt            time.Time
+	TimeZone          string
+	OperationMarker   string
 }
 
 type Campaign struct {
@@ -75,6 +95,76 @@ type Campaign struct {
 	WeeklyBudgetMinor int64
 	StartsAt          time.Time
 	EndsAt            time.Time
+	TimeZone          string
+	TrackingParams    string
+	Warnings          []ProviderIssue
+}
+
+// SafeUnifiedCampaignSettings is the complete set of mutable YES/NO settings
+// accepted for a v501 UnifiedCampaign. Returning every option explicitly
+// avoids provider defaults enabling content or targeting features outside the
+// graph authorized by the user.
+func SafeUnifiedCampaignSettings() []GraphCampaignSetting {
+	return []GraphCampaignSetting{
+		{Option: "ADD_METRICA_TAG", Value: "NO"},
+		{Option: "ADD_TO_FAVORITES", Value: "NO"},
+		{Option: "ALTERNATIVE_TEXTS_ENABLED", Value: "NO"},
+		{Option: "CAMPAIGN_EXACT_PHRASE_MATCHING_ENABLED", Value: "NO"},
+		{Option: "ENABLE_AREA_OF_INTEREST_TARGETING", Value: "NO"},
+		{Option: "ENABLE_COMPANY_INFO", Value: "NO"},
+		{Option: "ENABLE_SITE_MONITORING", Value: "NO"},
+		{Option: "REQUIRE_SERVICING", Value: "NO"},
+	}
+}
+
+// SafeUnifiedCampaignBiddingStrategy returns the only delivery strategy the
+// graph integration creates. Search is explicitly disabled and the network
+// strategy is bounded by the exact weekly budget, with Maps disabled.
+func SafeUnifiedCampaignBiddingStrategy(weeklyBudgetMinor int64) (json.RawMessage, error) {
+	weeklyBudgetMicros, err := MinorToMicros(weeklyBudgetMinor)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]any{
+		"Search": map[string]any{
+			"BiddingStrategyType": "SERVING_OFF",
+			"PlacementTypes": map[string]any{
+				"SearchResults":          "NO",
+				"ProductGallery":         "NO",
+				"DynamicPlaces":          "NO",
+				"Maps":                   "NO",
+				"SearchOrganizationList": "NO",
+			},
+		},
+		"Network": map[string]any{
+			"BiddingStrategyType": "WB_MAXIMUM_CLICKS",
+			"PlacementTypes": map[string]any{
+				"Maps":    "NO",
+				"Network": "YES",
+			},
+			"WbMaximumClicks": map[string]any{
+				"WeeklySpendLimit": weeklyBudgetMicros,
+			},
+		},
+	})
+}
+
+// SafeUnifiedCampaignTimeTargeting fixes the product policy at 24/7 delivery.
+// Keeping it explicit prevents a provider-side default from silently changing
+// the graph authorized by the user.
+func SafeUnifiedCampaignTimeTargeting() GraphTimeTargeting {
+	schedule := make([]string, 0, 7)
+	for day := 1; day <= 7; day++ {
+		hours := make([]string, 25)
+		hours[0] = strconv.Itoa(day)
+		for hour := 1; hour < len(hours); hour++ {
+			hours[hour] = "100"
+		}
+		schedule = append(schedule, strings.Join(hours, ","))
+	}
+	return GraphTimeTargeting{
+		Present: true, Schedule: schedule, ConsiderWorkingWeekends: "NO",
+	}
 }
 
 func New(
@@ -101,17 +191,20 @@ func New(
 	if host == "api-sandbox.direct.yandex.com" && !textV5 {
 		return nil, errors.New("sandbox for Yandex Direct supports the documented /json/v5 endpoint only")
 	}
-	redirect, err := url.Parse(strings.TrimSpace(redirectURI))
+	normalizedRedirectURI := strings.TrimSpace(redirectURI)
+	redirect, err := url.Parse(normalizedRedirectURI)
 	if err != nil {
 		return nil, errors.New("invalid Yandex Direct OAuth redirect URI")
 	}
-	redirectHost := redirect.Hostname()
-	redirectIsLoopback := redirectHost == "localhost" ||
-		(net.ParseIP(redirectHost) != nil && net.ParseIP(redirectHost).IsLoopback())
 	if !redirect.IsAbs() || redirect.User != nil || redirect.RawQuery != "" ||
-		redirect.Fragment != "" ||
-		(redirect.Scheme != "https" && (redirect.Scheme != "http" || !redirectIsLoopback)) {
+		redirect.Fragment != "" || redirect.Scheme != "https" {
 		return nil, errors.New("invalid Yandex Direct OAuth redirect URI")
+	}
+	oauthFlow := OAuthFlowCallback
+	if redirect.String() == VerificationCodeRedirectURI {
+		oauthFlow = OAuthFlowVerificationCode
+	} else if redirect.String() != CallbackRedirectURI {
+		return nil, errors.New("redirect URI for Yandex Direct OAuth is not in the fixed allowlist")
 	}
 	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" {
 		return nil, errors.New("OAuth client credentials for Yandex Direct are required")
@@ -127,12 +220,20 @@ func New(
 	}
 	return &Client{
 		baseURL: baseURL, clientID: strings.TrimSpace(clientID), clientSecret: clientSecret,
-		redirectURI: redirect.String(), http: &safeHTTPClient,
+		redirectURI: redirect.String(), oauthFlow: oauthFlow, http: &safeHTTPClient,
 		sandbox: host == "api-sandbox.direct.yandex.com", unified: unified,
+		oauthTokenURL: oauthExchangeEndpoint,
 	}, nil
 }
 
 func (c *Client) Sandbox() bool { return c != nil && c.sandbox }
+
+func (c *Client) OAuthFlow() OAuthFlow {
+	if c == nil {
+		return ""
+	}
+	return c.oauthFlow
+}
 
 func (c *Client) AuthorizationURL(state, codeChallenge string) string {
 	query := url.Values{
@@ -147,7 +248,9 @@ func (c *Client) AuthorizationURL(state, codeChallenge string) string {
 	return oauthAuthorizeURL + "?" + query.Encode()
 }
 
-func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (string, error) {
+func (c *Client) ExchangeCode(
+	ctx context.Context, code, verifier string,
+) (OAuthToken, error) {
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {strings.TrimSpace(code)},
@@ -156,37 +259,74 @@ func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (strin
 		"redirect_uri":  {c.redirectURI},
 		"code_verifier": {verifier},
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthExchangeEndpoint,
+	return c.exchangeOAuthToken(ctx, form)
+}
+
+func (c *Client) RefreshToken(
+	ctx context.Context, refreshToken string,
+) (OAuthToken, error) {
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {strings.TrimSpace(refreshToken)},
+		"client_id":     {c.clientID},
+		"client_secret": {c.clientSecret},
+	}
+	return c.exchangeOAuthToken(ctx, form)
+}
+
+func (c *Client) exchangeOAuthToken(
+	ctx context.Context, form url.Values,
+) (OAuthToken, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.oauthTokenURL,
 		strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return OAuthToken{}, err
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("exchange Yandex Direct OAuth code: %w", err)
+		return OAuthToken{}, fmt.Errorf("exchange Yandex Direct OAuth token: %w", err)
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
-		return "", err
+		return OAuthToken{}, err
 	}
 	var payload struct {
-		AccessToken string `json:"access_token"`
-		Error       string `json:"error"`
+		AccessToken  string      `json:"access_token"`
+		RefreshToken string      `json:"refresh_token"`
+		ExpiresIn    json.Number `json:"expires_in"`
+		TokenType    string      `json:"token_type"`
+		Error        string      `json:"error"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", &Error{StatusCode: response.StatusCode, Code: "invalid_oauth_response"}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return OAuthToken{}, &Error{StatusCode: response.StatusCode, Code: "invalid_oauth_response"}
 	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 || strings.TrimSpace(payload.AccessToken) == "" {
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		code := strings.TrimSpace(payload.Error)
 		if code == "" {
 			code = "oauth_exchange_failed"
 		}
-		return "", &Error{StatusCode: response.StatusCode, Code: code}
+		return OAuthToken{}, &Error{StatusCode: response.StatusCode, Code: code}
 	}
-	return strings.TrimSpace(payload.AccessToken), nil
+	expiresIn, err := strconv.ParseInt(payload.ExpiresIn.String(), 10, 64)
+	if err != nil || expiresIn <= 0 ||
+		!strings.EqualFold(strings.TrimSpace(payload.TokenType), "bearer") ||
+		strings.TrimSpace(payload.AccessToken) == "" ||
+		strings.TrimSpace(payload.RefreshToken) == "" {
+		return OAuthToken{}, &Error{
+			StatusCode: response.StatusCode,
+			Code:       "invalid_oauth_response",
+		}
+	}
+	return OAuthToken{
+		AccessToken:      strings.TrimSpace(payload.AccessToken),
+		RefreshToken:     strings.TrimSpace(payload.RefreshToken),
+		ExpiresInSeconds: expiresIn,
+	}, nil
 }
 
 func (c *Client) GetAccount(
@@ -258,6 +398,22 @@ func (c *Client) CreateCampaignDraft(
 	if err != nil {
 		return Campaign{}, err
 	}
+	timeZone := strings.TrimSpace(campaign.TimeZone)
+	if timeZone == "" {
+		timeZone = "Europe/Moscow"
+	}
+	if utf8.RuneCountInString(timeZone) > 128 {
+		return Campaign{}, errors.New("campaign time zone is too long")
+	}
+	operationMarker := strings.TrimSpace(campaign.OperationMarker)
+	if operationMarker != "" {
+		operationMarker, err = normalizeGraphMarker(
+			operationMarker, "invalid_campaign_operation_marker",
+		)
+		if err != nil {
+			return Campaign{}, err
+		}
+	}
 	var response struct {
 		AddResults []struct {
 			ID       int64      `json:"Id"`
@@ -269,40 +425,95 @@ func (c *Client) CreateCampaignDraft(
 	if !c.unified {
 		campaignType = "TextCampaign"
 	}
+	campaignDetails := map[string]any{
+		"BiddingStrategy": map[string]any{
+			"Search": map[string]any{"BiddingStrategyType": "SERVING_OFF"},
+			"Network": map[string]any{
+				"BiddingStrategyType": "WB_MAXIMUM_CLICKS",
+				"WbMaximumClicks": map[string]any{
+					"WeeklySpendLimit": weeklyBudgetMicros,
+				},
+			},
+		},
+	}
+	trackingParams := ""
+	if c.unified {
+		settings := SafeUnifiedCampaignSettings()
+		settingsPayload := make([]map[string]string, 0, len(settings))
+		for _, setting := range settings {
+			settingsPayload = append(settingsPayload, map[string]string{
+				"Option": setting.Option, "Value": setting.Value,
+			})
+		}
+		campaignDetails["Settings"] = settingsPayload
+		campaignDetails["AttributionModel"] = "AUTO"
+		campaignDetails["BiddingStrategy"] = map[string]any{
+			"Search": map[string]any{
+				"BiddingStrategyType": "SERVING_OFF",
+				"PlacementTypes": map[string]any{
+					"SearchResults":          "NO",
+					"ProductGallery":         "NO",
+					"DynamicPlaces":          "NO",
+					"Maps":                   "NO",
+					"SearchOrganizationList": "NO",
+				},
+			},
+			"Network": map[string]any{
+				"BiddingStrategyType": "WB_MAXIMUM_CLICKS",
+				"PlacementTypes": map[string]any{
+					"Maps":    "NO",
+					"Network": "YES",
+				},
+				"WbMaximumClicks": map[string]any{
+					"WeeklySpendLimit": weeklyBudgetMicros,
+				},
+			},
+		}
+		if operationMarker != "" {
+			trackingParams = url.Values{
+				graphOperationMarkerParam: []string{operationMarker},
+			}.Encode()
+			campaignDetails["TrackingParams"] = trackingParams
+		}
+	}
 	request := map[string]any{
 		"method": "add",
 		"params": map[string]any{
 			"Campaigns": []any{map[string]any{
-				"Name":      strings.TrimSpace(campaign.Name),
-				"StartDate": campaign.StartsAt.UTC().Format(time.DateOnly),
-				"EndDate":   campaign.EndsAt.UTC().Format(time.DateOnly),
-				campaignType: map[string]any{
-					"BiddingStrategy": map[string]any{
-						"Search": map[string]any{"BiddingStrategyType": "SERVING_OFF"},
-						"Network": map[string]any{
-							"BiddingStrategyType": "WB_MAXIMUM_CLICKS",
-							"WbMaximumClicks": map[string]any{
-								"WeeklySpendLimit": weeklyBudgetMicros,
-							},
-						},
-					},
-				},
+				"Name":       strings.TrimSpace(campaign.Name),
+				"StartDate":  campaign.StartsAt.UTC().Format(time.DateOnly),
+				"EndDate":    campaign.EndsAt.UTC().Format(time.DateOnly),
+				"TimeZone":   timeZone,
+				campaignType: campaignDetails,
 			}},
 		},
+	}
+	if c.unified {
+		timeTargeting := SafeUnifiedCampaignTimeTargeting()
+		request["params"].(map[string]any)["Campaigns"].([]any)[0].(map[string]any)["TimeTargeting"] =
+			map[string]any{
+				"Schedule":                map[string]any{"Items": timeTargeting.Schedule},
+				"ConsiderWorkingWeekends": timeTargeting.ConsiderWorkingWeekends,
+			}
 	}
 	if err := c.call(ctx, "campaigns", token, clientLogin, request, &response); err != nil {
 		return Campaign{}, err
 	}
-	if len(response.AddResults) != 1 || response.AddResults[0].ID <= 0 {
+	if len(response.AddResults) != 1 {
 		return Campaign{}, &Error{Code: "campaign_add_failed"}
 	}
 	if len(response.AddResults[0].Errors) != 0 {
 		return Campaign{}, issueError(response.AddResults[0].Errors[0], "campaign_add_failed")
 	}
+	if response.AddResults[0].ID <= 0 {
+		return Campaign{}, &Error{Code: "campaign_add_failed"}
+	}
 	return Campaign{
 		ID: response.AddResults[0].ID, Name: strings.TrimSpace(campaign.Name),
 		Status: "DRAFT", State: "OFF", WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
 		StartsAt: dateOnly(campaign.StartsAt), EndsAt: dateOnly(campaign.EndsAt),
+		TimeZone: timeZone, TrackingParams: trackingParams,
+		Warnings: exportProviderIssues(response.AddResults[0].Warnings),
 	}, nil
 }
 
@@ -374,9 +585,11 @@ func (c *Client) ResumeCampaign(
 	ctx context.Context, token, clientLogin string, campaignID int64,
 ) error {
 	var response struct {
-		ActionResults []struct {
-			Errors []apiIssue `json:"Errors"`
-		} `json:"ActionResults"`
+		ResumeResults []struct {
+			ID       int64      `json:"Id"`
+			Errors   []apiIssue `json:"Errors"`
+			Warnings []apiIssue `json:"Warnings"`
+		} `json:"ResumeResults"`
 	}
 	err := c.call(ctx, "campaigns", token, clientLogin, map[string]any{
 		"method": "resume",
@@ -387,12 +600,19 @@ func (c *Client) ResumeCampaign(
 	if err != nil {
 		return err
 	}
-	if len(response.ActionResults) != 1 {
+	if len(response.ResumeResults) != 1 {
 		return &Error{Code: "campaign_resume_failed"}
 	}
-	if len(response.ActionResults[0].Errors) != 0 {
-		return issueError(response.ActionResults[0].Errors[0], "campaign_resume_failed")
+	result := response.ResumeResults[0]
+	if len(result.Errors) != 0 {
+		return issueError(result.Errors[0], "campaign_resume_failed")
 	}
+	if result.ID != campaignID {
+		return &Error{Code: "invalid_campaign_resume_response"}
+	}
+	// Provider warnings are intentionally non-fatal. The DirectProvider
+	// contract returns only an error for resume, so there is no lossy mapping
+	// from warnings to failures.
 	return nil
 }
 

@@ -141,7 +141,7 @@ func TestLoadAcceptsCompleteEncryptedYandexDirectConfiguration(t *testing.T) {
 	setValidLocalYandexAuth(t)
 	t.Setenv("DIRECT_OAUTH_CLIENT_ID", "direct-client-id")
 	t.Setenv("DIRECT_OAUTH_CLIENT_SECRET", "direct-client-secret")
-	t.Setenv("DIRECT_OAUTH_REDIRECT_URI", "http://localhost:8080/api/v1/advertising/direct/oauth/callback")
+	t.Setenv("DIRECT_OAUTH_REDIRECT_URI", directOAuthCallbackRedirectURI)
 	t.Setenv("DIRECT_TOKEN_DATA_KEY", base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")))
 
 	cfg, err := Load()
@@ -156,6 +156,17 @@ func TestLoadAcceptsCompleteEncryptedYandexDirectConfiguration(t *testing.T) {
 		t.Fatalf("spend-capable Direct flags must remain opt-in: %#v", cfg)
 	}
 
+	t.Setenv("DIRECT_OAUTH_REDIRECT_URI", directOAuthVerificationCodeURI)
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("verification-code redirect was rejected: %v", err)
+	}
+	if cfg.DirectOAuthRedirectURI != directOAuthVerificationCodeURI ||
+		cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled {
+		t.Fatalf("unsafe verification-code configuration: %#v", cfg)
+	}
+
+	t.Setenv("DIRECT_OAUTH_REDIRECT_URI", directOAuthCallbackRedirectURI)
 	t.Setenv("DIRECT_SANDBOX", "false")
 	t.Setenv("DIRECT_API_BASE_URL", defaultDirectAPIBaseURL+"/")
 	t.Setenv("DIRECT_WRITES_ENABLED", "true")
@@ -189,7 +200,7 @@ func TestLoadRejectsIncompleteOrUnsafeYandexDirectConfiguration(t *testing.T) {
 			envs: map[string]string{
 				"DIRECT_OAUTH_CLIENT_ID":     "direct-client-id",
 				"DIRECT_OAUTH_CLIENT_SECRET": "direct-client-secret",
-				"DIRECT_OAUTH_REDIRECT_URI":  "http://localhost:8080/api/v1/advertising/direct/oauth/callback",
+				"DIRECT_OAUTH_REDIRECT_URI":  directOAuthCallbackRedirectURI,
 				"DIRECT_TOKEN_DATA_KEY":      base64.StdEncoding.EncodeToString([]byte("too-short")),
 			},
 			match: "exactly 32 random bytes",
@@ -202,7 +213,7 @@ func TestLoadRejectsIncompleteOrUnsafeYandexDirectConfiguration(t *testing.T) {
 				"DIRECT_OAUTH_REDIRECT_URI":  "http://localhost:8080/api/v1/auth/yandex/callback",
 				"DIRECT_TOKEN_DATA_KEY":      validKey,
 			},
-			match: "/api/v1/advertising/direct/oauth/callback",
+			match: "must be exactly",
 		},
 		{
 			name: "production base with sandbox flag",
@@ -223,7 +234,7 @@ func TestLoadRejectsIncompleteOrUnsafeYandexDirectConfiguration(t *testing.T) {
 			envs: map[string]string{
 				"DIRECT_OAUTH_CLIENT_ID":     "direct-client-id",
 				"DIRECT_OAUTH_CLIENT_SECRET": "direct-client-secret",
-				"DIRECT_OAUTH_REDIRECT_URI":  "http://localhost:8080/api/v1/advertising/direct/oauth/callback",
+				"DIRECT_OAUTH_REDIRECT_URI":  directOAuthCallbackRedirectURI,
 				"DIRECT_TOKEN_DATA_KEY":      validKey,
 				"DIRECT_AUTO_LAUNCH_ENABLED": "true",
 				"DIRECT_WRITES_ENABLED":      "false",
