@@ -8,11 +8,55 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestOAuthRedirectAllowlistAndVerificationCodeFlow(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		redirect string
+		flow     OAuthFlow
+	}{
+		{redirect: CallbackRedirectURI, flow: OAuthFlowCallback},
+		{redirect: VerificationCodeRedirectURI, flow: OAuthFlowVerificationCode},
+	} {
+		client, err := New(
+			DefaultSandboxAPIBaseURL, "client-id", "secret", test.redirect, nil,
+		)
+		if err != nil {
+			t.Fatalf("New(%q): %v", test.redirect, err)
+		}
+		if client.OAuthFlow() != test.flow {
+			t.Fatalf("flow for %q = %q, want %q", test.redirect, client.OAuthFlow(), test.flow)
+		}
+		authorizationURL, err := url.Parse(client.AuthorizationURL("opaque-state", "pkce-challenge"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := authorizationURL.Query().Get("redirect_uri"); got != test.redirect {
+			t.Fatalf("authorization redirect_uri = %q, want %q", got, test.redirect)
+		}
+		if authorizationURL.Query().Get("state") != "opaque-state" ||
+			authorizationURL.Query().Get("code_challenge") != "pkce-challenge" {
+			t.Fatalf("authorization query = %v", authorizationURL.Query())
+		}
+	}
+	for _, redirect := range []string{
+		"http://localhost:8080/api/v1/advertising/direct/oauth/callback",
+		"https://evil.example/api/v1/advertising/direct/oauth/callback",
+		"https://oauth.yandex.ru/verification_code/",
+	} {
+		if _, err := New(
+			DefaultSandboxAPIBaseURL, "client-id", "secret", redirect, nil,
+		); err == nil {
+			t.Fatalf("unsafe redirect %q was accepted", redirect)
+		}
+	}
+}
 
 func TestCreateCampaignUsesEndpointSpecificDocumentedShape(t *testing.T) {
 	t.Parallel()
@@ -61,7 +105,7 @@ func TestCreateCampaignUsesEndpointSpecificDocumentedShape(t *testing.T) {
 			defer server.Close()
 			client, err := New(
 				server.URL+test.basePath, "client-id", "secret",
-				"http://localhost:8080/api/v1/advertising/direct/oauth/callback", server.Client(),
+				CallbackRedirectURI, server.Client(),
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -99,7 +143,7 @@ func TestGetCampaignPreservesIntegerBudgetAboveFloatPrecision(t *testing.T) {
 	defer server.Close()
 	client, err := New(
 		server.URL+"/json/v501", "client-id", "secret",
-		"http://localhost:8080/api/v1/advertising/direct/oauth/callback", server.Client(),
+		CallbackRedirectURI, server.Client(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +231,7 @@ func TestGetAccountFailsClosedForAgencyUnknownOrNonChiefActors(t *testing.T) {
 			defer server.Close()
 			client, err := New(
 				server.URL+"/json/v501", "client-id", "secret",
-				"http://localhost:8080/api/v1/advertising/direct/oauth/callback", server.Client(),
+				CallbackRedirectURI, server.Client(),
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -214,7 +258,7 @@ func TestAPIErrorPreservesInvalidTokenCode(t *testing.T) {
 	defer server.Close()
 	client, err := New(
 		server.URL+"/json/v501", "client-id", "secret",
-		"http://localhost:8080/api/v1/advertising/direct/oauth/callback", server.Client(),
+		CallbackRedirectURI, server.Client(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +330,7 @@ func TestDirectClientNeverFollowsRedirectWithBearerToken(t *testing.T) {
 	defer source.Close()
 	client, err := New(
 		source.URL+"/json/v501", "client-id", "secret",
-		"http://localhost:8080/api/v1/advertising/direct/oauth/callback", source.Client(),
+		CallbackRedirectURI, source.Client(),
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -1032,6 +1032,29 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/DirectOAuthStartEnvelope'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/connect/complete:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Advertising]
+      operationId: completeDirectVerificationCodeConnection
+      summary: Complete a verification-code Yandex Direct OAuth connection
+      description: >
+        Accepts the seven-digit code shown by Yandex and the opaque one-time
+        attempt state returned by connect/start. The attempt is bound to the
+        current browser session, actor, workspace and verification-code flow.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectOAuthCompleteRequest'}
+      responses:
+        '200':
+          description: Connected Yandex Direct account; provider credentials are never returned
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectOAuthCompleteEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/advertising/direct/connection:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
     delete:
@@ -2939,17 +2962,48 @@ components:
         integration: {$ref: '#/components/schemas/DirectIntegration'}
     DirectOAuthStart:
       type: object
-      required: [authorization_url]
+      required: [authorization_url, expires_at, flow]
       properties:
         authorization_url:
           type: string
           format: uri
           pattern: '^https://oauth\.yandex\.ru/'
+        expires_at: {type: string, format: date-time}
+        flow:
+          type: string
+          enum: [callback, verification_code]
+        state:
+          type: string
+          minLength: 43
+          maxLength: 43
+          pattern: '^[A-Za-z0-9_-]{43}$'
+          description: >
+            Opaque one-time attempt state. Present only when flow is
+            verification_code; clients must not log or persist it beyond the
+            short authorization attempt.
     DirectOAuthStartEnvelope:
       type: object
       required: [connection]
       properties:
         connection: {$ref: '#/components/schemas/DirectOAuthStart'}
+    DirectOAuthCompleteRequest:
+      type: object
+      additionalProperties: false
+      required: [code, state]
+      properties:
+        code:
+          type: string
+          pattern: '^[0-9]{7}$'
+        state:
+          type: string
+          minLength: 43
+          maxLength: 43
+          pattern: '^[A-Za-z0-9_-]{43}$'
+    DirectOAuthCompleteEnvelope:
+      type: object
+      required: [connection]
+      properties:
+        connection: {$ref: '#/components/schemas/DirectConnection'}
     DirectCampaignStatus:
       type: string
       enum:

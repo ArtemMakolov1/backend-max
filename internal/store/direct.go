@@ -17,8 +17,10 @@ const DirectAutoLaunchConsentVersion = "yandex-direct-auto-launch-v1"
 
 const directLaunchRecoveryLease = 2 * time.Minute
 const directProviderPollLease = time.Minute
+const directOAuthCompletionRetention = 5 * time.Minute
 
 var directIdentifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+var directOAuthStateHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var (
 	ErrDirectConnectionRequired   = errors.New("direct connection is required")
@@ -208,6 +210,23 @@ func (s *Store) CreateDirectOAuthState(
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner); err != nil {
 		return err
 	}
+	// Serialize restarts for this workspace. Without the row lock, two empty
+	// DELETE snapshots could both insert an active state and leave an older tab
+	// able to win after the newer authorization.
+	var lockedWorkspaceID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID,
+	).Scan(&lockedWorkspaceID); err != nil {
+		return mapWorkspaceWriteError("lock workspace for Direct OAuth", err)
+	}
+	// A restart is authoritative for this actor and workspace. Removing the
+	// previous active attempt in the same transaction prevents an older tab
+	// from replacing the connection after a newer authorization was started.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM direct_oauth_states
+WHERE actor_user_id=$1 AND workspace_id=$2 AND expires_at>$3 AND consumed_at IS NULL`,
+		actorUserID, workspaceID, state.CreatedAt.UTC()); err != nil {
+		return err
+	}
 	var activeStates int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM direct_oauth_states
 WHERE actor_user_id=$1 AND expires_at>$2 AND consumed_at IS NULL`,
@@ -224,11 +243,35 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, state.StateHash, workspaceID, actorUserID,
 	if err != nil {
 		return mapWorkspaceWriteError("create Direct OAuth state", err)
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO direct_oauth_latest_attempts(
+workspace_id,state_hash,actor_user_id,created_at)
+VALUES($1,$2,$3,$4)
+ON CONFLICT(workspace_id) DO UPDATE SET
+state_hash=EXCLUDED.state_hash,actor_user_id=EXCLUDED.actor_user_id,created_at=EXCLUDED.created_at`,
+		workspaceID, state.StateHash, actorUserID, state.CreatedAt.UTC()); err != nil {
+		return mapWorkspaceWriteError("record latest Direct OAuth attempt", err)
+	}
 	return tx.Commit()
 }
 
 func (s *Store) ConsumeDirectOAuthState(
 	ctx context.Context, actorUserID, stateHash string, now time.Time,
+) (DirectOAuthState, error) {
+	return s.consumeDirectOAuthState(ctx, actorUserID, "", stateHash, now)
+}
+
+func (s *Store) ConsumeDirectOAuthStateForWorkspace(
+	ctx context.Context, actorUserID, workspaceID, stateHash string, now time.Time,
+) (DirectOAuthState, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return DirectOAuthState{}, ErrNotFound
+	}
+	return s.consumeDirectOAuthState(ctx, actorUserID, workspaceID, stateHash, now)
+}
+
+func (s *Store) consumeDirectOAuthState(
+	ctx context.Context, actorUserID, workspaceID, stateHash string, now time.Time,
 ) (DirectOAuthState, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -236,10 +279,17 @@ func (s *Store) ConsumeDirectOAuthState(
 	}
 	defer func() { _ = tx.Rollback() }()
 	var state DirectOAuthState
-	err = tx.QueryRowContext(ctx, `SELECT state_hash,workspace_id,actor_user_id,pkce_verifier,
+	query := `SELECT state_hash,workspace_id,actor_user_id,pkce_verifier,
 client_login,return_to,created_at,expires_at,consumed_at
-FROM direct_oauth_states WHERE state_hash=$1 AND actor_user_id=$2 FOR UPDATE`,
-		stateHash, actorUserID).Scan(&state.StateHash, &state.WorkspaceID, &state.ActorUserID,
+FROM direct_oauth_states WHERE state_hash=$1 AND actor_user_id=$2`
+	args := []any{stateHash, actorUserID}
+	if workspaceID != "" {
+		query += ` AND workspace_id=$3`
+		args = append(args, workspaceID)
+	}
+	query += ` FOR UPDATE`
+	err = tx.QueryRowContext(ctx, query, args...).Scan(
+		&state.StateHash, &state.WorkspaceID, &state.ActorUserID,
 		&state.PKCEVerifier, &state.ClientLogin, &state.ReturnTo, &state.CreatedAt,
 		&state.ExpiresAt, &state.ConsumedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -254,9 +304,25 @@ FROM direct_oauth_states WHERE state_hash=$1 AND actor_user_id=$2 FOR UPDATE`,
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, state.WorkspaceID, WorkspaceRoleOwner); err != nil {
 		return DirectOAuthState{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM direct_oauth_states
-WHERE state_hash=$1 AND actor_user_id=$2`, stateHash, actorUserID); err != nil {
+	var latest bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM direct_oauth_latest_attempts
+WHERE workspace_id=$1 AND state_hash=$2 AND actor_user_id=$3
+)`, state.WorkspaceID, stateHash, actorUserID).Scan(&latest); err != nil {
 		return DirectOAuthState{}, err
+	}
+	if !latest {
+		return DirectOAuthState{}, ErrConflict
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE direct_oauth_states
+SET consumed_at=$1
+WHERE state_hash=$2 AND actor_user_id=$3 AND consumed_at IS NULL`,
+		now.UTC(), stateHash, actorUserID)
+	if err != nil {
+		return DirectOAuthState{}, err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return DirectOAuthState{}, ErrConflict
 	}
 	if err := tx.Commit(); err != nil {
 		return DirectOAuthState{}, err
@@ -276,14 +342,16 @@ func (s *Store) PurgeExpiredDirectOAuthStates(
 	result, err := s.db.ExecContext(ctx, `WITH expired AS (
     SELECT state_hash
     FROM direct_oauth_states
-    WHERE expires_at <= $1 OR consumed_at IS NOT NULL
-    ORDER BY expires_at,state_hash
+    WHERE (consumed_at IS NULL AND expires_at <= $1)
+       OR (consumed_at IS NOT NULL AND consumed_at <= $2)
+    ORDER BY COALESCE(consumed_at,expires_at),state_hash
     FOR UPDATE SKIP LOCKED
-    LIMIT $2
+    LIMIT $3
 )
 DELETE FROM direct_oauth_states s
 USING expired e
-WHERE s.state_hash=e.state_hash`, now.UTC(), limit)
+WHERE s.state_hash=e.state_hash`,
+		now.UTC(), now.UTC().Add(-directOAuthCompletionRetention), limit)
 	if err != nil {
 		return 0, err
 	}
@@ -292,6 +360,26 @@ WHERE s.state_hash=e.state_hash`, now.UTC(), limit)
 
 func (s *Store) ReplaceDirectConnection(
 	ctx context.Context, actorUserID, workspaceID string, connection DirectConnection,
+) (DirectConnection, error) {
+	return s.replaceDirectConnection(ctx, actorUserID, workspaceID, "", connection)
+}
+
+func (s *Store) ReplaceDirectConnectionFromOAuthAttempt(
+	ctx context.Context, actorUserID, workspaceID, expectedStateHash string,
+	connection DirectConnection,
+) (DirectConnection, error) {
+	expectedStateHash = strings.TrimSpace(expectedStateHash)
+	if !directOAuthStateHashPattern.MatchString(expectedStateHash) {
+		return DirectConnection{}, ErrConflict
+	}
+	return s.replaceDirectConnection(
+		ctx, actorUserID, workspaceID, expectedStateHash, connection,
+	)
+}
+
+func (s *Store) replaceDirectConnection(
+	ctx context.Context, actorUserID, workspaceID, expectedStateHash string,
+	connection DirectConnection,
 ) (DirectConnection, error) {
 	connection.AccountID = strings.TrimSpace(connection.AccountID)
 	connection.ClientLogin = strings.TrimSpace(connection.ClientLogin)
@@ -321,6 +409,38 @@ func (s *Store) ReplaceDirectConnection(
 	defer func() { _ = tx.Rollback() }()
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner); err != nil {
 		return DirectConnection{}, err
+	}
+	var lockedWorkspaceID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID,
+	).Scan(&lockedWorkspaceID); err != nil {
+		return DirectConnection{}, mapWorkspaceWriteError("lock workspace for Direct connection", err)
+	}
+	if expectedStateHash != "" {
+		var currentAttemptStateHash string
+		err := tx.QueryRowContext(ctx, `SELECT a.state_hash
+FROM direct_oauth_latest_attempts a
+JOIN direct_oauth_states s ON s.state_hash=a.state_hash
+WHERE a.workspace_id=$1 AND a.actor_user_id=$2 AND a.state_hash=$3
+  AND s.workspace_id=a.workspace_id AND s.actor_user_id=a.actor_user_id
+  AND s.consumed_at IS NOT NULL
+FOR UPDATE`, workspaceID, actorUserID, expectedStateHash).Scan(&currentAttemptStateHash)
+		if errors.Is(err, sql.ErrNoRows) {
+			return DirectConnection{}, ErrConflict
+		}
+		if err != nil {
+			return DirectConnection{}, err
+		}
+	} else {
+		var oauthAttemptPending bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM direct_oauth_latest_attempts WHERE workspace_id=$1
+)`, workspaceID).Scan(&oauthAttemptPending); err != nil {
+			return DirectConnection{}, err
+		}
+		if oauthAttemptPending {
+			return DirectConnection{}, ErrConflict
+		}
 	}
 	var currentConnectionID string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM direct_connections
@@ -378,6 +498,17 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'active',$11,$12,$12,$12)`,
 		}), CreatedAt: now,
 	}); err != nil {
 		return DirectConnection{}, err
+	}
+	if expectedStateHash != "" {
+		result, err := tx.ExecContext(ctx, `DELETE FROM direct_oauth_states
+WHERE state_hash=$1 AND workspace_id=$2 AND actor_user_id=$3 AND consumed_at IS NOT NULL`,
+			expectedStateHash, workspaceID, actorUserID)
+		if err != nil {
+			return DirectConnection{}, err
+		}
+		if affected, _ := result.RowsAffected(); affected != 1 {
+			return DirectConnection{}, ErrConflict
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return DirectConnection{}, err

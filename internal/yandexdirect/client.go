@@ -17,10 +17,19 @@ import (
 )
 
 const (
-	DefaultAPIBaseURL        = "https://api.direct.yandex.com/json/v501"
-	DefaultSandboxAPIBaseURL = "https://api-sandbox.direct.yandex.com/json/v5"
-	oauthAuthorizeURL        = "https://oauth.yandex.ru/authorize"
-	oauthExchangeEndpoint    = "https://oauth.yandex.ru/token"
+	DefaultAPIBaseURL           = "https://api.direct.yandex.com/json/v501"
+	DefaultSandboxAPIBaseURL    = "https://api-sandbox.direct.yandex.com/json/v5"
+	CallbackRedirectURI         = "https://maxposty.ru/api/v1/advertising/direct/oauth/callback"
+	VerificationCodeRedirectURI = "https://oauth.yandex.ru/verification_code"
+	oauthAuthorizeURL           = "https://oauth.yandex.ru/authorize"
+	oauthExchangeEndpoint       = "https://oauth.yandex.ru/token"
+)
+
+type OAuthFlow string
+
+const (
+	OAuthFlowCallback         OAuthFlow = "callback"
+	OAuthFlowVerificationCode OAuthFlow = "verification_code"
 )
 
 type Client struct {
@@ -28,6 +37,7 @@ type Client struct {
 	clientID     string
 	clientSecret string
 	redirectURI  string
+	oauthFlow    OAuthFlow
 	http         *http.Client
 	sandbox      bool
 	unified      bool
@@ -101,17 +111,20 @@ func New(
 	if host == "api-sandbox.direct.yandex.com" && !textV5 {
 		return nil, errors.New("sandbox for Yandex Direct supports the documented /json/v5 endpoint only")
 	}
-	redirect, err := url.Parse(strings.TrimSpace(redirectURI))
+	normalizedRedirectURI := strings.TrimSpace(redirectURI)
+	redirect, err := url.Parse(normalizedRedirectURI)
 	if err != nil {
 		return nil, errors.New("invalid Yandex Direct OAuth redirect URI")
 	}
-	redirectHost := redirect.Hostname()
-	redirectIsLoopback := redirectHost == "localhost" ||
-		(net.ParseIP(redirectHost) != nil && net.ParseIP(redirectHost).IsLoopback())
 	if !redirect.IsAbs() || redirect.User != nil || redirect.RawQuery != "" ||
-		redirect.Fragment != "" ||
-		(redirect.Scheme != "https" && (redirect.Scheme != "http" || !redirectIsLoopback)) {
+		redirect.Fragment != "" || redirect.Scheme != "https" {
 		return nil, errors.New("invalid Yandex Direct OAuth redirect URI")
+	}
+	oauthFlow := OAuthFlowCallback
+	if redirect.String() == VerificationCodeRedirectURI {
+		oauthFlow = OAuthFlowVerificationCode
+	} else if redirect.String() != CallbackRedirectURI {
+		return nil, errors.New("Yandex Direct OAuth redirect URI is not in the fixed allowlist")
 	}
 	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" {
 		return nil, errors.New("OAuth client credentials for Yandex Direct are required")
@@ -127,12 +140,19 @@ func New(
 	}
 	return &Client{
 		baseURL: baseURL, clientID: strings.TrimSpace(clientID), clientSecret: clientSecret,
-		redirectURI: redirect.String(), http: &safeHTTPClient,
+		redirectURI: redirect.String(), oauthFlow: oauthFlow, http: &safeHTTPClient,
 		sandbox: host == "api-sandbox.direct.yandex.com", unified: unified,
 	}, nil
 }
 
 func (c *Client) Sandbox() bool { return c != nil && c.sandbox }
+
+func (c *Client) OAuthFlow() OAuthFlow {
+	if c == nil {
+		return ""
+	}
+	return c.oauthFlow
+}
 
 func (c *Client) AuthorizationURL(state, codeChallenge string) string {
 	query := url.Values{

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -434,7 +435,7 @@ func TestPurgeExpiredDirectOAuthStatesIsBoundedAndKeepsLiveState(t *testing.T) {
 	for _, state := range []DirectOAuthState{
 		{
 			StateHash: expiredStateHash, PKCEVerifier: strings.Repeat("x", 43),
-			CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+			CreatedAt: now.Add(-2 * time.Minute), ExpiresAt: now.Add(-time.Minute),
 		},
 		{
 			StateHash: liveStateHash, PKCEVerifier: strings.Repeat("y", 43),
@@ -447,19 +448,229 @@ func TestPurgeExpiredDirectOAuthStatesIsBoundedAndKeepsLiveState(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	removed, err := storage.PurgeExpiredDirectOAuthStates(ctx, now.Add(2*time.Minute), 1)
+	removed, err := storage.PurgeExpiredDirectOAuthStates(ctx, now, 1)
 	if err != nil || removed != 1 {
 		t.Fatalf("purge removed=%d err=%v, want one", removed, err)
 	}
 	if _, err := storage.ConsumeDirectOAuthState(
-		ctx, owner, expiredStateHash, now.Add(2*time.Minute),
+		ctx, owner, expiredStateHash, now,
 	); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expired state remained: %v", err)
 	}
 	if _, err := storage.ConsumeDirectOAuthState(
-		ctx, owner, liveStateHash, now.Add(2*time.Minute),
+		ctx, owner, liveStateHash, now,
 	); err != nil {
 		t.Fatalf("live state was purged: %v", err)
+	}
+}
+
+func TestPurgeKeepsConsumedDirectOAuthAttemptDuringProviderCompletionWindow(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	now := time.Date(2042, time.June, 7, 15, 0, 0, 0, time.UTC)
+	stateHash := strings.Repeat("4", 64)
+	if err := storage.CreateDirectOAuthState(ctx, owner, workspace.ID, DirectOAuthState{
+		StateHash: stateHash, PKCEVerifier: strings.Repeat("r", 43),
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.ConsumeDirectOAuthStateForWorkspace(
+		ctx, owner, workspace.ID, stateHash, now.Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := storage.PurgeExpiredDirectOAuthStates(ctx, now.Add(2*time.Minute), 10)
+	if err != nil || removed != 0 {
+		t.Fatalf("in-flight purge removed=%d err=%v, want zero", removed, err)
+	}
+	if _, err := storage.ReplaceDirectConnectionFromOAuthAttempt(
+		ctx, owner, workspace.ID, stateHash, DirectConnection{
+			AccountID: "retained-account", CurrencyCode: "RUB", Timezone: "Europe/Moscow",
+			TokenCiphertext: "v1.retained", TokenKeyVersion: 1, CreatedAt: now.Add(3 * time.Minute),
+		},
+	); err != nil {
+		t.Fatalf("retained completion could not commit: %v", err)
+	}
+}
+
+func TestDirectOAuthRestartInvalidatesOnlySameActorWorkspaceAndWorkspaceConsumeIsNonDestructive(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	otherWorkspace, err := storage.CreateWorkspace(ctx, owner, Workspace{Name: "Other OAuth workspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2042, time.June, 8, 12, 0, 0, 0, time.UTC)
+	oldHash := strings.Repeat("c", 64)
+	newHash := strings.Repeat("d", 64)
+	otherHash := strings.Repeat("e", 64)
+	for workspaceID, stateHash := range map[string]string{
+		workspace.ID: oldHash, otherWorkspace.ID: otherHash,
+	} {
+		if err := storage.CreateDirectOAuthState(ctx, owner, workspaceID, DirectOAuthState{
+			StateHash: stateHash, PKCEVerifier: strings.Repeat("v", 43),
+			CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := storage.CreateDirectOAuthState(ctx, owner, workspace.ID, DirectOAuthState{
+		StateHash: newHash, PKCEVerifier: strings.Repeat("n", 43),
+		CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.ConsumeDirectOAuthState(ctx, owner, oldHash, now.Add(2*time.Minute)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("superseded same-workspace state remained usable: %v", err)
+	}
+	if _, err := storage.ConsumeDirectOAuthStateForWorkspace(
+		ctx, owner, otherWorkspace.ID, newHash, now.Add(2*time.Minute),
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong-workspace consume error = %v, want ErrNotFound", err)
+	}
+	if _, err := storage.ConsumeDirectOAuthStateForWorkspace(
+		ctx, owner, workspace.ID, newHash, now.Add(2*time.Minute),
+	); err != nil {
+		t.Fatalf("wrong-workspace attempt consumed the state: %v", err)
+	}
+	if _, err := storage.ConsumeDirectOAuthStateForWorkspace(
+		ctx, owner, otherWorkspace.ID, otherHash, now.Add(2*time.Minute),
+	); err != nil {
+		t.Fatalf("restart invalidated another workspace state: %v", err)
+	}
+}
+
+func TestConcurrentDirectOAuthRestartsLeaveExactlyOneActiveAttempt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	now := time.Date(2042, time.June, 9, 12, 0, 0, 0, time.UTC)
+	hashes := []string{strings.Repeat("f", 64), strings.Repeat("1", 64)}
+	start := make(chan struct{})
+	errorsByAttempt := make([]error, len(hashes))
+	var wait sync.WaitGroup
+	for index, stateHash := range hashes {
+		index, stateHash := index, stateHash
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			errorsByAttempt[index] = storage.CreateDirectOAuthState(
+				ctx, owner, workspace.ID, DirectOAuthState{
+					StateHash: stateHash, PKCEVerifier: strings.Repeat("p", 43),
+					CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+				},
+			)
+		}()
+	}
+	close(start)
+	wait.Wait()
+	for index, err := range errorsByAttempt {
+		if err != nil {
+			t.Fatalf("restart %d: %v", index, err)
+		}
+	}
+	successes, missing := 0, 0
+	for _, stateHash := range hashes {
+		_, err := storage.ConsumeDirectOAuthStateForWorkspace(
+			ctx, owner, workspace.ID, stateHash, now.Add(time.Minute),
+		)
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrNotFound):
+			missing++
+		default:
+			t.Fatalf("consume %q: %v", stateHash, err)
+		}
+	}
+	if successes != 1 || missing != 1 {
+		t.Fatalf("active attempts: success=%d missing=%d, want exactly one of each", successes, missing)
+	}
+}
+
+func TestStaleInFlightDirectOAuthCompletionCannotReplaceConnectionAfterRestart(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	now := time.Date(2042, time.June, 10, 12, 0, 0, 0, time.UTC)
+	oldHash := strings.Repeat("2", 64)
+	newHash := strings.Repeat("3", 64)
+	createAttempt := func(stateHash string, createdAt time.Time) {
+		t.Helper()
+		if err := storage.CreateDirectOAuthState(ctx, owner, workspace.ID, DirectOAuthState{
+			StateHash: stateHash, PKCEVerifier: strings.Repeat("q", 43),
+			CreatedAt: createdAt, ExpiresAt: createdAt.Add(time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	createAttempt(oldHash, now)
+	if _, err := storage.ConsumeDirectOAuthStateForWorkspace(
+		ctx, owner, workspace.ID, oldHash, now.Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	providerCallStarted := make(chan struct{})
+	releaseProviderCall := make(chan struct{})
+	oldCompletionDone := make(chan error, 1)
+	go func() {
+		close(providerCallStarted)
+		<-releaseProviderCall
+		_, err := storage.ReplaceDirectConnectionFromOAuthAttempt(
+			ctx, owner, workspace.ID, oldHash, DirectConnection{
+				AccountID: "stale-account", CurrencyCode: "RUB", Timezone: "Europe/Moscow",
+				TokenCiphertext: "v1.stale", TokenKeyVersion: 1, CreatedAt: now.Add(2 * time.Minute),
+			},
+		)
+		oldCompletionDone <- err
+	}()
+	<-providerCallStarted
+
+	// This models a user restarting OAuth while the old completion is waiting
+	// on ExchangeCode/GetAccount outside the database transaction.
+	createAttempt(newHash, now.Add(2*time.Minute))
+	if _, err := storage.ReplaceDirectConnection(
+		ctx, owner, workspace.ID, DirectConnection{
+			AccountID: "bypass-account", CurrencyCode: "RUB", Timezone: "Europe/Moscow",
+			TokenCiphertext: "v1.bypass", TokenKeyVersion: 1, CreatedAt: now.Add(2 * time.Minute),
+		},
+	); !errors.Is(err, ErrConflict) {
+		t.Fatalf("non-CAS replacement bypassed pending OAuth attempt: %v", err)
+	}
+	close(releaseProviderCall)
+	if err := <-oldCompletionDone; !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale completion error = %v, want ErrConflict", err)
+	}
+	if _, err := storage.GetDirectConnection(ctx, owner, workspace.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale completion wrote a connection: %v", err)
+	}
+
+	if _, err := storage.ConsumeDirectOAuthStateForWorkspace(
+		ctx, owner, workspace.ID, newHash, now.Add(3*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := storage.ReplaceDirectConnectionFromOAuthAttempt(
+		ctx, owner, workspace.ID, newHash, DirectConnection{
+			AccountID: "latest-account", CurrencyCode: "RUB", Timezone: "Europe/Moscow",
+			TokenCiphertext: "v1.latest", TokenKeyVersion: 1, CreatedAt: now.Add(4 * time.Minute),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connection.AccountID != "latest-account" {
+		t.Fatalf("latest connection = %#v", connection)
+	}
+	if _, err := storage.ConsumeDirectOAuthStateForWorkspace(
+		ctx, owner, workspace.ID, newHash, now.Add(5*time.Minute),
+	); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("successful attempt was not retired: %v", err)
 	}
 }
 

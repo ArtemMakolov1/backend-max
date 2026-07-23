@@ -409,6 +409,14 @@ func authenticatedUserID(r *http.Request) (string, error) {
 	return principal.User.ID, nil
 }
 
+func authenticatedSessionBinding(r *http.Request) (string, error) {
+	principal, ok := r.Context().Value(principalContextKey{}).(authPrincipal)
+	if !ok || principal.SessionBinding == "" {
+		return "", errors.New("authenticated session binding is missing")
+	}
+	return principal.SessionBinding, nil
+}
+
 func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := strings.TrimRight(r.Header.Get("Origin"), "/")
@@ -655,6 +663,12 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, app.ErrDirectNotConfigured):
 		s.problem(w, http.StatusServiceUnavailable, "direct_not_configured",
 			"Яндекс Директ пока не настроен.", nil)
+	case errors.Is(err, app.ErrDirectOAuthInvalid):
+		s.problem(w, http.StatusBadRequest, "direct_oauth_invalid",
+			"Код подтверждения или попытка подключения Яндекс Директа недействительны.", nil)
+	case errors.Is(err, app.ErrDirectOAuthFlow):
+		s.problem(w, http.StatusConflict, "direct_oauth_flow_mismatch",
+			"Способ подтверждения Яндекс Директа изменился. Начните подключение заново.", nil)
 	case errors.Is(err, app.ErrDirectWritesDisabled):
 		s.problem(w, http.StatusServiceUnavailable, "direct_writes_disabled",
 			"Изменения в Яндекс Директе временно отключены.", nil)

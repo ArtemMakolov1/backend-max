@@ -18,12 +18,19 @@ import (
 type fakeDirectProvider struct {
 	account     yandexdirect.Account
 	campaign    yandexdirect.Campaign
+	oauthFlow   yandexdirect.OAuthFlow
 	resumeCalls int
 	resume      func(*fakeDirectProvider) error
 	getErr      error
 	getContext  func(context.Context)
 }
 
+func (f *fakeDirectProvider) OAuthFlow() yandexdirect.OAuthFlow {
+	if f.oauthFlow == "" {
+		return yandexdirect.OAuthFlowCallback
+	}
+	return f.oauthFlow
+}
 func (f *fakeDirectProvider) AuthorizationURL(string, string) string { return "https://oauth.test/" }
 func (f *fakeDirectProvider) ExchangeCode(context.Context, string, string) (string, error) {
 	return "token", nil
@@ -65,6 +72,33 @@ func (f *fakeDirectProvider) ResumeCampaign(context.Context, string, string, int
 	return nil
 }
 func (f *fakeDirectProvider) Sandbox() bool { return true }
+
+func TestDirectOAuthInputValidationIsFlowSpecific(t *testing.T) {
+	t.Parallel()
+	for _, code := range []string{"1234567", "0000000"} {
+		if !validDirectOAuthCode(yandexdirect.OAuthFlowVerificationCode, code) {
+			t.Fatalf("verification code %q was rejected", code)
+		}
+	}
+	for _, code := range []string{
+		"", "123456", "12345678", "123456a", " 1234567", "1234567 ", "１２３４５６７",
+	} {
+		if validDirectOAuthCode(yandexdirect.OAuthFlowVerificationCode, code) {
+			t.Fatalf("invalid verification code %q was accepted", code)
+		}
+	}
+	if !validDirectOAuthCode(yandexdirect.OAuthFlowCallback, "callback-code.with_symbols~") ||
+		validDirectOAuthCode(yandexdirect.OAuthFlowCallback, "callback code") {
+		t.Fatal("callback code validation is not bounded printable ASCII")
+	}
+	state, err := randomDirectToken(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validDirectOAuthState(state) || validDirectOAuthState(state+"x") {
+		t.Fatal("OAuth state validation did not require canonical 32-byte base64url")
+	}
+}
 
 func TestDirectAutoLaunchAmbiguousSuccessIsReconciledWithoutSecondWrite(t *testing.T) {
 	t.Parallel()

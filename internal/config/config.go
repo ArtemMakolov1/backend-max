@@ -32,6 +32,8 @@ const (
 	defaultOpenAIAPIBaseURL          = "https://api.openai.com"
 	defaultDirectAPIBaseURL          = "https://api.direct.yandex.com/json/v501"
 	defaultDirectSandboxAPIBaseURL   = "https://api-sandbox.direct.yandex.com/json/v5"
+	directOAuthCallbackRedirectURI   = "https://maxposty.ru/api/v1/advertising/direct/oauth/callback"
+	directOAuthVerificationCodeURI   = "https://oauth.yandex.ru/verification_code"
 	defaultOpenAIImageModel          = "gpt-image-2"
 	defaultOpenAIResearchModel       = "gpt-5.4-mini"
 	defaultSchedulerInterval         = 15 * time.Second
@@ -520,18 +522,15 @@ func validateYandexRedirectURI(raw string) error {
 }
 
 func validateDirectRedirectURI(raw string) error {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
-		parsed.Fragment != "" || parsed.RawQuery != "" {
-		return fmt.Errorf("DIRECT_OAUTH_REDIRECT_URI must be an absolute HTTP(S) URL without credentials, query or fragment")
+	switch strings.TrimSpace(raw) {
+	case directOAuthCallbackRedirectURI, directOAuthVerificationCodeURI:
+		return nil
+	default:
+		return fmt.Errorf(
+			"DIRECT_OAUTH_REDIRECT_URI must be exactly %s or %s",
+			directOAuthCallbackRedirectURI, directOAuthVerificationCodeURI,
+		)
 	}
-	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !isLoopbackHost(parsed.Hostname())) {
-		return fmt.Errorf("DIRECT_OAUTH_REDIRECT_URI must use HTTPS outside localhost")
-	}
-	if parsed.Path != "/api/v1/advertising/direct/oauth/callback" {
-		return fmt.Errorf("DIRECT_OAUTH_REDIRECT_URI path must be /api/v1/advertising/direct/oauth/callback")
-	}
-	return nil
 }
 
 func validateDirectAPIBaseURL(raw string, sandbox bool) error {

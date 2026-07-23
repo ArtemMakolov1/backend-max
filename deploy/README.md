@@ -382,9 +382,24 @@ remain display-only until their write paths are integrated with the catalog.
 
 The Yandex OAuth application and the connected advertiser account must have
 approved access to the Yandex Direct API before this integration is enabled.
-Register this exact production callback in the OAuth application:
+For an API/debugging OAuth application use Yandex's fixed verification-code
+redirect:
+
+`https://oauth.yandex.ru/verification_code`
+
+The backend also retains the browser-callback flow for a web OAuth application,
+but accepts only this exact callback:
 
 `https://maxposty.ru/api/v1/advertising/direct/oauth/callback`
+
+No other Direct OAuth redirect host or path is accepted. In verification-code
+mode `connect/start` returns a session-, actor-, workspace- and flow-bound
+one-time state. The browser sends the seven-digit code shown by Yandex and that
+state to the authenticated `connect/complete` endpoint. Starting again
+invalidates the previous active attempt for that actor and workspace. A durable
+latest-attempt marker is checked in the same transaction that stores the
+connection, so an older completion already waiting on Yandex cannot overwrite
+the connection after a restart.
 
 Store `DIRECT_OAUTH_CLIENT_ID`, `DIRECT_OAUTH_CLIENT_SECRET`, and
 `DIRECT_TOKEN_DATA_KEY` as production Environment secrets. The token data key
@@ -393,7 +408,7 @@ example, generated once with `openssl rand -base64 32`); rotating or losing it
 without a token re-encryption procedure makes existing connections unreadable.
 Set these production Environment variables:
 
-- `DIRECT_OAUTH_REDIRECT_URI=https://maxposty.ru/api/v1/advertising/direct/oauth/callback`
+- `DIRECT_OAUTH_REDIRECT_URI=https://oauth.yandex.ru/verification_code`
 - `DIRECT_SANDBOX=true`
 - `DIRECT_API_BASE_URL=https://api-sandbox.direct.yandex.com/json/v5`
 - `DIRECT_WRITES_ENABLED=false`

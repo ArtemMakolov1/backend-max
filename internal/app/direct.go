@@ -31,9 +31,12 @@ var (
 	ErrDirectAutoLaunchOff    = errors.New("auto-launch for Yandex Direct is disabled")
 	ErrDirectProvider         = errors.New("provider request to Yandex Direct failed")
 	ErrDirectSnapshotMismatch = errors.New("provider campaign in Yandex Direct does not match the authorized snapshot")
+	ErrDirectOAuthInvalid     = errors.New("invalid Yandex Direct OAuth completion")
+	ErrDirectOAuthFlow        = errors.New("Yandex Direct OAuth completion flow does not match the configured redirect")
 )
 
 type DirectProvider interface {
+	OAuthFlow() yandexdirect.OAuthFlow
 	AuthorizationURL(state, codeChallenge string) string
 	ExchangeCode(context.Context, string, string) (string, error)
 	GetAccount(context.Context, string, string) (yandexdirect.Account, error)
@@ -54,7 +57,10 @@ type directTokenCipher struct {
 }
 
 type DirectOAuthStart struct {
-	AuthorizationURL string `json:"authorization_url"`
+	AuthorizationURL string                 `json:"authorization_url"`
+	ExpiresAt        time.Time              `json:"expires_at"`
+	Flow             yandexdirect.OAuthFlow `json:"flow"`
+	State            string                 `json:"state,omitempty"`
 }
 
 type DirectOAuthCompletion struct {
@@ -78,6 +84,10 @@ func (a *App) ConfigureDirect(provider DirectProvider, dataKey []byte) error {
 	}
 	if len(dataKey) != 32 {
 		return errors.New("token data key for Yandex Direct must contain exactly 32 bytes")
+	}
+	if flow := provider.OAuthFlow(); flow != yandexdirect.OAuthFlowCallback &&
+		flow != yandexdirect.OAuthFlowVerificationCode {
+		return errors.New("provider for Yandex Direct returned an unsupported OAuth flow")
 	}
 	block, err := aes.NewCipher(dataKey)
 	if err != nil {
@@ -150,10 +160,15 @@ func (a *App) GetDirectIntegrationStatus(
 }
 
 func (a *App) StartDirectOAuth(
-	ctx context.Context, actorUserID, workspaceID, clientLogin, returnTo string,
+	ctx context.Context, actorUserID, workspaceID, sessionBinding, clientLogin, returnTo string,
 ) (DirectOAuthStart, error) {
 	if !a.DirectConfigured() {
 		return DirectOAuthStart{}, ErrDirectNotConfigured
+	}
+	flow := a.direct.OAuthFlow()
+	if !validDirectOAuthSessionBinding(sessionBinding) ||
+		(flow != yandexdirect.OAuthFlowCallback && flow != yandexdirect.OAuthFlowVerificationCode) {
+		return DirectOAuthStart{}, ErrDirectOAuthInvalid
 	}
 	state, err := randomDirectToken(32)
 	if err != nil {
@@ -164,32 +179,83 @@ func (a *App) StartDirectOAuth(
 		return DirectOAuthStart{}, err
 	}
 	now := a.now().UTC()
+	expiresAt := now.Add(directOAuthStateTTL)
 	returnTo = safeDirectReturnTo(returnTo)
 	if err := a.store.CreateDirectOAuthState(ctx, actorUserID, workspaceID, store.DirectOAuthState{
-		StateHash: sha256HexDirect(state), PKCEVerifier: verifier,
+		StateHash: directOAuthStateHash(flow, sessionBinding, state), PKCEVerifier: verifier,
 		ClientLogin: strings.TrimSpace(clientLogin), ReturnTo: returnTo,
-		CreatedAt: now, ExpiresAt: now.Add(directOAuthStateTTL),
+		CreatedAt: now, ExpiresAt: expiresAt,
 	}); err != nil {
 		return DirectOAuthStart{}, err
 	}
 	challengeBytes := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(challengeBytes[:])
-	return DirectOAuthStart{AuthorizationURL: a.direct.AuthorizationURL(state, challenge)}, nil
+	result := DirectOAuthStart{
+		AuthorizationURL: a.direct.AuthorizationURL(state, challenge),
+		ExpiresAt:        expiresAt, Flow: flow,
+	}
+	if flow == yandexdirect.OAuthFlowVerificationCode {
+		result.State = state
+	}
+	return result, nil
 }
 
-func (a *App) CompleteDirectOAuth(
-	ctx context.Context, actorUserID, state, code string,
+func (a *App) CompleteDirectOAuthCallback(
+	ctx context.Context, actorUserID, sessionBinding, state, code string,
+) (DirectOAuthCompletion, error) {
+	return a.completeDirectOAuth(
+		ctx, actorUserID, "", sessionBinding, yandexdirect.OAuthFlowCallback, state, code,
+	)
+}
+
+func (a *App) CompleteDirectOAuthVerification(
+	ctx context.Context, actorUserID, workspaceID, sessionBinding, state, code string,
+) (DirectOAuthCompletion, error) {
+	return a.completeDirectOAuth(
+		ctx, actorUserID, workspaceID, sessionBinding,
+		yandexdirect.OAuthFlowVerificationCode, state, code,
+	)
+}
+
+func (a *App) completeDirectOAuth(
+	ctx context.Context, actorUserID, workspaceID, sessionBinding string,
+	flow yandexdirect.OAuthFlow, state, code string,
 ) (DirectOAuthCompletion, error) {
 	if !a.DirectConfigured() {
 		return DirectOAuthCompletion{}, ErrDirectNotConfigured
 	}
-	stored, err := a.store.ConsumeDirectOAuthState(
-		ctx, actorUserID, sha256HexDirect(strings.TrimSpace(state)), a.now().UTC(),
+	if a.direct.OAuthFlow() != flow {
+		return DirectOAuthCompletion{}, ErrDirectOAuthFlow
+	}
+	if flow == yandexdirect.OAuthFlowVerificationCode {
+		if state != strings.TrimSpace(state) || code != strings.TrimSpace(code) {
+			return DirectOAuthCompletion{}, ErrDirectOAuthInvalid
+		}
+	} else {
+		state, code = strings.TrimSpace(state), strings.TrimSpace(code)
+	}
+	if !validDirectOAuthSessionBinding(sessionBinding) ||
+		!validDirectOAuthState(state) || !validDirectOAuthCode(flow, code) {
+		return DirectOAuthCompletion{}, ErrDirectOAuthInvalid
+	}
+	stateHash := directOAuthStateHash(flow, sessionBinding, state)
+	var (
+		stored store.DirectOAuthState
+		err    error
 	)
+	if workspaceID == "" {
+		stored, err = a.store.ConsumeDirectOAuthState(
+			ctx, actorUserID, stateHash, a.now().UTC(),
+		)
+	} else {
+		stored, err = a.store.ConsumeDirectOAuthStateForWorkspace(
+			ctx, actorUserID, workspaceID, stateHash, a.now().UTC(),
+		)
+	}
 	if err != nil {
 		return DirectOAuthCompletion{}, err
 	}
-	token, err := a.direct.ExchangeCode(ctx, strings.TrimSpace(code), stored.PKCEVerifier)
+	token, err := a.direct.ExchangeCode(ctx, code, stored.PKCEVerifier)
 	if err != nil {
 		return DirectOAuthCompletion{}, fmt.Errorf("%w: %w", ErrDirectProvider, err)
 	}
@@ -207,11 +273,12 @@ func (a *App) CompleteDirectOAuth(
 	if err != nil {
 		return DirectOAuthCompletion{}, err
 	}
-	connection, err := a.store.ReplaceDirectConnection(ctx, actorUserID, stored.WorkspaceID, store.DirectConnection{
-		AccountID: account.ID, ClientLogin: clientLogin, AccountName: account.DisplayName,
-		CurrencyCode: account.CurrencyCode, Timezone: account.Timezone, ReadOnly: account.ReadOnly,
-		TokenCiphertext: ciphertext, TokenKeyVersion: 1, CreatedAt: a.now().UTC(),
-	})
+	connection, err := a.store.ReplaceDirectConnectionFromOAuthAttempt(
+		ctx, actorUserID, stored.WorkspaceID, stored.StateHash, store.DirectConnection{
+			AccountID: account.ID, ClientLogin: clientLogin, AccountName: account.DisplayName,
+			CurrencyCode: account.CurrencyCode, Timezone: account.Timezone, ReadOnly: account.ReadOnly,
+			TokenCiphertext: ciphertext, TokenKeyVersion: 1, CreatedAt: a.now().UTC(),
+		})
 	if err != nil {
 		return DirectOAuthCompletion{}, err
 	}
@@ -826,9 +893,52 @@ func randomDirectToken(size int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(value), nil
 }
 
-func sha256HexDirect(value string) string {
-	sum := sha256.Sum256([]byte(value))
+func directOAuthStateHash(
+	flow yandexdirect.OAuthFlow, sessionBinding, state string,
+) string {
+	sum := sha256.Sum256([]byte(
+		string(flow) + "\x00" + strings.ToLower(sessionBinding) + "\x00" + state,
+	))
 	return hex.EncodeToString(sum[:])
+}
+
+func validDirectOAuthSessionBinding(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size
+}
+
+func validDirectOAuthState(value string) bool {
+	if len(value) != base64.RawURLEncoding.EncodedLen(32) {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(decoded) == 32
+}
+
+func validDirectOAuthCode(flow yandexdirect.OAuthFlow, value string) bool {
+	if flow == yandexdirect.OAuthFlowVerificationCode {
+		if len(value) != 7 {
+			return false
+		}
+		for index := 0; index < len(value); index++ {
+			if value[index] < '0' || value[index] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	if len(value) == 0 || len(value) > 2048 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < 0x21 || value[index] > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func safeDirectReturnTo(value string) string {

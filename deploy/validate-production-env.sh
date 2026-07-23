@@ -112,8 +112,9 @@ if [[ "$direct_parts" -ne 0 && "$direct_parts" -ne 4 ]]; then
   exit 1
 fi
 if [[ "$direct_parts" -eq 4 ]]; then
-  [[ "$direct_oauth_redirect_uri" == "https://maxposty.ru/api/v1/advertising/direct/oauth/callback" ]] || {
-    echo "DIRECT_OAUTH_REDIRECT_URI must be the MaxPosty Yandex Direct callback" >&2
+  [[ "$direct_oauth_redirect_uri" == "https://maxposty.ru/api/v1/advertising/direct/oauth/callback" ||
+    "$direct_oauth_redirect_uri" == "https://oauth.yandex.ru/verification_code" ]] || {
+    echo "DIRECT_OAUTH_REDIRECT_URI must be the MaxPosty callback or the fixed Yandex verification-code URL" >&2
     exit 1
   }
   [[ "$direct_token_data_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || {

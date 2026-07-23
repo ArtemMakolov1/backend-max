@@ -96,6 +96,11 @@ type directCampaignSuggestionRequest struct {
 	EndsAt            string   `json:"ends_at"`
 }
 
+type directOAuthCompleteRequest struct {
+	Code  string `json:"code"`
+	State string `json:"state"`
+}
+
 type directConsentRequest struct {
 	Confirmation               string `json:"confirmation"`
 	ExpectedConnectionID       string `json:"expected_connection_id"`
@@ -112,6 +117,7 @@ func (s *Server) registerDirectAdvertisingRoutes(r chi.Router) {
 	r.Route("/advertising/direct", func(r chi.Router) {
 		r.Get("/", s.getDirectIntegration)
 		r.Post("/connect/start", s.startDirectConnection)
+		r.Post("/connect/complete", s.completeDirectConnection)
 		r.Delete("/connection", s.revokeDirectConnection)
 		r.Get("/campaigns", s.listDirectCampaigns)
 		r.Post("/campaigns", s.createDirectCampaign)
@@ -150,12 +156,23 @@ func (s *Server) getDirectIntegration(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startDirectConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") != s.frontendOrigin {
+		s.problem(w, http.StatusForbidden, "origin_required",
+			"An exact frontend Origin is required to start Yandex Direct authorization", nil)
+		return
+	}
 	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityAdsCredentialsManage)
 	if !ok {
 		return
 	}
+	sessionBinding, err := authenticatedSessionBinding(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
 	result, err := s.app.StartDirectOAuth(
-		r.Context(), access.UserID, access.WorkspaceID, "", "/app/#/advertising",
+		r.Context(), access.UserID, access.WorkspaceID, sessionBinding,
+		"", "/app/#/advertising",
 	)
 	if err != nil {
 		s.writeError(w, err)
@@ -165,8 +182,46 @@ func (s *Server) startDirectConnection(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"connection": result})
 }
 
+func (s *Server) completeDirectConnection(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Origin") != s.frontendOrigin {
+		s.problem(w, http.StatusForbidden, "origin_required",
+			"An exact frontend Origin is required to complete Yandex Direct authorization", nil)
+		return
+	}
+	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityAdsCredentialsManage)
+	if !ok {
+		return
+	}
+	sessionBinding, err := authenticatedSessionBinding(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	var request directOAuthCompleteRequest
+	if !s.decodeJSON(w, r, &request) {
+		return
+	}
+	completion, err := s.app.CompleteDirectOAuthVerification(
+		r.Context(), access.UserID, access.WorkspaceID, sessionBinding,
+		request.State, request.Code,
+	)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"connection": publicDirectConnection(completion.Connection),
+	})
+}
+
 func (s *Server) finishDirectOAuth(w http.ResponseWriter, r *http.Request) {
 	userID, err := authenticatedUserID(r)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	sessionBinding, err := authenticatedSessionBinding(r)
 	if err != nil {
 		s.writeError(w, err)
 		return
@@ -177,7 +232,9 @@ func (s *Server) finishDirectOAuth(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, directOAuthErrorRedirect(s.frontendOrigin, "invalid_oauth"), http.StatusSeeOther)
 		return
 	}
-	completion, err := s.app.CompleteDirectOAuth(r.Context(), userID, state, code)
+	completion, err := s.app.CompleteDirectOAuthCallback(
+		r.Context(), userID, sessionBinding, state, code,
+	)
 	if err != nil {
 		s.logger.Warn("Yandex Direct OAuth callback failed", "error", err)
 		http.Redirect(w, r, directOAuthErrorRedirect(s.frontendOrigin, "connect_failed"), http.StatusSeeOther)

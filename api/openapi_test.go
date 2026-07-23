@@ -87,6 +87,7 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 		"/workspaces/{workspace_id}/billing/payment-method/detach":                                  {"post"},
 		"/workspaces/{workspace_id}/advertising/direct":                                             {"get"},
 		"/workspaces/{workspace_id}/advertising/direct/connect/start":                               {"post"},
+		"/workspaces/{workspace_id}/advertising/direct/connect/complete":                            {"post"},
 		"/workspaces/{workspace_id}/advertising/direct/connection":                                  {"delete"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns":                                   {"get", "post"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/suggest":                           {"post"},
@@ -181,6 +182,8 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertRequestSchemaRef(t, document, "/posts/{id}/generate-image", "post", "#/components/schemas/GeneratePostImageInput")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/posts/{post_id}/generate-image", "post", "#/components/schemas/GeneratePostImageInput")
 	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct", "get", "200", "#/components/schemas/DirectIntegrationEnvelope")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/connect/complete", "post", "#/components/schemas/DirectOAuthCompleteRequest")
+	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/connect/complete", "post", "200", "#/components/schemas/DirectOAuthCompleteEnvelope")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns", "post", "#/components/schemas/DirectCampaignDraftRequest")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/suggest", "post", "#/components/schemas/DirectCampaignSuggestionRequest")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}", "patch", "#/components/schemas/DirectCampaignPatchRequest")
@@ -190,6 +193,11 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns", "post", "422", "#/components/responses/ValidationProblem")
 	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}", "patch", "422", "#/components/responses/ValidationProblem")
 	assertSchemaRequiredProperty(t, document, "DirectIntegration", "auto_launch_enabled")
+	assertSchemaRequiredProperty(t, document, "DirectOAuthStart", "expires_at")
+	assertSchemaRequiredProperty(t, document, "DirectOAuthStart", "flow")
+	assertSchemaOptionalProperty(t, document, "DirectOAuthStart", "state")
+	assertSchemaRequiredProperty(t, document, "DirectOAuthCompleteRequest", "code")
+	assertSchemaRequiredProperty(t, document, "DirectOAuthCompleteRequest", "state")
 	assertSchemaRequiredProperty(t, document, "DirectConnection", "read_only")
 	assertSchemaOptionalProperty(t, document, "DirectConnection", "error_code")
 	assertSchemaRequiredProperty(t, document, "DirectCampaign", "provider_campaign_id")
