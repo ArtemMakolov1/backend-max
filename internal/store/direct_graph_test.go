@@ -818,6 +818,41 @@ func TestDirectProviderStageTransitionsRequireRevisionBoundary(t *testing.T) {
 	}
 }
 
+func TestDirectProviderStageUpdateKeepsEmptyJSONArrays(t *testing.T) {
+	t.Parallel()
+	var mappings []DirectKeywordMapping
+	var warnings []DirectProviderIssue
+	providerCampaignID := int64(1)
+	operation := DirectProviderOperation{}
+	if err := mergeDirectProviderStageUpdate(
+		&operation, DirectProviderStageUpdate{
+			Stage:                   "campaign_created",
+			ProviderCampaignID:      &providerCampaignID,
+			ProviderKeywordMappings: &mappings,
+			ProviderWarnings:        &warnings,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if operation.ProviderKeywordMappings == nil || operation.ProviderWarnings == nil {
+		t.Fatalf("empty provider arrays became nil: %#v", operation)
+	}
+	mappingsJSON, err := json.Marshal(operation.ProviderKeywordMappings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warningsJSON, err := json.Marshal(operation.ProviderWarnings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(mappingsJSON) != "[]" || string(warningsJSON) != "[]" {
+		t.Fatalf(
+			"empty provider arrays = mappings:%s warnings:%s, want []",
+			mappingsJSON, warningsJSON,
+		)
+	}
+}
+
 func TestDirectVerifiedGraphReplayRequiresExactImmutableRevision(t *testing.T) {
 	t.Parallel()
 	desired, err := canonicalDirectJSONObject([]byte(`{"name":"campaign"}`))

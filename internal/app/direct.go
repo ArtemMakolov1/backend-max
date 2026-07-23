@@ -33,13 +33,13 @@ const (
 
 var (
 	ErrDirectNotConfigured    = errors.New("integration with Yandex Direct is not configured")
-	ErrDirectGraphUnsupported = errors.New("Yandex Direct provider does not support the verified v501 campaign graph")
+	ErrDirectGraphUnsupported = errors.New("provider for Yandex Direct does not support the verified v501 campaign graph")
 	ErrDirectWritesDisabled   = errors.New("writes to Yandex Direct are disabled")
 	ErrDirectAutoLaunchOff    = errors.New("auto-launch for Yandex Direct is disabled")
 	ErrDirectProvider         = errors.New("provider request to Yandex Direct failed")
 	ErrDirectSnapshotMismatch = errors.New("provider campaign in Yandex Direct does not match the authorized snapshot")
 	ErrDirectOAuthInvalid     = errors.New("invalid Yandex Direct OAuth completion")
-	ErrDirectOAuthFlow        = errors.New("Yandex Direct OAuth completion flow does not match the configured redirect")
+	ErrDirectOAuthFlow        = errors.New("completion flow for Yandex Direct OAuth does not match the configured redirect")
 )
 
 type DirectProvider interface {
@@ -445,90 +445,8 @@ func (a *App) launchDirectAutoCampaign(
 	)
 }
 
-func (a *App) launchDirectCampaign(
-	ctx context.Context, material store.DirectLaunchMaterial, autoLaunch bool,
-	claim func(yandexdirect.Campaign) (store.DirectLaunchMaterial, error),
-) error {
-	if material.Campaign.ProviderCampaignID == nil {
-		return store.ErrDirectCampaignNotAccepted
-	}
-	token, err := a.directAccessToken(ctx, material.Connection)
-	if err != nil {
-		return err
-	}
-	providerCampaign, err := a.direct.GetCampaign(
-		ctx, token, material.Connection.ClientLogin, *material.Campaign.ProviderCampaignID,
-	)
-	if err != nil {
-		now := a.now().UTC()
-		connectionErr := a.markDirectConnectionAuthorizationRequired(
-			ctx, material.Connection, err, now,
-		)
-		if autoLaunch && directProviderStrategySnapshotError(err) {
-			if invalidateErr := a.store.InvalidateDirectAutoLaunchConsent(
-				ctx, material.Campaign.WorkspaceID, material.Campaign.ID,
-				"provider_strategy_changed", now,
-			); invalidateErr != nil {
-				return errors.Join(ErrDirectSnapshotMismatch, connectionErr, invalidateErr)
-			}
-			return errors.Join(ErrDirectSnapshotMismatch, connectionErr)
-		}
-		return errors.Join(fmt.Errorf("%w: %w", ErrDirectProvider, err), connectionErr)
-	}
-	snapshotMatches := directProviderSnapshotMatches(providerCampaign, material.Campaign)
-	if _, err := a.store.SyncDirectCampaignProviderStatus(
-		ctx, material.Campaign.WorkspaceID, material.Campaign.ID, providerCampaign.ID,
-		providerCampaign.Status, providerCampaign.State, a.now().UTC(),
-	); err != nil {
-		return err
-	}
-	if err := a.store.SetDirectCampaignProviderSnapshotMismatch(
-		ctx, material.Campaign.WorkspaceID, material.Campaign.ID,
-		!snapshotMatches, a.now().UTC(),
-	); err != nil {
-		return err
-	}
-	if directProviderCampaignRunning(providerCampaign) {
-		// The user may have launched the campaign directly in Yandex. Reflect
-		// provider truth and never send a duplicate Resume.
-		if !snapshotMatches {
-			return ErrDirectSnapshotMismatch
-		}
-		return nil
-	}
-	if providerCampaign.Status != "ACCEPTED" {
-		return store.ErrDirectCampaignNotAccepted
-	}
-	if !snapshotMatches {
-		// SetDirectCampaignProviderSnapshotMismatch already invalidated any
-		// outstanding consent in the same transaction as the clarification.
-		return ErrDirectSnapshotMismatch
-	}
-	if !directProviderCampaignDefinitelyOff(providerCampaign) {
-		if autoLaunch {
-			reason := "provider_state_" +
-				strings.ToLower(strings.TrimSpace(providerCampaign.State))
-			if strings.HasSuffix(reason, "_") {
-				reason = "provider_state_unknown"
-			}
-			if err := a.store.InvalidateDirectAutoLaunchConsent(
-				ctx, material.Campaign.WorkspaceID, material.Campaign.ID,
-				reason, a.now().UTC(),
-			); err != nil {
-				return err
-			}
-		}
-		return store.ErrDirectCampaignNotAccepted
-	}
-	claimed, err := claim(providerCampaign)
-	if err != nil {
-		return err
-	}
-	return a.attemptClaimedDirectLaunch(ctx, token, claimed)
-}
-
 func (a *App) attemptClaimedDirectLaunch(
-	ctx context.Context, token string, material store.DirectLaunchMaterial,
+	ctx context.Context, material store.DirectLaunchMaterial,
 ) error {
 	workspaceID := material.Campaign.WorkspaceID
 	campaignID := material.Campaign.ID
@@ -582,14 +500,14 @@ func (a *App) attemptClaimedDirectLaunch(
 			),
 		)
 	}
-	token = verifiedToken
 	if err := a.store.MarkDirectCampaignLaunchAttempt(
 		ctx, workspaceID, campaignID, launchClaimedAt, a.now().UTC(),
 	); err != nil {
 		return err
 	}
 	err := a.direct.ResumeCampaign(
-		ctx, token, material.Connection.ClientLogin, *material.Campaign.ProviderCampaignID,
+		ctx, verifiedToken, material.Connection.ClientLogin,
+		*material.Campaign.ProviderCampaignID,
 	)
 	if err != nil {
 		now := a.now().UTC()
@@ -624,107 +542,6 @@ func (a *App) attemptClaimedDirectLaunch(
 	return a.store.CompleteDirectCampaignLaunch(
 		ctx, workspaceID, campaignID, launchClaimedAt, a.now().UTC(),
 	)
-}
-
-func (a *App) reconcileDirectCampaignLaunchLegacy(
-	ctx context.Context, workspaceID, campaignID string, allowProviderRetry bool,
-) error {
-	material, err := a.store.GetDirectLaunchRecoveryMaterial(ctx, workspaceID, campaignID)
-	if err != nil {
-		return err
-	}
-	if material.Campaign.LaunchClaimedAt == nil {
-		return store.ErrDirectLaunchAlreadyClaimed
-	}
-	launchClaimedAt := *material.Campaign.LaunchClaimedAt
-	if material.Campaign.ProviderCampaignID == nil {
-		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, launchClaimedAt,
-			"provider_campaign_missing", a.now().UTC(),
-		)
-	}
-	token, err := a.directAccessToken(ctx, material.Connection)
-	if err != nil {
-		return err
-	}
-	providerCampaign, err := a.direct.GetCampaign(
-		ctx, token, material.Connection.ClientLogin, *material.Campaign.ProviderCampaignID,
-	)
-	if err != nil {
-		now := a.now().UTC()
-		connectionErr := a.markDirectConnectionAuthorizationRequired(
-			ctx, material.Connection, err, now,
-		)
-		markErr := a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, launchClaimedAt,
-			directProviderErrorCode(err), now,
-		)
-		return errors.Join(
-			fmt.Errorf("%w: %w", ErrDirectProvider, err), connectionErr, markErr,
-		)
-	}
-	if providerCampaign.ID != *material.Campaign.ProviderCampaignID {
-		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, launchClaimedAt,
-			"provider_campaign_mismatch", a.now().UTC(),
-		)
-	}
-	snapshotMatches := directProviderSnapshotMatches(providerCampaign, material.Campaign)
-	if _, err := a.store.SyncDirectCampaignProviderStatusForLaunch(
-		ctx, workspaceID, campaignID, providerCampaign.ID,
-		providerCampaign.Status, providerCampaign.State, launchClaimedAt,
-		a.now().UTC(),
-	); err != nil {
-		return err
-	}
-	if err := a.store.SetDirectCampaignProviderSnapshotMismatchForLaunch(
-		ctx, workspaceID, campaignID, !snapshotMatches, launchClaimedAt,
-		a.now().UTC(),
-	); err != nil {
-		return err
-	}
-	if !snapshotMatches {
-		// Provider ON is authoritative and SyncDirectCampaignProviderStatus has
-		// already promoted the launch atomically. Keep the mismatch visible,
-		// but never issue another Resume for a changed campaign.
-		return ErrDirectSnapshotMismatch
-	}
-	if providerCampaign.Status != "ACCEPTED" {
-		reason := "provider_status_mismatch"
-		if directProviderCampaignRunning(providerCampaign) {
-			reason = "provider_running_status_mismatch"
-		}
-		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, launchClaimedAt, reason, a.now().UTC(),
-		)
-	}
-	if directProviderCampaignRunning(providerCampaign) {
-		// The provider truth sync above completed launching/reconciling/failed
-		// states atomically when Direct reported ACCEPTED + ON.
-		return nil
-	}
-	if !directProviderCampaignDefinitelyOff(providerCampaign) {
-		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, launchClaimedAt,
-			"provider_state_ambiguous", a.now().UTC(),
-		)
-	}
-	if !allowProviderRetry {
-		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, launchClaimedAt,
-			"provider_retry_disabled", a.now().UTC(),
-		)
-	}
-	if material.Campaign.LaunchAttemptCount >= 2 {
-		return a.store.FailDirectCampaignLaunch(
-			ctx, workspaceID, campaignID, launchClaimedAt,
-			"provider_off_after_retries", a.now().UTC(),
-		)
-	}
-	// A bounded retry is allowed only after an authoritative provider read
-	// confirms that the campaign is still OFF. Further ambiguity is polled but
-	// never produces another provider write.
-	return a.attemptClaimedDirectLaunch(ctx, token, material)
 }
 
 func (a *App) RunDirectAutoLaunchOnce(ctx context.Context, limit int) {
@@ -812,77 +629,6 @@ func (a *App) RunDirectAutoLaunchOnce(ctx context.Context, limit int) {
 			!errors.Is(err, store.ErrDirectLaunchAlreadyClaimed) {
 			a.logger.Error("Yandex Direct auto-launch failed", "campaign_id", campaignID, "error", err)
 		}
-	}
-}
-
-func (a *App) syncDirectCampaignLifecycleLegacy(
-	ctx context.Context, workspaceID, campaignID string,
-) error {
-	material, err := a.store.GetDirectLifecycleMaterial(ctx, workspaceID, campaignID)
-	if err != nil {
-		return err
-	}
-	if material.Campaign.ProviderCampaignID == nil {
-		return store.ErrNotFound
-	}
-	token, err := a.directAccessToken(ctx, material.Connection)
-	if err != nil {
-		return err
-	}
-	providerCampaign, err := a.direct.GetCampaign(
-		ctx, token, material.Connection.ClientLogin, *material.Campaign.ProviderCampaignID,
-	)
-	if err != nil {
-		connectionErr := a.markDirectConnectionAuthorizationRequired(
-			ctx, material.Connection, err, a.now().UTC(),
-		)
-		return errors.Join(fmt.Errorf("%w: %w", ErrDirectProvider, err), connectionErr)
-	}
-	if providerCampaign.ID != *material.Campaign.ProviderCampaignID {
-		return ErrDirectSnapshotMismatch
-	}
-	snapshotMismatch := !directProviderSnapshotMatches(providerCampaign, material.Campaign)
-	if _, err = a.store.SyncDirectCampaignProviderStatus(
-		ctx, workspaceID, campaignID, providerCampaign.ID,
-		providerCampaign.Status, providerCampaign.State, a.now().UTC(),
-	); err != nil {
-		return err
-	}
-	return a.store.SetDirectCampaignProviderSnapshotMismatch(
-		ctx, workspaceID, campaignID, snapshotMismatch, a.now().UTC(),
-	)
-}
-
-func directProviderSnapshotMatches(
-	provider yandexdirect.Campaign, campaign store.DirectCampaign,
-) bool {
-	return campaign.ProviderCampaignID != nil &&
-		provider.ID == *campaign.ProviderCampaignID &&
-		strings.TrimSpace(provider.Name) == strings.TrimSpace(campaign.Name) &&
-		provider.WeeklyBudgetMinor == campaign.WeeklyBudgetMinor &&
-		sameDirectDate(provider.StartsAt, campaign.StartsAt) &&
-		sameDirectDate(provider.EndsAt, campaign.EndsAt)
-}
-
-func directProviderCampaignRunning(campaign yandexdirect.Campaign) bool {
-	return strings.EqualFold(strings.TrimSpace(campaign.State), "ON")
-}
-
-func directProviderCampaignDefinitelyOff(campaign yandexdirect.Campaign) bool {
-	state := strings.ToUpper(strings.TrimSpace(campaign.State))
-	return state == "OFF"
-}
-
-func directProviderStrategySnapshotError(err error) bool {
-	var providerErr *yandexdirect.Error
-	if !errors.As(err, &providerErr) {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(providerErr.Code)) {
-	case "campaign_budget_unavailable", "campaign_budget_invalid":
-		return true
-	default:
-		return false
 	}
 }
 
@@ -1110,7 +856,7 @@ func (a *App) directAccessToken(
 	}
 	token, ok := value.(string)
 	if !ok || strings.TrimSpace(token) == "" {
-		return "", errors.New("Yandex Direct access token is unavailable")
+		return "", errors.New("access token for Yandex Direct is unavailable")
 	}
 	return token, nil
 }
@@ -1172,8 +918,10 @@ func (c *directTokenCipher) sealBundle(
 	if !directTokenBundleUsable(bundle, bundle.RefreshedAt) ||
 		strings.TrimSpace(bundle.RefreshToken) == "" ||
 		bundle.RefreshAfter.IsZero() || bundle.RefreshedAt.IsZero() {
-		return "", errors.New("Yandex Direct token bundle is incomplete")
+		return "", errors.New("token bundle for Yandex Direct is incomplete")
 	}
+	// #nosec G117 -- this plaintext exists only long enough to be passed
+	// directly to sealValue, which encrypts and authenticates it with AES-GCM.
 	payload, err := json.Marshal(bundle)
 	if err != nil {
 		return "", err
@@ -1259,12 +1007,6 @@ func (c *directTokenCipher) openValue(
 		return nil, errors.New("invalid encrypted Yandex Direct token")
 	}
 	return plain, nil
-}
-
-func directTokenAAD(workspaceID, accountID, clientLogin string) []byte {
-	return directTokenAADForPrefix(
-		directTokenCipherPrefix, workspaceID, accountID, clientLogin,
-	)
 }
 
 func directTokenAADForPrefix(prefix, workspaceID, accountID, clientLogin string) []byte {

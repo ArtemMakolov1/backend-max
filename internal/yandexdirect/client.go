@@ -204,7 +204,7 @@ func New(
 	if redirect.String() == VerificationCodeRedirectURI {
 		oauthFlow = OAuthFlowVerificationCode
 	} else if redirect.String() != CallbackRedirectURI {
-		return nil, errors.New("Yandex Direct OAuth redirect URI is not in the fixed allowlist")
+		return nil, errors.New("redirect URI for Yandex Direct OAuth is not in the fixed allowlist")
 	}
 	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" {
 		return nil, errors.New("OAuth client credentials for Yandex Direct are required")

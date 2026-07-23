@@ -456,11 +456,17 @@ WHERE workspace_id=$1 AND id=$2 AND status='active' AND read_only=FALSE
 		operation.ProviderAdGroupID = cloneInt64Pointer(campaign.ProviderAdGroupID)
 		operation.ProviderAdID = cloneInt64Pointer(campaign.ProviderAdID)
 		operation.ProviderKeywordMappings = append(
-			[]DirectKeywordMapping(nil), campaign.ProviderKeywordMappings...,
+			[]DirectKeywordMapping{}, campaign.ProviderKeywordMappings...,
 		)
 		operation.ProviderWarnings = append(
-			[]DirectProviderIssue(nil), campaign.ProviderWarnings...,
+			[]DirectProviderIssue{}, campaign.ProviderWarnings...,
 		)
+	}
+	if operation.ProviderKeywordMappings == nil {
+		operation.ProviderKeywordMappings = []DirectKeywordMapping{}
+	}
+	if operation.ProviderWarnings == nil {
+		operation.ProviderWarnings = []DirectProviderIssue{}
 	}
 	initialMappingsJSON, _ := json.Marshal(operation.ProviderKeywordMappings)
 	initialWarningsJSON, _ := json.Marshal(operation.ProviderWarnings)
@@ -709,7 +715,7 @@ ORDER BY l.workspace_id,l.campaign_id,l.id`,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	candidates := make([]DirectGraphRecoveryCandidate, 0)
 	for rows.Next() {
 		var candidate DirectGraphRecoveryCandidate
@@ -820,6 +826,12 @@ WHERE workspace_id=$1 AND campaign_id=$2 AND id=$3 FOR UPDATE`,
 			operation.CompletedAt = directTimePointer(now)
 			operation.LeaseExpiresAt = now
 		}
+	}
+	if operation.ProviderKeywordMappings == nil {
+		operation.ProviderKeywordMappings = []DirectKeywordMapping{}
+	}
+	if operation.ProviderWarnings == nil {
+		operation.ProviderWarnings = []DirectProviderIssue{}
 	}
 	mappingsJSON, _ := json.Marshal(operation.ProviderKeywordMappings)
 	warningsJSON, _ := json.Marshal(operation.ProviderWarnings)
@@ -1654,7 +1666,7 @@ func directDesiredCampaignFromJSON(
 	var desired DirectCampaignDesiredGraph
 	if err := decoder.Decode(&desired); err != nil {
 		return DirectCampaign{}, fmt.Errorf(
-			"%w: decode desired provider graph: %v", ErrDirectValidation, err,
+			"%w: decode desired provider graph: %w", ErrDirectValidation, err,
 		)
 	}
 	base.Name = desired.Name
@@ -2171,7 +2183,7 @@ func mergeDirectProviderStageUpdate(
 			return err
 		}
 		operation.ProviderKeywordMappings = append(
-			[]DirectKeywordMapping(nil), (*update.ProviderKeywordMappings)...,
+			[]DirectKeywordMapping{}, (*update.ProviderKeywordMappings)...,
 		)
 	}
 	if update.ProviderWarnings != nil {
@@ -2179,7 +2191,7 @@ func mergeDirectProviderStageUpdate(
 			return err
 		}
 		operation.ProviderWarnings = append(
-			[]DirectProviderIssue(nil), (*update.ProviderWarnings)...,
+			[]DirectProviderIssue{}, (*update.ProviderWarnings)...,
 		)
 	}
 	if len(update.ObservedGraph) > 0 {

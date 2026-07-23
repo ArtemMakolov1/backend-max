@@ -75,7 +75,7 @@ FOR UPDATE`, workspaceID, campaignID, input.ExpectedOperationID))
 	}
 
 	clarification := ""
-	status := campaign.Status
+	var status string
 	baselineMarker := campaign.SubmissionOperationMarker
 	switch operation.OperationKind {
 	case "submission":

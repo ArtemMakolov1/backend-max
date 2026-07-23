@@ -1053,7 +1053,7 @@ func (a *App) directUpdateOrReconcileKeywords(
 				ctx, token, material.Connection.ClientLogin, drafts,
 			)
 			warnings = append(warnings, directMutationWarnings(results)...)
-			keywords, err = a.directGraph.ListKeywords(
+			_, err = a.directGraph.ListKeywords(
 				ctx, token, material.Connection.ClientLogin, campaignID,
 			)
 			if err != nil {
@@ -1272,7 +1272,7 @@ func (a *App) launchDirectCampaignVerified(
 		material.Campaign.ProviderRevisionID != expectedRevisionID {
 		return store.DirectCampaign{}, store.ErrDirectConsentMismatch
 	}
-	token, graph, verified, err := a.readVerifiedDirectLaunchGraph(ctx, material, false)
+	_, graph, verified, err := a.readVerifiedDirectLaunchGraph(ctx, material, false)
 	if err != nil {
 		return store.DirectCampaign{}, err
 	}
@@ -1305,7 +1305,7 @@ func (a *App) launchDirectCampaignVerified(
 	if err != nil {
 		return store.DirectCampaign{}, err
 	}
-	if err := a.attemptClaimedDirectLaunch(ctx, token, claimed); err != nil {
+	if err := a.attemptClaimedDirectLaunch(ctx, claimed); err != nil {
 		return store.DirectCampaign{}, err
 	}
 	return a.store.GetDirectCampaign(ctx, actorUserID, workspaceID, campaignID)
@@ -1317,7 +1317,7 @@ func (a *App) launchDirectAutoCampaignVerified(
 	if err := a.requireDirectGraphWrites(); err != nil {
 		return err
 	}
-	token, graph, verified, err := a.readVerifiedDirectLaunchGraph(ctx, material, true)
+	_, graph, verified, err := a.readVerifiedDirectLaunchGraph(ctx, material, true)
 	if err != nil {
 		_ = a.store.InvalidateDirectAutoLaunchConsent(
 			ctx, material.Campaign.WorkspaceID, material.Campaign.ID,
@@ -1353,7 +1353,7 @@ func (a *App) launchDirectAutoCampaignVerified(
 	if err != nil {
 		return err
 	}
-	return a.attemptClaimedDirectLaunch(ctx, token, claimed)
+	return a.attemptClaimedDirectLaunch(ctx, claimed)
 }
 
 func (a *App) readVerifiedDirectLaunchGraph(
@@ -1427,7 +1427,7 @@ func (a *App) reconcileDirectCampaignLaunch(
 		return store.ErrDirectLaunchAlreadyClaimed
 	}
 	launchClaimedAt := *material.Campaign.LaunchClaimedAt
-	token, graph, _, err := a.readVerifiedDirectLaunchGraph(ctx, material, false)
+	_, graph, _, err := a.readVerifiedDirectLaunchGraph(ctx, material, false)
 	if err != nil {
 		_ = a.store.MarkDirectCampaignLaunchReconciling(
 			ctx, workspaceID, campaignID, launchClaimedAt,
@@ -1463,7 +1463,7 @@ func (a *App) reconcileDirectCampaignLaunch(
 			"provider_off_after_retries", a.now().UTC(),
 		)
 	}
-	return a.attemptClaimedDirectLaunch(ctx, token, material)
+	return a.attemptClaimedDirectLaunch(ctx, material)
 }
 
 func (a *App) syncDirectCampaignLifecycle(
@@ -1840,7 +1840,7 @@ func directKeywordEditPlan(
 	for _, phrase := range desired {
 		desiredByKey[strings.ToLower(strings.TrimSpace(phrase))] = phrase
 	}
-	allowedExisting := make(map[string]struct{}, len(previous)+len(desired))
+	allowedExisting := make(map[string]struct{})
 	for _, phrase := range previous {
 		allowedExisting[strings.ToLower(strings.TrimSpace(phrase))] = struct{}{}
 	}

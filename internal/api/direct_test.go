@@ -178,7 +178,7 @@ func TestDirectVerificationCodeOAuthIsSessionWorkspaceOriginAndAttemptBound(t *t
 		t.Fatalf("completion leaked a secret: %s", response.Body.String())
 	}
 	response = performJSONRequest(handler, http.MethodPost, base+"/connect/complete", body)
-	assertProblemCode(t, response, http.StatusConflict, "state_conflict")
+	assertProblemCode(t, response, http.StatusNotFound, "not_found")
 	if provider.exchangeCalls != 1 {
 		t.Fatalf("replayed completion reached provider %d times", provider.exchangeCalls)
 	}
@@ -291,6 +291,7 @@ func TestDirectCampaignValidationIsAClientErrorForCreateAndPatch(t *testing.T) {
 		handler, http.MethodPost, base+"/campaigns",
 		`{"name":"Campaign","objective":"traffic","landing_url":"https://maxposty.ru/",`+
 			`"brief":"A valid campaign brief","regions":["225"],"weekly_budget_minor":1000001,`+
+			`"titles":["Safe title"],"texts":["Safe text"],"keywords":["safe keyword"],`+
 			`"currency_code":"RUB","starts_at":"2044-01-01","ends_at":"2044-02-01"}`,
 	)
 	assertProblemCode(

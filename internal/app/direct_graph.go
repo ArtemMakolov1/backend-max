@@ -32,27 +32,6 @@ type directVerifiedProviderGraph struct {
 	Clarification      string
 }
 
-func directCampaignDesiredGraph(campaign store.DirectCampaign) store.DirectCampaignDesiredGraph {
-	return store.DirectCampaignDesiredGraph{
-		Name: campaign.Name, LandingURL: campaign.LandingURL,
-		Regions:           append([]string(nil), campaign.Regions...),
-		WeeklyBudgetMinor: campaign.WeeklyBudgetMinor, CurrencyCode: campaign.CurrencyCode,
-		StartsAt: campaign.StartsAt, EndsAt: campaign.EndsAt,
-		Titles:           append([]string(nil), campaign.Titles...),
-		Texts:            append([]string(nil), campaign.Texts...),
-		Keywords:         append([]string(nil), campaign.Keywords...),
-		NegativeKeywords: append([]string(nil), campaign.NegativeKeywords...),
-	}
-}
-
-func marshalDirectCampaignDesiredGraph(campaign store.DirectCampaign) (json.RawMessage, error) {
-	encoded, err := json.Marshal(directCampaignDesiredGraph(campaign))
-	if err != nil {
-		return nil, err
-	}
-	return encoded, nil
-}
-
 func verifyDirectProviderGraph(
 	graph yandexdirect.CampaignGraph,
 	campaign store.DirectCampaign,
@@ -334,9 +313,7 @@ func normalizeDirectGraphHref(raw string) (string, error) {
 	}
 	parsed.Scheme = "https"
 	parsed.Host = strings.ToLower(parsed.Host)
-	if strings.HasSuffix(parsed.Host, ":443") {
-		parsed.Host = strings.TrimSuffix(parsed.Host, ":443")
-	}
+	parsed.Host = strings.TrimSuffix(parsed.Host, ":443")
 	if parsed.RawQuery != "" {
 		values, parseErr := url.ParseQuery(parsed.RawQuery)
 		if parseErr != nil {

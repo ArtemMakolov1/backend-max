@@ -2432,9 +2432,7 @@ func normalizeHTTPSHref(raw string) (string, error) {
 	}
 	parsed.Scheme = "https"
 	host := strings.ToLower(parsed.Host)
-	if strings.HasSuffix(host, ":443") {
-		host = strings.TrimSuffix(host, ":443")
-	}
+	host = strings.TrimSuffix(host, ":443")
 	parsed.Host = host
 	if parsed.RawQuery != "" {
 		values, err := url.ParseQuery(parsed.RawQuery)

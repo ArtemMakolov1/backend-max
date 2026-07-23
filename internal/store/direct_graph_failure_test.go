@@ -362,8 +362,9 @@ func createDirectRejectedGraphBaseline(
 			AdGroupModeration: DirectModerationSnapshot{
 				Status: "ACCEPTED", ServingStatus: "ELIGIBLE",
 			},
-			AdModeration: DirectModerationSnapshot{Status: "ACCEPTED", State: "OFF"},
-			ObservedAt:   now.Add(7 * time.Second), ActorUserID: owner,
+			AdModeration:              DirectModerationSnapshot{Status: "ACCEPTED", State: "OFF"},
+			AggregateModerationStatus: "REJECTED",
+			ObservedAt:                now.Add(7 * time.Second), ActorUserID: owner,
 		},
 	)
 	if err != nil {
