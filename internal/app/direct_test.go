@@ -427,13 +427,17 @@ func fakeModeratedTexts(
 
 func TestDirectOAuthInputValidationIsFlowSpecific(t *testing.T) {
 	t.Parallel()
-	for _, code := range []string{"1234567", "0000000"} {
+	for _, code := range []string{
+		"1234567", "0000000", "A1b2C3d4E5f6G7h8", "1234567890AbCdEf",
+	} {
 		if !validDirectOAuthCode(yandexdirect.OAuthFlowVerificationCode, code) {
 			t.Fatalf("verification code %q was rejected", code)
 		}
 	}
 	for _, code := range []string{
-		"", "123456", "12345678", "123456a", " 1234567", "1234567 ", "１２３４５６７",
+		"", "123456", "12345678", "123456a", "A1b2C3d4E5f6G7h",
+		"A1b2C3d4E5f6G7h8I", "A1b2C3d4-E5f6G7h", " 1234567", "1234567 ",
+		"１２３４５６７",
 	} {
 		if validDirectOAuthCode(yandexdirect.OAuthFlowVerificationCode, code) {
 			t.Fatalf("invalid verification code %q was accepted", code)

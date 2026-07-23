@@ -1062,11 +1062,15 @@ func validDirectOAuthState(value string) bool {
 
 func validDirectOAuthCode(flow yandexdirect.OAuthFlow, value string) bool {
 	if flow == yandexdirect.OAuthFlowVerificationCode {
-		if len(value) != 7 {
+		if len(value) != 7 && len(value) != 16 {
 			return false
 		}
 		for index := 0; index < len(value); index++ {
-			if value[index] < '0' || value[index] > '9' {
+			character := value[index]
+			isDigit := character >= '0' && character <= '9'
+			isLetter := character >= 'A' && character <= 'Z' ||
+				character >= 'a' && character <= 'z'
+			if !isDigit && (len(value) == 7 || !isLetter) {
 				return false
 			}
 		}

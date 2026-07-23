@@ -230,7 +230,7 @@ func TestOAuthCodeExchangeAndRefreshParseRotatingTokenWithoutLeaks(t *testing.T)
 		switch calls.Add(1) {
 		case 1:
 			if r.Form.Get("grant_type") != "authorization_code" ||
-				r.Form.Get("code") != "seven-digit-code" ||
+				r.Form.Get("code") != "A1b2C3d4E5f6G7h8" ||
 				r.Form.Get("code_verifier") != "pkce-verifier" ||
 				r.Form.Get("client_id") != "client-id" ||
 				r.Form.Get("client_secret") != "client-secret" {
@@ -269,7 +269,7 @@ func TestOAuthCodeExchangeAndRefreshParseRotatingTokenWithoutLeaks(t *testing.T)
 	}
 	client.oauthTokenURL = oauth.URL
 	issued, err := client.ExchangeCode(
-		context.Background(), "seven-digit-code", "pkce-verifier",
+		context.Background(), "A1b2C3d4E5f6G7h8", "pkce-verifier",
 	)
 	if err != nil {
 		t.Fatal(err)

@@ -394,12 +394,13 @@ but accepts only this exact callback:
 
 No other Direct OAuth redirect host or path is accepted. In verification-code
 mode `connect/start` returns a session-, actor-, workspace- and flow-bound
-one-time state. The browser sends the seven-digit code shown by Yandex and that
-state to the authenticated `connect/complete` endpoint. Starting again
-invalidates the previous active attempt for that actor and workspace. A durable
-latest-attempt marker is checked in the same transaction that stores the
-connection, so an older completion already waiting on Yandex cannot overwrite
-the connection after a restart.
+one-time state. The browser sends the 16-character alphanumeric code currently
+shown by Yandex (or its legacy seven-digit code) and that state to the
+authenticated `connect/complete` endpoint. Starting again invalidates the
+previous active attempt for that actor and workspace. A durable latest-attempt
+marker is checked in the same transaction that stores the connection, so an
+older completion already waiting on Yandex cannot overwrite the connection
+after a restart.
 
 Store `DIRECT_OAUTH_CLIENT_ID`, `DIRECT_OAUTH_CLIENT_SECRET`, and
 `DIRECT_TOKEN_DATA_KEY` as production Environment secrets. The token data key
