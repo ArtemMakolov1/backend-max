@@ -97,14 +97,38 @@ WHERE owner_id = ? AND id = ? AND max_chat_id = ? AND active
 func (s *Store) SyncChannelParticipantStatsForUser(ctx context.Context, userID string, channelID int64,
 	expectedMAXChatID, iconURL string, participantsCount int, capturedAt time.Time,
 ) (Channel, error) {
+	return s.syncChannelMAXInfoForUser(ctx, userID, channelID, expectedMAXChatID, Channel{
+		IconURL: iconURL, ParticipantsCount: participantsCount,
+	}, capturedAt, false)
+}
+
+// SyncChannelMAXInfoForUser atomically stores an authoritative single-chat
+// response from MAX and the participant observation it contains. The expected
+// chat ID protects against attaching a delayed response after reconnection.
+// MAXInfoSyncedAt is assigned from syncedAt rather than trusted from the input.
+func (s *Store) SyncChannelMAXInfoForUser(ctx context.Context, userID string, channelID int64,
+	expectedMAXChatID string, info Channel, syncedAt time.Time,
+) (Channel, error) {
+	if info.MAXChatID != "" && info.MAXChatID != expectedMAXChatID {
+		return Channel{}, fmt.Errorf("%w: MAX channel metadata does not match the expected chat", ErrConflict)
+	}
+	return s.syncChannelMAXInfoForUser(ctx, userID, channelID, expectedMAXChatID, info, syncedAt, true)
+}
+
+func (s *Store) syncChannelMAXInfoForUser(ctx context.Context, userID string, channelID int64,
+	expectedMAXChatID string, info Channel, capturedAt time.Time, fullProfile bool,
+) (Channel, error) {
 	if strings.TrimSpace(userID) == "" || channelID <= 0 || strings.TrimSpace(expectedMAXChatID) == "" {
 		return Channel{}, errors.New("channel owner, channel and MAX chat ID are required")
 	}
-	if participantsCount < 0 {
+	if info.ParticipantsCount < 0 {
 		return Channel{}, errors.New("MAX participant count must not be negative")
 	}
+	if info.MessagesCount < 0 {
+		return Channel{}, errors.New("MAX message count must not be negative")
+	}
 	if capturedAt.IsZero() {
-		return Channel{}, errors.New("participant stats capture time is required")
+		return Channel{}, errors.New("MAX channel sync time is required")
 	}
 	capturedAt = capturedAt.UTC()
 
@@ -114,10 +138,11 @@ func (s *Store) SyncChannelParticipantStatsForUser(ctx context.Context, userID s
 	}
 	defer func() { _ = tx.Rollback() }()
 	var currentMAXChatID string
-	var lastSynced sql.NullTime
+	var lastSynced, lastInfoSynced sql.NullTime
 	err = tx.QueryRowContext(ctx, bindSQL(`
-SELECT max_chat_id, participants_stats_synced_at
-FROM channels WHERE owner_id = ? AND id = ? FOR UPDATE`), userID, channelID).Scan(&currentMAXChatID, &lastSynced)
+SELECT max_chat_id, participants_stats_synced_at, max_info_synced_at
+FROM channels WHERE owner_id = ? AND id = ? FOR UPDATE`), userID, channelID).Scan(
+		&currentMAXChatID, &lastSynced, &lastInfoSynced)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Channel{}, ErrNotFound
 	}
@@ -128,19 +153,39 @@ FROM channels WHERE owner_id = ? AND id = ? FOR UPDATE`), userID, channelID).Sca
 		return Channel{}, fmt.Errorf("%w: MAX channel changed while participant statistics were being synchronized", ErrConflict)
 	}
 	// A delayed upstream response must never replace a more recent observation.
-	if lastSynced.Valid && capturedAt.Before(lastSynced.Time.UTC()) {
+	if (lastSynced.Valid && capturedAt.Before(lastSynced.Time.UTC())) ||
+		(fullProfile && lastInfoSynced.Valid && capturedAt.Before(lastInfoSynced.Time.UTC())) {
 		if err := tx.Commit(); err != nil {
 			return Channel{}, fmt.Errorf("commit stale channel participant stats no-op: %w", err)
 		}
 		return s.getChannelForOwner(ctx, userID, channelID)
 	}
-	result, err := tx.ExecContext(ctx, bindSQL(`
+	var result sql.Result
+	if fullProfile {
+		var maxLastEventTime any
+		if info.MAXLastEventTime != nil {
+			maxLastEventTime = info.MAXLastEventTime.UTC()
+		}
+		result, err = tx.ExecContext(ctx, bindSQL(`
+UPDATE channels
+SET title = CASE WHEN trim(?) <> '' THEN ? ELSE title END,
+    description = ?, public_link = ?, icon_url = ?, participants_count = ?,
+    is_public = ?, messages_count = ?, has_pinned_message = ?, max_last_event_time = ?,
+    max_info_synced_at = ?, participants_stats_synced_at = ?,
+    participants_stats_attempted_at = ?, updated_at = ?
+WHERE owner_id = ? AND id = ? AND max_chat_id = ?`),
+			info.Title, info.Title, info.Description, info.PublicLink, info.IconURL, info.ParticipantsCount,
+			info.IsPublic, info.MessagesCount, info.HasPinnedMessage, maxLastEventTime,
+			capturedAt, capturedAt, capturedAt, capturedAt, userID, channelID, expectedMAXChatID)
+	} else {
+		result, err = tx.ExecContext(ctx, bindSQL(`
 UPDATE channels
 SET icon_url = ?, participants_count = ?, participants_stats_synced_at = ?,
     participants_stats_attempted_at = ?, updated_at = ?
 WHERE owner_id = ? AND id = ? AND max_chat_id = ?`),
-		iconURL, participantsCount, capturedAt, capturedAt, capturedAt,
-		userID, channelID, expectedMAXChatID)
+			info.IconURL, info.ParticipantsCount, capturedAt, capturedAt, capturedAt,
+			userID, channelID, expectedMAXChatID)
+	}
 	if err != nil {
 		return Channel{}, fmt.Errorf("sync channel participant stats: %w", err)
 	}
@@ -155,7 +200,7 @@ ON CONFLICT(channel_id, observed_on) DO UPDATE SET
     captured_at = excluded.captured_at,
     participants_count = excluded.participants_count
 WHERE excluded.captured_at >= channel_participant_snapshots.captured_at`),
-		channelID, observedOn, capturedAt, participantsCount); err != nil {
+		channelID, observedOn, capturedAt, info.ParticipantsCount); err != nil {
 		return Channel{}, fmt.Errorf("upsert channel participant snapshot: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

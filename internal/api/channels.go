@@ -145,15 +145,7 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	candidate, err := s.app.PrepareChannelClaim(ctx, request.PublicLink, request.MAXChatID)
 	if err != nil {
-		if errors.Is(err, app.ErrMAXChannelEventRequired) {
-			s.problem(w, http.StatusUnprocessableEntity, "max_channel_event_required",
-				"MAX не передал ID этого уже подключённого канала. Опубликуйте в канале любой новый пост, затем нажмите „Обновить список“.",
-				map[string]any{"action": "publish_post_and_refresh"})
-			return
-		}
-		if errors.Is(err, store.ErrNotFound) || strings.Contains(err.Error(), "first add") {
-			s.problem(w, http.StatusUnprocessableEntity, "bot_not_observed",
-				"Сначала добавьте помощника MaxPosty администратором канала и повторите подключение", nil)
+		if s.writeChannelConnectPrerequisiteError(w, err) {
 			return
 		}
 		s.writeError(w, err)
@@ -184,6 +176,9 @@ func (s *Server) startChannelConnect(w http.ResponseWriter, r *http.Request) {
 		s.problem(w, http.StatusConflict, "channel_already_connected", "Канал уже подключён к другому аккаунту", nil)
 		return
 	case !errors.Is(connectErr, store.ErrNotFound):
+		if s.writeChannelConnectPrerequisiteError(w, connectErr) {
+			return
+		}
 		s.writeError(w, connectErr)
 		return
 	}
@@ -248,6 +243,34 @@ createClaim:
 			"public_link": candidate.Info.Link, "icon_url": maxclient.SafeAssetURL(candidate.Info.Icon.URL)},
 		"message": "Откройте помощника в MAX и подтвердите подключение в личном сообщении",
 	})
+}
+
+func (s *Server) writeChannelConnectPrerequisiteError(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, app.ErrMAXChannelEventRequired):
+		s.problem(w, http.StatusUnprocessableEntity, "max_channel_event_required",
+			"MAX ещё не передал канал помощнику. Добавьте помощника администратором канала, опубликуйте новый пост и нажмите «Обновить список».",
+			map[string]any{"action": "add_helper_publish_and_refresh"})
+		return true
+	case errors.Is(err, store.ErrNotFound) || strings.Contains(err.Error(), "first add"):
+		s.problem(w, http.StatusUnprocessableEntity, "bot_not_observed",
+			"Сначала добавьте помощника MaxPosty в канал и назначьте его администратором.",
+			map[string]any{"action": "add_helper_as_admin"})
+		return true
+	case errors.Is(err, app.ErrMAXChannelMetadataIncomplete):
+		s.problem(w, http.StatusUnprocessableEntity, "bot_not_ready",
+			"Помощник видит канал, но ещё не получил данные владельца. Назначьте его администратором и нажмите «Обновить список».",
+			map[string]any{"action": "promote_helper_and_refresh"})
+		return true
+	}
+	var maxErr *maxclient.Error
+	if errors.As(err, &maxErr) && (maxErr.StatusCode == http.StatusForbidden || maxErr.StatusCode == http.StatusNotFound) {
+		s.problem(w, http.StatusUnprocessableEntity, "bot_not_channel_admin",
+			"MAX не дал помощнику доступ к каналу. Добавьте его в канал, назначьте администратором и повторите подключение.",
+			map[string]any{"action": "add_helper_as_admin"})
+		return true
+	}
+	return false
 }
 
 func safeRequesterLabel(value string) string {
@@ -499,6 +522,17 @@ func (s *Server) decodeChannelMAXInfoForm(w http.ResponseWriter, r *http.Request
 		cleanups = append(cleanups, func() { _ = form.RemoveAll() })
 	}
 	var update app.ChannelMAXInfoUpdate
+	if values := r.MultipartForm.Value["notify"]; len(values) > 0 {
+		switch strings.ToLower(strings.TrimSpace(values[0])) {
+		case "true":
+			update.Notify = true
+		case "false", "":
+			update.Notify = false
+		default:
+			s.problem(w, http.StatusBadRequest, "validation_error", "notify must be true or false", nil)
+			return fail()
+		}
+	}
 	if titles := r.MultipartForm.Value["title"]; len(titles) > 0 {
 		title := strings.TrimSpace(titles[0])
 		if title == "" || utf8.RuneCountInString(title) > 200 {

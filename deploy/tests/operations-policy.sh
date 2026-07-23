@@ -112,6 +112,12 @@ env \
   S3_HOST=https://s3.example.test \
   S3_ACCESS_KEY=test-access-key \
   S3_SECRET_KEY=test-secret-key+/= \
+  YOOKASSA_SHOP_ID=123456 \
+  YOOKASSA_SECRET_KEY=test_live_secret_key \
+  YOOKASSA_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+  BILLING_ENFORCEMENT_ENABLED=false \
+  BILLING_LIVE_ENABLED=false \
+  YOOKASSA_RECEIPTS_CONFIRMED=false \
   "$repo_root/deploy/render-production-env.sh" "$production_env"
 production_alertmanager="$sandbox/alertmanager.yml"
 "$renderer" "$production_env" "$production_alertmanager"
@@ -154,6 +160,12 @@ env \
   S3_HOST=https://s3.example.test \
   S3_ACCESS_KEY=test-access-key \
   S3_SECRET_KEY=test-secret-key+/= \
+  YOOKASSA_SHOP_ID=123456 \
+  YOOKASSA_SECRET_KEY=test_live_secret_key \
+  YOOKASSA_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+  BILLING_ENFORCEMENT_ENABLED=false \
+  BILLING_LIVE_ENABLED=false \
+  YOOKASSA_RECEIPTS_CONFIRMED=false \
   "$repo_root/deploy/render-production-env.sh" "$without_alerts_env"
 without_alerts_config="$sandbox/alertmanager-disabled.yml"
 "$renderer" "$without_alerts_env" "$without_alerts_config"

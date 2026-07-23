@@ -147,3 +147,61 @@ func TestObservedChatRefreshRequiresVerifiedOwner(t *testing.T) {
 		t.Fatalf("verified MAX owner refresh = %#v, %v", stored, err)
 	}
 }
+
+func TestSyncChannelMAXInfoStoresFullProfileAndRejectsStaleResponse(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "channel-max-info.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	channel, err := storage.CreateChannel(ctx, Channel{
+		MAXChatID: "3001", Title: "Old", Description: "Old description", IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventAt := time.Date(2044, time.June, 1, 10, 0, 0, 0, time.UTC)
+	syncedAt := eventAt.Add(time.Minute)
+	channel, err = storage.SyncChannelMAXInfoForUser(ctx, channel.UserID, channel.ID, channel.MAXChatID, Channel{
+		MAXChatID: channel.MAXChatID, Title: "Fresh", Description: "Fresh description",
+		PublicLink: "https://max.ru/fresh", IconURL: "https://cdn.max.ru/fresh.png",
+		ParticipantsCount: 77, IsPublic: true, MessagesCount: 1234, HasPinnedMessage: true,
+		MAXLastEventTime: &eventAt,
+	}, syncedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.Title != "Fresh" || channel.Description != "Fresh description" || !channel.IsPublic ||
+		channel.MessagesCount != 1234 || !channel.HasPinnedMessage || channel.ParticipantsCount != 77 ||
+		channel.MAXLastEventTime == nil || !channel.MAXLastEventTime.Equal(eventAt) ||
+		channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(syncedAt) {
+		t.Fatalf("full MAX profile sync = %#v", channel)
+	}
+	participantOnlyAt := syncedAt.Add(time.Second)
+	channel, err = storage.SyncChannelParticipantStatsForUser(ctx, channel.UserID, channel.ID, channel.MAXChatID,
+		"https://cdn.max.ru/fresh-v2.png", 78, participantOnlyAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.Description != "Fresh description" || !channel.IsPublic || channel.MessagesCount != 1234 ||
+		!channel.HasPinnedMessage || channel.MAXLastEventTime == nil || !channel.MAXLastEventTime.Equal(eventAt) ||
+		channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(syncedAt) {
+		t.Fatalf("participant-only sync lost MAX profile: %#v", channel)
+	}
+
+	staleAt := syncedAt.Add(-time.Second)
+	staleEvent := eventAt.Add(-time.Hour)
+	channel, err = storage.SyncChannelMAXInfoForUser(ctx, channel.UserID, channel.ID, channel.MAXChatID, Channel{
+		MAXChatID: channel.MAXChatID, Title: "Stale", Description: "Stale description",
+		ParticipantsCount: 1, MessagesCount: 1, MAXLastEventTime: &staleEvent,
+	}, staleAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.Title != "Fresh" || channel.Description != "Fresh description" || channel.MessagesCount != 1234 ||
+		channel.MAXInfoSyncedAt == nil || !channel.MAXInfoSyncedAt.Equal(syncedAt) {
+		t.Fatalf("stale MAX profile replaced current data: %#v", channel)
+	}
+}

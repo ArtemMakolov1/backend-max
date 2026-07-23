@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -311,6 +313,27 @@ func newAIQuotaTestServer(
 	options AILimitOptions,
 	userIDs ...string,
 ) (*Server, *store.Store, http.Handler) {
+	return newAIQuotaTestServerWithPaidPlan(t, image, research, options, true, userIDs...)
+}
+
+func newFreeAIQuotaTestServer(
+	t *testing.T,
+	image app.ImageClient,
+	research app.ResearchClient,
+	options AILimitOptions,
+	userIDs ...string,
+) (*Server, *store.Store, http.Handler) {
+	return newAIQuotaTestServerWithPaidPlan(t, image, research, options, false, userIDs...)
+}
+
+func newAIQuotaTestServerWithPaidPlan(
+	t *testing.T,
+	image app.ImageClient,
+	research app.ResearchClient,
+	options AILimitOptions,
+	activatePaid bool,
+	userIDs ...string,
+) (*Server, *store.Store, http.Handler) {
 	t.Helper()
 	storage, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "ai-quota.db"))
 	if err != nil {
@@ -320,6 +343,9 @@ func newAIQuotaTestServer(
 	for _, userID := range userIDs {
 		if err := storage.UpsertUser(context.Background(), store.User{ID: userID, DisplayName: userID}); err != nil {
 			t.Fatal(err)
+		}
+		if activatePaid {
+			activatePaidWorkspaceForAPITest(t, storage, userID, personalWorkspaceIDForTest(t, storage, userID), "solo")
 		}
 	}
 	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
@@ -332,6 +358,47 @@ func newAIQuotaTestServer(
 		YandexClient: &fakeYandexOAuth{}, AILimits: &options,
 	})
 	return server, storage, server.Handler()
+}
+
+func activatePaidWorkspaceForAPITest(
+	t *testing.T, storage *store.Store, ownerUserID, workspaceID, planCode string,
+) {
+	t.Helper()
+	now := time.Now().UTC().Add(-time.Minute)
+	attempt, err := storage.CreateBillingCheckoutAttempt(
+		context.Background(), ownerUserID, workspaceID, planCode, true,
+		store.BillingRecurringConsentVersion,
+		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", now,
+	)
+	if err != nil {
+		t.Fatalf("create paid API test fixture: %v", err)
+	}
+	providerPaymentID := "api-test-" + attempt.ID
+	if _, err := storage.AttachBillingProviderPayment(
+		context.Background(), attempt.ID, providerPaymentID, "", now.Add(time.Second),
+	); err != nil {
+		t.Fatalf("attach paid API test fixture: %v", err)
+	}
+	dedupe := sha256.Sum256([]byte("paid-api-fixture:" + attempt.ID))
+	processed, err := storage.ReconcileBillingPayment(
+		context.Background(), "payment.succeeded", hex.EncodeToString(dedupe[:]),
+		store.BillingCanonicalPayment{
+			ProviderPaymentID:   providerPaymentID,
+			Status:              "succeeded",
+			Paid:                true,
+			AmountMinor:         attempt.AmountMinor,
+			CurrencyCode:        attempt.CurrencyCode,
+			PaymentMethodID:     "api-test-method-" + attempt.ID,
+			PaymentMethodSaved:  true,
+			MetadataAttemptID:   attempt.ID,
+			MetadataWorkspaceID: workspaceID,
+			OccurredAt:          now.Add(2 * time.Second),
+		},
+		now.Add(2*time.Second),
+	)
+	if err != nil || !processed {
+		t.Fatalf("activate paid API test fixture: processed=%v err=%v", processed, err)
+	}
 }
 
 func testAILimitOptions() AILimitOptions {

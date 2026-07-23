@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/email"
@@ -61,6 +62,8 @@ type Server struct {
 	sessionTTL             time.Duration
 	secureCookies          bool
 	oauthStartLimiter      *keyedWindowLimiter
+	yooWebhookLimiter      *keyedWindowLimiter
+	yooWebhookSlots        chan struct{}
 	aiLimiter              *aiRequestLimiter
 	mediaUploads           *mediaUploadGate
 	trustXRealIP           bool
@@ -90,6 +93,8 @@ func New(application *app.App, logger *slog.Logger, frontendOrigin, webhookSecre
 		frontendOrigin: strings.TrimRight(frontendOrigin, "/"), webhookSecret: webhookSecret,
 		sessionTTL:        12 * time.Hour,
 		oauthStartLimiter: newKeyedWindowLimiter(12, 600, time.Minute, 4096), now: time.Now,
+		yooWebhookLimiter:   newKeyedWindowLimiter(30, 240, time.Minute, 4096),
+		yooWebhookSlots:     make(chan struct{}, 8),
 		mediaUploads:        newMediaUploadGate(8, 2),
 		observabilityAdmins: make(map[string]struct{}), activityUsers: make(map[string]struct{}),
 		maxOwnedTeamWorkspaces: 5,
@@ -151,6 +156,7 @@ func (s *Server) Handler() http.Handler {
 		r.Get("/health", s.health)
 		r.Get("/plans", s.listPublicBillingPlans)
 		r.Post("/webhooks/max", s.maxWebhook)
+		r.Post("/webhooks/yookassa", s.yooKassaWebhook)
 		r.Get("/auth/session", s.authSession)
 		r.Post("/auth/yandex/start", s.startYandexAuth)
 		r.Get("/auth/yandex/callback", s.finishYandexAuth)
@@ -169,6 +175,12 @@ func (s *Server) Handler() http.Handler {
 			r.Route("/workspaces/{workspace_id}", func(r chi.Router) {
 				r.Get("/", s.getWorkspace)
 				r.Get("/billing", s.getWorkspaceBilling)
+				r.Post("/billing/checkout", s.createWorkspaceBillingCheckout)
+				r.Post("/billing/cancellation-intent", s.createWorkspaceBillingCancellationIntent)
+				r.Post("/billing/retention-offer", s.acceptWorkspaceBillingRetentionOffer)
+				r.Post("/billing/cancel-confirm", s.confirmWorkspaceBillingCancellation)
+				r.Post("/billing/resume", s.resumeWorkspaceBilling)
+				r.Post("/billing/payment-method/detach", s.detachWorkspaceBillingPaymentMethod)
 				r.Patch("/", s.updateWorkspace)
 				r.Delete("/", s.deleteWorkspace)
 				s.RegisterWorkspaceBrandRoutes(r)
@@ -190,6 +202,8 @@ func (s *Server) Handler() http.Handler {
 				r.Get("/channels/{channel_id}", s.getWorkspaceChannel)
 				r.Patch("/channels/{channel_id}", s.updateWorkspaceChannel)
 				r.Post("/channels/{channel_id}/max-info", s.updateWorkspaceChannelMAXInfo)
+				r.Post("/channels/{channel_id}/description/suggest", s.suggestWorkspaceChannelDescription)
+				r.Post("/channels/{channel_id}/test", s.testWorkspaceChannel)
 				r.Delete("/channels/{channel_id}", s.deleteWorkspaceChannel)
 				r.Get("/posts", s.listWorkspacePosts)
 				r.Post("/posts", s.createWorkspacePost)
@@ -246,6 +260,7 @@ func (s *Server) Handler() http.Handler {
 			r.Put("/channels/{id}", s.updateChannel)
 			r.Delete("/channels/{id}", s.deleteChannel)
 			r.Post("/channels/{id}/max-info", s.updateChannelMAXInfo)
+			r.Post("/channels/{id}/description/suggest", s.suggestChannelDescription)
 			r.Post("/channels/{id}/test", s.testChannel)
 			r.Get("/channels/{id}/participant-history", s.getChannelParticipantHistory)
 			r.Get("/analytics", s.getAnalytics)
@@ -515,6 +530,47 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	if err == nil {
 		return
 	}
+	var upgradeErr *store.WorkspacePlanUpgradeRequiredError
+	if errors.As(err, &upgradeErr) {
+		w.Header().Set("Cache-Control", "no-store")
+		s.problem(w, http.StatusForbidden, "plan_upgrade_required",
+			"Эта функция доступна на платном тарифе.", map[string]any{"feature": upgradeErr.Feature})
+		return
+	}
+	var usageLimitErr *store.WorkspaceUsageLimitError
+	if errors.As(err, &usageLimitErr) {
+		retryAfter := retryAfterSeconds(usageLimitErr.RetryAfter)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+		s.problem(w, http.StatusConflict, "plan_limit_exceeded",
+			"Лимит тарифа исчерпан.", map[string]any{
+				"resource": usageLimitErr.Metric, "limit": usageLimitErr.Limit,
+				"used": usageLimitErr.Used, "requested": usageLimitErr.Requested,
+				"retry_after_seconds": retryAfter,
+			})
+		return
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		resource := ""
+		switch pgErr.ConstraintName {
+		case "workspace_channels_entitlement":
+			resource = "channels"
+		case "workspace_seats_entitlement":
+			resource = "seats"
+		case "workspace_storage_entitlement":
+			resource = "storage_bytes"
+		case "workspace_static_entitlement_overage":
+			resource = "workspace_resources"
+		case "workspace_entitlement_unavailable":
+			resource = "subscription"
+		}
+		if resource != "" {
+			s.problem(w, http.StatusConflict, "plan_limit_exceeded",
+				"Достигнут лимит тарифа.", map[string]any{"resource": resource})
+			return
+		}
+	}
 	var planInactiveErr *store.WorkspacePlanInactiveError
 	if errors.As(err, &planInactiveErr) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -553,6 +609,27 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, store.ErrBillingConsentRequired):
+		s.problem(w, http.StatusBadRequest, "recurring_consent_required",
+			"Для подключения автопродления нужно отдельное согласие.", nil)
+	case errors.Is(err, store.ErrBillingOwnerRequired):
+		s.problem(w, http.StatusForbidden, "workspace_forbidden",
+			"Управлять подпиской может только владелец рабочего пространства.", nil)
+	case errors.Is(err, store.ErrBillingPlanUnavailable):
+		s.problem(w, http.StatusUnprocessableEntity, "billing_plan_unavailable",
+			"Выбранный тариф недоступен для подключения.", nil)
+	case errors.Is(err, store.ErrBillingIntentInvalid):
+		s.problem(w, http.StatusUnprocessableEntity, "billing_intent_invalid",
+			"Подтверждение отмены истекло или уже использовано.", nil)
+	case errors.Is(err, store.ErrBillingConflict):
+		s.problem(w, http.StatusConflict, "billing_conflict",
+			"Состояние подписки изменилось. Обновите страницу и повторите действие.", nil)
+	case errors.Is(err, app.ErrBillingNotConfigured):
+		s.problem(w, http.StatusServiceUnavailable, "billing_not_configured",
+			"Оплата временно недоступна.", nil)
+	case errors.Is(err, app.ErrPaymentProvider):
+		s.problem(w, http.StatusBadGateway, "payment_provider_error",
+			"ЮKassa временно не ответила. Платёж можно безопасно повторить.", nil)
 	case errors.Is(err, app.ErrApprovalRequired):
 		s.problem(w, http.StatusConflict, "post_approval_required",
 			"The current post revision must be approved before scheduling or publishing.", nil)

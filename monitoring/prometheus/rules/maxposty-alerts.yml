@@ -133,6 +133,15 @@ groups:
           summary: "Планировщик завершает задачи с ошибками"
           description: "За последние 10 минут планировщик не смог выполнить одну или несколько задач."
 
+      - alert: MaxPostyBillingManualReview
+        expr: max(maxposty_scheduler_due_items{job="billing_manual_review"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Платёж MaxPosty требует ручной сверки"
+          description: "Остановите новые списания, выполните canonical GET в YooKassa и следуйте docs/yookassa-activation.md; повторный POST запрещён."
+
   - name: maxposty-postgresql
     rules:
       - alert: MaxPostyPostgreSQLConnectionsHigh

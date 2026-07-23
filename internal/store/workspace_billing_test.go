@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -29,26 +30,42 @@ func TestBillingCatalogKeepsFuturePlansInternalAndCreatesFreeSubscriptions(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(public) != 1 || public[0].Plan.Code != "free" || public[0].Plan.MonthlyPriceMinor != 0 ||
-		!public[0].Plan.Public || !public[0].Plan.Available || len(public[0].Entitlements) != 6 {
+	if len(public) != 3 || public[0].Plan.Code != "free" || public[0].Plan.Version != 2 ||
+		public[0].Plan.MonthlyPriceMinor != 0 || !public[0].Plan.Public ||
+		!public[0].Plan.Available || len(public[0].Entitlements) != 6 {
 		t.Fatalf("public catalog = %#v", public)
 	}
 	image := entitlementByKey(t, public[0].Entitlements, "ai_images_monthly")
-	if image.Limit != 3 || image.LimitBaseUnits != 27 || image.UnitScale != 9 ||
+	if image.Limit != 0 || image.LimitBaseUnits != 0 || image.UnitScale != 9 ||
 		image.UsageMetric != UsageMetricAIImageCredits || !image.HardLimit {
 		t.Fatalf("free image entitlement = %#v", image)
 	}
-	if channels := entitlementByKey(t, public[0].Entitlements, "channels"); channels.HardLimit {
-		t.Fatalf("channels must remain display-only before paid launch: %#v", channels)
+	if channels := entitlementByKey(t, public[0].Entitlements, "channels"); !channels.HardLimit {
+		t.Fatalf("channel limit must be enforced after paid launch: %#v", channels)
 	}
 	format := entitlementByKey(t, public[0].Entitlements, "ai_format_monthly")
-	if format.Limit != 10 || format.UsageMetric != UsageMetricAIFormatRequests {
+	if format.Limit != 0 || format.UsageMetric != UsageMetricAIFormatRequests {
 		t.Fatalf("free format entitlement = %#v", format)
 	}
 
-	wantPrices := map[string]int64{"free": 0, "solo": 149000, "pro": 549000, "agency": 1599000}
+	wantPrices := map[string]int64{"free": 0, "solo": 99000, "pro": 249000}
+	for _, entry := range public {
+		if entry.Plan.Code == "free" {
+			if entry.RecurringConsentText != "" || entry.RecurringConsentVersion != "" {
+				t.Fatalf("Free unexpectedly has recurring consent: %#v", entry)
+			}
+			continue
+		}
+		if entry.RecurringConsentVersion != BillingRecurringConsentVersion ||
+			entry.RecurringConsentTermsVersion != BillingRecurringTermsVersion ||
+			entry.RecurringConsentTermsURL != BillingRecurringTermsURL ||
+			!strings.Contains(entry.RecurringConsentText, entry.Plan.Name) ||
+			!strings.Contains(entry.RecurringConsentText, "до отмены подписки") {
+			t.Fatalf("paid consent is not authoritative: %#v", entry)
+		}
+	}
 	rows, err := storage.db.QueryContext(ctx, `SELECT plan_code,monthly_price_minor,public,available
-FROM billing_plan_versions ORDER BY plan_code`)
+FROM billing_plan_versions WHERE public=TRUE AND available=TRUE ORDER BY monthly_price_minor`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,8 +79,8 @@ FROM billing_plan_versions ORDER BY plan_code`)
 			t.Fatal(err)
 		}
 		seen[code] = price
-		if code != "free" && (isPublic || available) {
-			t.Fatalf("internal plan %s is public=%v available=%v", code, isPublic, available)
+		if !isPublic || !available {
+			t.Fatalf("public plan %s is public=%v available=%v", code, isPublic, available)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -79,18 +96,39 @@ FROM billing_plan_versions ORDER BY plan_code`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.AddWorkspaceMember(ctx, "billing-owner", WorkspaceMember{
-		WorkspaceID: workspace.ID, UserID: "billing-viewer", Role: WorkspaceRoleViewer,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	state, err := storage.GetWorkspaceBillingState(ctx, "billing-viewer", workspace.ID,
+	state, err := storage.GetWorkspaceBillingState(ctx, "billing-owner", workspace.ID,
 		time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Subscription.Plan.Code != "free" || state.Subscription.Status != "active" || len(state.Usage) != 6 {
+	if state.Subscription.Plan.Code != "free" || state.Subscription.Plan.Version != 2 ||
+		state.Subscription.Status != "active" || len(state.Usage) != 6 || state.Features.AIImages {
 		t.Fatalf("workspace billing state = %#v", state)
+	}
+	attempt, err := storage.CreateBillingCheckoutAttempt(
+		ctx, "billing-owner", workspace.ID, "solo", true, BillingRecurringConsentVersion,
+		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var storedVersion, storedText, storedTermsVersion, storedTermsURL string
+	if err := storage.db.QueryRowContext(ctx, `SELECT consent_version,consent_text,terms_version,terms_url
+FROM billing_recurring_consents WHERE payment_attempt_id=$1`, attempt.ID).Scan(
+		&storedVersion, &storedText, &storedTermsVersion, &storedTermsURL,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var soloConsent string
+	for _, entry := range public {
+		if entry.Plan.Code == "solo" {
+			soloConsent = entry.RecurringConsentText
+		}
+	}
+	if storedVersion != BillingRecurringConsentVersion || storedText != soloConsent ||
+		storedTermsVersion != BillingRecurringTermsVersion || storedTermsURL != BillingRecurringTermsURL {
+		t.Fatalf("stored consent does not match catalog: version=%q text=%q terms=%q url=%q",
+			storedVersion, storedText, storedTermsVersion, storedTermsURL)
 	}
 	if _, err := storage.GetWorkspaceBillingState(ctx, "billing-outsider", workspace.ID, time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("outsider billing error=%v, want ErrNotFound", err)
@@ -112,46 +150,51 @@ func TestMonthlyUsageObserveAndEnforceAreAtomicAndQuantityBased(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	periodID := seedBillingContract(
+		t, storage, workspace.ID, "solo",
+		time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC), "sealed-usage-method",
+	)
 
-	// Observe mode records an expensive high-quality request even though the
-	// Free allowance is only 27 credits.
+	// Observe mode records usage even after the paid allowance is exhausted.
 	usage, err := storage.ChargeWorkspaceMonthlyUsage(
-		ctx, workspace.ID, UsageMetricAIImageCredits, 36, false, now)
-	if err != nil || usage.Quantity != 36 {
+		ctx, workspace.ID, UsageMetricAIImageCredits, 109, false, now)
+	if err != nil || usage.Quantity != 109 {
 		t.Fatalf("observe charge = %#v, %v", usage, err)
 	}
 	usage, err = storage.ChargeWorkspaceMonthlyUsage(
 		ctx, workspace.ID, UsageMetricAIImageCredits, 1, false, now.Add(time.Minute))
-	if err != nil || usage.Quantity != 37 {
+	if err != nil || usage.Quantity != 110 {
 		t.Fatalf("second observe charge = %#v, %v", usage, err)
 	}
 
 	_, err = storage.ChargeWorkspaceMonthlyUsage(
 		ctx, workspace.ID, UsageMetricAIImageCredits, 1, true, now.Add(2*time.Minute))
 	var limitErr *WorkspaceUsageLimitError
-	if !errors.As(err, &limitErr) || limitErr.Limit != 27 || limitErr.Used != 37 || limitErr.Requested != 1 {
+	if !errors.As(err, &limitErr) || limitErr.Limit != 108 || limitErr.Used != 110 || limitErr.Requested != 1 {
 		t.Fatalf("enforced error = %#v (%v)", limitErr, err)
 	}
 	var stored int64
-	if err := storage.db.QueryRowContext(ctx, `SELECT quantity FROM workspace_usage_monthly
-WHERE workspace_id=$1 AND period_start=DATE '2026-07-01' AND metric=$2`,
-		workspace.ID, UsageMetricAIImageCredits).Scan(&stored); err != nil {
+	if err := storage.db.QueryRowContext(ctx, `SELECT quantity FROM workspace_usage_periods
+WHERE subscription_period_id=$1 AND workspace_id=$2 AND metric=$3`,
+		periodID, workspace.ID, UsageMetricAIImageCredits).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored != 37 {
+	if stored != 110 {
 		t.Fatalf("rejected charge changed quantity to %d", stored)
 	}
 
-	// Metrics and months are independent; a new month starts from zero.
+	// Metrics are independent, while paid usage remains in the immutable
+	// provider period even when that period crosses a calendar-month boundary.
 	format, err := storage.ChargeWorkspaceMonthlyUsage(
 		ctx, workspace.ID, UsageMetricAIFormatRequests, 4, true, now)
 	if err != nil || format.Quantity != 4 {
 		t.Fatalf("format charge = %#v, %v", format, err)
 	}
-	august, err := storage.ChargeWorkspaceMonthlyUsage(
-		ctx, workspace.ID, UsageMetricAIImageCredits, 27, true, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
-	if err != nil || august.Quantity != 27 || !august.PeriodStart.Equal(time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)) {
-		t.Fatalf("August charge = %#v, %v", august, err)
+	_, err = storage.ChargeWorkspaceMonthlyUsage(
+		ctx, workspace.ID, UsageMetricAIImageCredits, 1, true, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	if !errors.As(err, &limitErr) {
+		t.Fatalf("calendar rollover reset a paid-period quota: %v", err)
 	}
 }
 
@@ -170,6 +213,7 @@ func TestInactiveWorkspaceSubscriptionRejectsUsageWithoutCharging(t *testing.T) 
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	seedBillingContract(t, storage, workspace.ID, "solo", now.AddDate(0, -1, 0), now.AddDate(0, 1, 0), "sealed-inactive-method")
 
 	for _, status := range []string{"paused", "canceled"} {
 		if err := storage.UpdateWorkspaceSubscriptionStatus(ctx, workspace.ID, status, now); err != nil {
@@ -187,7 +231,7 @@ func TestInactiveWorkspaceSubscriptionRejectsUsageWithoutCharging(t *testing.T) 
 
 	var stored int64
 	err = storage.db.QueryRowContext(ctx, `SELECT COALESCE(sum(quantity),0)
-FROM workspace_usage_monthly WHERE workspace_id=$1`, workspace.ID).Scan(&stored)
+FROM workspace_usage_periods WHERE workspace_id=$1`, workspace.ID).Scan(&stored)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,6 +245,40 @@ FROM workspace_usage_monthly WHERE workspace_id=$1`, workspace.ID).Scan(&stored)
 		ctx, workspace.ID, UsageMetricAIImageCredits, 1, true, now.Add(time.Minute))
 	if err != nil || usage.Quantity != 1 {
 		t.Fatalf("reactivated charge = %#v, %v", usage, err)
+	}
+}
+
+func TestFreePlanAlwaysRejectsAIFeaturesEvenInObserveMode(t *testing.T) {
+	storage, err := Open(context.Background(), filepath.Join(t.TempDir(), "billing-free-ai.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	ctx := context.Background()
+	if err := storage.UpsertUser(ctx, User{ID: "free-owner", DisplayName: "Owner"}); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := storage.CreateWorkspace(ctx, "free-owner", Workspace{Name: "Free team"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = storage.ChargeWorkspaceMonthlyUsage(
+		ctx, workspace.ID, UsageMetricAIFormatRequests, 1, false, time.Now().UTC())
+	var upgrade *WorkspacePlanUpgradeRequiredError
+	if !errors.As(err, &upgrade) || upgrade.Feature != "ai_format" {
+		t.Fatalf("free AI error=%#v (%v)", upgrade, err)
+	}
+}
+
+func TestFreePlanNeverAdvertisesLegacyAIEntitlementsAsFeatures(t *testing.T) {
+	features := billingFeatures("free", []BillingEntitlement{
+		{UsageMetric: UsageMetricAIImageCredits, LimitBaseUnits: 27},
+		{UsageMetric: UsageMetricAIResearchRequests, LimitBaseUnits: 3},
+		{UsageMetric: UsageMetricAIFormatRequests, LimitBaseUnits: 10},
+	})
+	if features.AIImages || features.AIResearch || features.AIFormat ||
+		features.AIChannelDescription || features.AIBrandKit {
+		t.Fatalf("legacy Free advertised premium AI features: %#v", features)
 	}
 }
 

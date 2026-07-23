@@ -314,15 +314,17 @@ start_monitoring() {
 
   # An exporter HTTP endpoint can be healthy while its database connection is
   # broken. Gate the release on the exporters' own connection metrics instead
-  # of accepting a stale or disconnected monitoring stack.
+  # of accepting a stale or disconnected monitoring stack. Do not use grep -q
+  # here: with pipefail it closes a real, long metrics stream early and turns
+  # the producer's expected SIGPIPE into a false deployment failure.
   if ! compose "$bundle_dir" "$environment_file" "$release_file" exec -T postgres-exporter \
-    wget -q -O - http://127.0.0.1:9187/metrics | grep -Eq '^pg_up 1(\.0)?$'; then
+    wget -q -O - http://127.0.0.1:9187/metrics | grep -E '^pg_up 1(\.0)?$' >/dev/null; then
     compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color postgres-exporter >&2 || true
     echo "PostgreSQL exporter is healthy but cannot query PostgreSQL" >&2
     return 1
   fi
   if ! compose "$bundle_dir" "$environment_file" "$release_file" exec -T pgbouncer-exporter \
-    wget -q -O - http://127.0.0.1:9127/metrics | grep -Eq '^pgbouncer_up 1(\.0)?$'; then
+    wget -q -O - http://127.0.0.1:9127/metrics | grep -E '^pgbouncer_up 1(\.0)?$' >/dev/null; then
     compose "$bundle_dir" "$environment_file" "$release_file" logs --tail=120 --no-color pgbouncer-exporter >&2 || true
     echo "PgBouncer exporter is healthy but cannot query PgBouncer" >&2
     return 1

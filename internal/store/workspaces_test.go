@@ -113,6 +113,9 @@ func TestWorkspaceMembershipInvitationAndOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, workspace.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-agency-method")
 	if !workspace.ApprovalRequired || !workspace.RequireDistinctApprover ||
 		workspace.CompatOwnerUserID == "test-owner" || !strings.HasPrefix(workspace.CompatOwnerUserID, "workspace_compat_") {
 		t.Fatalf("team defaults=%#v", workspace)
@@ -130,6 +133,9 @@ WHERE owner_user_id=$1 AND is_personal`, workspace.CompatOwnerUserID).Scan(&synt
 	})
 	if err != nil || member.Role != WorkspaceRoleEditor {
 		t.Fatalf("add editor=%#v err=%v", member, err)
+	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "test-owner", workspace.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := storage.TransferWorkspaceOwnership(ctx, "test-owner", workspace.ID, "editor"); err != nil {
 		t.Fatal(err)
@@ -180,12 +186,18 @@ func TestWorkspaceOwnershipTransferSerializesConcurrentRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, workspace.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-ownership-race-method")
 	for _, userID := range []string{"transfer-first", "transfer-second"} {
 		if _, err := storage.AddWorkspaceMember(ctx, "test-owner", WorkspaceMember{
 			WorkspaceID: workspace.ID, UserID: userID, Role: WorkspaceRoleEditor,
 		}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "test-owner", workspace.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
 	}
 
 	results := make(chan error, 2)
@@ -236,9 +248,15 @@ func TestOwnedTeamWorkspaceLimitSerializesCreateAndTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, incoming.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-incoming-method")
 	if _, err := storage.AddWorkspaceMember(ctx, "quota-source", WorkspaceMember{
 		WorkspaceID: incoming.ID, UserID: "quota-candidate", Role: WorkspaceRoleEditor,
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "quota-source", incoming.ID, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -312,6 +330,10 @@ func TestWorkspaceReviewInvalidationCommentsAndArchiveAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	billingEnd := billingNow.AddDate(0, 1, 0)
+	seedBillingContract(t, storage, workspace.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingEnd, "sealed-review-team-method")
 	for userID, role := range map[string]string{"editor": WorkspaceRoleEditor, "approver": WorkspaceRoleApprover} {
 		if _, err := storage.AddWorkspaceMember(ctx, "test-owner", WorkspaceMember{WorkspaceID: workspace.ID, UserID: userID, Role: role}); err != nil {
 			t.Fatal(err)
@@ -473,6 +495,14 @@ VALUES($1,$2,$3,'image',0,'attachment.png',10,'image/png')`,
 	if err := storage.DeleteChannel(ctx, channel.ID); err != nil {
 		t.Fatal(err)
 	}
+	if err := storage.DetachBillingPaymentMethod(ctx, "test-owner", workspace.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if attempt, downgraded, err := storage.PrepareBillingRenewal(
+		ctx, workspace.ID, billingEnd.Add(time.Second),
+	); err != nil || attempt != nil || !downgraded {
+		t.Fatalf("end paid fixture before archive: attempt=%#v downgraded=%v err=%v", attempt, downgraded, err)
+	}
 	archiveTokenHash := strings.Repeat("f", 64)
 	archiveInvite, err := storage.CreateWorkspaceInvitation(ctx, "test-owner", WorkspaceInvitation{
 		WorkspaceID: workspace.ID, Role: WorkspaceRoleViewer, TokenHash: archiveTokenHash,
@@ -521,6 +551,9 @@ func TestDecidePostReviewSurvivesRemovedRevisionAuthor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, workspace.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-review-orphans-method")
 	for userID, role := range map[string]string{"editor": WorkspaceRoleEditor, "approver": WorkspaceRoleApprover} {
 		if _, err := storage.AddWorkspaceMember(ctx, "test-owner", WorkspaceMember{WorkspaceID: workspace.ID, UserID: userID, Role: role}); err != nil {
 			t.Fatal(err)
@@ -563,6 +596,10 @@ func TestWorkspaceQuotasAreIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
+	seedBillingContract(t, storage, first.ID, "pro",
+		now.AddDate(0, -1, 0), now.AddDate(0, 1, 0), "sealed-first-quota-method")
+	seedBillingContract(t, storage, second.ID, "pro",
+		now.AddDate(0, -1, 0), now.AddDate(0, 1, 0), "sealed-second-quota-method")
 	limits := AILimits{PerMinute: 1, PerDay: 1, MaxConcurrent: 2, LeaseTTL: time.Minute}
 	if _, err := storage.AcquireWorkspaceAILease(ctx, first.ID, AIOperationImage, limits, now); err != nil {
 		t.Fatal(err)

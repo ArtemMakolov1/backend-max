@@ -5,6 +5,8 @@ repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 production_compose="$repo_root/deploy/compose.production.yaml"
 local_compose="$repo_root/compose.yaml"
 prometheus_image='prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893'
+security_workflow="$repo_root/.github/workflows/security.yml"
+monitoring_trivy_ignore="$repo_root/.github/trivy/monitoring-images.yaml"
 
 if [[ $(grep -c '^    ports:$' "$production_compose") -ne 1 ]] ||
   ! grep -F '127.0.0.1:19090:9090' "$production_compose" >/dev/null; then
@@ -24,6 +26,25 @@ for image in \
     exit 1
   }
 done
+
+if [[ $(grep -c '^  - id:' "$monitoring_trivy_ignore") -ne 1 ]] ||
+  ! grep -Fx '  - id: GHSA-hrxh-6v49-42gf' "$monitoring_trivy_ignore" >/dev/null ||
+  ! grep -Fx '    expired_at: 2026-08-05' "$monitoring_trivy_ignore" >/dev/null ||
+  ! grep -Fx '      - pkg:golang/google.golang.org/grpc@v1.81.1' "$monitoring_trivy_ignore" >/dev/null; then
+  echo "Monitoring Trivy exception must remain singular, version-scoped, and time-limited" >&2
+  exit 1
+fi
+for target in bin/prometheus bin/promtool usr/share/grafana/bin/grafana; do
+  grep -Fx "      - $target" "$monitoring_trivy_ignore" >/dev/null || {
+    echo "Monitoring Trivy exception is missing exact target: $target" >&2
+    exit 1
+  }
+done
+if [[ $(grep -Fc 'trivyignores: ".github/trivy/monitoring-images.yaml"' "$security_workflow") -ne 2 ]] ||
+  [[ $(grep -Fc 'trivyignores: ${{ matrix.trivyignores }}' "$security_workflow") -ne 1 ]]; then
+  echo "Temporary Trivy exception must apply only to Prometheus and Grafana image scans" >&2
+  exit 1
+fi
 
 grep -F -- '--storage.tsdb.retention.time=30d' "$production_compose" >/dev/null
 grep -F -- '--storage.tsdb.retention.size=5GB' "$production_compose" >/dev/null
@@ -45,8 +66,12 @@ grep -F 'GF_SECURITY_DATA_SOURCE_PROXY_WHITELIST: prometheus:9090' "$production_
 grep -F 'ipv4_address: 172.29.42.20' "$production_compose" >/dev/null
 grep -F 'name: maxposty-monitoring-edge' "$production_compose" >/dev/null
 grep -F '127.0.0.1:${GRAFANA_PORT:-3000}:3000' "$local_compose" >/dev/null
-grep -F "grep -Eq '^pg_up 1" "$repo_root/deploy/deploy-production.sh" >/dev/null
-grep -F "grep -Eq '^pgbouncer_up 1" "$repo_root/deploy/deploy-production.sh" >/dev/null
+grep -F "grep -E '^pg_up 1(\\.0)?$' >/dev/null" "$repo_root/deploy/deploy-production.sh" >/dev/null
+grep -F "grep -E '^pgbouncer_up 1(\\.0)?$' >/dev/null" "$repo_root/deploy/deploy-production.sh" >/dev/null
+if grep -E "grep -E?q .*\^(pg|pgbouncer)_up" "$repo_root/deploy/deploy-production.sh" >/dev/null; then
+  echo "Exporter connection gates must consume the complete metrics stream under pipefail" >&2
+  exit 1
+fi
 grep -F 'wait_for_prometheus_target' "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F 'wait_for_prometheus_alertmanager' "$repo_root/deploy/deploy-production.sh" >/dev/null
 grep -F 'wait_for_grafana_provisioning' "$repo_root/deploy/deploy-production.sh" >/dev/null

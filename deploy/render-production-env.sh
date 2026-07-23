@@ -8,6 +8,8 @@ if [[ -z "$output" ]]; then
 fi
 
 deploy_stage=${DEPLOY_STAGE:-bootstrap}
+billing_live_enabled=${BILLING_LIVE_ENABLED:-false}
+yookassa_receipts_confirmed=${YOOKASSA_RECEIPTS_CONFIRMED:-false}
 if [[ "$deploy_stage" != "bootstrap" && "$deploy_stage" != "production" ]]; then
   echo "DEPLOY_STAGE must be bootstrap or production" >&2
   exit 1
@@ -30,6 +32,9 @@ if [[ "$deploy_stage" == "production" ]]; then
     S3_ACCESS_KEY
     S3_SECRET_KEY
   )
+	if [[ "$billing_live_enabled" == "true" ]]; then
+		required_secret_names+=(YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY)
+	fi
 fi
 for name in "${required_secret_names[@]}"; do
   if [[ -z "${!name:-}" ]]; then
@@ -68,6 +73,10 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_smtp_password=''
   rendered_smtp_from_email=''
   rendered_smtp_from_name=MaxPosty
+  rendered_yookassa_shop_id=''
+  rendered_yookassa_secret_key=''
+  rendered_yookassa_data_key=''
+  rendered_yookassa_return_url=''
 else
   public_base_url=https://maxposty.ru
   frontend_origin=https://maxposty.ru
@@ -96,6 +105,13 @@ else
   rendered_smtp_password=${SMTP_PASSWORD:-}
   rendered_smtp_from_email=${SMTP_FROM_EMAIL:-}
   rendered_smtp_from_name=${SMTP_FROM_NAME:-MaxPosty}
+  rendered_yookassa_shop_id=${YOOKASSA_SHOP_ID:-}
+  rendered_yookassa_secret_key=${YOOKASSA_SECRET_KEY:-}
+  rendered_yookassa_data_key=${YOOKASSA_DATA_KEY:-}
+  rendered_yookassa_return_url=''
+  if [[ -n "$rendered_yookassa_shop_id" ]]; then
+    rendered_yookassa_return_url=https://maxposty.ru/app/?billing=pending#/workspace/settings/plan
+  fi
 fi
 
 {
@@ -137,7 +153,7 @@ fi
   printf 'S3_BUCKET=%s\n' "$rendered_s3_bucket"
   printf 'S3_REGION=%s\n' "$rendered_s3_region"
   printf 'MEDIA_USER_MAX_FILES=%s\n' "${MEDIA_USER_MAX_FILES:-500}"
-  printf 'MEDIA_USER_MAX_BYTES=%s\n' "${MEDIA_USER_MAX_BYTES:-1073741824}"
+  printf 'MEDIA_USER_MAX_BYTES=%s\n' "${MEDIA_USER_MAX_BYTES:-10737418240}"
   printf 'MEDIA_ORPHAN_GRACE_PERIOD=%s\n' "${MEDIA_ORPHAN_GRACE_PERIOD:-24h}"
   printf 'MEDIA_CLEANUP_INTERVAL=%s\n' "${MEDIA_CLEANUP_INTERVAL:-15m}"
   printf 'MEDIA_CLEANUP_BATCH_SIZE=%s\n' "${MEDIA_CLEANUP_BATCH_SIZE:-50}"
@@ -160,6 +176,12 @@ fi
   printf 'AI_RESEARCH_PER_DAY=%s\n' "${AI_RESEARCH_PER_DAY:-20}"
   printf 'AI_LEASE_TTL=%s\n' "${AI_LEASE_TTL:-4m}"
   printf 'BILLING_ENFORCEMENT_ENABLED=%s\n' "${BILLING_ENFORCEMENT_ENABLED:-false}"
+  printf 'BILLING_LIVE_ENABLED=%s\n' "$billing_live_enabled"
+  printf 'YOOKASSA_RECEIPTS_CONFIRMED=%s\n' "$yookassa_receipts_confirmed"
+  printf 'YOOKASSA_SHOP_ID=%s\n' "$rendered_yookassa_shop_id"
+  printf 'YOOKASSA_SECRET_KEY=%s\n' "$rendered_yookassa_secret_key"
+  printf 'YOOKASSA_DATA_KEY=%s\n' "$rendered_yookassa_data_key"
+  printf 'YOOKASSA_RETURN_URL=%s\n' "$rendered_yookassa_return_url"
   printf 'SCHEDULER_INTERVAL=%s\n' "${SCHEDULER_INTERVAL:-15s}"
   printf 'BACKUP_RETENTION_DAYS=%s\n' "${BACKUP_RETENTION_DAYS:-14}"
   printf 'PITR_RETENTION_DAYS=%s\n' "${PITR_RETENTION_DAYS:-7}"

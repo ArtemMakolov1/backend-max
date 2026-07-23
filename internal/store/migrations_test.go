@@ -335,7 +335,7 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "020_future_additive.sql"
+	const futureVersion = "022_future_additive.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {
@@ -628,10 +628,10 @@ func TestChannelIconBackfillAcceptsOnlyOfficialMAXAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `
-INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title, created_at, updated_at)
-VALUES ('owner', 'max-owner', 'safe-chat', 'Safe', $1, $1),
-       ('owner', 'max-owner', 'unsafe-chat', 'Unsafe', $1, $1),
-	   ('owner', 'max-owner', 'fragment-chat', 'Fragment', $1, $1)`, now); err != nil {
+INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title, active, created_at, updated_at)
+VALUES ('owner', 'max-owner', 'safe-chat', 'Safe', FALSE, $1, $1),
+       ('owner', 'max-owner', 'unsafe-chat', 'Unsafe', FALSE, $1, $1),
+	   ('owner', 'max-owner', 'fragment-chat', 'Fragment', FALSE, $1, $1)`, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `
