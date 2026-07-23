@@ -329,6 +329,31 @@ ORDER BY created_at,id LIMIT 1`, workspaceID).Scan(&openBillingAttemptID)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("inspect workspace payment attempts: %w", err)
 	}
+	var directCampaignID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM direct_campaigns
+WHERE workspace_id=$1
+  AND (
+    launch_state IN ('launching','reconciling')
+    OR status = 'active'
+    OR launch_state='failed'
+  )
+ORDER BY id LIMIT 1`, workspaceID).Scan(&directCampaignID)
+	if err == nil {
+		return fmt.Errorf("%w: reconcile or stop active Yandex Direct campaigns before archiving", ErrConflict)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect Yandex Direct campaign lifecycle: %w", err)
+	}
+	var directConnectionID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM direct_connections
+WHERE workspace_id=$1 AND revoked_at IS NULL
+ORDER BY id LIMIT 1`, workspaceID).Scan(&directConnectionID)
+	if err == nil {
+		return fmt.Errorf("%w: disconnect Yandex Direct before archiving", ErrConflict)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect Yandex Direct connection lifecycle: %w", err)
+	}
 	// Connected channels must be disconnected first: archived workspaces reject
 	// the channel UPDATEs issued by MAX webhook handlers, and the channel's
 	// max_chat_id would stay claimed by the archived workspace forever.

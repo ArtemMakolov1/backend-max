@@ -31,6 +31,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     POSTGRES_DB|POSTGRES_OWNER_USER|POSTGRES_OWNER_PASSWORD|POSTGRES_APP_USER|POSTGRES_APP_PASSWORD|POSTGRES_MONITOR_USER|POSTGRES_MONITOR_PASSWORD|\
     PGBOUNCER_DEFAULT_POOL_SIZE|PGBOUNCER_MIN_POOL_SIZE|PGBOUNCER_RESERVE_POOL_SIZE|PGBOUNCER_MAX_CLIENT_CONN|\
     PUBLIC_BASE_URL|FRONTEND_ORIGIN|GRAFANA_ROOT_URL|GRAFANA_ADMIN_PASSWORD|GRAFANA_SECRET_KEY|ALERTMANAGER_WEBHOOK_URL|AUTH_BOOTSTRAP_MODE|YANDEX_CLIENT_ID|YANDEX_CLIENT_SECRET|YANDEX_REDIRECT_URI|YANDEX_ALLOWED_USERS|OBSERVABILITY_ADMIN_USERS|\
+    DIRECT_OAUTH_CLIENT_ID|DIRECT_OAUTH_CLIENT_SECRET|DIRECT_OAUTH_REDIRECT_URI|DIRECT_TOKEN_DATA_KEY|DIRECT_API_BASE_URL|DIRECT_WRITES_ENABLED|DIRECT_AUTO_LAUNCH_ENABLED|DIRECT_SANDBOX|\
     AUTH_SESSION_TTL|WORKSPACE_MAX_OWNED_TEAM_WORKSPACES|OAUTH_TRUST_X_REAL_IP|OAUTH_RATE_LIMIT_AT_EDGE|MAX_API_BASE_URL|MAX_BOT_TOKEN|\
     MAX_WEBHOOK_SECRET|MAX_WEBHOOK_URL|MAX_CA_CERT_FILE|S3_HOST|S3_ACCESS_KEY|S3_SECRET_KEY|S3_BUCKET|S3_REGION|\
     MEDIA_USER_MAX_FILES|MEDIA_USER_MAX_BYTES|MEDIA_ORPHAN_GRACE_PERIOD|MEDIA_CLEANUP_INTERVAL|MEDIA_CLEANUP_BATCH_SIZE|\
@@ -61,6 +62,7 @@ required_keys=(
   POSTGRES_DB POSTGRES_OWNER_USER POSTGRES_OWNER_PASSWORD POSTGRES_APP_USER POSTGRES_APP_PASSWORD POSTGRES_MONITOR_USER POSTGRES_MONITOR_PASSWORD
   PGBOUNCER_DEFAULT_POOL_SIZE PGBOUNCER_MIN_POOL_SIZE PGBOUNCER_RESERVE_POOL_SIZE PGBOUNCER_MAX_CLIENT_CONN
   PUBLIC_BASE_URL FRONTEND_ORIGIN GRAFANA_ROOT_URL GRAFANA_ADMIN_PASSWORD GRAFANA_SECRET_KEY ALERTMANAGER_WEBHOOK_URL AUTH_BOOTSTRAP_MODE YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI OBSERVABILITY_ADMIN_USERS
+  DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY DIRECT_API_BASE_URL DIRECT_WRITES_ENABLED DIRECT_AUTO_LAUNCH_ENABLED DIRECT_SANDBOX
   AUTH_SESSION_TTL WORKSPACE_MAX_OWNED_TEAM_WORKSPACES OAUTH_TRUST_X_REAL_IP OAUTH_RATE_LIMIT_AT_EDGE MAX_API_BASE_URL MAX_BOT_TOKEN
   MAX_WEBHOOK_SECRET MAX_WEBHOOK_URL MAX_CA_CERT_FILE S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION
   MEDIA_USER_MAX_FILES MEDIA_USER_MAX_BYTES MEDIA_ORPHAN_GRACE_PERIOD MEDIA_CLEANUP_INTERVAL MEDIA_CLEANUP_BATCH_SIZE
@@ -87,13 +89,38 @@ for key in "${nonempty_keys[@]}"; do
   fi
 done
 
-for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET MAX_BOT_TOKEN OPENAI_API_KEY OPENAI_IMAGE_MODEL OPENAI_RESEARCH_MODEL; do
+for key in YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET MAX_BOT_TOKEN OPENAI_API_KEY OPENAI_IMAGE_MODEL OPENAI_RESEARCH_MODEL; do
   value=$(env_value "$key")
   if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9._~:/+@,=-]+$ ]]; then
     echo "Production environment key contains unsupported characters: $key" >&2
     exit 1
   fi
 done
+
+direct_oauth_client_id=$(env_value DIRECT_OAUTH_CLIENT_ID)
+direct_oauth_client_secret=$(env_value DIRECT_OAUTH_CLIENT_SECRET)
+direct_oauth_redirect_uri=$(env_value DIRECT_OAUTH_REDIRECT_URI)
+direct_token_data_key=$(env_value DIRECT_TOKEN_DATA_KEY)
+direct_parts=0
+for value in "$direct_oauth_client_id" "$direct_oauth_client_secret" "$direct_oauth_redirect_uri" "$direct_token_data_key"; do
+  if [[ -n "$value" ]]; then
+    direct_parts=$((direct_parts + 1))
+  fi
+done
+if [[ "$direct_parts" -ne 0 && "$direct_parts" -ne 4 ]]; then
+  echo "DIRECT_OAUTH_CLIENT_ID, DIRECT_OAUTH_CLIENT_SECRET, DIRECT_OAUTH_REDIRECT_URI and DIRECT_TOKEN_DATA_KEY must be configured together" >&2
+  exit 1
+fi
+if [[ "$direct_parts" -eq 4 ]]; then
+  [[ "$direct_oauth_redirect_uri" == "https://maxposty.ru/api/v1/advertising/direct/oauth/callback" ]] || {
+    echo "DIRECT_OAUTH_REDIRECT_URI must be the MaxPosty Yandex Direct callback" >&2
+    exit 1
+  }
+  [[ "$direct_token_data_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || {
+    echo "DIRECT_TOKEN_DATA_KEY must be standard base64 for 32 bytes" >&2
+    exit 1
+  }
+fi
 
 value=$(env_value YANDEX_ALLOWED_USERS)
 if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9._@,+-]+$ ]]; then
@@ -259,6 +286,41 @@ expect_exact MAX_API_BASE_URL "https://platform-api2.max.ru"
 expect_exact MAX_WEBHOOK_URL "https://maxposty.ru/api/v1/webhooks/max"
 expect_exact OPENAI_API_BASE_URL "https://api.openai.com"
 
+case "$(env_value DIRECT_WRITES_ENABLED)" in
+  true|false) ;;
+  *) echo "DIRECT_WRITES_ENABLED must be true or false" >&2; exit 1 ;;
+esac
+case "$(env_value DIRECT_AUTO_LAUNCH_ENABLED)" in
+  true|false) ;;
+  *) echo "DIRECT_AUTO_LAUNCH_ENABLED must be true or false" >&2; exit 1 ;;
+esac
+case "$(env_value DIRECT_SANDBOX)" in
+  true)
+    expect_exact DIRECT_API_BASE_URL "https://api-sandbox.direct.yandex.com/json/v5"
+    ;;
+  false)
+    expect_exact DIRECT_API_BASE_URL "https://api.direct.yandex.com/json/v501"
+    ;;
+  *)
+    echo "DIRECT_SANDBOX must be true or false" >&2
+    exit 1
+    ;;
+esac
+if [[ "$(env_value DIRECT_WRITES_ENABLED)" == "true" && "$direct_parts" -ne 4 ]]; then
+  echo "DIRECT_WRITES_ENABLED requires complete Yandex Direct credentials" >&2
+  exit 1
+fi
+if [[ "$(env_value DIRECT_AUTO_LAUNCH_ENABLED)" == "true" ]]; then
+  [[ "$(env_value DIRECT_WRITES_ENABLED)" == "true" ]] || {
+    echo "DIRECT_AUTO_LAUNCH_ENABLED requires DIRECT_WRITES_ENABLED=true" >&2
+    exit 1
+  }
+  [[ "$direct_parts" -eq 4 ]] || {
+    echo "DIRECT_AUTO_LAUNCH_ENABLED requires complete Yandex Direct credentials" >&2
+    exit 1
+  }
+fi
+
 case "$(env_value BILLING_ENFORCEMENT_ENABLED)" in
   true|false) ;;
   *)
@@ -287,7 +349,11 @@ case "$bootstrap_mode" in
     expect_exact PUBLIC_BASE_URL "http://178.159.94.83"
     expect_exact FRONTEND_ORIGIN "http://178.159.94.83"
     expect_exact GRAFANA_ROOT_URL "http://178.159.94.83/monitoring/"
-    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY YOOKASSA_RETURN_URL SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+    expect_exact DIRECT_SANDBOX "true"
+    expect_exact DIRECT_API_BASE_URL "https://api-sandbox.direct.yandex.com/json/v5"
+    expect_exact DIRECT_WRITES_ENABLED "false"
+    expect_exact DIRECT_AUTO_LAUNCH_ENABLED "false"
+    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY YOOKASSA_RETURN_URL SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
       if [[ -n "$(env_value "$key")" ]]; then
         echo "$key must be empty in fail-closed bootstrap mode" >&2
         exit 1

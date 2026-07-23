@@ -48,6 +48,7 @@ const (
 	defaultMediaOrphanGrace         = 24 * time.Hour
 	defaultMediaCleanupInterval     = 15 * time.Minute
 	defaultMediaCleanupBatch        = 50
+	directAutomationCycleTimeout    = 45 * time.Second
 )
 
 type MAXClient interface {
@@ -217,6 +218,11 @@ type App struct {
 	billingManualReviewMu        sync.Mutex
 	billingManualReviewLastCount int
 	billingManualReviewLastLog   time.Time
+	direct                       DirectProvider
+	directCipher                 *directTokenCipher
+	directWritesEnabled          bool
+	directAutoLaunchEnabled      bool
+	directSandbox                bool
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {
@@ -2052,6 +2058,36 @@ func (a *App) RunScheduler(ctx context.Context, interval time.Duration) {
 			a.runSchedulerCycle(ctx, a.now().UTC())
 		}
 	}
+}
+
+// RunDirectAutomation owns provider polling and spend-capable Direct writes.
+// It runs independently so a slow provider cannot delay MAX publications,
+// billing reconciliation, or media cleanup.
+func (a *App) RunDirectAutomation(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		a.logger.Error("Direct automation interval must be positive", "interval", interval)
+		return
+	}
+	if !a.DirectConfigured() {
+		return
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			a.runDirectAutomationCycle(ctx)
+			timer.Reset(interval)
+		}
+	}
+}
+
+func (a *App) runDirectAutomationCycle(ctx context.Context) {
+	cycleCtx, cancel := context.WithTimeout(ctx, directAutomationCycleTimeout)
+	defer cancel()
+	a.RunDirectAutoLaunchOnce(cycleCtx, 4)
 }
 
 func (a *App) runSchedulerCycle(ctx context.Context, now time.Time) {

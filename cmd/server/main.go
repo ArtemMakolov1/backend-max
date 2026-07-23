@@ -26,6 +26,7 @@ import (
 	"maxpilot/backend/internal/openairesearch"
 	"maxpilot/backend/internal/store"
 	"maxpilot/backend/internal/yandexauth"
+	"maxpilot/backend/internal/yandexdirect"
 	"maxpilot/backend/internal/yookassa"
 )
 
@@ -113,6 +114,33 @@ func main() {
 	}
 
 	application := app.NewWithMetrics(storage, mediaStore, maxAPI, openAI, research, logger, metrics)
+	if cfg.DirectConfigured() {
+		directClient, err := yandexdirect.New(
+			cfg.DirectAPIBaseURL,
+			cfg.DirectOAuthClientID,
+			cfg.DirectOAuthClientSecret,
+			cfg.DirectOAuthRedirectURI,
+			&http.Client{Timeout: 20 * time.Second},
+		)
+		if err != nil {
+			logger.Error("could not initialize Yandex Direct client", "error", err)
+			os.Exit(1)
+		}
+		if err := application.ConfigureDirect(directClient, cfg.DirectTokenDataKey); err != nil {
+			logger.Error("could not configure Yandex Direct integration", "error", err)
+			os.Exit(1)
+		}
+		if err := application.SetDirectFeatureFlags(
+			cfg.DirectWritesEnabled, cfg.DirectAutoLaunchEnabled,
+		); err != nil {
+			logger.Error("could not apply Yandex Direct feature flags", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("Yandex Direct integration configured",
+			"sandbox", cfg.DirectSandbox,
+			"writes_enabled", cfg.DirectWritesEnabled,
+			"auto_launch_enabled", cfg.DirectAutoLaunchEnabled)
+	}
 	if cfg.YooKassaConfigured() {
 		yooClient, err := yookassa.New(cfg.YooKassaShopID, cfg.YooKassaSecretKey, &http.Client{Timeout: 15 * time.Second})
 		if err != nil {
@@ -197,6 +225,11 @@ func main() {
 		defer close(schedulerDone)
 		application.RunScheduler(rootCtx, cfg.SchedulerInterval)
 	}()
+	directAutomationDone := make(chan struct{})
+	go func() {
+		defer close(directAutomationDone)
+		application.RunDirectAutomation(rootCtx, cfg.SchedulerInterval)
+	}()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -233,6 +266,11 @@ func main() {
 	case <-schedulerDone:
 	case <-time.After(3*time.Minute + 30*time.Second):
 		logger.Error("scheduler did not stop before the shutdown deadline")
+	}
+	select {
+	case <-directAutomationDone:
+	case <-time.After(5 * time.Second):
+		logger.Error("Yandex Direct automation did not stop before the shutdown deadline")
 	}
 	logger.Info("server stopped")
 }

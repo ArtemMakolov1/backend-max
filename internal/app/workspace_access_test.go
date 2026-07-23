@@ -15,23 +15,45 @@ func TestAccessContextForRole(t *testing.T) {
 		forbidden []Capability
 	}{
 		{
-			role:    "owner",
-			allowed: []Capability{CapabilityWorkspaceDelete, CapabilityMembersManage, CapabilityReviewDecide, CapabilityPostsPublish},
+			role: "owner",
+			allowed: []Capability{
+				CapabilityWorkspaceDelete, CapabilityMembersManage, CapabilityReviewDecide,
+				CapabilityPostsPublish, CapabilityAdsRead, CapabilityAdsWrite,
+				CapabilityAdsApprove, CapabilityAdsLaunch, CapabilityAdsBudgetManage,
+				CapabilityAdsCredentialsManage,
+			},
 		},
 		{
-			role:      "editor",
-			allowed:   []Capability{CapabilityPostsWrite, CapabilityCommentsWrite, CapabilityReviewSubmit, CapabilityPostsPublish},
-			forbidden: []Capability{CapabilityMembersManage, CapabilityReviewDecide, CapabilityAuditRead},
+			role: "editor",
+			allowed: []Capability{
+				CapabilityPostsWrite, CapabilityCommentsWrite, CapabilityReviewSubmit,
+				CapabilityPostsPublish, CapabilityAdsRead, CapabilityAdsWrite,
+			},
+			forbidden: []Capability{
+				CapabilityMembersManage, CapabilityReviewDecide, CapabilityAuditRead,
+				CapabilityAdsApprove, CapabilityAdsLaunch, CapabilityAdsBudgetManage,
+				CapabilityAdsCredentialsManage,
+			},
 		},
 		{
-			role:      "approver",
-			allowed:   []Capability{CapabilityPostsRead, CapabilityCommentsWrite, CapabilityReviewDecide},
-			forbidden: []Capability{CapabilityPostsWrite, CapabilityPostsPublish},
+			role: "approver",
+			allowed: []Capability{
+				CapabilityPostsRead, CapabilityCommentsWrite, CapabilityReviewDecide,
+				CapabilityAdsRead, CapabilityAdsApprove,
+			},
+			forbidden: []Capability{
+				CapabilityPostsWrite, CapabilityPostsPublish, CapabilityAdsWrite,
+				CapabilityAdsLaunch, CapabilityAdsBudgetManage, CapabilityAdsCredentialsManage,
+			},
 		},
 		{
-			role:      "viewer",
-			allowed:   []Capability{CapabilityPostsRead, CapabilityCommentsRead},
-			forbidden: []Capability{CapabilityPostsWrite, CapabilityCommentsWrite, CapabilityReviewSubmit},
+			role:    "viewer",
+			allowed: []Capability{CapabilityPostsRead, CapabilityCommentsRead, CapabilityAdsRead},
+			forbidden: []Capability{
+				CapabilityPostsWrite, CapabilityCommentsWrite, CapabilityReviewSubmit,
+				CapabilityAdsWrite, CapabilityAdsApprove, CapabilityAdsLaunch,
+				CapabilityAdsBudgetManage, CapabilityAdsCredentialsManage,
+			},
 		},
 		{role: "unknown", forbidden: []Capability{CapabilityWorkspaceRead, CapabilityPostsRead}},
 	}

@@ -171,6 +171,7 @@ func (s *Server) Handler() http.Handler {
 
 			r.Get("/workspaces", s.listWorkspaces)
 			r.Post("/workspaces", s.createWorkspace)
+			r.Get("/advertising/direct/oauth/callback", s.finishDirectOAuth)
 			r.Post("/workspace-invitations/{token}/accept", s.acceptWorkspaceInvitation)
 			r.Route("/workspaces/{workspace_id}", func(r chi.Router) {
 				r.Get("/", s.getWorkspace)
@@ -186,6 +187,7 @@ func (s *Server) Handler() http.Handler {
 				s.RegisterWorkspaceBrandRoutes(r)
 				s.RegisterAnalyticsContentRoutes(r)
 				s.registerCampaignRoutes(r)
+				s.registerDirectAdvertisingRoutes(r)
 				r.Post("/transfer-ownership", s.transferWorkspaceOwnership)
 				r.Get("/members", s.listWorkspaceMembers)
 				r.Post("/members", s.addWorkspaceMember)
@@ -650,6 +652,39 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrOwnedTeamWorkspaceLimit):
 		s.problem(w, http.StatusConflict, "workspace_owner_limit_reached",
 			"Team workspace ownership limit reached. Transfer ownership before creating or accepting another workspace; archived workspaces still retain their storage.", nil)
+	case errors.Is(err, app.ErrDirectNotConfigured):
+		s.problem(w, http.StatusServiceUnavailable, "direct_not_configured",
+			"Яндекс Директ пока не настроен.", nil)
+	case errors.Is(err, app.ErrDirectWritesDisabled):
+		s.problem(w, http.StatusServiceUnavailable, "direct_writes_disabled",
+			"Изменения в Яндекс Директе временно отключены.", nil)
+	case errors.Is(err, app.ErrDirectAutoLaunchOff):
+		s.problem(w, http.StatusServiceUnavailable, "direct_auto_launch_disabled",
+			"Автозапуск кампаний временно отключён.", nil)
+	case errors.Is(err, app.ErrDirectProvider):
+		s.problem(w, http.StatusBadGateway, "direct_provider_error",
+			"Не удалось выполнить запрос к Яндекс Директу. Попробуйте позже или обновите данные.", nil)
+	case errors.Is(err, app.ErrDirectSnapshotMismatch),
+		errors.Is(err, store.ErrDirectConsentMismatch),
+		errors.Is(err, store.ErrDirectConsentRequired):
+		s.problem(w, http.StatusConflict, "direct_snapshot_changed",
+			"Параметры кампании или рекламного кабинета изменились. Обновите страницу и подтвердите действие заново.", nil)
+	case errors.Is(err, store.ErrDirectConnectionRequired):
+		s.problem(w, http.StatusConflict, "direct_connection_required",
+			"Подключите доступный для изменений кабинет Яндекс Директа.", nil)
+	case errors.Is(err, store.ErrDirectValidation):
+		s.problem(w, http.StatusUnprocessableEntity, "direct_validation_error",
+			"Проверьте параметры рекламной кампании.", nil)
+	case errors.Is(err, store.ErrDirectCampaignNotDraft):
+		s.problem(w, http.StatusConflict, "direct_campaign_not_draft",
+			"Эта кампания уже создана в Яндекс Директе и больше не является локальным черновиком.", nil)
+	case errors.Is(err, store.ErrDirectCampaignNotAccepted):
+		s.problem(w, http.StatusConflict, "direct_campaign_not_accepted",
+			"Яндекс Директ ещё не разрешил запуск этой кампании.", nil)
+	case errors.Is(err, store.ErrDirectLaunchAlreadyClaimed),
+		errors.Is(err, store.ErrDirectLaunchRetryExhausted):
+		s.problem(w, http.StatusConflict, "direct_launch_reconciling",
+			"Запуск уже выполняется или сверяется с Яндекс Директом.", nil)
 	case errors.Is(err, store.ErrNotFound):
 		s.problem(w, http.StatusNotFound, "not_found", "Запрошенные данные не найдены.", nil)
 	case errors.Is(err, store.ErrConflict):

@@ -13,30 +13,36 @@ import (
 type Capability string
 
 const (
-	CapabilityWorkspaceRead       Capability = "workspace.read"
-	CapabilityWorkspaceUpdate     Capability = "workspace.update"
-	CapabilityWorkspaceDelete     Capability = "workspace.delete"
-	CapabilityMembersRead         Capability = "members.read"
-	CapabilityMembersManage       Capability = "members.manage"
-	CapabilityInvitesRead         Capability = "invitations.read"
-	CapabilityInvitesManage       Capability = "invitations.manage"
-	CapabilityChannelsRead        Capability = "channels.read"
-	CapabilityChannelsManage      Capability = "channels.manage"
-	CapabilityPostsRead           Capability = "posts.read"
-	CapabilityPostsWrite          Capability = "posts.write"
-	CapabilityPostsDelete         Capability = "posts.delete"
-	CapabilityMediaRead           Capability = "media.read"
-	CapabilityMediaWrite          Capability = "media.write"
-	CapabilityAIUse               Capability = "ai.use"
-	CapabilityCommentsRead        Capability = "comments.read"
-	CapabilityCommentsWrite       Capability = "comments.write"
-	CapabilityCommentsResolve     Capability = "comments.resolve"
-	CapabilityReviewSubmit        Capability = "review.submit"
-	CapabilityReviewDecide        Capability = "review.decide"
-	CapabilityPostsPublish        Capability = "posts.publish"
-	CapabilityAuditRead           Capability = "audit.read"
-	CapabilityNotificationsRead   Capability = "notifications.read"
-	CapabilityNotificationsManage Capability = "notifications.manage"
+	CapabilityWorkspaceRead        Capability = "workspace.read"
+	CapabilityWorkspaceUpdate      Capability = "workspace.update"
+	CapabilityWorkspaceDelete      Capability = "workspace.delete"
+	CapabilityMembersRead          Capability = "members.read"
+	CapabilityMembersManage        Capability = "members.manage"
+	CapabilityInvitesRead          Capability = "invitations.read"
+	CapabilityInvitesManage        Capability = "invitations.manage"
+	CapabilityChannelsRead         Capability = "channels.read"
+	CapabilityChannelsManage       Capability = "channels.manage"
+	CapabilityPostsRead            Capability = "posts.read"
+	CapabilityPostsWrite           Capability = "posts.write"
+	CapabilityPostsDelete          Capability = "posts.delete"
+	CapabilityMediaRead            Capability = "media.read"
+	CapabilityMediaWrite           Capability = "media.write"
+	CapabilityAIUse                Capability = "ai.use"
+	CapabilityCommentsRead         Capability = "comments.read"
+	CapabilityCommentsWrite        Capability = "comments.write"
+	CapabilityCommentsResolve      Capability = "comments.resolve"
+	CapabilityReviewSubmit         Capability = "review.submit"
+	CapabilityReviewDecide         Capability = "review.decide"
+	CapabilityPostsPublish         Capability = "posts.publish"
+	CapabilityAuditRead            Capability = "audit.read"
+	CapabilityNotificationsRead    Capability = "notifications.read"
+	CapabilityNotificationsManage  Capability = "notifications.manage"
+	CapabilityAdsRead              Capability = "ads.read"
+	CapabilityAdsWrite             Capability = "ads.write"
+	CapabilityAdsApprove           Capability = "ads.approve"
+	CapabilityAdsLaunch            Capability = "ads.launch"
+	CapabilityAdsBudgetManage      Capability = "ads.budget.manage"
+	CapabilityAdsCredentialsManage Capability = "ads.credentials.manage"
 )
 
 // AccessContext is the authorization result for one user and one workspace.
@@ -80,6 +86,8 @@ func AccessContextForRole(workspaceID, userID, role string) AccessContext {
 			CapabilityCommentsRead, CapabilityCommentsWrite, CapabilityCommentsResolve,
 			CapabilityReviewSubmit, CapabilityReviewDecide, CapabilityPostsPublish,
 			CapabilityAuditRead, CapabilityNotificationsRead, CapabilityNotificationsManage,
+			CapabilityAdsRead, CapabilityAdsWrite, CapabilityAdsApprove, CapabilityAdsLaunch,
+			CapabilityAdsBudgetManage, CapabilityAdsCredentialsManage,
 		)
 	case "editor":
 		add(
@@ -90,6 +98,7 @@ func AccessContextForRole(workspaceID, userID, role string) AccessContext {
 			CapabilityCommentsRead, CapabilityCommentsWrite, CapabilityCommentsResolve,
 			CapabilityReviewSubmit, CapabilityPostsPublish,
 			CapabilityNotificationsRead, CapabilityNotificationsManage,
+			CapabilityAdsRead, CapabilityAdsWrite,
 		)
 	case "approver":
 		add(
@@ -97,12 +106,14 @@ func AccessContextForRole(workspaceID, userID, role string) AccessContext {
 			CapabilityChannelsRead, CapabilityPostsRead,
 			CapabilityMediaRead, CapabilityCommentsRead, CapabilityCommentsWrite, CapabilityReviewDecide,
 			CapabilityNotificationsRead, CapabilityNotificationsManage,
+			CapabilityAdsRead, CapabilityAdsApprove,
 		)
 	case "viewer":
 		add(
 			CapabilityWorkspaceRead, CapabilityMembersRead,
 			CapabilityChannelsRead, CapabilityPostsRead, CapabilityMediaRead, CapabilityCommentsRead,
 			CapabilityNotificationsRead, CapabilityNotificationsManage,
+			CapabilityAdsRead,
 		)
 	}
 

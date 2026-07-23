@@ -17,6 +17,20 @@ for billing_flag in BILLING_LIVE_ENABLED YOOKASSA_RECEIPTS_CONFIRMED; do
   grep -F "          $billing_flag: \${{ vars.$billing_flag || 'false' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $billing_flag: \${$billing_flag}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
+for direct_secret in DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_TOKEN_DATA_KEY; do
+  grep -F "          $direct_secret: \${{ secrets.$direct_secret }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+  grep -F "      $direct_secret: \${$direct_secret}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
+for direct_var in DIRECT_OAUTH_REDIRECT_URI DIRECT_API_BASE_URL; do
+  grep -F "          $direct_var: \${{ vars.$direct_var }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+  grep -F "      $direct_var: \${$direct_var}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
+for direct_flag in DIRECT_WRITES_ENABLED DIRECT_AUTO_LAUNCH_ENABLED; do
+  grep -F "          $direct_flag: \${{ vars.$direct_flag || 'false' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+  grep -F "      $direct_flag: \${$direct_flag}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
+grep -F "          DIRECT_SANDBOX: \${{ vars.DIRECT_SANDBOX || 'true' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+grep -F '      DIRECT_SANDBOX: ${DIRECT_SANDBOX}' "$repo_root/deploy/compose.production.yaml" >/dev/null
 
 render_production() {
   local output=$1
@@ -64,6 +78,14 @@ grep -Fx 'MEDIA_ORPHAN_GRACE_PERIOD=24h' "$production_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_INTERVAL=15m' "$production_env" >/dev/null
 grep -Fx 'MEDIA_CLEANUP_BATCH_SIZE=50' "$production_env" >/dev/null
 grep -Fx 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=5' "$production_env" >/dev/null
+grep -Fx 'DIRECT_OAUTH_CLIENT_ID=' "$production_env" >/dev/null
+grep -Fx 'DIRECT_OAUTH_CLIENT_SECRET=' "$production_env" >/dev/null
+grep -Fx 'DIRECT_OAUTH_REDIRECT_URI=' "$production_env" >/dev/null
+grep -Fx 'DIRECT_TOKEN_DATA_KEY=' "$production_env" >/dev/null
+grep -Fx 'DIRECT_API_BASE_URL=https://api-sandbox.direct.yandex.com/json/v5' "$production_env" >/dev/null
+grep -Fx 'DIRECT_WRITES_ENABLED=false' "$production_env" >/dev/null
+grep -Fx 'DIRECT_AUTO_LAUNCH_ENABLED=false' "$production_env" >/dev/null
+grep -Fx 'DIRECT_SANDBOX=true' "$production_env" >/dev/null
 grep -Fx 'BILLING_ENFORCEMENT_ENABLED=false' "$production_env" >/dev/null
 grep -Fx 'BILLING_LIVE_ENABLED=false' "$production_env" >/dev/null
 grep -Fx 'YOOKASSA_RECEIPTS_CONFIRMED=false' "$production_env" >/dev/null
@@ -144,6 +166,30 @@ grep -Fx 'BILLING_ENFORCEMENT_ENABLED=true' "$configured_billing_env" >/dev/null
 grep -Fx 'BILLING_LIVE_ENABLED=true' "$configured_billing_env" >/dev/null
 grep -Fx 'YOOKASSA_RECEIPTS_CONFIRMED=true' "$configured_billing_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_billing_env"
+
+configured_direct_env="$sandbox/configured-direct.env"
+render_production "$configured_direct_env" \
+  DIRECT_OAUTH_CLIENT_ID=direct-client-id \
+  DIRECT_OAUTH_CLIENT_SECRET=direct-client-secret \
+  DIRECT_OAUTH_REDIRECT_URI=https://maxposty.ru/api/v1/advertising/direct/oauth/callback \
+  DIRECT_TOKEN_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+  DIRECT_WRITES_ENABLED=true \
+  DIRECT_AUTO_LAUNCH_ENABLED=true
+grep -Fx 'DIRECT_WRITES_ENABLED=true' "$configured_direct_env" >/dev/null
+grep -Fx 'DIRECT_AUTO_LAUNCH_ENABLED=true' "$configured_direct_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_direct_env"
+
+if render_production "$sandbox/partial-direct.env" \
+  DIRECT_OAUTH_CLIENT_ID=direct-client-id >/dev/null 2>&1; then
+  echo "Production render accepted partial Yandex Direct credentials" >&2
+  exit 1
+fi
+
+if render_production "$sandbox/unsafe-direct-auto-launch.env" \
+  DIRECT_AUTO_LAUNCH_ENABLED=true >/dev/null 2>&1; then
+  echo "Production render accepted Yandex Direct auto-launch without writes and credentials" >&2
+  exit 1
+fi
 
 if render_production "$sandbox/unsafe-live.env" \
   BILLING_LIVE_ENABLED=true BILLING_ENFORCEMENT_ENABLED=true >/dev/null 2>&1; then
@@ -272,6 +318,13 @@ env \
   GRAFANA_SECRET_KEY=grafana_secret_0123456789abcdef0123456789abcdef \
   ALERTMANAGER_WEBHOOK_URL=must-not-leak \
   YANDEX_CLIENT_ID=must-not-leak \
+  DIRECT_OAUTH_CLIENT_ID=must-not-leak \
+  DIRECT_OAUTH_CLIENT_SECRET=must-not-leak \
+  DIRECT_OAUTH_REDIRECT_URI=must-not-leak \
+  DIRECT_TOKEN_DATA_KEY=must-not-leak \
+  DIRECT_WRITES_ENABLED=true \
+  DIRECT_AUTO_LAUNCH_ENABLED=true \
+  DIRECT_SANDBOX=false \
   OBSERVABILITY_ADMIN_USERS=must-not-leak \
   MAX_BOT_TOKEN=must-not-leak \
   S3_HOST=must-not-leak \
@@ -286,7 +339,7 @@ env \
   SMTP_FROM_EMAIL=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

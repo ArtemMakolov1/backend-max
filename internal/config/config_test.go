@@ -119,6 +119,151 @@ func TestLoadAcceptsOAuthWithoutAllowlistForPublicSignup(t *testing.T) {
 	}
 }
 
+func TestLoadKeepsYandexDirectDisabledAndSandboxedByDefault(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DirectConfigured() || cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled {
+		t.Fatalf("Direct must be disabled by default: %#v", cfg)
+	}
+	if !cfg.DirectSandbox || cfg.DirectAPIBaseURL != defaultDirectSandboxAPIBaseURL {
+		t.Fatalf("unexpected Direct sandbox defaults: sandbox=%v base_url=%q",
+			cfg.DirectSandbox, cfg.DirectAPIBaseURL)
+	}
+}
+
+func TestLoadAcceptsCompleteEncryptedYandexDirectConfiguration(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("DIRECT_OAUTH_CLIENT_ID", "direct-client-id")
+	t.Setenv("DIRECT_OAUTH_CLIENT_SECRET", "direct-client-secret")
+	t.Setenv("DIRECT_OAUTH_REDIRECT_URI", "http://localhost:8080/api/v1/advertising/direct/oauth/callback")
+	t.Setenv("DIRECT_TOKEN_DATA_KEY", base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef")))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.DirectConfigured() || len(cfg.DirectTokenDataKey) != 32 {
+		t.Fatalf("Direct configuration was not enabled safely: configured=%v key_bytes=%d",
+			cfg.DirectConfigured(), len(cfg.DirectTokenDataKey))
+	}
+	if cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled {
+		t.Fatalf("spend-capable Direct flags must remain opt-in: %#v", cfg)
+	}
+
+	t.Setenv("DIRECT_SANDBOX", "false")
+	t.Setenv("DIRECT_API_BASE_URL", defaultDirectAPIBaseURL+"/")
+	t.Setenv("DIRECT_WRITES_ENABLED", "true")
+	t.Setenv("DIRECT_AUTO_LAUNCH_ENABLED", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DirectSandbox || !cfg.DirectWritesEnabled || !cfg.DirectAutoLaunchEnabled ||
+		cfg.DirectAPIBaseURL != defaultDirectAPIBaseURL {
+		t.Fatalf("unexpected enabled Direct configuration: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsIncompleteOrUnsafeYandexDirectConfiguration(t *testing.T) {
+	validKey := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	tests := []struct {
+		name  string
+		envs  map[string]string
+		match string
+	}{
+		{
+			name: "partial credentials",
+			envs: map[string]string{
+				"DIRECT_OAUTH_CLIENT_ID": "direct-client-id",
+			},
+			match: "must be configured together",
+		},
+		{
+			name: "short key",
+			envs: map[string]string{
+				"DIRECT_OAUTH_CLIENT_ID":     "direct-client-id",
+				"DIRECT_OAUTH_CLIENT_SECRET": "direct-client-secret",
+				"DIRECT_OAUTH_REDIRECT_URI":  "http://localhost:8080/api/v1/advertising/direct/oauth/callback",
+				"DIRECT_TOKEN_DATA_KEY":      base64.StdEncoding.EncodeToString([]byte("too-short")),
+			},
+			match: "exactly 32 random bytes",
+		},
+		{
+			name: "wrong callback",
+			envs: map[string]string{
+				"DIRECT_OAUTH_CLIENT_ID":     "direct-client-id",
+				"DIRECT_OAUTH_CLIENT_SECRET": "direct-client-secret",
+				"DIRECT_OAUTH_REDIRECT_URI":  "http://localhost:8080/api/v1/auth/yandex/callback",
+				"DIRECT_TOKEN_DATA_KEY":      validKey,
+			},
+			match: "/api/v1/advertising/direct/oauth/callback",
+		},
+		{
+			name: "production base with sandbox flag",
+			envs: map[string]string{
+				"DIRECT_API_BASE_URL": defaultDirectAPIBaseURL,
+			},
+			match: "DIRECT_SANDBOX=true",
+		},
+		{
+			name: "writes without credentials",
+			envs: map[string]string{
+				"DIRECT_WRITES_ENABLED": "true",
+			},
+			match: "complete Direct OAuth credentials",
+		},
+		{
+			name: "auto-launch without writes",
+			envs: map[string]string{
+				"DIRECT_OAUTH_CLIENT_ID":     "direct-client-id",
+				"DIRECT_OAUTH_CLIENT_SECRET": "direct-client-secret",
+				"DIRECT_OAUTH_REDIRECT_URI":  "http://localhost:8080/api/v1/advertising/direct/oauth/callback",
+				"DIRECT_TOKEN_DATA_KEY":      validKey,
+				"DIRECT_AUTO_LAUNCH_ENABLED": "true",
+				"DIRECT_WRITES_ENABLED":      "false",
+			},
+			match: "requires DIRECT_WRITES_ENABLED=true",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			for name, value := range tt.envs {
+				t.Setenv(name, value)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tt.match) {
+				t.Fatalf("Load() error = %v, want containing %q", err, tt.match)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsYandexDirectInBootstrapMode(t *testing.T) {
+	for _, envs := range []map[string]string{
+		{"DIRECT_OAUTH_CLIENT_ID": "must-not-be-present"},
+		{"DIRECT_SANDBOX": "false"},
+		{"DIRECT_API_BASE_URL": defaultDirectAPIBaseURL},
+	} {
+		clearAuthEnv(t)
+		t.Setenv("PUBLIC_BASE_URL", "http://178.159.94.83")
+		t.Setenv("FRONTEND_ORIGIN", "http://178.159.94.83")
+		t.Setenv("AUTH_BOOTSTRAP_MODE", "true")
+		for name, value := range envs {
+			t.Setenv(name, value)
+		}
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "AUTH_BOOTSTRAP_MODE") {
+			t.Fatalf("Load() envs=%v error = %v", envs, err)
+		}
+	}
+}
+
 func TestLoadAllowsOAuthAndMAXWithoutOpenAI(t *testing.T) {
 	clearAuthEnv(t)
 	setValidLocalYandexAuth(t)
@@ -537,6 +682,8 @@ func clearAuthEnv(t *testing.T) {
 	for _, name := range []string{
 		"ADMIN_API_KEY", "YANDEX_CLIENT_ID", "YANDEX_CLIENT_SECRET", "YANDEX_REDIRECT_URI",
 		"YANDEX_ALLOWED_USERS", "OBSERVABILITY_ADMIN_USERS", "AUTH_SESSION_TTL", "ALLOW_INSECURE_NO_AUTH", "AUTH_BOOTSTRAP_MODE", "OAUTH_TRUST_X_REAL_IP",
+		"DIRECT_OAUTH_CLIENT_ID", "DIRECT_OAUTH_CLIENT_SECRET", "DIRECT_OAUTH_REDIRECT_URI",
+		"DIRECT_TOKEN_DATA_KEY", "DIRECT_API_BASE_URL", "DIRECT_WRITES_ENABLED", "DIRECT_AUTO_LAUNCH_ENABLED", "DIRECT_SANDBOX",
 		"OAUTH_RATE_LIMIT_AT_EDGE", "AI_GLOBAL_MAX_CONCURRENT", "AI_USER_MAX_CONCURRENT",
 		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",

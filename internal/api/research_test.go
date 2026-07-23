@@ -37,6 +37,9 @@ type fakeResearchClient struct {
 	descriptionRequests []openairesearch.SuggestChannelDescriptionRequest
 	descriptionResult   openairesearch.SuggestChannelDescriptionResult
 	descriptionErr      error
+	directRequests      []openairesearch.SuggestDirectCampaignRequest
+	directResult        openairesearch.SuggestDirectCampaignResult
+	directErr           error
 }
 
 func (f *fakeResearchClient) Generate(ctx context.Context, request openairesearch.Request) (openairesearch.Result, error) {
@@ -72,6 +75,15 @@ func (f *fakeResearchClient) SuggestChannelDescription(_ context.Context, reques
 	f.descriptionRequests = append(f.descriptionRequests, request)
 	f.mu.Unlock()
 	return f.descriptionResult, f.descriptionErr
+}
+
+func (f *fakeResearchClient) SuggestDirectCampaign(
+	_ context.Context, request openairesearch.SuggestDirectCampaignRequest,
+) (openairesearch.SuggestDirectCampaignResult, error) {
+	f.mu.Lock()
+	f.directRequests = append(f.directRequests, request)
+	f.mu.Unlock()
+	return f.directResult, f.directErr
 }
 
 func TestResearchGenerateReturnsExactContractUnderYandexSession(t *testing.T) {
