@@ -87,7 +87,7 @@ func TestGetChatIsReadOnlyAndPreservesLargeID(t *testing.T) {
 			t.Errorf("Authorization = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"chat_id":-9007199254740993,"type":"channel","status":"active","title":"Новости","link":"https://max.ru/news","icon":{"url":"https://cdn.max.ru/news.png"},"participants_count":12450}`)
+		_, _ = io.WriteString(w, `{"chat_id":-9007199254740993,"type":"channel","status":"active","title":"Новости","description":"Daily product news","link":"https://max.ru/news","icon":{"url":"https://cdn.max.ru/news.png"},"participants_count":12450,"is_public":true,"messages_count":321,"last_event_time":1784741400123,"pinned_message":{"body":{"mid":"pin-1","text":"Welcome"}}}`)
 	}))
 	defer server.Close()
 
@@ -97,8 +97,36 @@ func TestGetChatIsReadOnlyAndPreservesLargeID(t *testing.T) {
 		t.Fatalf("GetChat() error = %v", err)
 	}
 	if chat.ChatID != "-9007199254740993" || chat.Type != "channel" || chat.Status != "active" || chat.Title != "Новости" ||
-		chat.Icon.URL != "https://cdn.max.ru/news.png" || chat.ParticipantsCount != 12450 {
+		chat.Icon.URL != "https://cdn.max.ru/news.png" || chat.ParticipantsCount != 12450 ||
+		chat.Description != "Daily product news" || !chat.IsPublic || chat.MessagesCount != 321 ||
+		chat.LastEventTime != 1784741400123 || !chat.HasPinnedMessage {
 		t.Fatalf("GetChat() = %#v", chat)
+	}
+}
+
+func TestGetChatTreatsMissingAndNullPinnedMessageAsUnpinned(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			_, _ = io.WriteString(w, `{"chat_id":-1,"type":"channel","pinned_message":null}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"chat_id":-1,"type":"channel"}`)
+	}))
+	defer server.Close()
+
+	client := mustClient(t, server.URL, "token", server.Client())
+	for range 2 {
+		chat, err := client.GetChat(context.Background(), "-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chat.HasPinnedMessage {
+			t.Fatalf("GetChat() = %#v, want no pinned message", chat)
+		}
 	}
 }
 
@@ -119,7 +147,7 @@ func TestGetChatAndMembershipAreReadOnly(t *testing.T) {
 		case "/chats/-9223372036854775807":
 			_, _ = io.WriteString(w, `{"chat_id":-9223372036854775807,"owner_id":777,"type":"channel","status":"active","title":"News","link":"https://max.ru/news-room"}`)
 		case "/chats/-9223372036854775807/members/me":
-			_, _ = io.WriteString(w, `{"user_id":42,"first_name":"Bot","is_bot":true,"is_admin":true,"permissions":["read_all_messages","post_edit_delete_message","edit_message","delete_message"]}`)
+			_, _ = io.WriteString(w, `{"user_id":42,"first_name":"Bot","is_bot":true,"is_admin":true,"permissions":["read_all_messages","post_edit_delete_message","edit_message","delete_message","change_chat_info"]}`)
 		default:
 			t.Errorf("unexpected path %q", r.URL.Path)
 			http.NotFound(w, r)
@@ -141,7 +169,7 @@ func TestGetChatAndMembershipAreReadOnly(t *testing.T) {
 	}
 	if !membership.IsAdmin || !membership.HasPermission(PermissionReadAllMessages) ||
 		!membership.HasPermission(PermissionWrite) || !membership.HasPermission(PermissionEdit) ||
-		!membership.HasPermission(PermissionDelete) {
+		!membership.HasPermission(PermissionDelete) || !membership.HasPermission(PermissionChangeChatInfo) {
 		t.Fatalf("unexpected membership: %#v", membership)
 	}
 	if calls.Load() != 2 {
@@ -907,7 +935,8 @@ func TestEditChatPatchesIconAndTitle(t *testing.T) {
 			Icon *struct {
 				Token string `json:"token"`
 			} `json:"icon"`
-			Title *string `json:"title"`
+			Title  *string `json:"title"`
+			Notify *bool   `json:"notify"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("decode body: %v", err)
@@ -918,6 +947,9 @@ func TestEditChatPatchesIconAndTitle(t *testing.T) {
 		if body.Title == nil || *body.Title != "Новое имя" {
 			t.Errorf("body title = %v, want Новое имя", body.Title)
 		}
+		if body.Notify == nil || *body.Notify {
+			t.Errorf("body notify = %v, want false", body.Notify)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"chat_id":-100200300,"owner_id":777,"type":"channel","status":"active","title":"Новое имя","icon":{"url":"https://cdn.max.ru/icons/new.png"},"participants_count":42}`)
 	}))
@@ -925,8 +957,9 @@ func TestEditChatPatchesIconAndTitle(t *testing.T) {
 
 	client := mustClient(t, server.URL, "token", server.Client())
 	title := " Новое имя "
+	notify := false
 	// #nosec G101 -- upload token fixture for the fake MAX server, not a credential.
-	chat, err := client.EditChat(context.Background(), "-100200300", ChatPatch{IconToken: "icon-upload-token", Title: &title})
+	chat, err := client.EditChat(context.Background(), "-100200300", ChatPatch{IconToken: "icon-upload-token", Title: &title, Notify: &notify})
 	if err != nil {
 		t.Fatalf("EditChat() error = %v", err)
 	}

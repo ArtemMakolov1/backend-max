@@ -59,6 +59,9 @@ func TestCampaignBatchScheduleIsAtomicAndApprovalGated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, workspace.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-approval-campaign-method")
 	if _, err := storage.AddWorkspaceMember(ctx, "test-owner", WorkspaceMember{
 		WorkspaceID: workspace.ID, UserID: "campaign-approver", Role: WorkspaceRoleApprover,
 	}); err != nil {

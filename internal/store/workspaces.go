@@ -281,23 +281,24 @@ func (s *Store) DeleteWorkspace(ctx context.Context, actorUserID, workspaceID st
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	access, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
+		"maxstudio:billing:"+workspaceID); err != nil {
 		return err
-	}
-	if access.Member.Role != WorkspaceRoleOwner || access.Workspace.IsPersonal {
-		return ErrConflict
 	}
 	// Serialize archival with FK-backed resource creation and with updates to
 	// existing posts. A workspace with an active or scheduled external
 	// lifecycle must be cleaned up explicitly; otherwise archiving would hide
 	// the only routes that can cancel the schedule or delete the MAX message.
-	var lockedWorkspaceID string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM workspaces
-WHERE id=$1 AND archived_at IS NULL FOR UPDATE`, workspaceID).Scan(&lockedWorkspaceID); errors.Is(err, sql.ErrNoRows) {
+	var lockedOwner string
+	var lockedPersonal bool
+	if err := tx.QueryRowContext(ctx, `SELECT owner_user_id,is_personal FROM workspaces
+WHERE id=$1 AND archived_at IS NULL FOR UPDATE`, workspaceID).Scan(&lockedOwner, &lockedPersonal); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
+	}
+	if lockedPersonal || lockedOwner != actorUserID {
+		return ErrConflict
 	}
 	var activePostID int64
 	err = tx.QueryRowContext(ctx, `SELECT id FROM posts
@@ -308,6 +309,25 @@ ORDER BY id LIMIT 1`, workspaceID).Scan(&activePostID)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("inspect workspace publication lifecycle: %w", err)
+	}
+	var billingStatus string
+	err = tx.QueryRowContext(ctx, `SELECT status FROM billing_subscription_contracts
+WHERE workspace_id=$1 AND status IN ('active','past_due')`, workspaceID).Scan(&billingStatus)
+	if err == nil {
+		return fmt.Errorf("%w: cancel the paid subscription before archiving", ErrConflict)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect workspace billing lifecycle: %w", err)
+	}
+	var openBillingAttemptID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM billing_payment_attempts
+WHERE workspace_id=$1 AND status IN ('prepared','pending','manual_review')
+ORDER BY created_at,id LIMIT 1`, workspaceID).Scan(&openBillingAttemptID)
+	if err == nil {
+		return fmt.Errorf("%w: resolve the pending payment before archiving", ErrConflict)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("inspect workspace payment attempts: %w", err)
 	}
 	// Connected channels must be disconnected first: archived workspaces reject
 	// the channel UPDATEs issued by MAX webhook handlers, and the channel's
@@ -517,12 +537,9 @@ func (s *Store) transferWorkspaceOwnership(
 		return Workspace{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	access, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
+		"maxstudio:billing:"+workspaceID); err != nil {
 		return Workspace{}, err
-	}
-	if access.Member.Role != WorkspaceRoleOwner || access.Workspace.IsPersonal {
-		return Workspace{}, ErrConflict
 	}
 	// Serialize ownership changes on the workspace row. Two requests may both
 	// resolve the actor as owner before either transaction reaches this point;
@@ -538,6 +555,18 @@ WHERE id=$1 AND archived_at IS NULL FOR UPDATE`, workspaceID).Scan(&lockedOwner,
 	}
 	if lockedPersonal || lockedOwner != actorUserID {
 		return Workspace{}, ErrConflict
+	}
+	var billingBlocksTransfer bool
+	if err := tx.QueryRowContext(ctx, `SELECT
+EXISTS(SELECT 1 FROM billing_payment_attempts
+       WHERE workspace_id=$1 AND status IN ('prepared','pending','manual_review')) OR
+EXISTS(SELECT 1 FROM billing_subscription_contracts
+       WHERE workspace_id=$1 AND status IN ('active','past_due') AND payment_method_id<>'')`,
+		workspaceID).Scan(&billingBlocksTransfer); err != nil {
+		return Workspace{}, fmt.Errorf("inspect workspace billing before ownership transfer: %w", err)
+	}
+	if billingBlocksTransfer {
+		return Workspace{}, fmt.Errorf("%w: detach the saved payment method and close pending checkout before transferring ownership", ErrConflict)
 	}
 	var newOwnerRole string
 	if err := tx.QueryRowContext(ctx, `SELECT role FROM workspace_members

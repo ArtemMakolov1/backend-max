@@ -198,6 +198,11 @@ func TestWorkspaceOwnerLimitReturnsDedicatedConflict(t *testing.T) {
 	response := performJSONRequest(handler, http.MethodPost, "/api/v1/workspaces", `{"name":"Over the limit"}`)
 	assertProblemCode(t, response, http.StatusConflict, "workspace_owner_limit_reached")
 
+	if err := fixture.storage.DetachBillingPaymentMethod(
+		t.Context(), "ws-owner", fixture.workspace.ID, time.Now().UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
 	response = performJSONRequest(handler, http.MethodPost,
 		"/api/v1/workspaces/"+fixture.workspace.ID+"/transfer-ownership",
 		`{"new_owner_user_id":"ws-editor"}`)
@@ -341,6 +346,7 @@ func newWorkspaceAPIFixture(t *testing.T) workspaceAPIFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	activatePaidWorkspaceForAPITest(t, storage, "ws-owner", workspace.ID, "pro")
 	for userID, role := range map[string]string{
 		"ws-editor": store.WorkspaceRoleEditor, "ws-approver": store.WorkspaceRoleApprover, "ws-viewer": store.WorkspaceRoleViewer,
 	} {
@@ -378,12 +384,21 @@ func (f workspaceAPIFixture) handler(t *testing.T, userID string) http.Handler {
 		New(f.app, f.logger, "http://localhost:4321", "webhook-secret", AuthOptions{YandexClient: &fakeYandexOAuth{}}).Handler(), userID)
 }
 
-func performChannelMAXInfoRequest(t *testing.T, handler http.Handler, path, title, filename string) *httptest.ResponseRecorder {
+func performChannelMAXInfoRequest(t *testing.T, handler http.Handler, path, title, filename string, notify ...bool) *httptest.ResponseRecorder {
 	t.Helper()
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	if title != "" {
 		if err := writer.WriteField("title", title); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(notify) > 0 {
+		value := "false"
+		if notify[0] {
+			value = "true"
+		}
+		if err := writer.WriteField("notify", value); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -414,7 +429,7 @@ func TestWorkspaceChannelMAXInfoUpdatePushesIconAndTitle(t *testing.T) {
 			Title: "Agency channel", ParticipantsCount: 512,
 		},
 		membership: maxclient.Membership{IsAdmin: true, Permissions: []maxclient.Permission{
-			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite,
+			maxclient.PermissionReadAllMessages, maxclient.PermissionWrite, maxclient.PermissionChangeChatInfo,
 		}},
 	}
 	application := app.New(fixture.storage, fixture.app.Media(), fake, nil, nil, fixture.logger)
@@ -462,6 +477,9 @@ func TestWorkspaceChannelMAXInfoUpdatePushesIconAndTitle(t *testing.T) {
 	if patch.IconToken != "uploaded-icon.png" || patch.Title == nil || *patch.Title != "Новое имя канала" {
 		t.Fatalf("edit chat patch = %#v", patch)
 	}
+	if patch.Notify == nil || *patch.Notify {
+		t.Fatalf("default channel metadata notification must be false: %#v", patch.Notify)
+	}
 
 	events, err := fixture.storage.ListAuditEvents(t.Context(), "ws-owner", fixture.workspace.ID, 20, 0)
 	if err != nil {
@@ -478,7 +496,7 @@ func TestWorkspaceChannelMAXInfoUpdatePushesIconAndTitle(t *testing.T) {
 	}
 
 	// Смена только фото тоже оставляет след в журнале и не трогает название.
-	response = performChannelMAXInfoRequest(t, owner, path, "", "second.png")
+	response = performChannelMAXInfoRequest(t, owner, path, "", "second.png", true)
 	if response.Code != http.StatusOK {
 		t.Fatalf("icon-only max-info = %d %s", response.Code, response.Body.String())
 	}
@@ -487,6 +505,9 @@ func TestWorkspaceChannelMAXInfoUpdatePushesIconAndTitle(t *testing.T) {
 	}
 	if channel.Title != "Новое имя канала" || channel.IconURL != "https://cdn.max.ru/icons/uploaded-second.png.png" {
 		t.Fatalf("icon-only update channel = %#v", channel)
+	}
+	if len(fake.editChatPatches) != 2 || fake.editChatPatches[1].Notify == nil || !*fake.editChatPatches[1].Notify {
+		t.Fatalf("explicit channel metadata notification was not forwarded: %#v", fake.editChatPatches)
 	}
 	events, err = fixture.storage.ListAuditEvents(t.Context(), "ws-owner", fixture.workspace.ID, 20, 0)
 	if err != nil {

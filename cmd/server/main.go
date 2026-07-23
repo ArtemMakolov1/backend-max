@@ -26,6 +26,7 @@ import (
 	"maxpilot/backend/internal/openairesearch"
 	"maxpilot/backend/internal/store"
 	"maxpilot/backend/internal/yandexauth"
+	"maxpilot/backend/internal/yookassa"
 )
 
 func main() {
@@ -112,6 +113,21 @@ func main() {
 	}
 
 	application := app.NewWithMetrics(storage, mediaStore, maxAPI, openAI, research, logger, metrics)
+	if cfg.YooKassaConfigured() {
+		yooClient, err := yookassa.New(cfg.YooKassaShopID, cfg.YooKassaSecretKey, &http.Client{Timeout: 15 * time.Second})
+		if err != nil {
+			logger.Error("could not initialize YooKassa client", "error", err)
+			os.Exit(1)
+		}
+		if err := application.ConfigureBilling(yooClient, cfg.YooKassaReturnURL, cfg.YooKassaDataKey); err != nil {
+			logger.Error("could not configure billing", "error", err)
+			os.Exit(1)
+		}
+		if err := application.SetBillingLiveEnabled(cfg.YooKassaEnabled()); err != nil {
+			logger.Error("could not apply billing live gate", "error", err)
+			os.Exit(1)
+		}
+	}
 	if err := application.ConfigureMediaPolicy(app.MediaPolicy{
 		MaxFiles: cfg.MediaUserMaxFiles, MaxBytes: cfg.MediaUserMaxBytes,
 		OrphanGrace: cfg.MediaOrphanGrace, CleanupInterval: cfg.MediaCleanupInterval,
