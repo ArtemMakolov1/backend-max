@@ -370,19 +370,35 @@ func createDirectRejectedGraphBaseline(
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := storage.UpdateDirectCampaignGraphModeration(
+		ctx, workspaceID, campaign.ID, DirectGraphModerationUpdate{
+			ExpectedGraphHash: graphHash, ExpectedRevisionID: revision.ID,
+			Campaign: DirectModerationSnapshot{Status: "REJECTED", State: "OFF"},
+			AdGroup: DirectModerationSnapshot{
+				Status: "ACCEPTED", ServingStatus: "ELIGIBLE",
+			},
+			Ad:                        DirectModerationSnapshot{Status: "ACCEPTED", State: "OFF"},
+			Keywords:                  keywordMappings,
+			AggregateModerationStatus: "REJECTED",
+			ProviderStatus:            "REJECTED", ProviderState: "OFF",
+			CheckedAt: now.Add(8 * time.Second),
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
 	material, err = storage.ReloadDirectCampaignGraphSubmission(
 		ctx, workspaceID, campaign.ID, material.Operation.ID,
-		now.Add(8*time.Second),
+		now.Add(9*time.Second),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	advance("verified", DirectProviderStageUpdate{
 		Stage: "moderation_requested",
-	}, now.Add(9*time.Second))
+	}, now.Add(10*time.Second))
 	advance("moderation_requested", DirectProviderStageUpdate{
 		Stage: "completed", Complete: true,
-	}, now.Add(10*time.Second))
+	}, now.Add(11*time.Second))
 	campaign, err = storage.GetDirectCampaign(
 		ctx, owner, workspaceID, campaign.ID,
 	)

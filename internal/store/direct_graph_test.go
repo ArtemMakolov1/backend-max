@@ -561,12 +561,11 @@ SET moderation_status='REJECTED' WHERE id=$1`, oldRevisionID); err == nil {
 		current.AutoLaunch.InvalidReason != "provider_edit_claimed" {
 		t.Fatalf("provider edit retained auto-launch consent: %#v", current.AutoLaunch)
 	}
-	retried, err := storage.ClaimDirectCampaignProviderEdit(
+	if _, err := storage.ClaimDirectCampaignProviderEdit(
 		ctx, owner, workspace.ID, campaign.ID, changes,
 		oldGraphHash, oldRevisionID, marker, now.Add(13*time.Second),
-	)
-	if err != nil || retried.Operation.ID != material.Operation.ID {
-		t.Fatalf("idempotent provider edit retry = %#v, %v", retried, err)
+	); !errors.Is(err, ErrDirectProviderOperationBusy) {
+		t.Fatalf("live provider edit retry error = %v, want busy", err)
 	}
 	if _, err := storage.ClaimDirectCampaignProviderEdit(
 		ctx, owner, workspace.ID, campaign.ID, changes,

@@ -1384,6 +1384,18 @@ func (a *App) readVerifiedDirectLaunchGraph(
 		*material.Campaign.ProviderCampaignID,
 	)
 	if err != nil {
+		if auto && directProviderStrategySnapshotError(err) {
+			invalidateErr := a.store.InvalidateDirectAutoLaunchConsent(
+				ctx, material.Campaign.WorkspaceID, material.Campaign.ID,
+				"provider_strategy_changed", a.now().UTC(),
+			)
+			return "", yandexdirect.CampaignGraph{}, directVerifiedProviderGraph{},
+				errors.Join(
+					ErrDirectSnapshotMismatch,
+					a.directGraphProviderError(ctx, material.Connection, err),
+					invalidateErr,
+				)
+		}
 		return "", yandexdirect.CampaignGraph{}, directVerifiedProviderGraph{},
 			a.directGraphProviderError(ctx, material.Connection, err)
 	}
@@ -1400,7 +1412,7 @@ func (a *App) readVerifiedDirectLaunchGraph(
 				"provider_graph_mismatch", a.now().UTC(),
 			)
 		}
-		return "", yandexdirect.CampaignGraph{}, directVerifiedProviderGraph{},
+		return token, graph, directVerifiedProviderGraph{},
 			errors.Join(ErrDirectSnapshotMismatch, err)
 	}
 	state := strings.ToUpper(strings.TrimSpace(graph.Campaign.State))
@@ -1414,9 +1426,12 @@ func (a *App) readVerifiedDirectLaunchGraph(
 func (a *App) reconcileDirectCampaignLaunch(
 	ctx context.Context, workspaceID, campaignID string, allowProviderRetry bool,
 ) error {
-	if err := a.requireDirectGraphWrites(); err != nil {
-		return err
+	if a.directGraph == nil || !a.directProviderGraphVerified {
+		return ErrDirectGraphUnsupported
 	}
+	// Reconciliation always remains available for read-only provider truth,
+	// but no caller may turn a retry back on while the write kill-switch is off.
+	allowProviderRetry = allowProviderRetry && a.DirectWritesEnabled()
 	material, err := a.store.GetDirectLaunchRecoveryMaterial(
 		ctx, workspaceID, campaignID,
 	)
@@ -1429,6 +1444,26 @@ func (a *App) reconcileDirectCampaignLaunch(
 	launchClaimedAt := *material.Campaign.LaunchClaimedAt
 	_, graph, _, err := a.readVerifiedDirectLaunchGraph(ctx, material, false)
 	if err != nil {
+		if errors.Is(err, ErrDirectSnapshotMismatch) &&
+			material.Campaign.ProviderCampaignID != nil &&
+			graph.Campaign.ID == *material.Campaign.ProviderCampaignID &&
+			directGraphCampaignRunning(graph.Campaign) {
+			now := a.now().UTC()
+			if _, syncErr := a.store.SyncDirectCampaignProviderStatusForLaunch(
+				ctx, workspaceID, campaignID, graph.Campaign.ID,
+				graph.Campaign.Status, graph.Campaign.State, launchClaimedAt, now,
+			); syncErr != nil {
+				return errors.Join(err, syncErr)
+			}
+			if mismatchErr := a.store.SetDirectCampaignProviderSnapshotMismatchForLaunch(
+				ctx, workspaceID, campaignID, true, launchClaimedAt, now,
+			); mismatchErr != nil {
+				return errors.Join(err, mismatchErr)
+			}
+			// Provider ON is authoritative for spend. Keep the content drift
+			// visible, but never issue another Resume for the changed graph.
+			return ErrDirectSnapshotMismatch
+		}
 		_ = a.store.MarkDirectCampaignLaunchReconciling(
 			ctx, workspaceID, campaignID, launchClaimedAt,
 			"provider_graph_mismatch", a.now().UTC(),
@@ -1451,7 +1486,7 @@ func (a *App) reconcileDirectCampaignLaunch(
 			"provider_state_ambiguous", a.now().UTC(),
 		)
 	}
-	if !allowProviderRetry {
+	if !allowProviderRetry || !a.DirectWritesEnabled() {
 		return a.store.MarkDirectCampaignLaunchReconciling(
 			ctx, workspaceID, campaignID, launchClaimedAt,
 			"provider_retry_disabled", a.now().UTC(),

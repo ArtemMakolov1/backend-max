@@ -642,6 +642,19 @@ func directProviderAuthorizationError(err error) bool {
 		strings.TrimSpace(providerErr.Code) == "53"
 }
 
+func directProviderStrategySnapshotError(err error) bool {
+	var providerErr *yandexdirect.Error
+	if !errors.As(err, &providerErr) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(providerErr.Code)) {
+	case "campaign_budget_unavailable", "campaign_budget_invalid":
+		return true
+	default:
+		return false
+	}
+}
+
 func (a *App) markDirectConnectionAuthorizationRequired(
 	ctx context.Context, connection store.DirectConnection, providerErr error, now time.Time,
 ) error {

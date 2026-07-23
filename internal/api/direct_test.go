@@ -311,6 +311,8 @@ func TestDirectCampaignValidationIsAClientErrorForCreateAndPatch(t *testing.T) {
 		t.Context(), "ws-owner", fixture.workspace.ID, store.DirectCampaign{
 			Name: "Campaign", Objective: "traffic", LandingURL: "https://maxposty.ru/",
 			Brief: "A valid campaign brief", Regions: []string{"225"},
+			Titles: []string{"Safe title"}, Texts: []string{"Safe text"},
+			Keywords:          []string{"safe keyword"},
 			WeeklyBudgetMinor: 30_000, CurrencyCode: "RUB",
 			StartsAt: now, EndsAt: now.AddDate(0, 1, 0), CreatedAt: now,
 		},

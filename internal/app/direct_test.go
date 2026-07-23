@@ -622,10 +622,12 @@ func TestDirectAutomationIsIsolatedFromCoreScheduler(t *testing.T) {
 	}
 	provider.campaign.Status = "ACCEPTED"
 	provider.campaign.State = "OFF"
-	campaign, err = storage.SyncDirectCampaignProviderStatus(
-		ctx, workspace.ID, campaign.ID, *campaign.ProviderCampaignID,
-		provider.campaign.Status, provider.campaign.State, *clock,
-	)
+	if err = application.syncDirectCampaignLifecycle(
+		ctx, workspace.ID, campaign.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	campaign, err = storage.GetDirectCampaign(ctx, owner, workspace.ID, campaign.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -802,8 +804,8 @@ func TestDirectManualLaunchNeedsNeitherAutoFlagNorConsentAndIsWorkspaceScoped(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if campaign.Status != "provider_draft" {
-		t.Fatalf("Campaigns.add result status = %q, want provider_draft", campaign.Status)
+	if campaign.Status != "moderation" {
+		t.Fatalf("Campaigns.add result status = %q, want moderation", campaign.Status)
 	}
 	provider.campaign.Status = "ACCEPTED"
 	provider.campaign.State = "OFF"
