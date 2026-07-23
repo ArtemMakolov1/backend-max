@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -21,12 +22,18 @@ import (
 )
 
 const (
-	directTokenCipherPrefix = "v1."
-	directOAuthStateTTL     = 10 * time.Minute
+	directTokenCipherPrefix       = "v1."
+	directTokenBundleCipherPrefix = "v2."
+	directOAuthStateTTL           = 10 * time.Minute
+	directTokenRefreshInterval    = 90 * 24 * time.Hour
+	directTokenRefreshSkew        = 5 * time.Minute
+	directTokenFallbackSkew       = 30 * time.Second
+	directTokenMaximumLifetime    = 100 * 365 * 24 * time.Hour
 )
 
 var (
 	ErrDirectNotConfigured    = errors.New("integration with Yandex Direct is not configured")
+	ErrDirectGraphUnsupported = errors.New("Yandex Direct provider does not support the verified v501 campaign graph")
 	ErrDirectWritesDisabled   = errors.New("writes to Yandex Direct are disabled")
 	ErrDirectAutoLaunchOff    = errors.New("auto-launch for Yandex Direct is disabled")
 	ErrDirectProvider         = errors.New("provider request to Yandex Direct failed")
@@ -38,12 +45,61 @@ var (
 type DirectProvider interface {
 	OAuthFlow() yandexdirect.OAuthFlow
 	AuthorizationURL(state, codeChallenge string) string
-	ExchangeCode(context.Context, string, string) (string, error)
+	ExchangeCode(context.Context, string, string) (yandexdirect.OAuthToken, error)
+	RefreshToken(context.Context, string) (yandexdirect.OAuthToken, error)
 	GetAccount(context.Context, string, string) (yandexdirect.Account, error)
 	CreateCampaignDraft(context.Context, string, string, yandexdirect.CampaignDraft) (yandexdirect.Campaign, error)
 	GetCampaign(context.Context, string, string, int64) (yandexdirect.Campaign, error)
 	ResumeCampaign(context.Context, string, string, int64) error
 	Sandbox() bool
+}
+
+// DirectGraphProvider is deliberately separate from DirectProvider so OAuth
+// and read-only status can remain available on legacy/sandbox endpoints while
+// every spend-capable write stays fail-closed unless the complete v501 graph
+// can be read, fingerprinted, and reconciled.
+type DirectGraphProvider interface {
+	SupportsUnifiedGraph() bool
+	ResolveRegionNames(context.Context, string, string, []string) ([]yandexdirect.GeoRegion, error)
+	CreateUnifiedAdGroup(
+		context.Context, string, string, yandexdirect.UnifiedAdGroupDraft,
+	) (yandexdirect.MutationResult, error)
+	ListUnifiedAdGroups(context.Context, string, string, int64) ([]yandexdirect.UnifiedAdGroup, error)
+	UpdateUnifiedAdGroups(
+		context.Context, string, string, []yandexdirect.UnifiedAdGroupUpdate,
+	) ([]yandexdirect.MutationResult, error)
+	CreateResponsiveAd(
+		context.Context, string, string, yandexdirect.ResponsiveAdDraft,
+	) (yandexdirect.MutationResult, error)
+	ListResponsiveAds(context.Context, string, string, int64) ([]yandexdirect.ResponsiveAd, error)
+	UpdateResponsiveAds(
+		context.Context, string, string, []yandexdirect.ResponsiveAdUpdate,
+	) ([]yandexdirect.MutationResult, error)
+	AddKeywords(
+		context.Context, string, string, []yandexdirect.KeywordDraft,
+	) ([]yandexdirect.MutationResult, error)
+	UpdateKeywords(
+		context.Context, string, string, []yandexdirect.KeywordUpdate,
+	) ([]yandexdirect.MutationResult, error)
+	DeleteKeywords(
+		context.Context, string, string, []int64,
+	) ([]yandexdirect.MutationResult, error)
+	ListKeywords(context.Context, string, string, int64) ([]yandexdirect.Keyword, error)
+	ModerateAds(
+		context.Context, string, string, []int64,
+	) ([]yandexdirect.MutationResult, error)
+	FindUnifiedCampaignByOperationMarker(
+		context.Context, string, string, string,
+	) (int64, error)
+	FindUnifiedAdGroupByTrackingMarker(
+		context.Context, string, string, int64, string,
+	) (int64, error)
+	EnsureNoBidModifiers(context.Context, string, string, int64) error
+	EnsureNoAudienceTargets(context.Context, string, string, int64) error
+	UpdateUnifiedCampaigns(
+		context.Context, string, string, []yandexdirect.UnifiedCampaignUpdate,
+	) ([]yandexdirect.MutationResult, error)
+	GetCampaignGraph(context.Context, string, string, int64) (yandexdirect.CampaignGraph, error)
 }
 
 type DirectCampaignSuggester interface {
@@ -54,6 +110,15 @@ type DirectCampaignSuggester interface {
 
 type directTokenCipher struct {
 	aead cipher.AEAD
+}
+
+type directTokenBundle struct {
+	AccessToken  string    `json:"access_token"`
+	RefreshToken string    `json:"refresh_token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	RefreshAfter time.Time `json:"refresh_after"`
+	RefreshedAt  time.Time `json:"refreshed_at"`
+	Legacy       bool      `json:"-"`
 }
 
 type DirectOAuthStart struct {
@@ -98,6 +163,12 @@ func (a *App) ConfigureDirect(provider DirectProvider, dataKey []byte) error {
 		return fmt.Errorf("initialize Yandex Direct authenticated encryption: %w", err)
 	}
 	a.direct = provider
+	a.directGraph = nil
+	a.directProviderGraphVerified = false
+	if graph, ok := provider.(DirectGraphProvider); ok && graph.SupportsUnifiedGraph() {
+		a.directGraph = graph
+		a.directProviderGraphVerified = true
+	}
 	a.directCipher = &directTokenCipher{aead: aead}
 	a.directSandbox = provider.Sandbox()
 	// Provider credentials alone never enable a spend-capable write.
@@ -113,6 +184,9 @@ func (a *App) SetDirectFeatureFlags(writesEnabled, autoLaunchEnabled bool) error
 	if autoLaunchEnabled && !writesEnabled {
 		return errors.New("auto-launch for Yandex Direct requires writes to be enabled")
 	}
+	if writesEnabled && !a.directProviderGraphVerified {
+		return ErrDirectGraphUnsupported
+	}
 	a.directWritesEnabled = writesEnabled
 	a.directAutoLaunchEnabled = autoLaunchEnabled
 	return nil
@@ -127,7 +201,8 @@ func (a *App) DirectWritesEnabled() bool {
 }
 
 func (a *App) DirectAutoLaunchEnabled() bool {
-	return a != nil && a.DirectWritesEnabled() && a.directAutoLaunchEnabled
+	return a != nil && a.DirectWritesEnabled() && a.directAutoLaunchEnabled &&
+		a.directProviderGraphVerified
 }
 
 func (a *App) DirectCampaignSuggestionConfigured() bool {
@@ -255,11 +330,11 @@ func (a *App) completeDirectOAuth(
 	if err != nil {
 		return DirectOAuthCompletion{}, err
 	}
-	token, err := a.direct.ExchangeCode(ctx, code, stored.PKCEVerifier)
+	oauthToken, err := a.direct.ExchangeCode(ctx, code, stored.PKCEVerifier)
 	if err != nil {
 		return DirectOAuthCompletion{}, fmt.Errorf("%w: %w", ErrDirectProvider, err)
 	}
-	account, err := a.direct.GetAccount(ctx, token, stored.ClientLogin)
+	account, err := a.direct.GetAccount(ctx, oauthToken.AccessToken, stored.ClientLogin)
 	if err != nil {
 		return DirectOAuthCompletion{}, fmt.Errorf("%w: %w", ErrDirectProvider, err)
 	}
@@ -267,8 +342,12 @@ func (a *App) completeDirectOAuth(
 	if clientLogin == "" {
 		clientLogin = strings.TrimSpace(account.Login)
 	}
-	ciphertext, err := a.directCipher.seal(
-		stored.WorkspaceID, account.ID, clientLogin, token,
+	bundle, err := newDirectTokenBundle(a.now().UTC(), oauthToken)
+	if err != nil {
+		return DirectOAuthCompletion{}, fmt.Errorf("%w: %w", ErrDirectProvider, err)
+	}
+	ciphertext, err := a.directCipher.sealBundle(
+		stored.WorkspaceID, account.ID, clientLogin, bundle,
 	)
 	if err != nil {
 		return DirectOAuthCompletion{}, err
@@ -309,51 +388,9 @@ func (a *App) UpdateDirectCampaignDraft(
 func (a *App) SubmitDirectCampaign(
 	ctx context.Context, actorUserID, workspaceID, campaignID string, expectedVersion int64,
 ) (store.DirectCampaign, error) {
-	if !a.DirectWritesEnabled() {
-		return store.DirectCampaign{}, ErrDirectWritesDisabled
-	}
-	campaign, connection, err := a.store.ClaimDirectCampaignSubmission(
-		ctx, actorUserID, workspaceID, campaignID, expectedVersion, a.now().UTC(),
+	return a.submitDirectCampaignGraph(
+		ctx, actorUserID, workspaceID, campaignID, expectedVersion,
 	)
-	if err != nil {
-		return store.DirectCampaign{}, err
-	}
-	token, err := a.directCipher.open(
-		connection.WorkspaceID, connection.AccountID, connection.ClientLogin, connection.TokenCiphertext,
-	)
-	if err != nil {
-		_ = a.store.FailDirectCampaignSubmission(ctx, workspaceID, campaignID, "token_decryption_failed", a.now().UTC())
-		return store.DirectCampaign{}, err
-	}
-	providerCampaign, err := a.direct.CreateCampaignDraft(ctx, token, connection.ClientLogin, yandexdirect.CampaignDraft{
-		Name: campaign.Name, WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
-		StartsAt: campaign.StartsAt, EndsAt: campaign.EndsAt,
-	})
-	if err != nil {
-		now := a.now().UTC()
-		connectionErr := a.markDirectConnectionAuthorizationRequired(
-			ctx, connection, err, now,
-		)
-		failureErr := a.store.FailDirectCampaignSubmission(
-			ctx, workspaceID, campaignID, directProviderErrorCode(err), now,
-		)
-		return store.DirectCampaign{}, errors.Join(
-			fmt.Errorf("%w: %w", ErrDirectProvider, err), connectionErr, failureErr,
-		)
-	}
-	submitted, err := a.store.MarkDirectCampaignSubmitted(
-		ctx, actorUserID, workspaceID, campaignID, expectedVersion, providerCampaign.ID,
-		providerCampaign.Status, providerCampaign.State, a.now().UTC(),
-	)
-	if err != nil {
-		// Fail closed: the creating claim remains and this provider campaign is
-		// never created again automatically. An operator must reconcile its ID.
-		a.logger.Error("Yandex Direct campaign created but local submission finalization failed",
-			"workspace_id", workspaceID, "campaign_id", campaignID,
-			"provider_campaign_id", providerCampaign.ID, "error", err)
-		return store.DirectCampaign{}, err
-	}
-	return submitted, nil
 }
 
 func (a *App) GrantDirectAutoLaunchConsent(
@@ -385,32 +422,15 @@ func (a *App) RevokeDirectAutoLaunchConsent(
 
 func (a *App) LaunchDirectCampaign(
 	ctx context.Context, actorUserID, workspaceID, campaignID string, expectedVersion int64,
+	expectedGraphEvidence ...string,
 ) (store.DirectCampaign, error) {
-	if !a.DirectWritesEnabled() {
-		return store.DirectCampaign{}, ErrDirectWritesDisabled
+	if len(expectedGraphEvidence) != 2 {
+		return store.DirectCampaign{}, store.ErrDirectGraphUnverified
 	}
-	material, err := a.store.GetDirectManualLaunchMaterial(
-		ctx, actorUserID, workspaceID, campaignID,
+	return a.launchDirectCampaignVerified(
+		ctx, actorUserID, workspaceID, campaignID, expectedVersion,
+		expectedGraphEvidence[0], expectedGraphEvidence[1],
 	)
-	if err != nil {
-		return store.DirectCampaign{}, err
-	}
-	if expectedVersion <= 0 || material.Campaign.Version != expectedVersion {
-		return store.DirectCampaign{}, store.ErrConflict
-	}
-	if err := a.launchDirectCampaign(
-		ctx, material, false, func(providerCampaign yandexdirect.Campaign) (store.DirectLaunchMaterial, error) {
-			return a.store.ClaimDirectManualCampaignLaunch(
-				ctx, actorUserID, workspaceID, campaignID, expectedVersion,
-				providerCampaign.ID, material.Connection.AccountID,
-				providerCampaign.WeeklyBudgetMinor, providerCampaign.StartsAt,
-				providerCampaign.EndsAt, a.now().UTC(),
-			)
-		},
-	); err != nil {
-		return store.DirectCampaign{}, err
-	}
-	return a.store.GetDirectCampaign(ctx, actorUserID, workspaceID, campaignID)
 }
 
 func (a *App) launchDirectAutoCampaign(
@@ -420,15 +440,8 @@ func (a *App) launchDirectAutoCampaign(
 	if err != nil {
 		return err
 	}
-	return a.launchDirectCampaign(
-		ctx, material, true, func(providerCampaign yandexdirect.Campaign) (store.DirectLaunchMaterial, error) {
-			return a.store.ClaimDirectAutoCampaignLaunch(
-				ctx, material.Campaign.WorkspaceID, campaignID, material.Campaign.Version,
-				providerCampaign.ID, material.Connection.AccountID,
-				providerCampaign.WeeklyBudgetMinor, providerCampaign.StartsAt,
-				providerCampaign.EndsAt, a.now().UTC(),
-			)
-		},
+	return a.launchDirectAutoCampaignVerified(
+		ctx, material,
 	)
 }
 
@@ -439,10 +452,7 @@ func (a *App) launchDirectCampaign(
 	if material.Campaign.ProviderCampaignID == nil {
 		return store.ErrDirectCampaignNotAccepted
 	}
-	token, err := a.directCipher.open(
-		material.Connection.WorkspaceID, material.Connection.AccountID,
-		material.Connection.ClientLogin, material.TokenCiphertext,
-	)
+	token, err := a.directAccessToken(ctx, material.Connection)
 	if err != nil {
 		return err
 	}
@@ -522,11 +532,59 @@ func (a *App) attemptClaimedDirectLaunch(
 ) error {
 	workspaceID := material.Campaign.WorkspaceID
 	campaignID := material.Campaign.ID
-	if material.Campaign.ProviderCampaignID == nil {
+	if material.Campaign.ProviderCampaignID == nil ||
+		material.Campaign.LaunchClaimedAt == nil {
 		return store.ErrDirectCampaignNotAccepted
 	}
+	launchClaimedAt := *material.Campaign.LaunchClaimedAt
+	if a.directGraph == nil || !a.directProviderGraphVerified {
+		return ErrDirectGraphUnsupported
+	}
+	verifiedToken, graph, verified, verifyErr := a.readVerifiedDirectLaunchGraph(
+		ctx, material, material.Campaign.LaunchMode == "auto",
+	)
+	if verifyErr != nil || verified.ModerationStatus != "ACCEPTED" ||
+		!directGraphDeliveryReady(graph) {
+		reconcileErr := a.store.MarkDirectCampaignLaunchReconciling(
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			"provider_graph_changed_before_resume",
+			a.now().UTC(),
+		)
+		if material.Campaign.LaunchMode == "auto" {
+			reconcileErr = errors.Join(
+				reconcileErr,
+				a.store.InvalidateDirectAutoLaunchConsent(
+					ctx, workspaceID, campaignID,
+					"provider_graph_changed_before_resume", a.now().UTC(),
+				),
+			)
+		}
+		if verifyErr == nil {
+			verifyErr = store.ErrDirectModerationNotReady
+		}
+		return errors.Join(verifyErr, reconcileErr)
+	}
+	if directGraphCampaignRunning(graph.Campaign) {
+		_, syncErr := a.store.SyncDirectCampaignProviderStatusForLaunch(
+			ctx, workspaceID, campaignID, graph.Campaign.ID,
+			graph.Campaign.Status, graph.Campaign.State, launchClaimedAt,
+			a.now().UTC(),
+		)
+		return syncErr
+	}
+	if !strings.EqualFold(strings.TrimSpace(graph.Campaign.State), "OFF") {
+		return errors.Join(
+			store.ErrDirectCampaignNotAccepted,
+			a.store.MarkDirectCampaignLaunchReconciling(
+				ctx, workspaceID, campaignID, launchClaimedAt,
+				"provider_state_changed_before_resume",
+				a.now().UTC(),
+			),
+		)
+	}
+	token = verifiedToken
 	if err := a.store.MarkDirectCampaignLaunchAttempt(
-		ctx, workspaceID, campaignID, a.now().UTC(),
+		ctx, workspaceID, campaignID, launchClaimedAt, a.now().UTC(),
 	); err != nil {
 		return err
 	}
@@ -545,14 +603,15 @@ func (a *App) attemptClaimedDirectLaunch(
 				ctx, material.Connection, err, now,
 			)
 			abortErr := a.store.AbortDirectCampaignLaunchForAuthorization(
-				ctx, workspaceID, campaignID, now,
+				ctx, workspaceID, campaignID, launchClaimedAt, now,
 			)
 			return errors.Join(
 				fmt.Errorf("%w: %w", ErrDirectProvider, err), connectionErr, abortErr,
 			)
 		}
 		reconcileErr := a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, directProviderErrorCode(err), now,
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			directProviderErrorCode(err), now,
 		)
 		if reconcileErr != nil {
 			return errors.Join(fmt.Errorf("%w: %w", ErrDirectProvider, err), reconcileErr)
@@ -563,26 +622,28 @@ func (a *App) attemptClaimedDirectLaunch(
 	// remains. The reconciliation worker will observe provider State=ON and
 	// finish the local transition without issuing another write.
 	return a.store.CompleteDirectCampaignLaunch(
-		ctx, workspaceID, campaignID, a.now().UTC(),
+		ctx, workspaceID, campaignID, launchClaimedAt, a.now().UTC(),
 	)
 }
 
-func (a *App) reconcileDirectCampaignLaunch(
+func (a *App) reconcileDirectCampaignLaunchLegacy(
 	ctx context.Context, workspaceID, campaignID string, allowProviderRetry bool,
 ) error {
 	material, err := a.store.GetDirectLaunchRecoveryMaterial(ctx, workspaceID, campaignID)
 	if err != nil {
 		return err
 	}
+	if material.Campaign.LaunchClaimedAt == nil {
+		return store.ErrDirectLaunchAlreadyClaimed
+	}
+	launchClaimedAt := *material.Campaign.LaunchClaimedAt
 	if material.Campaign.ProviderCampaignID == nil {
 		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, "provider_campaign_missing", a.now().UTC(),
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			"provider_campaign_missing", a.now().UTC(),
 		)
 	}
-	token, err := a.directCipher.open(
-		material.Connection.WorkspaceID, material.Connection.AccountID,
-		material.Connection.ClientLogin, material.TokenCiphertext,
-	)
+	token, err := a.directAccessToken(ctx, material.Connection)
 	if err != nil {
 		return err
 	}
@@ -595,7 +656,8 @@ func (a *App) reconcileDirectCampaignLaunch(
 			ctx, material.Connection, err, now,
 		)
 		markErr := a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, directProviderErrorCode(err), now,
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			directProviderErrorCode(err), now,
 		)
 		return errors.Join(
 			fmt.Errorf("%w: %w", ErrDirectProvider, err), connectionErr, markErr,
@@ -603,18 +665,21 @@ func (a *App) reconcileDirectCampaignLaunch(
 	}
 	if providerCampaign.ID != *material.Campaign.ProviderCampaignID {
 		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, "provider_campaign_mismatch", a.now().UTC(),
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			"provider_campaign_mismatch", a.now().UTC(),
 		)
 	}
 	snapshotMatches := directProviderSnapshotMatches(providerCampaign, material.Campaign)
-	if _, err := a.store.SyncDirectCampaignProviderStatus(
+	if _, err := a.store.SyncDirectCampaignProviderStatusForLaunch(
 		ctx, workspaceID, campaignID, providerCampaign.ID,
-		providerCampaign.Status, providerCampaign.State, a.now().UTC(),
+		providerCampaign.Status, providerCampaign.State, launchClaimedAt,
+		a.now().UTC(),
 	); err != nil {
 		return err
 	}
-	if err := a.store.SetDirectCampaignProviderSnapshotMismatch(
-		ctx, workspaceID, campaignID, !snapshotMatches, a.now().UTC(),
+	if err := a.store.SetDirectCampaignProviderSnapshotMismatchForLaunch(
+		ctx, workspaceID, campaignID, !snapshotMatches, launchClaimedAt,
+		a.now().UTC(),
 	); err != nil {
 		return err
 	}
@@ -630,7 +695,7 @@ func (a *App) reconcileDirectCampaignLaunch(
 			reason = "provider_running_status_mismatch"
 		}
 		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, reason, a.now().UTC(),
+			ctx, workspaceID, campaignID, launchClaimedAt, reason, a.now().UTC(),
 		)
 	}
 	if directProviderCampaignRunning(providerCampaign) {
@@ -640,17 +705,20 @@ func (a *App) reconcileDirectCampaignLaunch(
 	}
 	if !directProviderCampaignDefinitelyOff(providerCampaign) {
 		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, "provider_state_ambiguous", a.now().UTC(),
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			"provider_state_ambiguous", a.now().UTC(),
 		)
 	}
 	if !allowProviderRetry {
 		return a.store.MarkDirectCampaignLaunchReconciling(
-			ctx, workspaceID, campaignID, "provider_retry_disabled", a.now().UTC(),
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			"provider_retry_disabled", a.now().UTC(),
 		)
 	}
 	if material.Campaign.LaunchAttemptCount >= 2 {
 		return a.store.FailDirectCampaignLaunch(
-			ctx, workspaceID, campaignID, "provider_off_after_retries", a.now().UTC(),
+			ctx, workspaceID, campaignID, launchClaimedAt,
+			"provider_off_after_retries", a.now().UTC(),
 		)
 	}
 	// A bounded retry is allowed only after an authoritative provider read
@@ -665,6 +733,38 @@ func (a *App) RunDirectAutoLaunchOnce(ctx context.Context, limit int) {
 	}
 	if _, err := a.store.PurgeExpiredDirectOAuthStates(ctx, a.now().UTC(), 100); err != nil {
 		a.logger.Error("could not purge expired Yandex Direct OAuth states", "error", err)
+	}
+	if a.DirectWritesEnabled() && a.directProviderGraphVerified && a.directGraph != nil {
+		graphCandidates, err := a.store.ClaimDirectCampaignGraphRecoveryCandidates(
+			ctx, a.now().UTC(), limit,
+		)
+		if err != nil {
+			a.logger.Error(
+				"could not list Yandex Direct graph recovery candidates",
+				"error", err,
+			)
+		} else {
+			for _, candidate := range graphCandidates {
+				material, reloadErr := a.store.GetDirectCampaignGraphSubmissionMaterial(
+					ctx, candidate.WorkspaceID, candidate.CampaignID,
+					candidate.OperationID, a.now().UTC(),
+				)
+				if reloadErr == nil {
+					reloadErr = a.runDirectGraphOperation(ctx, material)
+				}
+				if reloadErr != nil &&
+					!errors.Is(reloadErr, store.ErrDirectProviderOperationBusy) &&
+					!errors.Is(reloadErr, store.ErrDirectProviderOperationStale) {
+					a.logger.Error(
+						"Yandex Direct graph recovery failed",
+						"workspace_id", candidate.WorkspaceID,
+						"campaign_id", candidate.CampaignID,
+						"operation_id", candidate.OperationID,
+						"stage", candidate.Stage, "error", reloadErr,
+					)
+				}
+			}
+		}
 	}
 	recoveryCandidates, err := a.store.ClaimDirectLaunchRecoveryCandidates(
 		ctx, a.now().UTC(), limit,
@@ -715,7 +815,7 @@ func (a *App) RunDirectAutoLaunchOnce(ctx context.Context, limit int) {
 	}
 }
 
-func (a *App) syncDirectCampaignLifecycle(
+func (a *App) syncDirectCampaignLifecycleLegacy(
 	ctx context.Context, workspaceID, campaignID string,
 ) error {
 	material, err := a.store.GetDirectLifecycleMaterial(ctx, workspaceID, campaignID)
@@ -725,10 +825,7 @@ func (a *App) syncDirectCampaignLifecycle(
 	if material.Campaign.ProviderCampaignID == nil {
 		return store.ErrNotFound
 	}
-	token, err := a.directCipher.open(
-		material.Connection.WorkspaceID, material.Connection.AccountID,
-		material.Connection.ClientLogin, material.TokenCiphertext,
-	)
+	token, err := a.directAccessToken(ctx, material.Connection)
 	if err != nil {
 		return err
 	}
@@ -852,36 +949,326 @@ func (a *App) SuggestDirectCampaign(
 	return suggester.SuggestDirectCampaign(ctx, request)
 }
 
+func (a *App) directAccessToken(
+	ctx context.Context, connection store.DirectConnection,
+) (string, error) {
+	if !a.DirectConfigured() {
+		return "", ErrDirectNotConfigured
+	}
+	value, err, _ := a.directTokenRefresh.Do(connection.ID, func() (any, error) {
+		current, err := a.store.GetDirectConnectionTokenMaterial(
+			ctx, connection.WorkspaceID, connection.ID,
+		)
+		if err != nil {
+			return "", err
+		}
+		bundle, err := a.directCipher.openBundle(
+			current.WorkspaceID, current.AccountID, current.ClientLogin,
+			current.TokenCiphertext,
+		)
+		if err != nil {
+			return "", err
+		}
+		now := a.now().UTC()
+		if bundle.Legacy {
+			return bundle.AccessToken, nil
+		}
+		if now.Before(bundle.RefreshAfter) {
+			if !bundle.ExpiresAt.After(now) {
+				if markErr := a.store.MarkDirectConnectionAuthorizationRequired(
+					ctx, current.WorkspaceID, current.ID, now,
+				); markErr != nil {
+					return "", errors.Join(store.ErrDirectConnectionRequired, markErr)
+				}
+				return "", store.ErrDirectConnectionRequired
+			}
+			return bundle.AccessToken, nil
+		}
+		claimed, err := a.store.ClaimDirectConnectionTokenRefresh(
+			ctx, current.WorkspaceID, current.ID, current.TokenCiphertext, now,
+		)
+		if errors.Is(err, store.ErrDirectTokenRefreshBusy) ||
+			errors.Is(err, store.ErrConflict) {
+			latest, latestErr := a.store.GetDirectConnectionTokenMaterial(
+				ctx, current.WorkspaceID, current.ID,
+			)
+			if latestErr == nil && latest.TokenCiphertext != current.TokenCiphertext {
+				latestBundle, openErr := a.directCipher.openBundle(
+					latest.WorkspaceID, latest.AccountID, latest.ClientLogin,
+					latest.TokenCiphertext,
+				)
+				if openErr == nil && directTokenBundleUsable(latestBundle, now) {
+					return latestBundle.AccessToken, nil
+				}
+			}
+			if directTokenBundleUsable(bundle, now.Add(directTokenFallbackSkew)) {
+				return bundle.AccessToken, nil
+			}
+			return "", fmt.Errorf("%w: %w", ErrDirectProvider, err)
+		}
+		if err != nil {
+			return "", err
+		}
+		if claimed.TokenRefreshClaimedAt == nil {
+			return "", fmt.Errorf("%w: missing token refresh claim", ErrDirectProvider)
+		}
+		claimedBundle, err := a.directCipher.openBundle(
+			claimed.WorkspaceID, claimed.AccountID, claimed.ClientLogin,
+			claimed.TokenCiphertext,
+		)
+		if err != nil {
+			_ = a.store.ReleaseDirectConnectionTokenRefresh(
+				ctx, claimed.WorkspaceID, claimed.ID, claimed.TokenCiphertext,
+				*claimed.TokenRefreshClaimedAt, now,
+			)
+			return "", err
+		}
+		refreshed, refreshErr := a.direct.RefreshToken(ctx, claimedBundle.RefreshToken)
+		if refreshErr != nil {
+			if directOAuthRefreshInvalidGrant(refreshErr) {
+				marked, markErr := a.store.MarkDirectConnectionRefreshAuthorizationRequired(
+					ctx, claimed.WorkspaceID, claimed.ID, claimed.TokenCiphertext,
+					*claimed.TokenRefreshClaimedAt, now,
+				)
+				if markErr != nil {
+					return "", errors.Join(store.ErrDirectConnectionRequired, markErr)
+				}
+				if marked {
+					return "", store.ErrDirectConnectionRequired
+				}
+				latest, latestErr := a.store.GetDirectConnectionTokenMaterial(
+					ctx, claimed.WorkspaceID, claimed.ID,
+				)
+				if latestErr == nil && latest.TokenCiphertext != claimed.TokenCiphertext {
+					latestBundle, openErr := a.directCipher.openBundle(
+						latest.WorkspaceID, latest.AccountID, latest.ClientLogin,
+						latest.TokenCiphertext,
+					)
+					if openErr == nil && directTokenBundleUsable(latestBundle, now) {
+						return latestBundle.AccessToken, nil
+					}
+				}
+				return "", store.ErrDirectConnectionRequired
+			}
+			releaseErr := a.store.ReleaseDirectConnectionTokenRefresh(
+				ctx, claimed.WorkspaceID, claimed.ID, claimed.TokenCiphertext,
+				*claimed.TokenRefreshClaimedAt, now,
+			)
+			if directTokenBundleUsable(claimedBundle, now.Add(directTokenFallbackSkew)) {
+				if releaseErr != nil && !errors.Is(releaseErr, store.ErrConflict) {
+					return "", errors.Join(refreshErr, releaseErr)
+				}
+				return claimedBundle.AccessToken, nil
+			}
+			return "", errors.Join(
+				fmt.Errorf("%w: %w", ErrDirectProvider, refreshErr), releaseErr,
+			)
+		}
+		replacement, err := newDirectTokenBundle(now, refreshed)
+		if err != nil {
+			_ = a.store.ReleaseDirectConnectionTokenRefresh(
+				ctx, claimed.WorkspaceID, claimed.ID, claimed.TokenCiphertext,
+				*claimed.TokenRefreshClaimedAt, now,
+			)
+			return "", fmt.Errorf("%w: %w", ErrDirectProvider, err)
+		}
+		replacementCiphertext, err := a.directCipher.sealBundle(
+			claimed.WorkspaceID, claimed.AccountID, claimed.ClientLogin, replacement,
+		)
+		if err != nil {
+			_ = a.store.ReleaseDirectConnectionTokenRefresh(
+				ctx, claimed.WorkspaceID, claimed.ID, claimed.TokenCiphertext,
+				*claimed.TokenRefreshClaimedAt, now,
+			)
+			return "", err
+		}
+		_, err = a.store.CompleteDirectConnectionTokenRefresh(
+			ctx, claimed.WorkspaceID, claimed.ID, claimed.TokenCiphertext,
+			*claimed.TokenRefreshClaimedAt, replacementCiphertext, now,
+		)
+		if errors.Is(err, store.ErrConflict) {
+			latest, latestErr := a.store.GetDirectConnectionTokenMaterial(
+				ctx, claimed.WorkspaceID, claimed.ID,
+			)
+			if latestErr == nil {
+				latestBundle, openErr := a.directCipher.openBundle(
+					latest.WorkspaceID, latest.AccountID, latest.ClientLogin,
+					latest.TokenCiphertext,
+				)
+				if openErr == nil && directTokenBundleUsable(latestBundle, now) {
+					return latestBundle.AccessToken, nil
+				}
+			}
+		}
+		if err != nil {
+			return "", err
+		}
+		return replacement.AccessToken, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	token, ok := value.(string)
+	if !ok || strings.TrimSpace(token) == "" {
+		return "", errors.New("Yandex Direct access token is unavailable")
+	}
+	return token, nil
+}
+
+func newDirectTokenBundle(
+	now time.Time, token yandexdirect.OAuthToken,
+) (directTokenBundle, error) {
+	now = now.UTC()
+	accessToken := strings.TrimSpace(token.AccessToken)
+	refreshToken := strings.TrimSpace(token.RefreshToken)
+	if accessToken == "" || refreshToken == "" || token.ExpiresInSeconds <= 0 {
+		return directTokenBundle{}, errors.New("incomplete Yandex OAuth token response")
+	}
+	lifetime := directTokenMaximumLifetime
+	if token.ExpiresInSeconds <= int64(directTokenMaximumLifetime/time.Second) {
+		lifetime = time.Duration(token.ExpiresInSeconds) * time.Second
+	}
+	expiresAt := now.Add(lifetime)
+	refreshAfter := expiresAt.Add(-directTokenRefreshSkew)
+	quarterlyRefresh := now.Add(directTokenRefreshInterval)
+	if refreshAfter.After(quarterlyRefresh) {
+		refreshAfter = quarterlyRefresh
+	}
+	if refreshAfter.Before(now) {
+		refreshAfter = now
+	}
+	return directTokenBundle{
+		AccessToken: accessToken, RefreshToken: refreshToken,
+		ExpiresAt: expiresAt, RefreshAfter: refreshAfter, RefreshedAt: now,
+	}, nil
+}
+
+func directTokenBundleUsable(bundle directTokenBundle, at time.Time) bool {
+	if strings.TrimSpace(bundle.AccessToken) == "" {
+		return false
+	}
+	return bundle.Legacy || bundle.ExpiresAt.After(at.UTC())
+}
+
+func directOAuthRefreshInvalidGrant(err error) bool {
+	var providerErr *yandexdirect.Error
+	return errors.As(err, &providerErr) &&
+		strings.EqualFold(strings.TrimSpace(providerErr.Code), "invalid_grant")
+}
+
 func (c *directTokenCipher) seal(workspaceID, accountID, clientLogin, token string) (string, error) {
 	if c == nil || c.aead == nil || strings.TrimSpace(token) == "" {
+		return "", errors.New("token encryption for Yandex Direct is unavailable")
+	}
+	return c.sealValue(
+		directTokenCipherPrefix, workspaceID, accountID, clientLogin, []byte(token),
+	)
+}
+
+func (c *directTokenCipher) sealBundle(
+	workspaceID, accountID, clientLogin string, bundle directTokenBundle,
+) (string, error) {
+	bundle.Legacy = false
+	if !directTokenBundleUsable(bundle, bundle.RefreshedAt) ||
+		strings.TrimSpace(bundle.RefreshToken) == "" ||
+		bundle.RefreshAfter.IsZero() || bundle.RefreshedAt.IsZero() {
+		return "", errors.New("Yandex Direct token bundle is incomplete")
+	}
+	payload, err := json.Marshal(bundle)
+	if err != nil {
+		return "", err
+	}
+	return c.sealValue(
+		directTokenBundleCipherPrefix, workspaceID, accountID, clientLogin, payload,
+	)
+}
+
+func (c *directTokenCipher) sealValue(
+	prefix, workspaceID, accountID, clientLogin string, plaintext []byte,
+) (string, error) {
+	if c == nil || c.aead == nil || len(plaintext) == 0 {
 		return "", errors.New("token encryption for Yandex Direct is unavailable")
 	}
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return "", err
 	}
-	sealed := c.aead.Seal(nonce, nonce, []byte(token), directTokenAAD(workspaceID, accountID, clientLogin))
-	return directTokenCipherPrefix + base64.RawURLEncoding.EncodeToString(sealed), nil
+	sealed := c.aead.Seal(
+		nonce, nonce, plaintext,
+		directTokenAADForPrefix(prefix, workspaceID, accountID, clientLogin),
+	)
+	return prefix + base64.RawURLEncoding.EncodeToString(sealed), nil
 }
 
 func (c *directTokenCipher) open(workspaceID, accountID, clientLogin, value string) (string, error) {
-	if c == nil || c.aead == nil || !strings.HasPrefix(value, directTokenCipherPrefix) {
-		return "", errors.New("invalid encrypted Yandex Direct token")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, directTokenCipherPrefix))
-	if err != nil || len(payload) <= c.aead.NonceSize() {
-		return "", errors.New("invalid encrypted Yandex Direct token")
-	}
-	nonce, ciphertext := payload[:c.aead.NonceSize()], payload[c.aead.NonceSize():]
-	plain, err := c.aead.Open(nil, nonce, ciphertext, directTokenAAD(workspaceID, accountID, clientLogin))
+	plain, err := c.openValue(
+		directTokenCipherPrefix, workspaceID, accountID, clientLogin, value,
+	)
 	if err != nil {
-		return "", errors.New("invalid encrypted Yandex Direct token")
+		return "", err
 	}
 	return string(plain), nil
 }
 
+func (c *directTokenCipher) openBundle(
+	workspaceID, accountID, clientLogin, value string,
+) (directTokenBundle, error) {
+	if strings.HasPrefix(value, directTokenCipherPrefix) {
+		accessToken, err := c.open(workspaceID, accountID, clientLogin, value)
+		if err != nil {
+			return directTokenBundle{}, err
+		}
+		return directTokenBundle{AccessToken: accessToken, Legacy: true}, nil
+	}
+	plain, err := c.openValue(
+		directTokenBundleCipherPrefix, workspaceID, accountID, clientLogin, value,
+	)
+	if err != nil {
+		return directTokenBundle{}, err
+	}
+	var bundle directTokenBundle
+	if err := json.Unmarshal(plain, &bundle); err != nil ||
+		strings.TrimSpace(bundle.AccessToken) == "" ||
+		strings.TrimSpace(bundle.RefreshToken) == "" ||
+		bundle.ExpiresAt.IsZero() || bundle.RefreshAfter.IsZero() ||
+		bundle.RefreshedAt.IsZero() {
+		return directTokenBundle{}, errors.New("invalid encrypted Yandex Direct token")
+	}
+	bundle.ExpiresAt = bundle.ExpiresAt.UTC()
+	bundle.RefreshAfter = bundle.RefreshAfter.UTC()
+	bundle.RefreshedAt = bundle.RefreshedAt.UTC()
+	return bundle, nil
+}
+
+func (c *directTokenCipher) openValue(
+	prefix, workspaceID, accountID, clientLogin, value string,
+) ([]byte, error) {
+	if c == nil || c.aead == nil || !strings.HasPrefix(value, prefix) {
+		return nil, errors.New("invalid encrypted Yandex Direct token")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(value, prefix))
+	if err != nil || len(payload) <= c.aead.NonceSize() {
+		return nil, errors.New("invalid encrypted Yandex Direct token")
+	}
+	nonce, ciphertext := payload[:c.aead.NonceSize()], payload[c.aead.NonceSize():]
+	plain, err := c.aead.Open(
+		nil, nonce, ciphertext,
+		directTokenAADForPrefix(prefix, workspaceID, accountID, clientLogin),
+	)
+	if err != nil {
+		return nil, errors.New("invalid encrypted Yandex Direct token")
+	}
+	return plain, nil
+}
+
 func directTokenAAD(workspaceID, accountID, clientLogin string) []byte {
-	return []byte(directTokenCipherPrefix + "\x00" + workspaceID + "\x00" +
+	return directTokenAADForPrefix(
+		directTokenCipherPrefix, workspaceID, accountID, clientLogin,
+	)
+}
+
+func directTokenAADForPrefix(prefix, workspaceID, accountID, clientLogin string) []byte {
+	return []byte(prefix + "\x00" + workspaceID + "\x00" +
 		accountID + "\x00" + strings.ToLower(strings.TrimSpace(clientLogin)))
 }
 

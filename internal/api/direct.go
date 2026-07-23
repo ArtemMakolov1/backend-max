@@ -28,13 +28,15 @@ type directConnectionResponse struct {
 }
 
 type directIntegrationResponse struct {
-	Configured        bool                      `json:"configured"`
-	WritesEnabled     bool                      `json:"writes_enabled"`
-	AutoLaunchEnabled bool                      `json:"auto_launch_enabled"`
-	Sandbox           bool                      `json:"sandbox"`
-	Connected         bool                      `json:"connected"`
-	Connection        *directConnectionResponse `json:"connection,omitempty"`
-	Capabilities      []string                  `json:"capabilities"`
+	Configured                    bool                      `json:"configured"`
+	WritesEnabled                 bool                      `json:"writes_enabled"`
+	AutoLaunchEnabled             bool                      `json:"auto_launch_enabled"`
+	MaxCampaignWeeklyBudgetMinor  int64                     `json:"max_campaign_weekly_budget_minor"`
+	MaxWorkspaceWeeklyBudgetMinor int64                     `json:"max_workspace_weekly_budget_minor"`
+	Sandbox                       bool                      `json:"sandbox"`
+	Connected                     bool                      `json:"connected"`
+	Connection                    *directConnectionResponse `json:"connection,omitempty"`
+	Capabilities                  []string                  `json:"capabilities"`
 }
 
 type directCampaignResponse struct {
@@ -44,6 +46,10 @@ type directCampaignResponse struct {
 	Objective           string                        `json:"objective"`
 	LandingURL          string                        `json:"landing_url"`
 	Brief               string                        `json:"brief"`
+	Titles              []string                      `json:"titles"`
+	Texts               []string                      `json:"texts"`
+	Keywords            []string                      `json:"keywords"`
+	NegativeKeywords    []string                      `json:"negative_keywords"`
 	Regions             []string                      `json:"regions"`
 	WeeklyBudgetMinor   int64                         `json:"weekly_budget_minor"`
 	CurrencyCode        string                        `json:"currency_code"`
@@ -52,12 +58,17 @@ type directCampaignResponse struct {
 	Status              string                        `json:"status"`
 	LaunchState         string                        `json:"launch_state"`
 	ProviderCampaignID  *string                       `json:"provider_campaign_id"`
+	ProviderState       *string                       `json:"provider_state"`
 	ModerationStatus    *string                       `json:"moderation_status"`
 	StatusClarification *string                       `json:"status_clarification"`
 	AutoLaunch          store.DirectAutoLaunchSummary `json:"auto_launch"`
 	Version             int64                         `json:"version"`
 	CreatedAt           time.Time                     `json:"created_at"`
 	UpdatedAt           time.Time                     `json:"updated_at"`
+	SetupWarningCode    *string                       `json:"setup_warning_code"`
+	GraphVerified       bool                          `json:"graph_verified"`
+	GraphHash           *string                       `json:"graph_hash"`
+	RevisionID          *string                       `json:"revision_id"`
 }
 
 type directCampaignDraftRequest struct {
@@ -65,6 +76,10 @@ type directCampaignDraftRequest struct {
 	Objective         string   `json:"objective"`
 	LandingURL        string   `json:"landing_url"`
 	Brief             string   `json:"brief"`
+	Titles            []string `json:"titles"`
+	Texts             []string `json:"texts"`
+	Keywords          []string `json:"keywords"`
+	NegativeKeywords  []string `json:"negative_keywords"`
 	Regions           []string `json:"regions"`
 	WeeklyBudgetMinor int64    `json:"weekly_budget_minor"`
 	CurrencyCode      string   `json:"currency_code"`
@@ -73,15 +88,21 @@ type directCampaignDraftRequest struct {
 }
 
 type directCampaignPatchRequest struct {
-	Name              *string   `json:"name"`
-	Objective         *string   `json:"objective"`
-	LandingURL        *string   `json:"landing_url"`
-	Brief             *string   `json:"brief"`
-	Regions           *[]string `json:"regions"`
-	WeeklyBudgetMinor *int64    `json:"weekly_budget_minor"`
-	StartsAt          *string   `json:"starts_at"`
-	EndsAt            *string   `json:"ends_at"`
-	ExpectedVersion   int64     `json:"expected_version"`
+	Name               *string   `json:"name"`
+	Objective          *string   `json:"objective"`
+	LandingURL         *string   `json:"landing_url"`
+	Brief              *string   `json:"brief"`
+	Titles             *[]string `json:"titles"`
+	Texts              *[]string `json:"texts"`
+	Keywords           *[]string `json:"keywords"`
+	NegativeKeywords   *[]string `json:"negative_keywords"`
+	Regions            *[]string `json:"regions"`
+	WeeklyBudgetMinor  *int64    `json:"weekly_budget_minor"`
+	StartsAt           *string   `json:"starts_at"`
+	EndsAt             *string   `json:"ends_at"`
+	ExpectedVersion    int64     `json:"expected_version"`
+	ExpectedGraphHash  string    `json:"expected_graph_hash"`
+	ExpectedRevisionID string    `json:"expected_revision_id"`
 }
 
 type directCampaignSuggestionRequest struct {
@@ -111,6 +132,8 @@ type directConsentRequest struct {
 	WeeklyBudgetMinor          int64  `json:"weekly_budget_minor"`
 	StartsAt                   string `json:"starts_at"`
 	EndsAt                     string `json:"ends_at"`
+	ExpectedGraphHash          string `json:"expected_graph_hash"`
+	ExpectedRevisionID         string `json:"expected_revision_id"`
 }
 
 func (s *Server) registerDirectAdvertisingRoutes(r chi.Router) {
@@ -144,8 +167,10 @@ func (s *Server) getDirectIntegration(w http.ResponseWriter, r *http.Request) {
 	}
 	response := directIntegrationResponse{
 		Configured: status.Configured, WritesEnabled: status.WritesEnabled,
-		AutoLaunchEnabled: status.AutoLaunchEnabled,
-		Sandbox:           status.Sandbox, Connected: status.Connected,
+		AutoLaunchEnabled:             status.AutoLaunchEnabled,
+		MaxCampaignWeeklyBudgetMinor:  store.DirectMaxCampaignWeeklyBudgetMinor,
+		MaxWorkspaceWeeklyBudgetMinor: store.DirectMaxWorkspaceWeeklyBudgetMinor,
+		Sandbox:                       status.Sandbox, Connected: status.Connected,
 		Capabilities: directCapabilities(access),
 	}
 	if status.Connection != nil {
@@ -294,6 +319,8 @@ func (s *Server) createDirectCampaign(w http.ResponseWriter, r *http.Request) {
 	campaign, err := s.app.CreateDirectCampaign(r.Context(), access.UserID, access.WorkspaceID, store.DirectCampaign{
 		Name: request.Name, Objective: request.Objective, LandingURL: request.LandingURL,
 		Brief: request.Brief, Regions: request.Regions,
+		Titles: request.Titles, Texts: request.Texts, Keywords: request.Keywords,
+		NegativeKeywords:  request.NegativeKeywords,
 		WeeklyBudgetMinor: request.WeeklyBudgetMinor, CurrencyCode: request.CurrencyCode,
 		StartsAt: startsAt, EndsAt: endsAt, CreatedAt: s.now().UTC(),
 	})
@@ -315,7 +342,9 @@ func (s *Server) updateDirectCampaign(w http.ResponseWriter, r *http.Request) {
 	}
 	changes := store.DirectCampaignChanges{
 		Name: request.Name, Objective: request.Objective, LandingURL: request.LandingURL,
-		Brief: request.Brief, Regions: request.Regions,
+		Brief: request.Brief, Regions: request.Regions, Titles: request.Titles,
+		Texts: request.Texts, Keywords: request.Keywords,
+		NegativeKeywords:  request.NegativeKeywords,
 		WeeklyBudgetMinor: request.WeeklyBudgetMinor, ExpectedVersion: request.ExpectedVersion,
 	}
 	if request.StartsAt != nil {
@@ -334,8 +363,9 @@ func (s *Server) updateDirectCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 		changes.EndsAt = &value
 	}
-	campaign, err := s.app.UpdateDirectCampaignDraft(
+	campaign, err := s.app.UpdateDirectCampaign(
 		r.Context(), access.UserID, access.WorkspaceID, campaignID, changes,
+		request.ExpectedGraphHash, request.ExpectedRevisionID,
 	)
 	if err != nil {
 		s.writeError(w, err)
@@ -413,6 +443,8 @@ func (s *Server) grantDirectConsent(w http.ResponseWriter, r *http.Request) {
 			ExpectedAccountID:    request.ExpectedAccountID,
 			ExpectedCampaignName: request.ExpectedCampaignName,
 			ExpectedProviderID:   providerCampaignID,
+			ExpectedGraphHash:    request.ExpectedGraphHash,
+			ExpectedRevisionID:   request.ExpectedRevisionID,
 			WeeklyBudgetMinor:    request.WeeklyBudgetMinor,
 			StartsAt:             startsAt, EndsAt: endsAt,
 		})
@@ -465,8 +497,10 @@ func (s *Server) launchDirectCampaign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		Confirmation    string `json:"confirmation"`
-		ExpectedVersion int64  `json:"expected_version"`
+		Confirmation       string `json:"confirmation"`
+		ExpectedVersion    int64  `json:"expected_version"`
+		ExpectedGraphHash  string `json:"expected_graph_hash"`
+		ExpectedRevisionID string `json:"expected_revision_id"`
 	}
 	if !s.decodeJSON(w, r, &request) {
 		return
@@ -477,6 +511,7 @@ func (s *Server) launchDirectCampaign(w http.ResponseWriter, r *http.Request) {
 	}
 	campaign, err := s.app.LaunchDirectCampaign(
 		r.Context(), access.UserID, access.WorkspaceID, campaignID, request.ExpectedVersion,
+		request.ExpectedGraphHash, request.ExpectedRevisionID,
 	)
 	if err != nil {
 		s.writeError(w, err)
@@ -574,25 +609,59 @@ func publicDirectCampaign(campaign store.DirectCampaign) directCampaignResponse 
 		value := strconv.FormatInt(*campaign.ProviderCampaignID, 10)
 		providerID = &value
 	}
-	var moderationStatus, clarification *string
-	if value := strings.TrimSpace(campaign.ProviderStatus); value != "" {
+	var moderationStatus, providerState, clarification, graphHash, revisionID, setupWarning *string
+	if value := strings.TrimSpace(campaign.ProviderState); value != "" {
+		providerState = &value
+	}
+	if value := strings.TrimSpace(campaign.ModerationStatus); value != "" {
 		moderationStatus = &value
 	}
-	if value := strings.TrimSpace(campaign.LaunchFailureCode); value != "" {
+	if value := strings.TrimSpace(campaign.SubmissionFailureClarification); value != "" {
+		clarification = &value
+	} else if value := strings.TrimSpace(campaign.ModerationClarification); value != "" {
+		clarification = &value
+	} else if value := strings.TrimSpace(campaign.LaunchFailureCode); value != "" {
 		clarification = &value
 	} else if value := strings.TrimSpace(campaign.ProviderState); value != "" {
 		clarification = &value
 	}
+	graphVerified := campaign.GraphVerifiedAt != nil &&
+		len(strings.TrimSpace(campaign.ProviderGraphHash)) == 64 &&
+		strings.TrimSpace(campaign.ProviderRevisionID) != "" &&
+		strings.TrimSpace(campaign.LaunchFailureCode) != "provider_snapshot_mismatch" &&
+		campaign.ProviderCampaignID != nil &&
+		campaign.ProviderAdGroupID != nil &&
+		campaign.ProviderAdID != nil &&
+		len(campaign.ProviderKeywordMappings) == len(campaign.Keywords)
+	if graphVerified {
+		hash, revision := campaign.ProviderGraphHash, campaign.ProviderRevisionID
+		graphHash, revisionID = &hash, &revision
+	} else {
+		warning := strings.TrimSpace(campaign.SubmissionFailureCode)
+		if warning == "" &&
+			strings.TrimSpace(campaign.LaunchFailureCode) == "provider_snapshot_mismatch" {
+			warning = "provider_snapshot_mismatch"
+		}
+		if warning == "" {
+			warning = "provider_graph_unverified"
+		}
+		setupWarning = &warning
+	}
 	return directCampaignResponse{
 		ID: campaign.ID, ConnectionID: campaign.ConnectionID, Name: campaign.Name,
 		Objective: campaign.Objective, LandingURL: campaign.LandingURL, Brief: campaign.Brief,
-		Regions: campaign.Regions, WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
+		Titles: campaign.Titles, Texts: campaign.Texts, Keywords: campaign.Keywords,
+		NegativeKeywords: campaign.NegativeKeywords,
+		Regions:          campaign.Regions, WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
 		CurrencyCode: campaign.CurrencyCode, StartsAt: campaign.StartsAt.Format(time.DateOnly),
 		EndsAt: campaign.EndsAt.Format(time.DateOnly), Status: campaign.Status,
 		LaunchState:        campaign.LaunchState,
-		ProviderCampaignID: providerID, ModerationStatus: moderationStatus,
+		ProviderCampaignID: providerID, ProviderState: providerState,
+		ModerationStatus:    moderationStatus,
 		StatusClarification: clarification, AutoLaunch: campaign.AutoLaunch,
 		Version: campaign.Version, CreatedAt: campaign.CreatedAt, UpdatedAt: campaign.UpdatedAt,
+		SetupWarningCode: setupWarning, GraphVerified: graphVerified,
+		GraphHash: graphHash, RevisionID: revisionID,
 	}
 }
 

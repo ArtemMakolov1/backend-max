@@ -1133,7 +1133,7 @@ paths:
             schema: {$ref: '#/components/schemas/DirectCampaignPatchRequest'}
       responses:
         '200':
-          description: Updated local campaign draft
+          description: Updated local draft or durably edited and re-verified provider campaign
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DirectCampaignEnvelope'}
@@ -1179,8 +1179,11 @@ paths:
     post:
       tags: [Advertising]
       operationId: submitDirectCampaign
-      summary: Create the campaign container in Yandex Direct
-      description: This creates only a provider-side campaign draft; ads, keywords, and moderation remain separate actions.
+      summary: Create and verify the complete campaign graph in Yandex Direct
+      description: >
+        Durably creates or reconciles the campaign, one unified ad group, one
+        responsive ad and all keyword conditions. The campaign remains OFF and
+        the ad is sent to moderation only after an exact graph read succeeds.
       security: [{sessionCookie: []}]
       requestBody:
         required: true
@@ -1202,7 +1205,10 @@ paths:
       tags: [Advertising]
       operationId: launchDirectCampaign
       summary: Manually launch an accepted Yandex Direct campaign
-      description: Requires an exact confirmation and an optimistic-lock version.
+      description: >
+        Requires an exact confirmation, optimistic-lock version and the exact
+        verified graph hash/revision. A fresh full graph read is performed
+        before the launch claim.
       security: [{sessionCookie: []}]
       requestBody:
         required: true
@@ -2939,6 +2945,8 @@ components:
         - configured
         - writes_enabled
         - auto_launch_enabled
+        - max_campaign_weekly_budget_minor
+        - max_workspace_weekly_budget_minor
         - sandbox
         - connected
         - capabilities
@@ -2947,7 +2955,22 @@ components:
         writes_enabled: {type: boolean}
         auto_launch_enabled:
           type: boolean
-          description: Server-side kill switch for explicit-consent automatic launches.
+          description: >
+            Effective automatic-launch availability. It remains false even
+            when the deployment switch is on until the complete provider graph
+            can be stored and verified against the user's consent.
+        max_campaign_weekly_budget_minor:
+          type: integer
+          format: int64
+          const: 1000000
+          description: Hard safety ceiling of 10,000 RUB per campaign per week.
+        max_workspace_weekly_budget_minor:
+          type: integer
+          format: int64
+          const: 3000000
+          description: >
+            Hard safety ceiling of 30,000 RUB for the sum of MaxPosty-managed
+            active or launch-claimed campaigns in one workspace.
         sandbox: {type: boolean}
         connected: {type: boolean}
         connection: {$ref: '#/components/schemas/DirectConnection'}
@@ -3046,6 +3069,10 @@ components:
         - objective
         - landing_url
         - brief
+        - titles
+        - texts
+        - keywords
+        - negative_keywords
         - regions
         - weekly_budget_minor
         - currency_code
@@ -3054,9 +3081,14 @@ components:
         - status
         - launch_state
         - provider_campaign_id
+        - provider_state
         - moderation_status
         - status_clarification
         - auto_launch
+        - setup_warning_code
+        - graph_verified
+        - graph_hash
+        - revision_id
         - version
         - created_at
         - updated_at
@@ -3073,6 +3105,25 @@ components:
           pattern: '^https://'
           maxLength: 2048
         brief: {type: string, minLength: 1, maxLength: 4000}
+        titles:
+          type: array
+          minItems: 1
+          maxItems: 7
+          items: {type: string, minLength: 1, maxLength: 56, pattern: '^\S{1,22}(?:\s+\S{1,22})*$'}
+        texts:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items: {type: string, minLength: 1, maxLength: 81, pattern: '^\S{1,23}(?:\s+\S{1,23})*$'}
+        keywords:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: {type: string, minLength: 1, maxLength: 4096}
+        negative_keywords:
+          type: array
+          maxItems: 50
+          items: {type: string, minLength: 1, maxLength: 4096}
         regions:
           type: array
           minItems: 1
@@ -3082,6 +3133,7 @@ components:
           type: integer
           format: int64
           minimum: 30000
+          maximum: 1000000
           description: Weekly budget in minor RUB units.
         currency_code: {type: string, const: RUB}
         starts_at: {type: string, format: date}
@@ -3092,11 +3144,24 @@ components:
           type: [string, 'null']
           pattern: '^[1-9][0-9]*$'
           description: Decimal string, never a JSON number, to remain JavaScript-safe.
+        provider_state:
+          type: [string, 'null']
+          description: Current provider state; unknown or null must fail closed for edits and launch.
         moderation_status:
           type: [string, 'null']
         status_clarification:
           type: [string, 'null']
         auto_launch: {$ref: '#/components/schemas/DirectAutoLaunch'}
+        setup_warning_code:
+          type: [string, 'null']
+          description: Null only after the complete provider graph is verified.
+        graph_verified: {type: boolean}
+        graph_hash:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+        revision_id:
+          type: [string, 'null']
+          pattern: '^drev_[0-9a-f]{32}$'
         version: {type: integer, format: int64, minimum: 1}
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
@@ -3119,6 +3184,10 @@ components:
         - objective
         - landing_url
         - brief
+        - titles
+        - texts
+        - keywords
+        - negative_keywords
         - regions
         - weekly_budget_minor
         - currency_code
@@ -3135,12 +3204,31 @@ components:
           pattern: '^https://'
           maxLength: 2048
         brief: {type: string, minLength: 1, maxLength: 4000}
+        titles:
+          type: array
+          minItems: 1
+          maxItems: 7
+          items: {type: string, minLength: 1, maxLength: 56, pattern: '^\S{1,22}(?:\s+\S{1,22})*$'}
+        texts:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items: {type: string, minLength: 1, maxLength: 81, pattern: '^\S{1,23}(?:\s+\S{1,23})*$'}
+        keywords:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: {type: string, minLength: 1, maxLength: 4096}
+        negative_keywords:
+          type: array
+          maxItems: 50
+          items: {type: string, minLength: 1, maxLength: 4096}
         regions:
           type: array
           minItems: 1
           maxItems: 100
           items: {type: string, minLength: 1, maxLength: 120}
-        weekly_budget_minor: {type: integer, format: int64, minimum: 30000}
+        weekly_budget_minor: {type: integer, format: int64, minimum: 30000, maximum: 1000000}
         currency_code: {type: string, const: RUB}
         starts_at: {type: string, format: date}
         ends_at: {type: string, format: date}
@@ -3158,15 +3246,42 @@ components:
           pattern: '^https://'
           maxLength: 2048
         brief: {type: string, minLength: 1, maxLength: 4000}
+        titles:
+          type: array
+          minItems: 1
+          maxItems: 7
+          items: {type: string, minLength: 1, maxLength: 56, pattern: '^\S{1,22}(?:\s+\S{1,22})*$'}
+        texts:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items: {type: string, minLength: 1, maxLength: 81, pattern: '^\S{1,23}(?:\s+\S{1,23})*$'}
+        keywords:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: {type: string, minLength: 1, maxLength: 4096}
+        negative_keywords:
+          type: array
+          maxItems: 50
+          items: {type: string, minLength: 1, maxLength: 4096}
         regions:
           type: array
           minItems: 1
           maxItems: 100
           items: {type: string, minLength: 1, maxLength: 120}
-        weekly_budget_minor: {type: integer, format: int64, minimum: 30000}
+        weekly_budget_minor: {type: integer, format: int64, minimum: 30000, maximum: 1000000}
         starts_at: {type: string, format: date}
         ends_at: {type: string, format: date}
         expected_version: {type: integer, format: int64, minimum: 1}
+        expected_graph_hash:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Required when editing an already submitted provider campaign.
+        expected_revision_id:
+          type: string
+          pattern: '^drev_[0-9a-f]{32}$'
+          description: Required when editing an already submitted provider campaign.
     DirectCampaignSuggestionRequest:
       type: object
       required: [objective, landing_url, brief, starts_at, ends_at]
@@ -3182,7 +3297,7 @@ components:
           type: array
           maxItems: 20
           items: {type: string, minLength: 1, maxLength: 100}
-        weekly_budget_minor: {type: integer, format: int64, minimum: 0}
+        weekly_budget_minor: {type: integer, format: int64, minimum: 0, maximum: 1000000}
         currency_code: {type: string, const: RUB}
         starts_at: {type: string, format: date}
         ends_at: {type: string, format: date}
@@ -3190,8 +3305,18 @@ components:
       type: object
       required: [title, text, image_prompt]
       properties:
-        title: {type: string, minLength: 1, maxLength: 56}
-        text: {type: string, minLength: 1, maxLength: 764}
+        title:
+          type: string
+          minLength: 1
+          maxLength: 56
+          pattern: '^\S{1,22}(?:\s+\S{1,22})*$'
+          description: Каждое отдельное слово — не более 22 символов.
+        text:
+          type: string
+          minLength: 1
+          maxLength: 81
+          pattern: '^\S{1,23}(?:\s+\S{1,23})*$'
+          description: Каждое отдельное слово — не более 23 символов.
         image_prompt: {type: string, maxLength: 2000}
     DirectCampaignSuggestion:
       type: object
@@ -3212,6 +3337,7 @@ components:
           items: {$ref: '#/components/schemas/DirectCreativeVariant'}
         keywords:
           type: array
+          minItems: 1
           maxItems: 50
           items: {type: string, minLength: 1, maxLength: 200}
         negative_keywords:
@@ -3247,6 +3373,8 @@ components:
         - weekly_budget_minor
         - starts_at
         - ends_at
+        - expected_graph_hash
+        - expected_revision_id
       properties:
         confirmation: {type: string, const: АВТОЗАПУСК}
         expected_connection_id: {type: string, minLength: 1}
@@ -3256,9 +3384,11 @@ components:
           type: string
           pattern: '^[1-9][0-9]*$'
         expected_version: {type: integer, format: int64, minimum: 1}
-        weekly_budget_minor: {type: integer, format: int64, minimum: 30000}
+        weekly_budget_minor: {type: integer, format: int64, minimum: 30000, maximum: 1000000}
         starts_at: {type: string, format: date}
         ends_at: {type: string, format: date}
+        expected_graph_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        expected_revision_id: {type: string, pattern: '^drev_[0-9a-f]{32}$'}
     DirectVersionRequest:
       type: object
       required: [expected_version]
@@ -3266,10 +3396,12 @@ components:
         expected_version: {type: integer, format: int64, minimum: 1}
     DirectLaunchRequest:
       type: object
-      required: [confirmation, expected_version]
+      required: [confirmation, expected_version, expected_graph_hash, expected_revision_id]
       properties:
         confirmation: {type: string, const: ЗАПУСТИТЬ}
         expected_version: {type: integer, format: int64, minimum: 1}
+        expected_graph_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        expected_revision_id: {type: string, pattern: '^drev_[0-9a-f]{32}$'}
     LoginStart:
       type: object
       required: [return_to, terms_accepted, personal_data_accepted]

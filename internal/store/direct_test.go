@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -37,6 +38,8 @@ func TestDirectLaunchClaimIsRecoverableAndPreservesCredential(t *testing.T) {
 			ExpectedAccountID:    connection.AccountID,
 			ExpectedCampaignName: campaign.Name,
 			ExpectedProviderID:   *campaign.ProviderCampaignID,
+			ExpectedGraphHash:    campaign.ProviderGraphHash,
+			ExpectedRevisionID:   campaign.ProviderRevisionID,
 			WeeklyBudgetMinor:    campaign.WeeklyBudgetMinor,
 			StartsAt:             campaign.StartsAt,
 			EndsAt:               campaign.EndsAt,
@@ -62,13 +65,14 @@ func TestDirectLaunchClaimIsRecoverableAndPreservesCredential(t *testing.T) {
 	if campaign.AutoLaunch.CampaignID != campaign.ID ||
 		campaign.AutoLaunch.CampaignName != campaign.Name ||
 		campaign.AutoLaunch.ProviderCampaignID != "77001" ||
-		campaign.AutoLaunch.WarningCode != "provider_creatives_not_snapshotted" {
+		campaign.AutoLaunch.WarningCode != "" {
 		t.Fatalf("public consent summary is incomplete: %#v", campaign.AutoLaunch)
 	}
 
 	claimed, err := storage.ClaimDirectAutoCampaignLaunch(
 		ctx, workspace.ID, campaign.ID, campaign.Version, *campaign.ProviderCampaignID,
 		connection.AccountID, campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID,
 		now.Add(time.Minute),
 	)
 	if err != nil {
@@ -88,12 +92,14 @@ func TestDirectLaunchClaimIsRecoverableAndPreservesCredential(t *testing.T) {
 		t.Fatalf("replace during reconciliation error = %v, want ErrConflict", err)
 	}
 	if err := storage.MarkDirectCampaignLaunchAttempt(
-		ctx, workspace.ID, campaign.ID, now.Add(3*time.Minute),
+		ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+		now.Add(3*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.MarkDirectCampaignLaunchReconciling(
-		ctx, workspace.ID, campaign.ID, "provider_timeout", now.Add(4*time.Minute),
+		ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+		"provider_timeout", now.Add(4*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -107,8 +113,15 @@ func TestDirectLaunchClaimIsRecoverableAndPreservesCredential(t *testing.T) {
 		candidates[0].CampaignID != campaign.ID {
 		t.Fatalf("recovery candidates = %#v", candidates)
 	}
+	recoveryMaterial, err := storage.GetDirectLaunchRecoveryMaterial(
+		ctx, workspace.ID, campaign.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := storage.CompleteDirectCampaignLaunch(
-		ctx, workspace.ID, campaign.ID, now.Add(5*time.Minute),
+		ctx, workspace.ID, campaign.ID,
+		*recoveryMaterial.Campaign.LaunchClaimedAt, now.Add(5*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -162,6 +175,7 @@ func TestDirectManualLaunchIsWorkspaceScopedAndDoesNotRequireAutoConsent(t *test
 	claimed, err := storage.ClaimDirectManualCampaignLaunch(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version, *campaign.ProviderCampaignID,
 		connection.AccountID, campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID,
 		now.Add(time.Minute),
 	)
 	if err != nil {
@@ -188,6 +202,8 @@ func TestDirectRevokeAllowsActiveCampaignAndReconnectsExplicitly(t *testing.T) {
 			ExpectedAccountID:    connection.AccountID,
 			ExpectedCampaignName: campaign.Name,
 			ExpectedProviderID:   *campaign.ProviderCampaignID,
+			ExpectedGraphHash:    campaign.ProviderGraphHash,
+			ExpectedRevisionID:   campaign.ProviderRevisionID,
 			WeeklyBudgetMinor:    campaign.WeeklyBudgetMinor,
 			StartsAt:             campaign.StartsAt,
 			EndsAt:               campaign.EndsAt,
@@ -255,6 +271,7 @@ func TestDirectErrorConnectionCanBeRevokedAndReauthorized(t *testing.T) {
 			Confirmation: "АВТОЗАПУСК", ExpectedVersion: campaign.Version,
 			ExpectedConnectionID: connection.ID, ExpectedAccountID: connection.AccountID,
 			ExpectedCampaignName: campaign.Name, ExpectedProviderID: *campaign.ProviderCampaignID,
+			ExpectedGraphHash: campaign.ProviderGraphHash, ExpectedRevisionID: campaign.ProviderRevisionID,
 			WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
 			StartsAt:          campaign.StartsAt, EndsAt: campaign.EndsAt, AuthorizedAt: now,
 		},
@@ -307,24 +324,28 @@ func TestDirectAuthoritativeUnauthorizedLaunchCanBeDisconnected(t *testing.T) {
 	now := time.Date(2042, time.April, 9, 12, 0, 0, 0, time.UTC)
 	campaign := createDirectTestCampaign(t, ctx, storage, owner, workspace.ID, now)
 	campaign = acceptDirectTestCampaign(t, ctx, storage, owner, workspace.ID, campaign, now)
-	if _, err := storage.ClaimDirectManualCampaignLaunch(
+	claimed, err := storage.ClaimDirectManualCampaignLaunch(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version, *campaign.ProviderCampaignID,
 		connection.AccountID, campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID,
 		now.Add(time.Minute),
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.MarkDirectCampaignLaunchAttempt(
-		ctx, workspace.ID, campaign.ID, now.Add(2*time.Minute),
+		ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+		now.Add(2*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.AbortDirectCampaignLaunchForAuthorization(
-		ctx, workspace.ID, campaign.ID, now.Add(3*time.Minute),
+		ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+		now.Add(3*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
-	campaign, err := storage.GetDirectCampaign(ctx, owner, workspace.ID, campaign.ID)
+	campaign, err = storage.GetDirectCampaign(ctx, owner, workspace.ID, campaign.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,6 +378,7 @@ func TestDirectAutoLaunchConsentRequiresWritableActiveConnection(t *testing.T) {
 		Confirmation: "АВТОЗАПУСК", ExpectedVersion: campaign.Version,
 		ExpectedConnectionID: connection.ID, ExpectedAccountID: connection.AccountID,
 		ExpectedCampaignName: campaign.Name, ExpectedProviderID: *campaign.ProviderCampaignID,
+		ExpectedGraphHash: campaign.ProviderGraphHash, ExpectedRevisionID: campaign.ProviderRevisionID,
 		WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
 		StartsAt:          campaign.StartsAt, EndsAt: campaign.EndsAt, AuthorizedAt: now,
 	}
@@ -686,11 +708,13 @@ func TestWorkspaceArchiveRefusesDirectLaunchReconciliation(t *testing.T) {
 	now := time.Date(2042, time.July, 8, 12, 0, 0, 0, time.UTC)
 	campaign := createDirectTestCampaign(t, ctx, storage, owner, workspace.ID, now)
 	campaign = acceptDirectTestCampaign(t, ctx, storage, owner, workspace.ID, campaign, now)
-	if _, err := storage.ClaimDirectManualCampaignLaunch(
+	_, err = storage.ClaimDirectManualCampaignLaunch(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version, *campaign.ProviderCampaignID,
 		connection.AccountID, campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID,
 		now.Add(time.Minute),
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 	err = storage.DeleteWorkspace(ctx, owner, workspace.ID)
@@ -704,6 +728,8 @@ func TestValidateDirectCampaignBudgetMinimum(t *testing.T) {
 	base := DirectCampaign{
 		Name: "Budget", Objective: "traffic", LandingURL: "https://maxposty.ru/",
 		Brief: "Validate official minimum", Regions: []string{"225"}, CurrencyCode: "RUB",
+		Titles: []string{"Budget title"}, Texts: []string{"Budget text"},
+		Keywords: []string{"budget keyword"}, NegativeKeywords: []string{},
 		StartsAt: time.Date(2042, 1, 1, 0, 0, 0, 0, time.UTC),
 		EndsAt:   time.Date(2042, 2, 1, 0, 0, 0, 0, time.UTC),
 	}
@@ -744,34 +770,39 @@ func TestDirectDelayedLaunchTruthIsAtomicAndKeepsCredential(t *testing.T) {
 			Confirmation: "АВТОЗАПУСК", ExpectedVersion: campaign.Version,
 			ExpectedConnectionID: connection.ID, ExpectedAccountID: connection.AccountID,
 			ExpectedCampaignName: campaign.Name, ExpectedProviderID: *campaign.ProviderCampaignID,
+			ExpectedGraphHash: campaign.ProviderGraphHash, ExpectedRevisionID: campaign.ProviderRevisionID,
 			WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
 			StartsAt:          campaign.StartsAt, EndsAt: campaign.EndsAt, AuthorizedAt: now,
 		},
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := storage.ClaimDirectManualCampaignLaunch(
+	claimed, err := storage.ClaimDirectManualCampaignLaunch(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version, *campaign.ProviderCampaignID,
 		connection.AccountID, campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID,
 		now.Add(time.Minute),
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		at := now.Add(time.Duration(attempt+2) * time.Minute)
 		if err := storage.MarkDirectCampaignLaunchAttempt(
-			ctx, workspace.ID, campaign.ID, at,
+			ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt, at,
 		); err != nil {
 			t.Fatal(err)
 		}
 		if err := storage.MarkDirectCampaignLaunchReconciling(
-			ctx, workspace.ID, campaign.ID, "provider_timeout", at,
+			ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+			"provider_timeout", at,
 		); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if err := storage.FailDirectCampaignLaunch(
-		ctx, workspace.ID, campaign.ID, "provider_off_after_retries", now.Add(4*time.Minute),
+		ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+		"provider_off_after_retries", now.Add(4*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -832,26 +863,31 @@ func TestDirectProviderONConfirmsReconcilingLaunchAtomically(t *testing.T) {
 	now := time.Date(2042, time.October, 11, 12, 0, 0, 0, time.UTC)
 	campaign := createDirectTestCampaign(t, ctx, storage, owner, workspace.ID, now)
 	campaign = acceptDirectTestCampaign(t, ctx, storage, owner, workspace.ID, campaign, now)
-	if _, err := storage.ClaimDirectManualCampaignLaunch(
+	claimed, err := storage.ClaimDirectManualCampaignLaunch(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version, *campaign.ProviderCampaignID,
 		connection.AccountID, campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID,
 		now.Add(time.Minute),
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.MarkDirectCampaignLaunchAttempt(
-		ctx, workspace.ID, campaign.ID, now.Add(2*time.Minute),
+		ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+		now.Add(2*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := storage.MarkDirectCampaignLaunchReconciling(
-		ctx, workspace.ID, campaign.ID, "provider_timeout", now.Add(2*time.Minute),
+		ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt,
+		"provider_timeout", now.Add(2*time.Minute),
 	); err != nil {
 		t.Fatal(err)
 	}
-	campaign, err := storage.SyncDirectCampaignProviderStatus(
+	campaign, err = storage.SyncDirectCampaignProviderStatusForLaunch(
 		ctx, workspace.ID, campaign.ID, *campaign.ProviderCampaignID,
-		"ACCEPTED", "ON", now.Add(3*time.Minute),
+		"ACCEPTED", "ON", *claimed.Campaign.LaunchClaimedAt,
+		now.Add(3*time.Minute),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -908,6 +944,314 @@ func TestDirectProviderPollingQueueDoesNotStarveBeyondLimit(t *testing.T) {
 	}
 }
 
+func TestDirectTokenRefreshLeaseAndCiphertextCAS(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	connection := connectDirectTestAccount(t, ctx, storage, owner, workspace.ID)
+	now := time.Date(2042, time.November, 12, 13, 0, 0, 0, time.UTC)
+	claimed, err := storage.ClaimDirectConnectionTokenRefresh(
+		ctx, workspace.ID, connection.ID, connection.TokenCiphertext, now,
+	)
+	if err != nil || claimed.TokenRefreshClaimedAt == nil {
+		t.Fatalf("claim = %#v, %v", claimed, err)
+	}
+	if _, err := storage.ClaimDirectConnectionTokenRefresh(
+		ctx, workspace.ID, connection.ID, connection.TokenCiphertext,
+		now.Add(time.Second),
+	); !errors.Is(err, ErrDirectTokenRefreshBusy) {
+		t.Fatalf("concurrent claim error = %v, want busy", err)
+	}
+	if _, err := storage.CompleteDirectConnectionTokenRefresh(
+		ctx, workspace.ID, connection.ID, "different-ciphertext",
+		*claimed.TokenRefreshClaimedAt, "v2.replacement", now.Add(2*time.Second),
+	); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale CAS error = %v, want conflict", err)
+	}
+	updated, err := storage.CompleteDirectConnectionTokenRefresh(
+		ctx, workspace.ID, connection.ID, connection.TokenCiphertext,
+		*claimed.TokenRefreshClaimedAt, "v2.replacement", now.Add(2*time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.TokenCiphertext != "v2.replacement" ||
+		updated.TokenRefreshClaimedAt != nil ||
+		updated.LastVerifiedAt == nil {
+		t.Fatalf("completed refresh = %#v", updated)
+	}
+	if err := storage.ReleaseDirectConnectionTokenRefresh(
+		ctx, workspace.ID, connection.ID, connection.TokenCiphertext,
+		*claimed.TokenRefreshClaimedAt, now.Add(3*time.Second),
+	); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale release error = %v, want conflict", err)
+	}
+	reclaimed, err := storage.ClaimDirectConnectionTokenRefresh(
+		ctx, workspace.ID, connection.ID, updated.TokenCiphertext,
+		now.Add(directTokenRefreshLease+time.Second),
+	)
+	if err != nil || reclaimed.TokenRefreshClaimedAt == nil {
+		t.Fatalf("claim after rotation = %#v, %v", reclaimed, err)
+	}
+}
+
+func TestDirectAggregateBudgetCapSerializesConcurrentLaunchClaims(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	connection := connectDirectTestAccount(t, ctx, storage, owner, workspace.ID)
+	now := time.Date(2042, time.December, 13, 12, 0, 0, 0, time.UTC)
+	nextProviderID := int64(88_000)
+	createAccepted := func(budget int64) DirectCampaign {
+		nextProviderID++
+		campaign, err := storage.CreateDirectCampaign(ctx, owner, workspace.ID, DirectCampaign{
+			Name:      fmt.Sprintf("Budget campaign %d", nextProviderID),
+			Objective: "traffic", LandingURL: "https://maxposty.ru/",
+			Brief: "Verify aggregate budget serialization", Regions: []string{"225"},
+			Titles: []string{"Budget campaign"}, Texts: []string{"Budget campaign text"},
+			Keywords: []string{"budget campaign"}, NegativeKeywords: []string{},
+			WeeklyBudgetMinor: budget, StartsAt: now, EndsAt: now.AddDate(0, 1, 0),
+			CreatedAt: now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return acceptDirectTestCampaign(
+			t, ctx, storage, owner, workspace.ID, campaign, now,
+		)
+	}
+	for _, budget := range []int64{1_000_000, 1_000_000, 500_000} {
+		campaign := createAccepted(budget)
+		claimed, err := storage.ClaimDirectManualCampaignLaunch(
+			ctx, owner, workspace.ID, campaign.ID, campaign.Version,
+			*campaign.ProviderCampaignID, connection.AccountID,
+			campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+			campaign.ProviderGraphHash, campaign.ProviderRevisionID, now,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := storage.CompleteDirectCampaignLaunch(
+			ctx, workspace.ID, campaign.ID, *claimed.Campaign.LaunchClaimedAt, now,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	candidates := []DirectCampaign{createAccepted(400_000), createAccepted(400_000)}
+	start := make(chan struct{})
+	results := make(chan error, len(candidates))
+	var wait sync.WaitGroup
+	for _, candidate := range candidates {
+		candidate := candidate
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			_, err := storage.ClaimDirectManualCampaignLaunch(
+				ctx, owner, workspace.ID, candidate.ID, candidate.Version,
+				*candidate.ProviderCampaignID, connection.AccountID,
+				candidate.WeeklyBudgetMinor, candidate.StartsAt, candidate.EndsAt,
+				candidate.ProviderGraphHash, candidate.ProviderRevisionID,
+				now.Add(time.Minute),
+			)
+			results <- err
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	var succeeded, capped int
+	for err := range results {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrDirectBudgetCapExceeded):
+			capped++
+		default:
+			t.Fatalf("unexpected concurrent claim error: %v", err)
+		}
+	}
+	if succeeded != 1 || capped != 1 {
+		t.Fatalf("concurrent claims succeeded=%d capped=%d", succeeded, capped)
+	}
+}
+
+func TestDirectLaunchRecoveryRotatesFenceAndRejectsStaleWorker(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	connection := connectDirectTestAccount(t, ctx, storage, owner, workspace.ID)
+	now := time.Date(2043, time.January, 14, 12, 0, 0, 0, time.UTC)
+	campaign := createDirectTestCampaign(t, ctx, storage, owner, workspace.ID, now)
+	campaign = acceptDirectTestCampaign(t, ctx, storage, owner, workspace.ID, campaign, now)
+	claimed, err := storage.ClaimDirectManualCampaignLaunch(
+		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
+		*campaign.ProviderCampaignID, connection.AccountID,
+		campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleGeneration := *claimed.Campaign.LaunchClaimedAt
+	if err := storage.MarkDirectCampaignLaunchReconciling(
+		ctx, workspace.ID, campaign.ID, staleGeneration,
+		"provider_timeout", now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := storage.ClaimDirectLaunchRecoveryCandidates(ctx, now, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].CampaignID != campaign.ID {
+		t.Fatalf("recovery candidates = %#v", candidates)
+	}
+	recovery, err := storage.GetDirectLaunchRecoveryMaterial(
+		ctx, workspace.ID, campaign.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshGeneration := *recovery.Campaign.LaunchClaimedAt
+	if !freshGeneration.After(staleGeneration) {
+		t.Fatalf(
+			"recovery generation %s did not advance past %s",
+			freshGeneration, staleGeneration,
+		)
+	}
+	staleCalls := map[string]func() error{
+		"attempt": func() error {
+			return storage.MarkDirectCampaignLaunchAttempt(
+				ctx, workspace.ID, campaign.ID, staleGeneration, now,
+			)
+		},
+		"reconciling": func() error {
+			return storage.MarkDirectCampaignLaunchReconciling(
+				ctx, workspace.ID, campaign.ID, staleGeneration,
+				"stale_worker", now,
+			)
+		},
+		"abort": func() error {
+			return storage.AbortDirectCampaignLaunchForAuthorization(
+				ctx, workspace.ID, campaign.ID, staleGeneration, now,
+			)
+		},
+		"complete": func() error {
+			return storage.CompleteDirectCampaignLaunch(
+				ctx, workspace.ID, campaign.ID, staleGeneration, now,
+			)
+		},
+		"sync": func() error {
+			_, syncErr := storage.SyncDirectCampaignProviderStatusForLaunch(
+				ctx, workspace.ID, campaign.ID, *campaign.ProviderCampaignID,
+				"ACCEPTED", "ON", staleGeneration, now,
+			)
+			return syncErr
+		},
+		"snapshot_mismatch": func() error {
+			return storage.SetDirectCampaignProviderSnapshotMismatchForLaunch(
+				ctx, workspace.ID, campaign.ID, true, staleGeneration, now,
+			)
+		},
+	}
+	for name, staleCall := range staleCalls {
+		if err := staleCall(); err == nil {
+			t.Fatalf("stale %s transition succeeded", name)
+		}
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := storage.MarkDirectCampaignLaunchAttempt(
+			ctx, workspace.ID, campaign.ID, freshGeneration,
+			now.Add(time.Duration(attempt+1)*time.Second),
+		); err != nil {
+			t.Fatalf("fresh attempt %d: %v", attempt+1, err)
+		}
+	}
+	if err := storage.FailDirectCampaignLaunch(
+		ctx, workspace.ID, campaign.ID, staleGeneration,
+		"stale_failure", now.Add(3*time.Second),
+	); err == nil {
+		t.Fatal("stale terminal failure succeeded")
+	}
+	current, err := storage.GetDirectCampaign(
+		ctx, owner, workspace.ID, campaign.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.LaunchClaimedAt == nil ||
+		!current.LaunchClaimedAt.Equal(freshGeneration) ||
+		current.LaunchState != "launching" ||
+		current.LaunchAttemptCount != 2 {
+		t.Fatalf("stale worker changed fresh recovery claim: %#v", current)
+	}
+}
+
+func TestDirectManualReclaimRotatesFenceAndRejectsPriorGeneration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	connection := connectDirectTestAccount(t, ctx, storage, owner, workspace.ID)
+	now := time.Date(2043, time.February, 15, 12, 0, 0, 0, time.UTC)
+	campaign := createDirectTestCampaign(t, ctx, storage, owner, workspace.ID, now)
+	campaign = acceptDirectTestCampaign(t, ctx, storage, owner, workspace.ID, campaign, now)
+	first, err := storage.ClaimDirectManualCampaignLaunch(
+		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
+		*campaign.ProviderCampaignID, connection.AccountID,
+		campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstGeneration := *first.Campaign.LaunchClaimedAt
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := storage.MarkDirectCampaignLaunchAttempt(
+			ctx, workspace.ID, campaign.ID, firstGeneration, now,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := storage.FailDirectCampaignLaunch(
+		ctx, workspace.ID, campaign.ID, firstGeneration,
+		"provider_off_after_retries", now,
+	); err != nil {
+		t.Fatal(err)
+	}
+	second, err := storage.ClaimDirectManualCampaignLaunch(
+		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
+		*campaign.ProviderCampaignID, connection.AccountID,
+		campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondGeneration := *second.Campaign.LaunchClaimedAt
+	if !secondGeneration.After(firstGeneration) {
+		t.Fatalf(
+			"manual reclaim generation %s did not advance past %s",
+			secondGeneration, firstGeneration,
+		)
+	}
+	if err := storage.AbortDirectCampaignLaunchForAuthorization(
+		ctx, workspace.ID, campaign.ID, firstGeneration, now,
+	); err == nil {
+		t.Fatal("prior generation aborted manual reclaim")
+	}
+	if err := storage.CompleteDirectCampaignLaunch(
+		ctx, workspace.ID, campaign.ID, firstGeneration, now,
+	); err == nil {
+		t.Fatal("prior generation completed manual reclaim")
+	}
+	if err := storage.CompleteDirectCampaignLaunch(
+		ctx, workspace.ID, campaign.ID, secondGeneration, now,
+	); err != nil {
+		t.Fatalf("fresh generation completion: %v", err)
+	}
+}
+
 func newDirectStoreFixture(
 	t *testing.T, ctx context.Context,
 ) (*Store, string, Workspace) {
@@ -946,6 +1290,10 @@ func createDirectTestCampaign(
 	campaign, err := storage.CreateDirectCampaign(ctx, owner, workspaceID, DirectCampaign{
 		Name: "Test campaign", Objective: "traffic", LandingURL: "https://maxposty.ru/",
 		Brief: "Promote the workspace channel", Regions: []string{"225"},
+		Titles:            []string{"Тестовое объявление"},
+		Texts:             []string{"Проверяем полную схему объявления"},
+		Keywords:          []string{"ведение канала"},
+		NegativeKeywords:  []string{"бесплатно"},
 		WeeklyBudgetMinor: 30_000, StartsAt: now, EndsAt: now.AddDate(0, 1, 0),
 		CreatedAt: now,
 	})
@@ -960,24 +1308,110 @@ func acceptDirectTestCampaign(
 	campaign DirectCampaign, now time.Time,
 ) DirectCampaign {
 	t.Helper()
-	if _, _, err := storage.ClaimDirectCampaignSubmission(
-		ctx, owner, workspaceID, campaign.ID, campaign.Version, now.Add(time.Second),
+	material, err := storage.ClaimDirectCampaignGraphSubmission(
+		ctx, owner, workspaceID, campaign.ID, campaign.Version,
+		"submit_"+campaign.ID, now.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var providerCampaignID int64
+	if err := storage.db.QueryRowContext(ctx, `SELECT COALESCE(
+MAX(provider_campaign_id),77000
+)+1 FROM direct_campaigns WHERE workspace_id=$1`, workspaceID).Scan(
+		&providerCampaignID,
 	); err != nil {
 		t.Fatal(err)
 	}
-	submitted, err := storage.MarkDirectCampaignSubmitted(
-		ctx, owner, workspaceID, campaign.ID, campaign.Version,
-		77_001, "DRAFT", "OFF", now.Add(2*time.Second),
+	providerAdGroupID, providerAdID := providerCampaignID*10+1, providerCampaignID*10+2
+	keywordMappings := make([]DirectKeywordMapping, len(campaign.Keywords))
+	for index, keyword := range campaign.Keywords {
+		keywordMappings[index] = DirectKeywordMapping{
+			Keyword: keyword, ProviderKeywordID: providerCampaignID*100 + int64(index+1),
+			Moderation: DirectModerationSnapshot{Status: "DRAFT"},
+		}
+	}
+	advance := func(expectedStage string, update DirectProviderStageUpdate, at time.Time) {
+		t.Helper()
+		update.ExpectedClaimedAt = material.Operation.ClaimedAt
+		material, err = storage.AdvanceDirectCampaignGraphSubmission(
+			ctx, workspaceID, campaign.ID, material.Operation.ID,
+			expectedStage, update, at,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	advance("claimed", DirectProviderStageUpdate{
+		Stage: "campaign_created", ProviderCampaignID: &providerCampaignID,
+	}, now.Add(2*time.Second))
+	advance("campaign_created", DirectProviderStageUpdate{
+		Stage: "ad_group_created", ProviderAdGroupID: &providerAdGroupID,
+	}, now.Add(3*time.Second))
+	advance("ad_group_created", DirectProviderStageUpdate{
+		Stage: "ad_created", ProviderAdID: &providerAdID,
+	}, now.Add(4*time.Second))
+	advance("ad_created", DirectProviderStageUpdate{
+		Stage: "keywords_created", ProviderKeywordMappings: &keywordMappings,
+	}, now.Add(5*time.Second))
+	observedGraph := directObservedGraphFixture(
+		t, providerCampaignID, providerAdGroupID, providerAdID, keywordMappings,
+		DirectModerationSnapshot{Status: "DRAFT", State: "OFF"},
+		DirectModerationSnapshot{Status: "DRAFT"},
+		DirectModerationSnapshot{Status: "DRAFT", State: "OFF"},
+	)
+	graphHash := strings.Repeat("d", 64)
+	if graphHash == directGraphHash(observedGraph) {
+		t.Fatal("test provider fingerprint unexpectedly equals full JSON hash")
+	}
+	advance("keywords_created", DirectProviderStageUpdate{
+		Stage: "graph_observed", ObservedGraph: observedGraph, GraphHash: graphHash,
+	}, now.Add(6*time.Second))
+	revision, err := storage.RecordVerifiedDirectCampaignGraph(
+		ctx, workspaceID, campaign.ID, DirectVerifiedGraphInput{
+			ExpectedOperationID: material.Operation.ID,
+			ExpectedStage:       "graph_observed", ExpectedCampaignVersion: campaign.Version,
+			ExpectedClaimedAt: material.Operation.ClaimedAt,
+			GraphVersion:      DirectGraphFingerprintVersion,
+			DesiredGraph:      material.Operation.DesiredGraph, ObservedGraph: observedGraph,
+			GraphHash: graphHash, ProviderCampaignID: providerCampaignID,
+			ProviderAdGroupID: providerAdGroupID, ProviderAdID: providerAdID,
+			ProviderKeywordMappings:   keywordMappings,
+			CampaignModeration:        DirectModerationSnapshot{Status: "DRAFT"},
+			AdGroupModeration:         DirectModerationSnapshot{Status: "DRAFT"},
+			AdModeration:              DirectModerationSnapshot{Status: "DRAFT"},
+			AggregateModerationStatus: "MODERATION",
+			ObservedAt:                now.Add(7 * time.Second), ActorUserID: owner,
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	accepted, err := storage.SyncDirectCampaignProviderStatus(
-		ctx, workspaceID, campaign.ID, *submitted.ProviderCampaignID,
-		"ACCEPTED", "OFF", now.Add(3*time.Second),
+	acceptedMappings := append([]DirectKeywordMapping(nil), keywordMappings...)
+	for index := range acceptedMappings {
+		acceptedMappings[index].Moderation.Status = "ACCEPTED"
+	}
+	accepted, err := storage.UpdateDirectCampaignGraphModeration(
+		ctx, workspaceID, campaign.ID, DirectGraphModerationUpdate{
+			ExpectedGraphHash: graphHash, ExpectedRevisionID: revision.ID,
+			Campaign: DirectModerationSnapshot{Status: "ACCEPTED"},
+			AdGroup:  DirectModerationSnapshot{Status: "ACCEPTED"},
+			Ad:       DirectModerationSnapshot{Status: "ACCEPTED"},
+			Keywords: acceptedMappings, ProviderStatus: "ACCEPTED",
+			AggregateModerationStatus: "ACCEPTED",
+			ProviderState:             "OFF", CheckedAt: now.Add(8 * time.Second),
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	material.Operation.Stage = "verified"
+	advance("verified", DirectProviderStageUpdate{
+		Stage: "moderation_requested",
+	}, now.Add(9*time.Second))
+	advance("moderation_requested", DirectProviderStageUpdate{
+		Stage: "completed", Complete: true,
+	}, now.Add(10*time.Second))
+	accepted.SubmissionStage = material.Operation.Stage
 	return accepted
 }

@@ -39,10 +39,23 @@ func (f *fakeDirectOAuthProvider) AuthorizationURL(state, challenge string) stri
 
 func (f *fakeDirectOAuthProvider) ExchangeCode(
 	_ context.Context, code, verifier string,
-) (string, error) {
+) (yandexdirect.OAuthToken, error) {
 	f.exchangeCalls++
 	f.exchangedCode, f.verifier = code, verifier
-	return "provider-access-token", nil
+	return yandexdirect.OAuthToken{
+		AccessToken: "provider-access-token", RefreshToken: "provider-refresh-token",
+		ExpiresInSeconds: int64((24 * time.Hour) / time.Second),
+	}, nil
+}
+
+func (f *fakeDirectOAuthProvider) RefreshToken(
+	context.Context, string,
+) (yandexdirect.OAuthToken, error) {
+	return yandexdirect.OAuthToken{
+		AccessToken:      "refreshed-provider-access-token",
+		RefreshToken:     "rotated-provider-refresh-token",
+		ExpiresInSeconds: int64((24 * time.Hour) / time.Second),
+	}, nil
 }
 
 func (f *fakeDirectOAuthProvider) GetAccount(
@@ -220,6 +233,19 @@ func TestDirectAdvertisingRoutesUseDedicatedCapabilities(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("%s GET state = %d %s", userID, response.Code, response.Body.String())
 		}
+		var payload struct {
+			Integration directIntegrationResponse `json:"integration"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Integration.MaxCampaignWeeklyBudgetMinor !=
+			store.DirectMaxCampaignWeeklyBudgetMinor ||
+			payload.Integration.MaxWorkspaceWeeklyBudgetMinor !=
+				store.DirectMaxWorkspaceWeeklyBudgetMinor ||
+			payload.Integration.AutoLaunchEnabled {
+			t.Fatalf("%s integration safety limits = %#v", userID, payload.Integration)
+		}
 	}
 	response := performJSONRequest(
 		fixture.handler(t, "ws-editor"), http.MethodPost, base+"/connect/start", "",
@@ -261,6 +287,15 @@ func TestDirectCampaignValidationIsAClientErrorForCreateAndPatch(t *testing.T) {
 			assertProblemCode(t, response, http.StatusUnprocessableEntity, "direct_validation_error")
 		})
 	}
+	response := performJSONRequest(
+		handler, http.MethodPost, base+"/campaigns",
+		`{"name":"Campaign","objective":"traffic","landing_url":"https://maxposty.ru/",`+
+			`"brief":"A valid campaign brief","regions":["225"],"weekly_budget_minor":1000001,`+
+			`"currency_code":"RUB","starts_at":"2044-01-01","ends_at":"2044-02-01"}`,
+	)
+	assertProblemCode(
+		t, response, http.StatusUnprocessableEntity, "direct_budget_cap_exceeded",
+	)
 
 	now := time.Date(2043, time.December, 1, 12, 0, 0, 0, time.UTC)
 	if _, err := fixture.storage.ReplaceDirectConnection(
@@ -282,7 +317,7 @@ func TestDirectCampaignValidationIsAClientErrorForCreateAndPatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := performJSONRequest(handler, http.MethodPatch,
+	response = performJSONRequest(handler, http.MethodPatch,
 		base+"/campaigns/"+campaign.ID,
 		`{"landing_url":"https://maxposty.ru/#fragment","expected_version":1}`)
 	assertProblemCode(t, response, http.StatusUnprocessableEntity, "direct_validation_error")
@@ -304,7 +339,9 @@ func TestPublicDirectCampaignExposesTruthfulSafeLaunchState(t *testing.T) {
 		AutoLaunch: store.DirectAutoLaunchSummary{Enabled: false, Valid: false},
 	})
 	if response.Status != "provider_draft" || response.LaunchState != "reconciling" ||
-		response.ProviderCampaignID == nil || *response.ProviderCampaignID != "9007199254740001" {
+		response.ProviderCampaignID == nil || *response.ProviderCampaignID != "9007199254740001" ||
+		response.SetupWarningCode == nil ||
+		*response.SetupWarningCode != "provider_graph_unverified" {
 		t.Fatalf("public campaign = %#v", response)
 	}
 	encoded, err := json.Marshal(response)

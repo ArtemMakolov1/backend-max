@@ -219,10 +219,15 @@ type App struct {
 	billingManualReviewLastCount int
 	billingManualReviewLastLog   time.Time
 	direct                       DirectProvider
+	directGraph                  DirectGraphProvider
 	directCipher                 *directTokenCipher
 	directWritesEnabled          bool
 	directAutoLaunchEnabled      bool
 	directSandbox                bool
+	// Automated launch stays fail-closed until the provider-graph rollout can
+	// prove that ad groups, ads and keywords match the user's consent.
+	directProviderGraphVerified bool
+	directTokenRefresh          singleflight.Group
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {

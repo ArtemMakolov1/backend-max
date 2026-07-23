@@ -193,6 +193,8 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns", "post", "422", "#/components/responses/ValidationProblem")
 	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}", "patch", "422", "#/components/responses/ValidationProblem")
 	assertSchemaRequiredProperty(t, document, "DirectIntegration", "auto_launch_enabled")
+	assertSchemaRequiredProperty(t, document, "DirectIntegration", "max_campaign_weekly_budget_minor")
+	assertSchemaRequiredProperty(t, document, "DirectIntegration", "max_workspace_weekly_budget_minor")
 	assertSchemaRequiredProperty(t, document, "DirectOAuthStart", "expires_at")
 	assertSchemaRequiredProperty(t, document, "DirectOAuthStart", "flow")
 	assertSchemaOptionalProperty(t, document, "DirectOAuthStart", "state")
@@ -202,6 +204,7 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertSchemaOptionalProperty(t, document, "DirectConnection", "error_code")
 	assertSchemaRequiredProperty(t, document, "DirectCampaign", "provider_campaign_id")
 	assertSchemaRequiredProperty(t, document, "DirectCampaign", "launch_state")
+	assertSchemaRequiredProperty(t, document, "DirectCampaign", "setup_warning_code")
 	assertSchemaEnumValue(t, document, "DirectCampaignStatus", "provider_draft")
 	assertSchemaEnumValue(t, document, "DirectLaunchState", "failed")
 	for _, capability := range []string{

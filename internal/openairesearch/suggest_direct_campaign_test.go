@@ -6,8 +6,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func validDirectCampaignSuggestionRequest() SuggestDirectCampaignRequest {
@@ -17,7 +19,7 @@ func validDirectCampaignSuggestionRequest() SuggestDirectCampaignRequest {
 		LandingURL:         "https://max.ru/channel_ai_business",
 		Audience:           "Владельцы малого бизнеса и руководители небольших команд.",
 		Regions:            []string{"Москва", "Санкт-Петербург"},
-		WeeklyBudgetMinor:  1500000,
+		WeeklyBudgetMinor:  500000,
 		CurrencyCode:       "RUB",
 		ChannelTitle:       "ИИ по делу",
 		ChannelDescription: "Практические кейсы и инструкции.",
@@ -66,6 +68,9 @@ func TestValidateSuggestDirectCampaignRequestRejectsUnsafeOrOversizedInput(t *te
 		}, field: "landing_url"},
 		{name: "negative budget", mutate: func(value *SuggestDirectCampaignRequest) {
 			value.WeeklyBudgetMinor = -1
+		}, field: "weekly_budget_minor"},
+		{name: "budget above safety cap", mutate: func(value *SuggestDirectCampaignRequest) {
+			value.WeeklyBudgetMinor = MaxDirectCampaignWeeklyBudgetMinor + 1
 		}, field: "weekly_budget_minor"},
 		{name: "unexpected currency", mutate: func(value *SuggestDirectCampaignRequest) {
 			value.CurrencyCode = "USD"
@@ -150,6 +155,9 @@ func TestSuggestDirectCampaignUsesStrictSchemaAndTreatsBriefAsData(t *testing.T)
 	if !strings.Contains(user, malicious) {
 		t.Fatalf("brief missing from user data: %s", user)
 	}
+	if !strings.Contains(system, suggestDirectCampaignProviderLimitsInstruction) {
+		t.Fatalf("provider phrase limits missing from system instruction: %s", system)
+	}
 	text := payload["text"].(map[string]any)
 	format := text["format"].(map[string]any)
 	if format["type"] != "json_schema" || format["strict"] != true ||
@@ -163,6 +171,30 @@ func TestSuggestDirectCampaignUsesStrictSchemaAndTreatsBriefAsData(t *testing.T)
 			"suggested_regions", "rationale", "risk_warnings",
 		}) {
 		t.Fatalf("schema = %#v", schema)
+	}
+	properties := schema["properties"].(map[string]any)
+	variants := properties["variants"].(map[string]any)
+	variantItems := variants["items"].(map[string]any)
+	variantProperties := variantItems["properties"].(map[string]any)
+	titleSchema := variantProperties["title"].(map[string]any)
+	textSchema := variantProperties["text"].(map[string]any)
+	if titleSchema["maxLength"] != float64(MaxDirectCampaignTitleRunes) ||
+		titleSchema["description"] != "Каждое отдельное слово — не более 22 символов." ||
+		textSchema["maxLength"] != float64(MaxDirectCampaignTextRunes) ||
+		textSchema["description"] != "Каждое отдельное слово — не более 23 символов." {
+		t.Fatalf("variant schema = %#v", variantProperties)
+	}
+	keywordsSchema := properties["keywords"].(map[string]any)
+	negativeKeywordsSchema := properties["negative_keywords"].(map[string]any)
+	keywordItems := keywordsSchema["items"].(map[string]any)
+	negativeKeywordItems := negativeKeywordsSchema["items"].(map[string]any)
+	if keywordsSchema["minItems"] != float64(1) ||
+		keywordsSchema["maxItems"] != float64(MaxDirectCampaignKeywords) ||
+		negativeKeywordsSchema["minItems"] != float64(0) ||
+		negativeKeywordsSchema["maxItems"] != float64(MaxDirectCampaignKeywords) ||
+		keywordItems["pattern"] != `^\S{1,35}(?:\s+\S{1,35}){0,6}$` ||
+		negativeKeywordItems["pattern"] != `^[^-]\S{0,34}(?:\s+\S{1,35}){0,6}$` {
+		t.Fatalf("keyword schemas = %#v %#v", keywordsSchema, negativeKeywordsSchema)
 	}
 	if payload["store"] != false {
 		t.Fatalf("payload store = %#v", payload["store"])
@@ -189,8 +221,43 @@ func TestDecodeSuggestDirectCampaignResultRejectsInvalidShapeAndLimits(t *testin
 		{name: "long title", mutate: func(value *SuggestDirectCampaignResult) {
 			value.Variants[0].Title = strings.Repeat("я", MaxDirectCampaignTitleRunes+1)
 		}},
+		{name: "oversized title word", mutate: func(value *SuggestDirectCampaignResult) {
+			value.Variants[0].Title = strings.Repeat("я", MaxDirectCampaignTitleWordRunes+1)
+		}},
+		{name: "long text", mutate: func(value *SuggestDirectCampaignResult) {
+			value.Variants[0].Text = strings.Repeat("я", MaxDirectCampaignTextRunes+1)
+		}},
+		{name: "oversized text word", mutate: func(value *SuggestDirectCampaignResult) {
+			value.Variants[0].Text = strings.Repeat("я", MaxDirectCampaignTextWordRunes+1)
+		}},
+		{name: "missing keyword", mutate: func(value *SuggestDirectCampaignResult) {
+			value.Keywords = nil
+		}},
 		{name: "duplicate keyword", mutate: func(value *SuggestDirectCampaignResult) {
 			value.Keywords = []string{"ИИ для бизнеса", "ии для бизнеса"}
+		}},
+		{name: "keyword above provider word count", mutate: func(value *SuggestDirectCampaignResult) {
+			value.Keywords = []string{"один два три четыре пять шесть семь восемь"}
+		}},
+		{name: "keyword above provider word length", mutate: func(value *SuggestDirectCampaignResult) {
+			value.Keywords = []string{strings.Repeat(
+				"я", MaxDirectCampaignKeywordWordRunes+1,
+			)}
+		}},
+		{name: "negative keyword with leading minus", mutate: func(value *SuggestDirectCampaignResult) {
+			value.NegativeKeywords = []string{"-бесплатно"}
+		}},
+		{name: "too many keywords", mutate: func(value *SuggestDirectCampaignResult) {
+			value.Keywords = make([]string, MaxDirectCampaignKeywords+1)
+			for index := range value.Keywords {
+				value.Keywords[index] = "ключ " + strconv.Itoa(index)
+			}
+		}},
+		{name: "too many negative keywords", mutate: func(value *SuggestDirectCampaignResult) {
+			value.NegativeKeywords = make([]string, MaxDirectCampaignKeywords+1)
+			for index := range value.NegativeKeywords {
+				value.NegativeKeywords[index] = "минус " + strconv.Itoa(index)
+			}
 		}},
 		{name: "too many warnings", mutate: func(value *SuggestDirectCampaignResult) {
 			value.RiskWarnings = make([]string, MaxDirectCampaignNotes+1)
@@ -213,5 +280,52 @@ func TestDecodeSuggestDirectCampaignResultRejectsInvalidShapeAndLimits(t *testin
 				t.Fatalf("decode accepted %s", raw)
 			}
 		})
+	}
+}
+
+func TestDecodeSuggestDirectCampaignResultAllowsNoNegativeKeywords(t *testing.T) {
+	t.Parallel()
+	candidate := validDirectCampaignSuggestionResult()
+	candidate.NegativeKeywords = nil
+	raw, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := decodeSuggestDirectCampaignResult(string(raw))
+	if err != nil {
+		t.Fatalf("decode without negative keywords: %v", err)
+	}
+	if len(result.NegativeKeywords) != 0 {
+		t.Fatalf("negative keywords = %#v", result.NegativeKeywords)
+	}
+}
+
+func TestDecodeSuggestDirectCampaignResultAcceptsExactCreativeAndKeywordLimits(t *testing.T) {
+	t.Parallel()
+	candidate := validDirectCampaignSuggestionResult()
+	candidate.Variants[0].Title = strings.Repeat("я", 22) + " " +
+		strings.Repeat("я", 22) + " " + strings.Repeat("я", 10)
+	candidate.Variants[0].Text = strings.Repeat("я", 23) + " " +
+		strings.Repeat("я", 23) + " " + strings.Repeat("я", 23) + " " +
+		strings.Repeat("я", 9)
+	candidate.Keywords = make([]string, MaxDirectCampaignKeywords)
+	candidate.NegativeKeywords = make([]string, MaxDirectCampaignKeywords)
+	for index := 0; index < MaxDirectCampaignKeywords; index++ {
+		candidate.Keywords[index] = "ключ " + strconv.Itoa(index)
+		candidate.NegativeKeywords[index] = "минус " + strconv.Itoa(index)
+	}
+	raw, err := json.Marshal(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := decodeSuggestDirectCampaignResult(string(raw))
+	if err != nil {
+		t.Fatalf("decode exact limits: %v", err)
+	}
+	if utf8.RuneCountInString(result.Variants[0].Title) != MaxDirectCampaignTitleRunes ||
+		utf8.RuneCountInString(result.Variants[0].Text) != MaxDirectCampaignTextRunes ||
+		len(result.Keywords) != MaxDirectCampaignKeywords ||
+		len(result.NegativeKeywords) != MaxDirectCampaignKeywords {
+		t.Fatalf("decoded limits = %#v", result)
 	}
 }
