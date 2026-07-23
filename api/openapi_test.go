@@ -67,6 +67,7 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 		"/posts/{id}/pin":                             {"post", "delete"},
 		"/posts/{id}/publication":                     {"delete"},
 		"/posts/{id}/delete-publication":              {"post"},
+		"/advertising/direct/oauth/callback":          {"get"},
 		"/images/generate":                            {"post"},
 		"/research/generate":                          {"post"},
 		"/integration/max":                            {"get"},
@@ -79,70 +80,79 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 		"/workspaces/{workspace_id}":                  {"get", "patch", "delete"},
 		"/workspaces/{workspace_id}/billing":          {"get"},
 		"/workspaces/{workspace_id}/billing/checkout": {"post"},
-		"/workspaces/{workspace_id}/billing/cancellation-intent":                    {"post"},
-		"/workspaces/{workspace_id}/billing/retention-offer":                        {"post"},
-		"/workspaces/{workspace_id}/billing/cancel-confirm":                         {"post"},
-		"/workspaces/{workspace_id}/billing/resume":                                 {"post"},
-		"/workspaces/{workspace_id}/billing/payment-method/detach":                  {"post"},
-		"/workspaces/{workspace_id}/transfer-ownership":                             {"post"},
-		"/workspaces/{workspace_id}/members":                                        {"get", "post"},
-		"/workspaces/{workspace_id}/members/{user_id}":                              {"patch", "delete"},
-		"/workspaces/{workspace_id}/invitations":                                    {"get", "post"},
-		"/workspaces/{workspace_id}/invitations/{invitation_id}":                    {"delete"},
-		"/workspaces/{workspace_id}/audit":                                          {"get"},
-		"/workspaces/{workspace_id}/brand-kit":                                      {"get", "put", "patch"},
-		"/workspaces/{workspace_id}/brand-kit/suggest":                              {"post"},
-		"/workspaces/{workspace_id}/channel-templates":                              {"get", "post"},
-		"/workspaces/{workspace_id}/channel-templates/{template_id}":                {"get", "put", "patch", "delete"},
-		"/workspaces/{workspace_id}/analytics":                                      {"get"},
-		"/workspaces/{workspace_id}/analytics/content":                              {"get"},
-		"/workspaces/{workspace_id}/analytics/content/posts/{post_id}":              {"get"},
-		"/workspaces/{workspace_id}/analytics/content/posts/{post_id}/variation":    {"post"},
-		"/workspaces/{workspace_id}/analytics/content/posts/{post_id}/repeat":       {"post"},
-		"/workspaces/{workspace_id}/calendar":                                       {"get"},
-		"/workspaces/{workspace_id}/calendar/posts/{post_id}":                       {"put"},
-		"/workspaces/{workspace_id}/campaigns":                                      {"get", "post"},
-		"/workspaces/{workspace_id}/campaigns/{campaign_id}":                        {"get", "patch", "delete"},
-		"/workspaces/{workspace_id}/campaigns/{campaign_id}/variants":               {"post"},
-		"/workspaces/{workspace_id}/campaigns/{campaign_id}/variants/{variant_id}":  {"patch", "delete"},
-		"/workspaces/{workspace_id}/campaigns/{campaign_id}/materialize":            {"post"},
-		"/workspaces/{workspace_id}/campaigns/{campaign_id}/schedule":               {"post"},
-		"/workspaces/{workspace_id}/channels":                                       {"get", "post"},
-		"/workspaces/{workspace_id}/channels/connect/start":                         {"post"},
-		"/workspaces/{workspace_id}/channels/connect/{claim_id}":                    {"get"},
-		"/workspaces/{workspace_id}/channels/{channel_id}":                          {"get", "patch", "delete"},
-		"/workspaces/{workspace_id}/channels/{channel_id}/description/suggest":      {"post"},
-		"/workspaces/{workspace_id}/channels/{channel_id}/test":                     {"post"},
-		"/workspaces/{workspace_id}/posts":                                          {"get", "post"},
-		"/workspaces/{workspace_id}/posts/format-content":                           {"post"},
-		"/workspaces/{workspace_id}/posts/suggest-image-prompt":                     {"post"},
-		"/workspaces/{workspace_id}/research/generate":                              {"post"},
-		"/workspaces/{workspace_id}/images/generate":                                {"post"},
-		"/workspaces/{workspace_id}/media":                                          {"post"},
-		"/workspaces/{workspace_id}/media/{filename}":                               {"get"},
-		"/workspaces/{workspace_id}/posts/{post_id}":                                {"get", "patch", "put", "delete"},
-		"/workspaces/{workspace_id}/posts/{post_id}/duplicate":                      {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/schedule":                       {"post", "delete"},
-		"/workspaces/{workspace_id}/posts/{post_id}/publish":                        {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/update-published":               {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/sync-max":                       {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/pin":                            {"post", "delete"},
-		"/workspaces/{workspace_id}/posts/{post_id}/publication":                    {"delete"},
-		"/workspaces/{workspace_id}/posts/{post_id}/view-history":                   {"get"},
-		"/workspaces/{workspace_id}/posts/{post_id}/generate-image":                 {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/image":                          {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/attachments":                    {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/attachments/{attachment_id}":    {"put", "delete"},
-		"/workspaces/{workspace_id}/posts/{post_id}/attachments/order":              {"patch"},
-		"/workspaces/{workspace_id}/posts/{post_id}/revisions":                      {"get"},
-		"/workspaces/{workspace_id}/posts/{post_id}/reviews":                        {"get"},
-		"/workspaces/{workspace_id}/posts/{post_id}/review":                         {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/review/submit":                  {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/review/approve":                 {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/review/request-changes":         {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/reviews/{revision_id}/decision": {"post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/comments":                       {"get", "post"},
-		"/workspaces/{workspace_id}/posts/{post_id}/comments/{comment_id}":          {"patch", "delete"},
+		"/workspaces/{workspace_id}/billing/cancellation-intent":                                    {"post"},
+		"/workspaces/{workspace_id}/billing/retention-offer":                                        {"post"},
+		"/workspaces/{workspace_id}/billing/cancel-confirm":                                         {"post"},
+		"/workspaces/{workspace_id}/billing/resume":                                                 {"post"},
+		"/workspaces/{workspace_id}/billing/payment-method/detach":                                  {"post"},
+		"/workspaces/{workspace_id}/advertising/direct":                                             {"get"},
+		"/workspaces/{workspace_id}/advertising/direct/connect/start":                               {"post"},
+		"/workspaces/{workspace_id}/advertising/direct/connection":                                  {"delete"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns":                                   {"get", "post"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/suggest":                           {"post"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}":                     {"patch"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/auto-launch-consent": {"post", "delete"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/submit":              {"post"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/launch":              {"post"},
+		"/workspaces/{workspace_id}/transfer-ownership":                                             {"post"},
+		"/workspaces/{workspace_id}/members":                                                        {"get", "post"},
+		"/workspaces/{workspace_id}/members/{user_id}":                                              {"patch", "delete"},
+		"/workspaces/{workspace_id}/invitations":                                                    {"get", "post"},
+		"/workspaces/{workspace_id}/invitations/{invitation_id}":                                    {"delete"},
+		"/workspaces/{workspace_id}/audit":                                                          {"get"},
+		"/workspaces/{workspace_id}/brand-kit":                                                      {"get", "put", "patch"},
+		"/workspaces/{workspace_id}/brand-kit/suggest":                                              {"post"},
+		"/workspaces/{workspace_id}/channel-templates":                                              {"get", "post"},
+		"/workspaces/{workspace_id}/channel-templates/{template_id}":                                {"get", "put", "patch", "delete"},
+		"/workspaces/{workspace_id}/analytics":                                                      {"get"},
+		"/workspaces/{workspace_id}/analytics/content":                                              {"get"},
+		"/workspaces/{workspace_id}/analytics/content/posts/{post_id}":                              {"get"},
+		"/workspaces/{workspace_id}/analytics/content/posts/{post_id}/variation":                    {"post"},
+		"/workspaces/{workspace_id}/analytics/content/posts/{post_id}/repeat":                       {"post"},
+		"/workspaces/{workspace_id}/calendar":                                                       {"get"},
+		"/workspaces/{workspace_id}/calendar/posts/{post_id}":                                       {"put"},
+		"/workspaces/{workspace_id}/campaigns":                                                      {"get", "post"},
+		"/workspaces/{workspace_id}/campaigns/{campaign_id}":                                        {"get", "patch", "delete"},
+		"/workspaces/{workspace_id}/campaigns/{campaign_id}/variants":                               {"post"},
+		"/workspaces/{workspace_id}/campaigns/{campaign_id}/variants/{variant_id}":                  {"patch", "delete"},
+		"/workspaces/{workspace_id}/campaigns/{campaign_id}/materialize":                            {"post"},
+		"/workspaces/{workspace_id}/campaigns/{campaign_id}/schedule":                               {"post"},
+		"/workspaces/{workspace_id}/channels":                                                       {"get", "post"},
+		"/workspaces/{workspace_id}/channels/connect/start":                                         {"post"},
+		"/workspaces/{workspace_id}/channels/connect/{claim_id}":                                    {"get"},
+		"/workspaces/{workspace_id}/channels/{channel_id}":                                          {"get", "patch", "delete"},
+		"/workspaces/{workspace_id}/channels/{channel_id}/description/suggest":                      {"post"},
+		"/workspaces/{workspace_id}/channels/{channel_id}/test":                                     {"post"},
+		"/workspaces/{workspace_id}/posts":                                                          {"get", "post"},
+		"/workspaces/{workspace_id}/posts/format-content":                                           {"post"},
+		"/workspaces/{workspace_id}/posts/suggest-image-prompt":                                     {"post"},
+		"/workspaces/{workspace_id}/research/generate":                                              {"post"},
+		"/workspaces/{workspace_id}/images/generate":                                                {"post"},
+		"/workspaces/{workspace_id}/media":                                                          {"post"},
+		"/workspaces/{workspace_id}/media/{filename}":                                               {"get"},
+		"/workspaces/{workspace_id}/posts/{post_id}":                                                {"get", "patch", "put", "delete"},
+		"/workspaces/{workspace_id}/posts/{post_id}/duplicate":                                      {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/schedule":                                       {"post", "delete"},
+		"/workspaces/{workspace_id}/posts/{post_id}/publish":                                        {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/update-published":                               {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/sync-max":                                       {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/pin":                                            {"post", "delete"},
+		"/workspaces/{workspace_id}/posts/{post_id}/publication":                                    {"delete"},
+		"/workspaces/{workspace_id}/posts/{post_id}/view-history":                                   {"get"},
+		"/workspaces/{workspace_id}/posts/{post_id}/generate-image":                                 {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/image":                                          {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/attachments":                                    {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/attachments/{attachment_id}":                    {"put", "delete"},
+		"/workspaces/{workspace_id}/posts/{post_id}/attachments/order":                              {"patch"},
+		"/workspaces/{workspace_id}/posts/{post_id}/revisions":                                      {"get"},
+		"/workspaces/{workspace_id}/posts/{post_id}/reviews":                                        {"get"},
+		"/workspaces/{workspace_id}/posts/{post_id}/review":                                         {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/review/submit":                                  {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/review/approve":                                 {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/review/request-changes":                         {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/reviews/{revision_id}/decision":                 {"post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/comments":                                       {"get", "post"},
+		"/workspaces/{workspace_id}/posts/{post_id}/comments/{comment_id}":                          {"patch", "delete"},
 		"/notifications":                   {"get", "patch"},
 		"/notifications/{notification_id}": {"patch"},
 	}
@@ -170,6 +180,31 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertRequestSchemaRef(t, document, "/images/generate", "post", "#/components/schemas/GenerateImageInput")
 	assertRequestSchemaRef(t, document, "/posts/{id}/generate-image", "post", "#/components/schemas/GeneratePostImageInput")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/posts/{post_id}/generate-image", "post", "#/components/schemas/GeneratePostImageInput")
+	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct", "get", "200", "#/components/schemas/DirectIntegrationEnvelope")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns", "post", "#/components/schemas/DirectCampaignDraftRequest")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/suggest", "post", "#/components/schemas/DirectCampaignSuggestionRequest")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}", "patch", "#/components/schemas/DirectCampaignPatchRequest")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/auto-launch-consent", "post", "#/components/schemas/DirectAutoLaunchConsentRequest")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/submit", "post", "#/components/schemas/DirectVersionRequest")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/launch", "post", "#/components/schemas/DirectLaunchRequest")
+	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns", "post", "422", "#/components/responses/ValidationProblem")
+	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}", "patch", "422", "#/components/responses/ValidationProblem")
+	assertSchemaRequiredProperty(t, document, "DirectIntegration", "auto_launch_enabled")
+	assertSchemaRequiredProperty(t, document, "DirectConnection", "read_only")
+	assertSchemaOptionalProperty(t, document, "DirectConnection", "error_code")
+	assertSchemaRequiredProperty(t, document, "DirectCampaign", "provider_campaign_id")
+	assertSchemaRequiredProperty(t, document, "DirectCampaign", "launch_state")
+	assertSchemaEnumValue(t, document, "DirectCampaignStatus", "provider_draft")
+	assertSchemaEnumValue(t, document, "DirectLaunchState", "failed")
+	for _, capability := range []string{
+		"ads.read", "ads.write", "ads.approve", "ads.launch",
+		"ads.budget.manage", "ads.credentials.manage",
+	} {
+		assertSchemaEnumValue(t, document, "DirectCapability", capability)
+		assertSchemaEnumValue(t, document, "WorkspaceCapability", capability)
+	}
+	assertSchemaPropertyType(t, document, "DirectCampaign", "provider_campaign_id", "string")
+	assertSchemaPropertyType(t, document, "DirectCampaign", "provider_campaign_id", "null")
 	assertSchemaRequiredProperty(t, document, "WorkspaceBilling", "monthly_enforcement_enabled")
 	assertSchemaRequiredProperty(t, document, "WorkspaceBilling", "image_credit_costs")
 	assertSchemaRequiredProperty(t, document, "WorkspaceBilling", "checkout_enabled")
@@ -189,6 +224,63 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertSchemaOptionalProperty(t, document, "GenerateImageInput", "quality")
 	assertSchemaOptionalProperty(t, document, "GeneratePostImageInput", "prompt")
 	assertSchemaRequiredProperty(t, document, "WorkspacePostAnalyticsSummary", "series_truncated")
+}
+
+func assertSchemaEnumValue(t *testing.T, document openAPIDocument, schemaName, want string) {
+	t.Helper()
+	schemas, ok := stringMap(document.Components["schemas"])
+	if !ok {
+		t.Fatal("contract components are missing schemas")
+	}
+	schema, ok := stringMap(schemas[schemaName])
+	if !ok {
+		t.Fatalf("contract is missing schema %s", schemaName)
+	}
+	values, ok := schema["enum"].([]any)
+	if !ok {
+		t.Fatalf("schema %s is missing enum values", schemaName)
+	}
+	for _, value := range values {
+		if value == want {
+			return
+		}
+	}
+	t.Fatalf("schema %s enum does not contain %q", schemaName, want)
+}
+
+func assertSchemaPropertyType(
+	t *testing.T, document openAPIDocument, schemaName, propertyName, want string,
+) {
+	t.Helper()
+	schemas, ok := stringMap(document.Components["schemas"])
+	if !ok {
+		t.Fatal("contract components are missing schemas")
+	}
+	schema, ok := stringMap(schemas[schemaName])
+	if !ok {
+		t.Fatalf("contract is missing schema %s", schemaName)
+	}
+	properties, ok := stringMap(schema["properties"])
+	if !ok {
+		t.Fatalf("schema %s is missing properties", schemaName)
+	}
+	property, ok := stringMap(properties[propertyName])
+	if !ok {
+		t.Fatalf("schema %s is missing property %s", schemaName, propertyName)
+	}
+	switch value := property["type"].(type) {
+	case string:
+		if value == want {
+			return
+		}
+	case []any:
+		for _, item := range value {
+			if item == want {
+				return
+			}
+		}
+	}
+	t.Fatalf("schema %s property %s type does not contain %q", schemaName, propertyName, want)
 }
 
 func assertSchemaRequiredProperty(t *testing.T, document openAPIDocument, schemaName, propertyName string) {

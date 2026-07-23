@@ -10,6 +10,9 @@ fi
 deploy_stage=${DEPLOY_STAGE:-bootstrap}
 billing_live_enabled=${BILLING_LIVE_ENABLED:-false}
 yookassa_receipts_confirmed=${YOOKASSA_RECEIPTS_CONFIRMED:-false}
+direct_writes_enabled=${DIRECT_WRITES_ENABLED:-false}
+direct_auto_launch_enabled=${DIRECT_AUTO_LAUNCH_ENABLED:-false}
+direct_sandbox=${DIRECT_SANDBOX:-true}
 if [[ "$deploy_stage" != "bootstrap" && "$deploy_stage" != "production" ]]; then
   echo "DEPLOY_STAGE must be bootstrap or production" >&2
   exit 1
@@ -58,6 +61,14 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_oauth_redirect_uri=''
   rendered_allowed_users=''
   rendered_observability_admins=''
+  rendered_direct_oauth_client_id=''
+  rendered_direct_oauth_client_secret=''
+  rendered_direct_oauth_redirect_uri=''
+  rendered_direct_token_data_key=''
+  rendered_direct_api_base_url=https://api-sandbox.direct.yandex.com/json/v5
+  direct_writes_enabled=false
+  direct_auto_launch_enabled=false
+  direct_sandbox=true
   rendered_bot_token=''
   rendered_webhook_secret=''
   rendered_s3_host=''
@@ -86,6 +97,15 @@ else
   rendered_oauth_redirect_uri=https://maxposty.ru/api/v1/auth/yandex/callback
   rendered_allowed_users=${YANDEX_ALLOWED_USERS:-}
   rendered_observability_admins=${OBSERVABILITY_ADMIN_USERS:-}
+  rendered_direct_oauth_client_id=${DIRECT_OAUTH_CLIENT_ID:-}
+  rendered_direct_oauth_client_secret=${DIRECT_OAUTH_CLIENT_SECRET:-}
+  rendered_direct_oauth_redirect_uri=${DIRECT_OAUTH_REDIRECT_URI:-}
+  rendered_direct_token_data_key=${DIRECT_TOKEN_DATA_KEY:-}
+  if [[ "$direct_sandbox" == "true" ]]; then
+    rendered_direct_api_base_url=${DIRECT_API_BASE_URL:-https://api-sandbox.direct.yandex.com/json/v5}
+  else
+    rendered_direct_api_base_url=${DIRECT_API_BASE_URL:-https://api.direct.yandex.com/json/v501}
+  fi
   if [[ -z "$rendered_observability_admins" ]]; then
     echo "Missing required production deployment variable: OBSERVABILITY_ADMIN_USERS" >&2
     exit 1
@@ -142,6 +162,14 @@ fi
   printf 'WORKSPACE_MAX_OWNED_TEAM_WORKSPACES=%s\n' "${WORKSPACE_MAX_OWNED_TEAM_WORKSPACES:-5}"
   printf 'OAUTH_TRUST_X_REAL_IP=true\n'
   printf 'OAUTH_RATE_LIMIT_AT_EDGE=false\n'
+  printf 'DIRECT_OAUTH_CLIENT_ID=%s\n' "$rendered_direct_oauth_client_id"
+  printf 'DIRECT_OAUTH_CLIENT_SECRET=%s\n' "$rendered_direct_oauth_client_secret"
+  printf 'DIRECT_OAUTH_REDIRECT_URI=%s\n' "$rendered_direct_oauth_redirect_uri"
+  printf 'DIRECT_TOKEN_DATA_KEY=%s\n' "$rendered_direct_token_data_key"
+  printf 'DIRECT_API_BASE_URL=%s\n' "$rendered_direct_api_base_url"
+  printf 'DIRECT_WRITES_ENABLED=%s\n' "$direct_writes_enabled"
+  printf 'DIRECT_AUTO_LAUNCH_ENABLED=%s\n' "$direct_auto_launch_enabled"
+  printf 'DIRECT_SANDBOX=%s\n' "$direct_sandbox"
   printf 'MAX_API_BASE_URL=https://platform-api2.max.ru\n'
   printf 'MAX_BOT_TOKEN=%s\n' "$rendered_bot_token"
   printf 'MAX_WEBHOOK_SECRET=%s\n' "$rendered_webhook_secret"

@@ -30,6 +30,8 @@ const (
 	defaultFrontendOrigin            = "http://localhost:4321"
 	defaultMAXAPIBaseURL             = "https://platform-api2.max.ru"
 	defaultOpenAIAPIBaseURL          = "https://api.openai.com"
+	defaultDirectAPIBaseURL          = "https://api.direct.yandex.com/json/v501"
+	defaultDirectSandboxAPIBaseURL   = "https://api-sandbox.direct.yandex.com/json/v5"
 	defaultOpenAIImageModel          = "gpt-image-2"
 	defaultOpenAIResearchModel       = "gpt-5.4-mini"
 	defaultSchedulerInterval         = 15 * time.Second
@@ -80,6 +82,14 @@ type Config struct {
 	YandexClientSecret        string
 	YandexRedirectURI         string
 	YandexAllowedUsers        []string
+	DirectOAuthClientID       string
+	DirectOAuthClientSecret   string
+	DirectOAuthRedirectURI    string
+	DirectTokenDataKey        []byte
+	DirectAPIBaseURL          string
+	DirectWritesEnabled       bool
+	DirectAutoLaunchEnabled   bool
+	DirectSandbox             bool
 	ObservabilityAdmins       []string
 	AuthSessionTTL            time.Duration
 	MaxOwnedTeamWorkspaces    int
@@ -164,6 +174,25 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE must be true or false: %q", authBootstrapText)
 	}
+	directWritesText := env("DIRECT_WRITES_ENABLED", "false")
+	directWritesEnabled, err := strconv.ParseBool(directWritesText)
+	if err != nil {
+		return Config{}, fmt.Errorf("DIRECT_WRITES_ENABLED must be true or false: %q", directWritesText)
+	}
+	directAutoLaunchText := env("DIRECT_AUTO_LAUNCH_ENABLED", "false")
+	directAutoLaunchEnabled, err := strconv.ParseBool(directAutoLaunchText)
+	if err != nil {
+		return Config{}, fmt.Errorf("DIRECT_AUTO_LAUNCH_ENABLED must be true or false: %q", directAutoLaunchText)
+	}
+	directSandboxText := env("DIRECT_SANDBOX", "true")
+	directSandbox, err := strconv.ParseBool(directSandboxText)
+	if err != nil {
+		return Config{}, fmt.Errorf("DIRECT_SANDBOX must be true or false: %q", directSandboxText)
+	}
+	directAPIBaseURLFallback := defaultDirectAPIBaseURL
+	if directSandbox {
+		directAPIBaseURLFallback = defaultDirectSandboxAPIBaseURL
+	}
 	aiGlobalConcurrent, err := boundedPositiveIntEnv("AI_GLOBAL_MAX_CONCURRENT", defaultAIGlobalConcurrent, maxAIConfiguredConcurrent)
 	if err != nil {
 		return Config{}, err
@@ -242,6 +271,14 @@ func Load() (Config, error) {
 		YandexClientSecret:        strings.TrimSpace(os.Getenv("YANDEX_CLIENT_SECRET")),
 		YandexRedirectURI:         strings.TrimSpace(os.Getenv("YANDEX_REDIRECT_URI")),
 		YandexAllowedUsers:        splitNormalizedCSV(os.Getenv("YANDEX_ALLOWED_USERS")),
+		DirectOAuthClientID:       strings.TrimSpace(os.Getenv("DIRECT_OAUTH_CLIENT_ID")),
+		DirectOAuthClientSecret:   strings.TrimSpace(os.Getenv("DIRECT_OAUTH_CLIENT_SECRET")),
+		DirectOAuthRedirectURI:    strings.TrimSpace(os.Getenv("DIRECT_OAUTH_REDIRECT_URI")),
+		DirectTokenDataKey:        nil,
+		DirectAPIBaseURL:          env("DIRECT_API_BASE_URL", directAPIBaseURLFallback),
+		DirectWritesEnabled:       directWritesEnabled,
+		DirectAutoLaunchEnabled:   directAutoLaunchEnabled,
+		DirectSandbox:             directSandbox,
 		ObservabilityAdmins:       splitNormalizedCSV(os.Getenv("OBSERVABILITY_ADMIN_USERS")),
 		AuthSessionTTL:            sessionTTL,
 		MaxOwnedTeamWorkspaces:    maxOwnedTeamWorkspaces,
@@ -337,6 +374,19 @@ func Load() (Config, error) {
 			oauthParts++
 		}
 	}
+	directDataKey := strings.TrimSpace(os.Getenv("DIRECT_TOKEN_DATA_KEY"))
+	directValues := []string{
+		cfg.DirectOAuthClientID,
+		cfg.DirectOAuthClientSecret,
+		cfg.DirectOAuthRedirectURI,
+		directDataKey,
+	}
+	directParts := 0
+	for _, value := range directValues {
+		if value != "" {
+			directParts++
+		}
+	}
 	s3Values := []string{cfg.S3Host, cfg.S3AccessKey, cfg.S3SecretKey}
 	s3Parts := 0
 	for _, value := range s3Values {
@@ -351,7 +401,10 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("S3_BUCKET and S3_REGION require S3 credentials")
 	}
 	if cfg.AuthBootstrapMode {
-		if oauthParts != 0 || len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
+		if oauthParts != 0 || directParts != 0 || cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled ||
+			!cfg.DirectSandbox ||
+			strings.TrimSuffix(cfg.DirectAPIBaseURL, "/") != defaultDirectSandboxAPIBaseURL ||
+			len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
 		}
 		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.YooKassaConfigured() {
@@ -367,6 +420,28 @@ func Load() (Config, error) {
 	}
 	if oauthParts != 0 && oauthParts != len(oauthValues) {
 		return Config{}, fmt.Errorf("YANDEX_CLIENT_ID, YANDEX_CLIENT_SECRET and YANDEX_REDIRECT_URI must be configured together")
+	}
+	if directParts != 0 && directParts != len(directValues) {
+		return Config{}, fmt.Errorf("DIRECT_OAUTH_CLIENT_ID, DIRECT_OAUTH_CLIENT_SECRET, DIRECT_OAUTH_REDIRECT_URI and DIRECT_TOKEN_DATA_KEY must be configured together")
+	}
+	if err := validateDirectAPIBaseURL(cfg.DirectAPIBaseURL, cfg.DirectSandbox); err != nil {
+		return Config{}, err
+	}
+	cfg.DirectAPIBaseURL = strings.TrimSuffix(cfg.DirectAPIBaseURL, "/")
+	if directParts == len(directValues) {
+		decodedKey, decodeErr := base64.StdEncoding.DecodeString(directDataKey)
+		if decodeErr != nil || len(decodedKey) != 32 {
+			return Config{}, fmt.Errorf("DIRECT_TOKEN_DATA_KEY must be standard base64 encoding of exactly 32 random bytes")
+		}
+		cfg.DirectTokenDataKey = decodedKey
+		if err := validateDirectRedirectURI(cfg.DirectOAuthRedirectURI); err != nil {
+			return Config{}, err
+		}
+	} else if cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled {
+		return Config{}, fmt.Errorf("feature flags for Yandex Direct require complete Direct OAuth credentials")
+	}
+	if cfg.DirectAutoLaunchEnabled && !cfg.DirectWritesEnabled {
+		return Config{}, fmt.Errorf("DIRECT_AUTO_LAUNCH_ENABLED requires DIRECT_WRITES_ENABLED=true")
 	}
 	if cfg.YandexAuthEnabled() {
 		if err := validateYandexRedirectURI(cfg.YandexRedirectURI); err != nil {
@@ -391,6 +466,11 @@ func Load() (Config, error) {
 
 func (c Config) YandexAuthEnabled() bool {
 	return c.YandexClientID != "" && c.YandexClientSecret != "" && c.YandexRedirectURI != ""
+}
+
+func (c Config) DirectConfigured() bool {
+	return c.DirectOAuthClientID != "" && c.DirectOAuthClientSecret != "" &&
+		c.DirectOAuthRedirectURI != "" && len(c.DirectTokenDataKey) == 32
 }
 
 func (c Config) S3Enabled() bool {
@@ -435,6 +515,33 @@ func validateYandexRedirectURI(raw string) error {
 	}
 	if parsed.Path != "/api/v1/auth/yandex/callback" {
 		return fmt.Errorf("YANDEX_REDIRECT_URI path must be /api/v1/auth/yandex/callback")
+	}
+	return nil
+}
+
+func validateDirectRedirectURI(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Fragment != "" || parsed.RawQuery != "" {
+		return fmt.Errorf("DIRECT_OAUTH_REDIRECT_URI must be an absolute HTTP(S) URL without credentials, query or fragment")
+	}
+	if parsed.Scheme != "https" && (parsed.Scheme != "http" || !isLoopbackHost(parsed.Hostname())) {
+		return fmt.Errorf("DIRECT_OAUTH_REDIRECT_URI must use HTTPS outside localhost")
+	}
+	if parsed.Path != "/api/v1/advertising/direct/oauth/callback" {
+		return fmt.Errorf("DIRECT_OAUTH_REDIRECT_URI path must be /api/v1/advertising/direct/oauth/callback")
+	}
+	return nil
+}
+
+func validateDirectAPIBaseURL(raw string, sandbox bool) error {
+	expected := defaultDirectAPIBaseURL
+	if sandbox {
+		expected = defaultDirectSandboxAPIBaseURL
+	}
+	normalized := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if normalized != expected {
+		return fmt.Errorf("DIRECT_API_BASE_URL must be exactly %s when DIRECT_SANDBOX=%t (one trailing slash is allowed)", expected, sandbox)
 	}
 	return nil
 }

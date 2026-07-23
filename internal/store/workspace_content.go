@@ -123,6 +123,41 @@ func (s *Store) ListPostsForWorkspace(ctx context.Context, actorUserID, workspac
 	return posts, nil
 }
 
+// ListRecentPublishedPostContentsForWorkspace is a narrow AI-context query.
+// It deliberately returns no post metadata, media, attachments, or drafts and
+// enforces both workspace and channel scope in SQL.
+func (s *Store) ListRecentPublishedPostContentsForWorkspace(
+	ctx context.Context, actorUserID, workspaceID string, channelID int64,
+) ([]string, error) {
+	if channelID <= 0 {
+		return nil, ErrNotFound
+	}
+	if _, err := s.ResolveWorkspaceAccess(ctx, actorUserID, workspaceID); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT content
+FROM posts
+WHERE workspace_id=? AND channel_id=? AND status=? AND content ~ '[^[:space:]]'
+ORDER BY published_at DESC NULLS LAST,id DESC
+LIMIT 10`, workspaceID, channelID, PostStatusPublished)
+	if err != nil {
+		return nil, fmt.Errorf("list recent published workspace post content: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	contents := make([]string, 0, 10)
+	for rows.Next() {
+		var content string
+		if err := rows.Scan(&content); err != nil {
+			return nil, err
+		}
+		contents = append(contents, content)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return contents, nil
+}
+
 func (s *Store) GetPostForWorkspace(ctx context.Context, actorUserID, workspaceID string, postID int64) (Post, error) {
 	if _, err := s.ResolveWorkspaceAccess(ctx, actorUserID, workspaceID); err != nil {
 		return Post{}, err

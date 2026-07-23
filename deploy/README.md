@@ -377,3 +377,91 @@ limits remain active, and usage telemetry is recorded in both modes. Keep the
 switch disabled until the observed cost model has been reviewed. Internal paid
 plans are not available for purchase, and channel/seat/storage entitlements
 remain display-only until their write paths are integrated with the catalog.
+
+## Yandex Direct rollout
+
+The Yandex OAuth application and the connected advertiser account must have
+approved access to the Yandex Direct API before this integration is enabled.
+Register this exact production callback in the OAuth application:
+
+`https://maxposty.ru/api/v1/advertising/direct/oauth/callback`
+
+Store `DIRECT_OAUTH_CLIENT_ID`, `DIRECT_OAUTH_CLIENT_SECRET`, and
+`DIRECT_TOKEN_DATA_KEY` as production Environment secrets. The token data key
+must be a stable standard-base64 encoding of exactly 32 random bytes (for
+example, generated once with `openssl rand -base64 32`); rotating or losing it
+without a token re-encryption procedure makes existing connections unreadable.
+Set these production Environment variables:
+
+- `DIRECT_OAUTH_REDIRECT_URI=https://maxposty.ru/api/v1/advertising/direct/oauth/callback`
+- `DIRECT_SANDBOX=true`
+- `DIRECT_API_BASE_URL=https://api-sandbox.direct.yandex.com/json/v5`
+- `DIRECT_WRITES_ENABLED=false`
+- `DIRECT_AUTO_LAUNCH_ENABLED=false`
+
+Use this staged rollout:
+
+1. Deploy the fail-closed sandbox configuration above. Verify OAuth, advertiser
+   identity, existing-campaign reads, and logs; campaign creation is
+   intentionally unavailable while writes are disabled.
+2. In a separate sandbox deployment set `DIRECT_WRITES_ENABLED=true`, keep
+   auto-launch disabled, and verify campaign creation, manual launch, provider
+   status polling, and ambiguous-launch recovery.
+3. Switch together to `DIRECT_SANDBOX=false` and
+   `DIRECT_API_BASE_URL=https://api.direct.yandex.com/json/v501`, initially
+   keeping auto-launch disabled while the live account and manual workflow are
+   verified.
+4. Enable `DIRECT_AUTO_LAUNCH_ENABLED=true` only in another deliberate
+   deployment after the recovery test has passed; auto-launch requires writes.
+
+Do not point a production OAuth credential at an unapproved custom API origin.
+Disabling write flags is an emergency kill switch for provider mutations;
+read-only status reconciliation remains active so an ambiguous launch can
+still be observed and recorded safely.
+
+Auto-launch consent snapshots the provider campaign ID, campaign name, weekly
+budget, dates, account, and local version, but it cannot snapshot every ad and
+creative edited directly in Yandex Direct. The owner must review the actual
+provider-side ads immediately before consent. Keep
+`DIRECT_AUTO_LAUNCH_ENABLED=false` until creative-level verification is
+implemented and separately approved.
+
+Revoking the OAuth connection does not stop, pause, delete, or rebind campaigns
+that already exist in Yandex Direct. The UI must require an explicit second
+confirmation with that warning, and the operator should stop spend-capable
+campaigns in Yandex before disconnecting. A later connection is stored as a new
+account connection; historical campaigns retain their old connection and their
+last confirmed provider status.
+
+A launch in local `failed` state is still treated as potentially spend-capable:
+workspace archival and Direct credential revoke/replacement remain blocked
+without a time-based unlock. The current operator recovery procedure is to
+retain the credential, perform repeated authoritative provider reads, stop the
+campaign in Yandex if it is or may be running, and use an explicit audited
+recovery action once quiescence is proven. That reset action is not part of
+this rollout, so support must not delete the token or bypass the database
+guard.
+
+Provider token revocation/401 does not currently have a refresh-token flow or
+token-expiry metadata: the current OAuth response handler stores only the access
+token actually returned by Yandex. On an HTTP 401 or the documented Direct API
+invalid-token error 53, the backend marks the connection `error` with the safe
+code `authorization_required`, invalidates outstanding auto-launch consent, and
+stops scheduling work for that connection.
+The owner must use the explicit disconnect confirmation and complete OAuth
+again. There is no background token refresh. Keep production writes and
+auto-launch disabled until this reconnect path has been verified with a live
+token expiry/revocation. Do not invent, synthesize, or persist a refresh token
+or expiry that Yandex did not return. If an authorization error occurs while
+reconciling an earlier ambiguous launch, the launch remains blocked for
+operator recovery because the earlier provider write may still have succeeded.
+Campaigns remain tied to the old connection and are not silently rebound after
+OAuth; an unlaunched campaign must be recreated or handled directly in Yandex
+after reconnecting.
+
+This MVP supports direct advertiser accounts only; it does not implement
+`AgencyClients` enumeration or client selection. Agency accounts, unknown
+account types, non-chief representatives, and accounts without an explicit
+`EDIT_CAMPAIGNS=YES` grant are connected read-only and must never enable
+campaign writes or auto-launch. Add a separately reviewed agency-client
+selection flow before claiming agency support.
