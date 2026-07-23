@@ -204,6 +204,25 @@ func TestDirectGraphTerminalEditFailureRestoresImmutableBaseline(t *testing.T) {
 		edit.Campaign.ProviderRevisionID != "" {
 		t.Fatalf("edit claim did not invalidate graph evidence: %#v", edit.Campaign)
 	}
+	var storedCampaignID, storedAdGroupID, storedAdID int64
+	if err := storage.db.QueryRowContext(ctx, `SELECT
+provider_campaign_id,provider_ad_group_id,provider_ad_id
+FROM direct_provider_operations
+WHERE workspace_id=$1 AND campaign_id=$2 AND id=$3`,
+		workspace.ID, campaign.ID, edit.Operation.ID,
+	).Scan(&storedCampaignID, &storedAdGroupID, &storedAdID); err != nil {
+		t.Fatal(err)
+	}
+	if storedCampaignID != revision.ProviderCampaignID ||
+		storedAdGroupID != revision.ProviderAdGroupID ||
+		storedAdID != revision.ProviderAdID {
+		t.Fatalf(
+			"stored edit baseline IDs = (%d,%d,%d), want (%d,%d,%d)",
+			storedCampaignID, storedAdGroupID, storedAdID,
+			revision.ProviderCampaignID, revision.ProviderAdGroupID,
+			revision.ProviderAdID,
+		)
+	}
 	failed, err := storage.FailDirectCampaignGraphOperation(
 		ctx, workspace.ID, campaign.ID, DirectGraphTerminalFailureInput{
 			ExpectedOperationID: edit.Operation.ID,

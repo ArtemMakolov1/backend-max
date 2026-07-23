@@ -474,14 +474,16 @@ WHERE workspace_id=$1 AND id=$2 AND status='active' AND read_only=FALSE
 id,workspace_id,campaign_id,connection_id,actor_user_id,operation_kind,
 operation_marker,expected_campaign_version,expected_graph_hash,
 expected_revision_id,stage,desired_graph,provider_keyword_mappings,
-provider_warnings,claimed_at,lease_expires_at,
+provider_warnings,provider_campaign_id,provider_ad_group_id,provider_ad_id,
+claimed_at,lease_expires_at,
 created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,$12,$13,$14,$15,$16,$17,$17)`,
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NULLIF($10,''),$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$20)`,
 		operation.ID, workspaceID, campaignID, campaign.ConnectionID, actorUserID,
 		operationKind, operation.OperationMarker, expectedVersion,
 		operation.ExpectedGraphHash, operation.ExpectedRevisionID, operation.Stage,
 		string(desiredJSON), string(initialMappingsJSON), string(initialWarningsJSON),
-		now, operation.LeaseExpiresAt, now)
+		operation.ProviderCampaignID, operation.ProviderAdGroupID,
+		operation.ProviderAdID, now, operation.LeaseExpiresAt, now)
 	if err != nil {
 		return DirectGraphSubmissionMaterial{}, mapWorkspaceWriteError(
 			"claim Direct graph operation", err,
