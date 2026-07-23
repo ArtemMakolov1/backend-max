@@ -20,7 +20,7 @@ const (
 	DefaultAPIBaseURL        = "https://api.direct.yandex.com/json/v501"
 	DefaultSandboxAPIBaseURL = "https://api-sandbox.direct.yandex.com/json/v5"
 	oauthAuthorizeURL        = "https://oauth.yandex.ru/authorize"
-	oauthTokenURL            = "https://oauth.yandex.ru/token"
+	oauthExchangeEndpoint    = "https://oauth.yandex.ru/token"
 )
 
 type Client struct {
@@ -86,30 +86,35 @@ func New(
 	}
 	host := strings.ToLower(baseURL.Hostname())
 	isLoopback := net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback() || host == "localhost"
-	if baseURL.Scheme != "https" && !(baseURL.Scheme == "http" && isLoopback) {
-		return nil, errors.New("Yandex Direct API base URL must use HTTPS outside localhost")
+	if baseURL.Scheme != "https" && (baseURL.Scheme != "http" || !isLoopback) {
+		return nil, errors.New("API base URL for Yandex Direct must use HTTPS outside localhost")
 	}
 	if !isLoopback && host != "api.direct.yandex.com" && host != "api-sandbox.direct.yandex.com" {
-		return nil, errors.New("Yandex Direct API base URL host is not allowed")
+		return nil, errors.New("API base URL host for Yandex Direct is not allowed")
 	}
 	basePath := strings.TrimRight(baseURL.Path, "/")
 	unified := strings.HasSuffix(basePath, "/json/v501")
 	textV5 := strings.HasSuffix(basePath, "/json/v5")
 	if !unified && !textV5 {
-		return nil, errors.New("Yandex Direct API base URL must target /json/v501 or /json/v5")
+		return nil, errors.New("API base URL for Yandex Direct must target /json/v501 or /json/v5")
 	}
 	if host == "api-sandbox.direct.yandex.com" && !textV5 {
-		return nil, errors.New("Yandex Direct sandbox supports the documented /json/v5 endpoint only")
+		return nil, errors.New("sandbox for Yandex Direct supports the documented /json/v5 endpoint only")
 	}
 	redirect, err := url.Parse(strings.TrimSpace(redirectURI))
-	if err != nil || !redirect.IsAbs() || redirect.User != nil || redirect.RawQuery != "" ||
-		redirect.Fragment != "" || (redirect.Scheme != "https" && !(redirect.Scheme == "http" &&
-		(redirect.Hostname() == "localhost" || (net.ParseIP(redirect.Hostname()) != nil &&
-			net.ParseIP(redirect.Hostname()).IsLoopback())))) {
+	if err != nil {
+		return nil, errors.New("invalid Yandex Direct OAuth redirect URI")
+	}
+	redirectHost := redirect.Hostname()
+	redirectIsLoopback := redirectHost == "localhost" ||
+		(net.ParseIP(redirectHost) != nil && net.ParseIP(redirectHost).IsLoopback())
+	if !redirect.IsAbs() || redirect.User != nil || redirect.RawQuery != "" ||
+		redirect.Fragment != "" ||
+		(redirect.Scheme != "https" && (redirect.Scheme != "http" || !redirectIsLoopback)) {
 		return nil, errors.New("invalid Yandex Direct OAuth redirect URI")
 	}
 	if strings.TrimSpace(clientID) == "" || strings.TrimSpace(clientSecret) == "" {
-		return nil, errors.New("Yandex Direct OAuth client credentials are required")
+		return nil, errors.New("OAuth client credentials for Yandex Direct are required")
 	}
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 20 * time.Second}
@@ -151,7 +156,7 @@ func (c *Client) ExchangeCode(ctx context.Context, code, verifier string) (strin
 		"redirect_uri":  {c.redirectURI},
 		"code_verifier": {verifier},
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL,
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthExchangeEndpoint,
 		strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err

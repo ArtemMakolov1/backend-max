@@ -137,7 +137,7 @@ func (s *Store) ListRecentPublishedPostContentsForWorkspace(
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT content
 FROM posts
-WHERE workspace_id=? AND channel_id=? AND status=? AND btrim(content)<>''
+WHERE workspace_id=? AND channel_id=? AND status=? AND content ~ '[^[:space:]]'
 ORDER BY published_at DESC NULLS LAST,id DESC
 LIMIT 10`, workspaceID, channelID, PostStatusPublished)
 	if err != nil {

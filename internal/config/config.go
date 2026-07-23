@@ -438,7 +438,7 @@ func Load() (Config, error) {
 			return Config{}, err
 		}
 	} else if cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled {
-		return Config{}, fmt.Errorf("Yandex Direct feature flags require complete Direct OAuth credentials")
+		return Config{}, fmt.Errorf("feature flags for Yandex Direct require complete Direct OAuth credentials")
 	}
 	if cfg.DirectAutoLaunchEnabled && !cfg.DirectWritesEnabled {
 		return Config{}, fmt.Errorf("DIRECT_AUTO_LAUNCH_ENABLED requires DIRECT_WRITES_ENABLED=true")

@@ -176,7 +176,7 @@ CREATE INDEX idx_direct_campaigns_launch_recovery
 
 CREATE INDEX idx_posts_direct_recent_context
     ON posts(workspace_id, channel_id, published_at DESC NULLS LAST, id DESC)
-    WHERE status = 'published' AND btrim(content) <> '';
+    WHERE status = 'published' AND content ~ '[^[:space:]]';
 
 CREATE TABLE direct_auto_launch_consents (
     id TEXT PRIMARY KEY CHECK (id ~ '^dcons_[0-9a-f]{32}$'),

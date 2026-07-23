@@ -4,11 +4,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"maxpilot/backend/internal/store"
 )
+
+var testSessionSequence atomic.Uint64
 
 type credentialedTestHandler struct {
 	next   http.Handler
@@ -25,7 +29,8 @@ func (h credentialedTestHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 func withTestSession(t *testing.T, storage *store.Store, handler http.Handler, userID string) http.Handler {
 	t.Helper()
-	raw := "test-session-" + userID + "-" + t.Name()
+	raw := "test-session-" + userID + "-" + t.Name() + "-" +
+		strconv.FormatUint(testSessionSequence.Add(1), 10)
 	digest := sha256.Sum256([]byte(raw))
 	now := time.Now().UTC()
 	if err := storage.CreateAuthSession(t.Context(), store.AuthSession{

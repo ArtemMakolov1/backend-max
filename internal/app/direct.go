@@ -26,11 +26,11 @@ const (
 )
 
 var (
-	ErrDirectNotConfigured    = errors.New("Yandex Direct integration is not configured")
-	ErrDirectWritesDisabled   = errors.New("Yandex Direct writes are disabled")
-	ErrDirectAutoLaunchOff    = errors.New("Yandex Direct auto-launch is disabled")
-	ErrDirectProvider         = errors.New("Yandex Direct provider request failed")
-	ErrDirectSnapshotMismatch = errors.New("Yandex Direct provider campaign does not match the authorized snapshot")
+	ErrDirectNotConfigured    = errors.New("integration with Yandex Direct is not configured")
+	ErrDirectWritesDisabled   = errors.New("writes to Yandex Direct are disabled")
+	ErrDirectAutoLaunchOff    = errors.New("auto-launch for Yandex Direct is disabled")
+	ErrDirectProvider         = errors.New("provider request to Yandex Direct failed")
+	ErrDirectSnapshotMismatch = errors.New("provider campaign in Yandex Direct does not match the authorized snapshot")
 )
 
 type DirectProvider interface {
@@ -74,10 +74,10 @@ type DirectIntegrationStatus struct {
 
 func (a *App) ConfigureDirect(provider DirectProvider, dataKey []byte) error {
 	if provider == nil {
-		return errors.New("Yandex Direct provider is required")
+		return errors.New("provider for Yandex Direct is required")
 	}
 	if len(dataKey) != 32 {
-		return errors.New("Yandex Direct token data key must contain exactly 32 bytes")
+		return errors.New("token data key for Yandex Direct must contain exactly 32 bytes")
 	}
 	block, err := aes.NewCipher(dataKey)
 	if err != nil {
@@ -101,7 +101,7 @@ func (a *App) SetDirectFeatureFlags(writesEnabled, autoLaunchEnabled bool) error
 		return ErrDirectNotConfigured
 	}
 	if autoLaunchEnabled && !writesEnabled {
-		return errors.New("Yandex Direct auto-launch requires writes to be enabled")
+		return errors.New("auto-launch for Yandex Direct requires writes to be enabled")
 	}
 	a.directWritesEnabled = writesEnabled
 	a.directAutoLaunchEnabled = autoLaunchEnabled
@@ -121,8 +121,11 @@ func (a *App) DirectAutoLaunchEnabled() bool {
 }
 
 func (a *App) DirectCampaignSuggestionConfigured() bool {
+	if a == nil || a.research == nil {
+		return false
+	}
 	_, ok := a.research.(DirectCampaignSuggester)
-	return a != nil && a.research != nil && ok
+	return ok
 }
 
 func (a *App) GetDirectIntegrationStatus(
@@ -784,7 +787,7 @@ func (a *App) SuggestDirectCampaign(
 
 func (c *directTokenCipher) seal(workspaceID, accountID, clientLogin, token string) (string, error) {
 	if c == nil || c.aead == nil || strings.TrimSpace(token) == "" {
-		return "", errors.New("Yandex Direct token encryption is unavailable")
+		return "", errors.New("token encryption for Yandex Direct is unavailable")
 	}
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {

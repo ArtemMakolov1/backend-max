@@ -21,13 +21,13 @@ const directProviderPollLease = time.Minute
 var directIdentifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 var (
-	ErrDirectConnectionRequired   = errors.New("Yandex Direct connection is required")
-	ErrDirectCampaignNotDraft     = errors.New("Yandex Direct campaign is not a draft")
-	ErrDirectCampaignNotAccepted  = errors.New("Yandex Direct campaign is not accepted")
-	ErrDirectConsentRequired      = errors.New("active Yandex Direct auto-launch consent is required")
-	ErrDirectConsentMismatch      = errors.New("Yandex Direct auto-launch consent does not match the campaign")
-	ErrDirectLaunchAlreadyClaimed = errors.New("Yandex Direct launch was already claimed")
-	ErrDirectLaunchRetryExhausted = errors.New("Yandex Direct launch retry is exhausted; reconciliation is still required")
+	ErrDirectConnectionRequired   = errors.New("direct connection is required")
+	ErrDirectCampaignNotDraft     = errors.New("direct campaign is not a draft")
+	ErrDirectCampaignNotAccepted  = errors.New("direct campaign is not accepted")
+	ErrDirectConsentRequired      = errors.New("active direct auto-launch consent is required")
+	ErrDirectConsentMismatch      = errors.New("direct auto-launch consent does not match the campaign")
+	ErrDirectLaunchAlreadyClaimed = errors.New("direct launch was already claimed")
+	ErrDirectLaunchRetryExhausted = errors.New("direct launch retry is exhausted; reconciliation is still required")
 	ErrDirectValidation           = errors.New("invalid Yandex Direct campaign")
 )
 
@@ -500,7 +500,7 @@ func (s *Store) CreateDirectCampaign(
 	ctx context.Context, actorUserID, workspaceID string, campaign DirectCampaign,
 ) (DirectCampaign, error) {
 	if err := validateDirectCampaignDraft(&campaign); err != nil {
-		return DirectCampaign{}, fmt.Errorf("%w: %v", ErrDirectValidation, err)
+		return DirectCampaign{}, fmt.Errorf("%w: %w", ErrDirectValidation, err)
 	}
 	if campaign.ID == "" {
 		campaign.ID = newStoreID("dcmp_")
@@ -545,7 +545,7 @@ weekly_budget_minor,currency_code,starts_at,ends_at,
 status,provider_status,provider_state,version,created_by,created_at,updated_at)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'draft','','',1,$13,$14,$14)`,
 		campaign.ID, workspaceID, connection.ID, campaign.Name, campaign.Objective,
-		campaign.LandingURL, campaign.Brief, regionsJSON, campaign.WeeklyBudgetMinor,
+		campaign.LandingURL, campaign.Brief, string(regionsJSON), campaign.WeeklyBudgetMinor,
 		campaign.CurrencyCode, dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
 		actorUserID, now)
 	if err != nil {
@@ -656,7 +656,7 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 		campaign.EndsAt = *changes.EndsAt
 	}
 	if err := validateDirectCampaignDraft(&campaign); err != nil {
-		return DirectCampaign{}, fmt.Errorf("%w: %v", ErrDirectValidation, err)
+		return DirectCampaign{}, fmt.Errorf("%w: %w", ErrDirectValidation, err)
 	}
 	now := time.Now().UTC()
 	regionsJSON, err := json.Marshal(campaign.Regions)
@@ -667,7 +667,7 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 SET name=$1,objective=$2,landing_url=$3,brief=$4,regions=$5,
 weekly_budget_minor=$6,starts_at=$7,ends_at=$8,version=version+1,updated_at=$9
 WHERE workspace_id=$10 AND id=$11 AND version=$12 AND status='draft'`,
-		campaign.Name, campaign.Objective, campaign.LandingURL, campaign.Brief, regionsJSON,
+		campaign.Name, campaign.Objective, campaign.LandingURL, campaign.Brief, string(regionsJSON),
 		campaign.WeeklyBudgetMinor, dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
 		now, workspaceID, campaignID, changes.ExpectedVersion)
 	if err != nil {
@@ -1682,9 +1682,14 @@ ORDER BY authorized_at DESC,id DESC LIMIT 1`, workspaceID, campaign.ID))
 		return summary, nil
 	}
 	connection, connectionErr := s.getDirectConnectionForWorker(ctx, workspaceID, campaign.ConnectionID)
-	if connectionErr != nil {
+	if errors.Is(connectionErr, ErrNotFound) {
 		summary.InvalidReason = "connection_unavailable"
 		return summary, nil
+	}
+	if connectionErr != nil {
+		return DirectAutoLaunchSummary{}, fmt.Errorf(
+			"load direct connection for auto-launch summary: %w", connectionErr,
+		)
 	}
 	summary.Valid = directConsentMatches(consent, campaign, connection)
 	if !summary.Valid {

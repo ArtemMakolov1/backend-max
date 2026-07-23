@@ -335,7 +335,15 @@ func TestOpenRuntimeAllowsOnlyNewerUnknownMigrations(t *testing.T) {
 	if err := Migrate(ctx, testURL); err != nil {
 		t.Fatalf("initial migration: %v", err)
 	}
-	const futureVersion = "022_future_additive.sql"
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Runtime compatibility is based on lexicographic migration versions.
+	// Derive the unknown version from the current maximum so this fixture stays
+	// newer when a previously "future" numbered migration becomes real.
+	futureVersion := strings.TrimSuffix(migrations[len(migrations)-1].version, ".sql") +
+		"_future.sql"
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO schema_migrations(version, checksum_sha256) VALUES ($1, $2)`,
 		futureVersion, strings.Repeat("a", sha256.Size*2)); err != nil {
