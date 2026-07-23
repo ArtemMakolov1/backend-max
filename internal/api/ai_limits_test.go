@@ -365,9 +365,32 @@ func activatePaidWorkspaceForAPITest(
 ) {
 	t.Helper()
 	now := time.Now().UTC().Add(-time.Minute)
+	user, err := storage.GetUser(context.Background(), ownerUserID)
+	if err != nil {
+		t.Fatalf("read paid API fixture user: %v", err)
+	}
+	consentSessionHash := sha256.Sum256([]byte("paid-api-consent:" + ownerUserID))
+	if _, err := storage.CreateAuthenticatedSession(context.Background(), user, []store.Consent{
+		{Document: "terms", Version: termsVersion, AcceptedAt: now, Source: "test"},
+		{Document: "personal_data", Version: personalDataVersion, AcceptedAt: now, Source: "test"},
+	}, store.AuthSession{
+		TokenHash: hex.EncodeToString(consentSessionHash[:]), OwnerID: ownerUserID,
+		Provider: "yandex", ProviderSubject: ownerUserID, Login: user.Login, Email: user.Email,
+		DisplayName: user.DisplayName, AvatarURL: user.AvatarURL,
+		CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("record paid API fixture consent: %v", err)
+	}
+	price := int64(99000)
+	if planCode == "pro" {
+		price = 249000
+	}
 	attempt, err := storage.CreateBillingCheckoutAttempt(
-		context.Background(), ownerUserID, workspaceID, planCode, true,
-		store.BillingRecurringConsentVersion,
+		context.Background(), ownerUserID, workspaceID, store.BillingCheckoutSnapshot{
+			PlanCode: planCode, PlanVersion: 2, MonthlyPriceMinor: price, CurrencyCode: "RUB",
+			RecurringConsent: true, RecurringConsentVersion: store.BillingRecurringConsentVersion,
+			RecurringConsentTermsVersion: store.BillingRecurringTermsVersion,
+		},
 		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", now,
 	)
 	if err != nil {

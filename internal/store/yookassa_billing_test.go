@@ -11,19 +11,19 @@ import (
 	"time"
 )
 
-func TestInFlightRenewalDoesNotPreventCancelOrDetach(t *testing.T) {
+func TestSubmittedRenewalMustBeBoundBeforeCancelOrDetachCanSucceed(t *testing.T) {
 	for _, test := range []struct {
 		name         string
 		manualReview bool
-		ambiguous    bool
+		unbound      bool
 		detach       bool
 	}{
 		{name: "pending cancel"},
 		{name: "manual review cancel", manualReview: true},
 		{name: "pending detach", detach: true},
 		{name: "manual review detach", manualReview: true, detach: true},
-		{name: "ambiguous cancel", ambiguous: true},
-		{name: "ambiguous detach", ambiguous: true, detach: true},
+		{name: "unbound submitted cancel", unbound: true},
+		{name: "unbound submitted detach", unbound: true, detach: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -44,7 +44,7 @@ func TestInFlightRenewalDoesNotPreventCancelOrDetach(t *testing.T) {
 				t.Fatalf("prepare renewal = %#v, %v", attempt, err)
 			}
 			providerID := strings.ReplaceAll(test.name, " ", "_")
-			if test.ambiguous {
+			if test.unbound {
 				if _, err := storage.BeginBillingProviderCreate(ctx, attempt.ID, now.Add(time.Second)); err != nil {
 					t.Fatal(err)
 				}
@@ -61,42 +61,135 @@ func TestInFlightRenewalDoesNotPreventCancelOrDetach(t *testing.T) {
 				}
 			}
 
+			var confirm func() error
+			actionAt := now.Add(3 * time.Second)
 			if test.detach {
-				err = storage.DetachBillingPaymentMethod(ctx, "test-owner", workspace.ID, now.Add(3*time.Second))
-			} else {
-				var intent BillingCancellationIntent
-				intent, err = storage.CreateBillingCancellationIntent(ctx, "test-owner", workspace.ID, now.Add(3*time.Second))
-				if err == nil {
-					digest := sha256.Sum256([]byte(intent.Token))
-					err = storage.ConfirmBillingCancellation(
-						ctx, "test-owner", workspace.ID, hex.EncodeToString(digest[:]), now.Add(4*time.Second),
+				confirm = func() error {
+					return storage.DetachBillingPaymentMethod(
+						ctx, "test-owner", workspace.ID, actionAt,
 					)
 				}
+			} else {
+				intent, intentErr := storage.CreateBillingCancellationIntent(
+					ctx, "test-owner", workspace.ID, now.Add(3*time.Second),
+				)
+				if intentErr != nil {
+					t.Fatal(intentErr)
+				}
+				digest := sha256.Sum256([]byte(intent.Token))
+				confirm = func() error {
+					return storage.ConfirmBillingCancellation(
+						ctx, "test-owner", workspace.ID, hex.EncodeToString(digest[:]), actionAt,
+					)
+				}
+			}
+			err = confirm()
+			if test.unbound {
+				if !errors.Is(err, ErrBillingConflict) {
+					t.Fatalf("unbound provider create cancel/detach error=%v, want ErrBillingConflict", err)
+				}
+				var cancelAtEnd bool
+				var paymentMethod string
+				if readErr := storage.db.QueryRowContext(ctx, `SELECT cancel_at_period_end,payment_method_id
+FROM billing_subscription_contracts WHERE workspace_id=$1`, workspace.ID).
+					Scan(&cancelAtEnd, &paymentMethod); readErr != nil {
+					t.Fatal(readErr)
+				}
+				if cancelAtEnd || paymentMethod == "" {
+					t.Fatalf("blocked operation mutated contract: cancel=%v method=%q", cancelAtEnd, paymentMethod)
+				}
+				if _, attachErr := storage.AttachBillingProviderPayment(
+					ctx, attempt.ID, providerID, "", now.Add(5*time.Second),
+				); attachErr != nil {
+					t.Fatal(attachErr)
+				}
+				actionAt = now.Add(6 * time.Second)
+				err = confirm()
 			}
 			if err != nil {
 				t.Fatalf("disable future renewal: %v", err)
 			}
-			if test.ambiguous {
-				ambiguous, readErr := storage.GetBillingPaymentAttempt(ctx, attempt.ID)
-				if readErr != nil || ambiguous.Status != "manual_review" ||
-					ambiguous.ErrorCode != "canceled_with_provider_outcome_unknown" {
-					t.Fatalf("ambiguous attempt = %#v, %v", ambiguous, readErr)
-				}
-			}
 			assertBillingTombstone(t, storage, workspace.ID, test.detach)
 
-			processed, err := storage.ReconcileBillingPayment(ctx, "payment.succeeded",
+			processed, reconcileErr := storage.ReconcileBillingPayment(ctx, "payment.succeeded",
 				billingTestDedupe(test.name), BillingCanonicalPayment{
 					ProviderPaymentID: providerID, Status: "succeeded", Paid: true,
 					AmountMinor: attempt.AmountMinor, CurrencyCode: attempt.CurrencyCode,
 					PaymentMethodID: "sealed-provider-method", PaymentMethodSaved: true,
 					MetadataAttemptID: attempt.ID, MetadataWorkspaceID: workspace.ID,
-					OccurredAt: now.Add(5 * time.Second),
-				}, now.Add(5*time.Second))
-			if err != nil || !processed {
-				t.Fatalf("late successful renewal processed=%v err=%v", processed, err)
+					OccurredAt: now.Add(7 * time.Second),
+				}, now.Add(7*time.Second))
+			if processed || !errors.Is(reconcileErr, ErrBillingIntegrity) {
+				t.Fatalf("late successful renewal processed=%v err=%v, want refund quarantine", processed, reconcileErr)
 			}
 			assertBillingTombstone(t, storage, workspace.ID, test.detach)
+		})
+	}
+}
+
+func TestTerminalPaymentMethodCancellationReasonDisablesFutureRenewals(t *testing.T) {
+	for _, reason := range []string{"permission_revoked", "card_expired", "payment_method_restricted"} {
+		t.Run(reason, func(t *testing.T) {
+			ctx := context.Background()
+			storage, err := Open(ctx, filepath.Join(t.TempDir(), "billing-terminal-method.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = storage.Close() })
+			workspace, err := storage.CreateWorkspace(ctx, "test-owner", Workspace{Name: reason})
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Date(2026, time.July, 23, 12, 0, 0, 0, time.UTC)
+			seedBillingContract(t, storage, workspace.ID, "solo", now.AddDate(0, -1, 0), now, "sealed-old-method")
+			attempt, _, err := storage.PrepareBillingRenewal(ctx, workspace.ID, now)
+			if err != nil || attempt == nil {
+				t.Fatalf("prepare renewal = %#v, %v", attempt, err)
+			}
+			providerID := "terminal_" + reason
+			if _, err := storage.AttachBillingProviderPayment(
+				ctx, attempt.ID, providerID, "", now.Add(time.Second),
+			); err != nil {
+				t.Fatal(err)
+			}
+			processed, err := storage.ReconcileBillingPayment(
+				ctx, "payment.canceled", billingTestDedupe(reason), BillingCanonicalPayment{
+					ProviderPaymentID: providerID, Status: "canceled",
+					AmountMinor: attempt.AmountMinor, CurrencyCode: attempt.CurrencyCode,
+					MetadataAttemptID: attempt.ID, MetadataWorkspaceID: workspace.ID,
+					CancellationReason: reason, OccurredAt: now.Add(2 * time.Second),
+				}, now.Add(2*time.Second),
+			)
+			if err != nil || !processed {
+				t.Fatalf("terminal cancellation processed=%v err=%v", processed, err)
+			}
+			var cancelAtEnd bool
+			var paymentMethod, attemptStatus, errorCode string
+			if err := storage.db.QueryRowContext(ctx, `SELECT c.cancel_at_period_end,c.payment_method_id,
+a.status,a.error_code FROM billing_subscription_contracts c
+JOIN billing_payment_attempts a ON a.id=$2 WHERE c.workspace_id=$1`,
+				workspace.ID, attempt.ID).Scan(
+				&cancelAtEnd, &paymentMethod, &attemptStatus, &errorCode,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if !cancelAtEnd || paymentMethod != "" || attemptStatus != "canceled" ||
+				errorCode != "provider_canceled_"+reason {
+				t.Fatalf("terminal cancellation state cancel=%v method=%q attempt=%s code=%s",
+					cancelAtEnd, paymentMethod, attemptStatus, errorCode)
+			}
+			next, downgraded, err := storage.PrepareBillingRenewal(ctx, workspace.ID, now.Add(3*time.Second))
+			if err != nil || next != nil || !downgraded {
+				t.Fatalf("terminal method renewal lifecycle = %#v, %v, %v", next, downgraded, err)
+			}
+			var renewalCount int
+			if err := storage.db.QueryRowContext(ctx, `SELECT count(*) FROM billing_payment_attempts
+WHERE workspace_id=$1 AND purpose='renewal'`, workspace.ID).Scan(&renewalCount); err != nil {
+				t.Fatal(err)
+			}
+			if renewalCount != 1 {
+				t.Fatalf("terminal cancellation created %d renewal attempts, want 1", renewalCount)
+			}
 		})
 	}
 }

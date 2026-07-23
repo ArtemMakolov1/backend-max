@@ -34,9 +34,13 @@ type imageCreditCosts struct {
 }
 
 type billingCheckoutRequest struct {
-	PlanCode                string `json:"plan_code"`
-	RecurringConsent        bool   `json:"recurring_consent"`
-	RecurringConsentVersion string `json:"recurring_consent_version"`
+	PlanCode                     string `json:"plan_code"`
+	PlanVersion                  int    `json:"plan_version"`
+	MonthlyPriceMinor            int64  `json:"monthly_price_minor"`
+	CurrencyCode                 string `json:"currency_code"`
+	RecurringConsent             bool   `json:"recurring_consent"`
+	RecurringConsentVersion      string `json:"recurring_consent_version"`
+	RecurringConsentTermsVersion string `json:"recurring_consent_terms_version"`
 }
 
 type billingIntentRequest struct {
@@ -119,8 +123,15 @@ func (s *Server) createWorkspaceBillingCheckout(w http.ResponseWriter, r *http.R
 		return
 	}
 	checkout, err := s.app.CreateBillingCheckout(
-		r.Context(), access.UserID, access.WorkspaceID, request.PlanCode, request.RecurringConsent,
-		strings.TrimSpace(request.RecurringConsentVersion))
+		r.Context(), access.UserID, access.WorkspaceID, store.BillingCheckoutSnapshot{
+			PlanCode:                     request.PlanCode,
+			PlanVersion:                  request.PlanVersion,
+			MonthlyPriceMinor:            request.MonthlyPriceMinor,
+			CurrencyCode:                 strings.TrimSpace(request.CurrencyCode),
+			RecurringConsent:             request.RecurringConsent,
+			RecurringConsentVersion:      strings.TrimSpace(request.RecurringConsentVersion),
+			RecurringConsentTermsVersion: strings.TrimSpace(request.RecurringConsentTermsVersion),
+		})
 	if err != nil {
 		s.writeError(w, err)
 		return

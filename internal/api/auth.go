@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"maxpilot/backend/internal/email"
+	"maxpilot/backend/internal/legal"
 	"maxpilot/backend/internal/store"
 	"maxpilot/backend/internal/yandexauth"
 )
@@ -26,8 +27,8 @@ const (
 	sessionCookieName   = "maxstudio_session"
 	stateCookieName     = "maxstudio_oauth_state"
 	oauthStateTTL       = 10 * time.Minute
-	termsVersion        = "2026-07-22"
-	personalDataVersion = "2026-07-22"
+	termsVersion        = legal.CurrentTermsVersion
+	personalDataVersion = legal.CurrentPersonalDataVersion
 )
 
 type authUser struct {

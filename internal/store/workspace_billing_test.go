@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"maxpilot/backend/internal/legal"
 )
 
 func TestBillingCatalogKeepsFuturePlansInternalAndCreatesFreeSubscriptions(t *testing.T) {
@@ -105,17 +107,44 @@ FROM billing_plan_versions WHERE public=TRUE AND available=TRUE ORDER BY monthly
 		state.Subscription.Status != "active" || len(state.Usage) != 6 || state.Features.AIImages {
 		t.Fatalf("workspace billing state = %#v", state)
 	}
+	checkoutSnapshot := BillingCheckoutSnapshot{
+		PlanCode: "solo", PlanVersion: 2, MonthlyPriceMinor: 99000, CurrencyCode: "RUB",
+		RecurringConsent: true, RecurringConsentVersion: BillingRecurringConsentVersion,
+		RecurringConsentTermsVersion: BillingRecurringTermsVersion,
+	}
+	if _, err := storage.CreateBillingCheckoutAttempt(
+		ctx, "billing-owner", workspace.ID, checkoutSnapshot,
+		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", time.Now().UTC(),
+	); !errors.Is(err, ErrBillingLegalConsentRequired) {
+		t.Fatalf("checkout without current legal consent error=%v, want ErrBillingLegalConsentRequired", err)
+	}
+	if _, err := storage.db.ExecContext(ctx, `INSERT INTO user_consents(
+owner_id,document,version,accepted_at,source) VALUES
+	($1,'terms',$2,CURRENT_TIMESTAMP,'test'),
+	($1,'personal_data',$3,CURRENT_TIMESTAMP,'test')`,
+		"billing-owner", legal.CurrentTermsVersion, legal.CurrentPersonalDataVersion); err != nil {
+		t.Fatal(err)
+	}
+	staleSnapshot := checkoutSnapshot
+	staleSnapshot.MonthlyPriceMinor--
+	if _, err := storage.CreateBillingCheckoutAttempt(
+		ctx, "billing-owner", workspace.ID, staleSnapshot,
+		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", time.Now().UTC(),
+	); !errors.Is(err, ErrBillingCheckoutSnapshotMismatch) {
+		t.Fatalf("stale checkout snapshot error=%v, want ErrBillingCheckoutSnapshotMismatch", err)
+	}
 	attempt, err := storage.CreateBillingCheckoutAttempt(
-		ctx, "billing-owner", workspace.ID, "solo", true, BillingRecurringConsentVersion,
+		ctx, "billing-owner", workspace.ID, checkoutSnapshot,
 		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", time.Now().UTC(),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var storedVersion, storedText, storedTermsVersion, storedTermsURL string
-	if err := storage.db.QueryRowContext(ctx, `SELECT consent_version,consent_text,terms_version,terms_url
+	var storedVersion, storedText, storedTermsVersion, acceptedTermsVersion, effectiveTermsVersion, storedTermsURL string
+	if err := storage.db.QueryRowContext(ctx, `SELECT consent_version,consent_text,terms_version,
+accepted_terms_version,COALESCE(accepted_terms_version,terms_version),terms_url
 FROM billing_recurring_consents WHERE payment_attempt_id=$1`, attempt.ID).Scan(
-		&storedVersion, &storedText, &storedTermsVersion, &storedTermsURL,
+		&storedVersion, &storedText, &storedTermsVersion, &acceptedTermsVersion, &effectiveTermsVersion, &storedTermsURL,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -126,9 +155,12 @@ FROM billing_recurring_consents WHERE payment_attempt_id=$1`, attempt.ID).Scan(
 		}
 	}
 	if storedVersion != BillingRecurringConsentVersion || storedText != soloConsent ||
-		storedTermsVersion != BillingRecurringTermsVersion || storedTermsURL != BillingRecurringTermsURL {
-		t.Fatalf("stored consent does not match catalog: version=%q text=%q terms=%q url=%q",
-			storedVersion, storedText, storedTermsVersion, storedTermsURL)
+		storedTermsVersion != billingRecurringLegacyTermsVersion ||
+		acceptedTermsVersion != BillingRecurringTermsVersion ||
+		effectiveTermsVersion != BillingRecurringTermsVersion ||
+		storedTermsURL != BillingRecurringTermsURL {
+		t.Fatalf("stored consent does not match catalog: version=%q text=%q legacy_terms=%q accepted_terms=%q effective_terms=%q url=%q",
+			storedVersion, storedText, storedTermsVersion, acceptedTermsVersion, effectiveTermsVersion, storedTermsURL)
 	}
 	if _, err := storage.GetWorkspaceBillingState(ctx, "billing-outsider", workspace.ID, time.Now()); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("outsider billing error=%v, want ErrNotFound", err)
