@@ -92,15 +92,13 @@ func (a *App) BillingLiveEnabled() bool {
 }
 
 func (a *App) CreateBillingCheckout(
-	ctx context.Context, actorUserID, workspaceID, planCode string, recurringConsent bool,
-	recurringConsentVersion string,
+	ctx context.Context, actorUserID, workspaceID string, snapshot store.BillingCheckoutSnapshot,
 ) (BillingCheckout, error) {
 	if !a.BillingLiveEnabled() {
 		return BillingCheckout{}, ErrBillingNotConfigured
 	}
 	attempt, err := a.store.CreateBillingCheckoutAttempt(
-		ctx, actorUserID, workspaceID, planCode, recurringConsent, recurringConsentVersion,
-		a.billingReturnURL, a.now().UTC())
+		ctx, actorUserID, workspaceID, snapshot, a.billingReturnURL, a.now().UTC())
 	if err != nil {
 		return BillingCheckout{}, err
 	}
@@ -460,6 +458,9 @@ func (a *App) canonicalBillingPayment(payment yookassa.Payment) (store.BillingCa
 		MetadataAttemptID:   payment.Metadata["attempt_id"],
 		MetadataWorkspaceID: payment.Metadata["workspace_id"],
 		Test:                payment.Test,
+	}
+	if payment.CancellationDetails != nil {
+		result.CancellationReason = strings.TrimSpace(payment.CancellationDetails.Reason)
 	}
 	if payment.PaymentMethod != nil {
 		result.PaymentMethodSaved = payment.PaymentMethod.Saved

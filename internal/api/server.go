@@ -19,6 +19,7 @@ import (
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/email"
+	"maxpilot/backend/internal/legal"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/openaiimg"
@@ -619,6 +620,15 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		return
 	}
 	switch {
+	case errors.Is(err, store.ErrBillingLegalConsentRequired):
+		s.problem(w, http.StatusPreconditionRequired, "billing_legal_consent_required",
+			"Перед оплатой выйдите, войдите снова и примите актуальные условия.", map[string]string{
+				"terms_version":         legal.CurrentTermsVersion,
+				"personal_data_version": legal.CurrentPersonalDataVersion,
+			})
+	case errors.Is(err, store.ErrBillingCheckoutSnapshotMismatch):
+		s.problem(w, http.StatusConflict, "billing_checkout_snapshot_mismatch",
+			"Тариф или условия оплаты изменились. Обновите страницу и подтвердите актуальные данные.", nil)
 	case errors.Is(err, store.ErrBillingConsentRequired):
 		s.problem(w, http.StatusBadRequest, "recurring_consent_required",
 			"Для подключения автопродления нужно отдельное согласие.", nil)

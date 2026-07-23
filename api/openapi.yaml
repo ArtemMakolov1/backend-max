@@ -1538,6 +1538,16 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/BillingCheckout'}
+        '409':
+          description: Catalog or recurring-consent snapshot is stale or mismatched.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProblemEnvelope'}
+        '428':
+          description: The owner must sign in again and accept the current Terms and Privacy versions.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ProblemEnvelope'}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/billing/cancellation-intent:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
@@ -3742,15 +3752,32 @@ components:
     BillingCheckoutRequest:
       type: object
       additionalProperties: false
-      required: [plan_code, recurring_consent, recurring_consent_version]
+      description: |
+        Echoes the exact paid catalog and recurring-consent snapshot shown to
+        the owner. The server rejects stale or mismatched snapshots before
+        creating a provider payment.
+      required:
+        - plan_code
+        - plan_version
+        - monthly_price_minor
+        - currency_code
+        - recurring_consent
+        - recurring_consent_version
+        - recurring_consent_terms_version
       properties:
         plan_code: {type: string, enum: [solo, pro]}
+        plan_version: {type: integer, minimum: 1}
+        monthly_price_minor: {type: integer, format: int64, minimum: 1}
+        currency_code: {type: string, pattern: '^[A-Z]{3}$'}
         recurring_consent:
           type: boolean
           const: true
         recurring_consent_version:
           type: string
           const: yookassa-recurring-v2
+        recurring_consent_terms_version:
+          type: string
+          const: '2026-07-23'
     BillingCheckout:
       type: object
       required: [checkout_id, status]

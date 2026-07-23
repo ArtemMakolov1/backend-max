@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"maxpilot/backend/internal/store"
+	"maxpilot/backend/internal/yookassa"
 )
 
 func TestBillingPendingHorizonBoundary(t *testing.T) {
@@ -15,5 +16,27 @@ func TestBillingPendingHorizonBoundary(t *testing.T) {
 	}
 	if !billingPendingHorizonExceeded(attempt, started.Add(billingProviderPendingHorizon)) {
 		t.Fatal("pending payment did not enter manual review at the horizon")
+	}
+}
+
+func TestCanonicalBillingPaymentCarriesCancellationReason(t *testing.T) {
+	application := &App{}
+	canonical, err := application.canonicalBillingPayment(yookassa.Payment{
+		ID:     "provider-payment",
+		Status: "canceled",
+		Amount: yookassa.Amount{Value: "990.00", Currency: "RUB"},
+		Metadata: map[string]string{
+			"attempt_id":   "attempt",
+			"workspace_id": "workspace",
+		},
+		CancellationDetails: &yookassa.CancellationDetails{
+			Party: "yoo_kassa", Reason: " permission_revoked ",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.CancellationReason != "permission_revoked" {
+		t.Fatalf("canonical cancellation reason=%q", canonical.CancellationReason)
 	}
 }

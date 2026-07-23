@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"maxpilot/backend/internal/legal"
 )
 
 func TestBillingCatalogKeepsFuturePlansInternalAndCreatesFreeSubscriptions(t *testing.T) {
@@ -105,8 +107,34 @@ FROM billing_plan_versions WHERE public=TRUE AND available=TRUE ORDER BY monthly
 		state.Subscription.Status != "active" || len(state.Usage) != 6 || state.Features.AIImages {
 		t.Fatalf("workspace billing state = %#v", state)
 	}
+	checkoutSnapshot := BillingCheckoutSnapshot{
+		PlanCode: "solo", PlanVersion: 2, MonthlyPriceMinor: 99000, CurrencyCode: "RUB",
+		RecurringConsent: true, RecurringConsentVersion: BillingRecurringConsentVersion,
+		RecurringConsentTermsVersion: BillingRecurringTermsVersion,
+	}
+	if _, err := storage.CreateBillingCheckoutAttempt(
+		ctx, "billing-owner", workspace.ID, checkoutSnapshot,
+		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", time.Now().UTC(),
+	); !errors.Is(err, ErrBillingLegalConsentRequired) {
+		t.Fatalf("checkout without current legal consent error=%v, want ErrBillingLegalConsentRequired", err)
+	}
+	if _, err := storage.db.ExecContext(ctx, `INSERT INTO user_consents(
+owner_id,document,version,accepted_at,source) VALUES
+	($1,'terms',$2,CURRENT_TIMESTAMP,'test'),
+	($1,'personal_data',$3,CURRENT_TIMESTAMP,'test')`,
+		"billing-owner", legal.CurrentTermsVersion, legal.CurrentPersonalDataVersion); err != nil {
+		t.Fatal(err)
+	}
+	staleSnapshot := checkoutSnapshot
+	staleSnapshot.MonthlyPriceMinor--
+	if _, err := storage.CreateBillingCheckoutAttempt(
+		ctx, "billing-owner", workspace.ID, staleSnapshot,
+		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", time.Now().UTC(),
+	); !errors.Is(err, ErrBillingCheckoutSnapshotMismatch) {
+		t.Fatalf("stale checkout snapshot error=%v, want ErrBillingCheckoutSnapshotMismatch", err)
+	}
 	attempt, err := storage.CreateBillingCheckoutAttempt(
-		ctx, "billing-owner", workspace.ID, "solo", true, BillingRecurringConsentVersion,
+		ctx, "billing-owner", workspace.ID, checkoutSnapshot,
 		"https://maxposty.ru/app/?billing=pending#/workspace/settings/plan", time.Now().UTC(),
 	)
 	if err != nil {

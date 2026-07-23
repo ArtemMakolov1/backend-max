@@ -189,6 +189,32 @@ func TestWriteErrorTranslatesMediaQuotaFailures(t *testing.T) {
 	}
 }
 
+func TestWriteErrorTranslatesBillingCheckoutPreconditions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			err:        store.ErrBillingCheckoutSnapshotMismatch,
+			wantStatus: http.StatusConflict,
+			wantCode:   "billing_checkout_snapshot_mismatch",
+		},
+		{
+			err:        store.ErrBillingLegalConsentRequired,
+			wantStatus: http.StatusPreconditionRequired,
+			wantCode:   "billing_legal_consent_required",
+		},
+	}
+	for _, test := range tests {
+		response := httptest.NewRecorder()
+		server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		server.writeError(response, test.err)
+		assertProblemCode(t, response, test.wantStatus, test.wantCode)
+	}
+}
+
 func TestMetricsEndpointAllowsOnlyDirectPrivateScrapers(t *testing.T) {
 	t.Parallel()
 

@@ -258,3 +258,92 @@ WHERE w.owner_user_id='migration-after-v2' AND w.is_personal=TRUE`).Scan(&newVer
 		t.Fatalf("new workspace version=%d, want 2", newVersion)
 	}
 }
+
+func TestRecurringTermsMigrationPreservesPriorConsentEvidence(t *testing.T) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	termsIndex := -1
+	for index, migration := range migrations {
+		if migration.version == "026_billing_recurring_terms_20260723.sql" {
+			termsIndex = index
+			break
+		}
+	}
+	if termsIndex <= 0 {
+		t.Fatal("026_billing_recurring_terms_20260723.sql not found in embedded migrations")
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:termsIndex]); err != nil {
+		t.Fatalf("apply prerequisite migrations: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO users(id,display_name,created_at,updated_at)
+VALUES('terms-migration-owner','Terms migration',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	var workspaceID string
+	if err := db.QueryRowContext(ctx, `SELECT id FROM workspaces
+WHERE owner_user_id='terms-migration-owner' AND is_personal=TRUE`).Scan(&workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	insertAttempt := func(id, idempotencyKey, planCode string, price int64) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO billing_payment_attempts(
+id,workspace_id,requested_by_user_id,purpose,idempotency_key,plan_code,plan_version,
+amount_minor,currency_code,status,provider_description,provider_return_url,
+create_deadline,next_attempt_at,created_at,updated_at)
+VALUES($1,$2,'terms-migration-owner','checkout',$3,$4,2,$5,'RUB','failed',
+'Terms migration checkout','https://maxposty.ru/app/',
+CURRENT_TIMESTAMP+INTERVAL '1 day',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+			id, workspaceID, idempotencyKey, planCode, price); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertConsent := func(attemptID, termsVersion, planCode string, price int64) error {
+		_, err := db.ExecContext(ctx, `INSERT INTO billing_recurring_consents(
+payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,
+terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
+VALUES($1,$2,'terms-migration-owner','yookassa-recurring-v2','Immutable consent',$3,
+'https://maxposty.ru/terms/',$4,2,$5,'RUB',CURRENT_TIMESTAMP)`,
+			attemptID, workspaceID, termsVersion, planCode, price)
+		return err
+	}
+
+	oldAttemptID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	insertAttempt(oldAttemptID, "11111111-1111-1111-1111-111111111111", "solo", 99000)
+	if err := insertConsent(oldAttemptID, "2026-07-22", "solo", 99000); err != nil {
+		t.Fatalf("insert prior consent: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, string(migrations[termsIndex].contents)); err != nil {
+		t.Fatalf("apply recurring terms migration: %v", err)
+	}
+	var preservedVersion string
+	if err := db.QueryRowContext(ctx, `SELECT terms_version FROM billing_recurring_consents
+WHERE payment_attempt_id=$1`, oldAttemptID).Scan(&preservedVersion); err != nil {
+		t.Fatal(err)
+	}
+	if preservedVersion != "2026-07-22" {
+		t.Fatalf("prior consent version=%q, want preserved 2026-07-22", preservedVersion)
+	}
+	currentAttemptID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	insertAttempt(currentAttemptID, "22222222-2222-2222-2222-222222222222", "pro", 249000)
+	if err := insertConsent(currentAttemptID, "2026-07-23", "pro", 249000); err != nil {
+		t.Fatalf("insert current consent: %v", err)
+	}
+	invalidAttemptID := "cccccccccccccccccccccccccccccccc"
+	insertAttempt(invalidAttemptID, "33333333-3333-3333-3333-333333333333", "solo", 99000)
+	if err := insertConsent(invalidAttemptID, "2026-07-24", "solo", 99000); err == nil {
+		t.Fatal("future unknown recurring terms version passed the migrated CHECK")
+	}
+	var validated bool
+	if err := db.QueryRowContext(ctx, `SELECT convalidated FROM pg_constraint
+WHERE conrelid='billing_recurring_consents'::regclass
+  AND conname='billing_recurring_consents_terms_version_check'`).Scan(&validated); err != nil {
+		t.Fatal(err)
+	}
+	if !validated {
+		t.Fatal("recurring terms CHECK is not validated")
+	}
+}

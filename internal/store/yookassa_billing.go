@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"maxpilot/backend/internal/legal"
 )
 
 const (
@@ -22,18 +24,30 @@ const (
 	billingProviderCreateWindow    = 23 * time.Hour
 	billingWorkerLease             = 2 * time.Minute
 	BillingRecurringConsentVersion = "yookassa-recurring-v2"
-	BillingRecurringTermsVersion   = "2026-07-22"
+	BillingRecurringTermsVersion   = legal.CurrentTermsVersion
 	BillingRecurringTermsURL       = "https://maxposty.ru/terms/"
 )
 
 var (
-	ErrBillingOwnerRequired   = errors.New("workspace owner is required for billing")
-	ErrBillingPlanUnavailable = errors.New("billing plan is unavailable")
-	ErrBillingConflict        = errors.New("billing state conflict")
-	ErrBillingIntentInvalid   = errors.New("billing cancellation intent is invalid")
-	ErrBillingConsentRequired = errors.New("recurring payment consent is required")
-	ErrBillingIntegrity       = errors.New("billing provider integrity check failed")
+	ErrBillingOwnerRequired            = errors.New("workspace owner is required for billing")
+	ErrBillingPlanUnavailable          = errors.New("billing plan is unavailable")
+	ErrBillingConflict                 = errors.New("billing state conflict")
+	ErrBillingIntentInvalid            = errors.New("billing cancellation intent is invalid")
+	ErrBillingConsentRequired          = errors.New("recurring payment consent is required")
+	ErrBillingCheckoutSnapshotMismatch = errors.New("billing checkout snapshot does not match the current catalog")
+	ErrBillingLegalConsentRequired     = errors.New("current legal document consent is required for billing")
+	ErrBillingIntegrity                = errors.New("billing provider integrity check failed")
 )
+
+type BillingCheckoutSnapshot struct {
+	PlanCode                     string
+	PlanVersion                  int
+	MonthlyPriceMinor            int64
+	CurrencyCode                 string
+	RecurringConsent             bool
+	RecurringConsentVersion      string
+	RecurringConsentTermsVersion string
+}
 
 type BillingPaymentAttempt struct {
 	ID                      string
@@ -90,6 +104,7 @@ type BillingCanonicalPayment struct {
 	MetadataWorkspaceID string
 	OccurredAt          time.Time
 	Test                bool
+	CancellationReason  string
 }
 
 type BillingDueContract struct {
@@ -125,21 +140,23 @@ WHERE p.plan_code=$1 AND p.public=TRUE AND p.available=TRUE`, planCode).Scan(
 }
 
 func (s *Store) CreateBillingCheckoutAttempt(
-	ctx context.Context, actorUserID, workspaceID, planCode string, recurringConsent bool,
-	recurringConsentVersion string,
+	ctx context.Context, actorUserID, workspaceID string, snapshot BillingCheckoutSnapshot,
 	providerReturnURL string, now time.Time,
 ) (BillingPaymentAttempt, error) {
 	providerReturnURL = strings.TrimSpace(providerReturnURL)
 	if actorUserID == "" || workspaceID == "" || providerReturnURL == "" || now.IsZero() {
 		return BillingPaymentAttempt{}, errors.New("billing actor, workspace and time are required")
 	}
-	planCode = strings.TrimSpace(planCode)
+	planCode := strings.TrimSpace(snapshot.PlanCode)
 	if planCode == "free" || planCode == "" {
 		return BillingPaymentAttempt{}, ErrBillingPlanUnavailable
 	}
-	if !recurringConsent {
+	if !snapshot.RecurringConsent {
 		return BillingPaymentAttempt{}, ErrBillingConsentRequired
 	}
+	snapshot.CurrencyCode = strings.TrimSpace(snapshot.CurrencyCode)
+	snapshot.RecurringConsentVersion = strings.TrimSpace(snapshot.RecurringConsentVersion)
+	snapshot.RecurringConsentTermsVersion = strings.TrimSpace(snapshot.RecurringConsentTermsVersion)
 	now = now.UTC()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -152,6 +169,17 @@ func (s *Store) CreateBillingCheckoutAttempt(
 	}
 	if err := requireBillingOwner(ctx, tx, actorUserID, workspaceID); err != nil {
 		return BillingPaymentAttempt{}, err
+	}
+	var currentTermsAccepted, currentPersonalDataAccepted bool
+	if err := tx.QueryRowContext(ctx, `SELECT
+EXISTS(SELECT 1 FROM user_consents WHERE owner_id=$1 AND document='terms' AND version=$2),
+EXISTS(SELECT 1 FROM user_consents WHERE owner_id=$1 AND document='personal_data' AND version=$3)`,
+		actorUserID, legal.CurrentTermsVersion, legal.CurrentPersonalDataVersion).
+		Scan(&currentTermsAccepted, &currentPersonalDataAccepted); err != nil {
+		return BillingPaymentAttempt{}, err
+	}
+	if !currentTermsAccepted || !currentPersonalDataAccepted {
+		return BillingPaymentAttempt{}, ErrBillingLegalConsentRequired
 	}
 	var contractStatus string
 	err = tx.QueryRowContext(ctx, `SELECT status FROM billing_subscription_contracts WHERE workspace_id=$1`, workspaceID).
@@ -169,21 +197,6 @@ WHERE workspace_id=$1 AND purpose='checkout' AND status='prepared'
 		workspaceID, now, now.Add(-billingCheckoutTTL)); err != nil {
 		return BillingPaymentAttempt{}, err
 	}
-	openAttempt, openErr := scanBillingPaymentAttempt(tx.QueryRowContext(ctx,
-		billingAttemptSelect+` WHERE a.workspace_id=$1 AND a.purpose='checkout'
-AND a.status IN ('prepared','pending','manual_review') FOR UPDATE`, workspaceID))
-	if openErr == nil {
-		if openAttempt.PlanCode != planCode || openAttempt.RequestedByUserID != actorUserID {
-			return BillingPaymentAttempt{}, ErrBillingConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return BillingPaymentAttempt{}, err
-		}
-		return openAttempt, nil
-	}
-	if !errors.Is(openErr, ErrNotFound) {
-		return BillingPaymentAttempt{}, openErr
-	}
 	var plan BillingPlan
 	err = tx.QueryRowContext(ctx, `SELECT `+billingPlanColumns+`
 FROM billing_plan_versions p
@@ -197,8 +210,49 @@ WHERE p.plan_code=$1 AND p.public=TRUE AND p.available=TRUE`, planCode).Scan(
 		return BillingPaymentAttempt{}, err
 	}
 	consent := billingRecurringConsent(plan)
-	if strings.TrimSpace(recurringConsentVersion) != consent.Version {
-		return BillingPaymentAttempt{}, ErrBillingConsentRequired
+	if snapshot.PlanVersion != plan.Version ||
+		snapshot.MonthlyPriceMinor != plan.MonthlyPriceMinor ||
+		snapshot.CurrencyCode != plan.CurrencyCode ||
+		snapshot.RecurringConsentVersion != consent.Version ||
+		snapshot.RecurringConsentTermsVersion != consent.TermsVersion {
+		return BillingPaymentAttempt{}, ErrBillingCheckoutSnapshotMismatch
+	}
+	openAttempt, openErr := scanBillingPaymentAttempt(tx.QueryRowContext(ctx,
+		billingAttemptSelect+` WHERE a.workspace_id=$1 AND a.purpose='checkout'
+AND a.status IN ('prepared','pending','manual_review') FOR UPDATE`, workspaceID))
+	if openErr == nil {
+		if openAttempt.RequestedByUserID != actorUserID {
+			return BillingPaymentAttempt{}, ErrBillingConflict
+		}
+		var acceptedConsentVersion, acceptedTermsVersion, acceptedCurrencyCode string
+		var acceptedPlanVersion int
+		var acceptedMonthlyPriceMinor int64
+		err = tx.QueryRowContext(ctx, `SELECT consent_version,terms_version,plan_version,
+monthly_price_minor,currency_code FROM billing_recurring_consents WHERE payment_attempt_id=$1`,
+			openAttempt.ID).Scan(&acceptedConsentVersion, &acceptedTermsVersion, &acceptedPlanVersion,
+			&acceptedMonthlyPriceMinor, &acceptedCurrencyCode)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return BillingPaymentAttempt{}, err
+		}
+		if errors.Is(err, sql.ErrNoRows) ||
+			openAttempt.PlanCode != planCode ||
+			openAttempt.PlanVersion != snapshot.PlanVersion ||
+			openAttempt.AmountMinor != snapshot.MonthlyPriceMinor ||
+			openAttempt.CurrencyCode != snapshot.CurrencyCode ||
+			acceptedConsentVersion != snapshot.RecurringConsentVersion ||
+			acceptedTermsVersion != snapshot.RecurringConsentTermsVersion ||
+			acceptedPlanVersion != snapshot.PlanVersion ||
+			acceptedMonthlyPriceMinor != snapshot.MonthlyPriceMinor ||
+			acceptedCurrencyCode != snapshot.CurrencyCode {
+			return BillingPaymentAttempt{}, ErrBillingCheckoutSnapshotMismatch
+		}
+		if err := tx.Commit(); err != nil {
+			return BillingPaymentAttempt{}, err
+		}
+		return openAttempt, nil
+	}
+	if !errors.Is(openErr, ErrNotFound) {
+		return BillingPaymentAttempt{}, openErr
 	}
 	attempt, err := newBillingPaymentAttempt(actorUserID, workspaceID, "checkout", plan, 1, nil, nil, 0, now)
 	if err != nil {
@@ -419,7 +473,7 @@ WHERE id=$1`, attempt.ID, payment.ProviderPaymentID, now); updateErr != nil {
 		}
 	case "canceled":
 		if attempt.Status != "canceled" && attempt.Status != "succeeded" {
-			if err := cancelBillingAttempt(ctx, tx, attempt, now); err != nil {
+			if err := cancelBillingAttempt(ctx, tx, attempt, payment.CancellationReason, now); err != nil {
 				return false, err
 			}
 			processed = true
@@ -577,6 +631,9 @@ WHERE c.workspace_id=$1 AND c.status IN ('active','past_due') FOR UPDATE OF c`, 
 		return ErrBillingConflict
 	}
 	if err != nil {
+		return err
+	}
+	if err := rejectUnboundSubmittedBillingRenewal(ctx, tx, workspaceID); err != nil {
 		return err
 	}
 	if paymentMethodID == "" && cancelAtEnd {
@@ -1072,10 +1129,30 @@ WHERE workspace_id=$1 AND purpose='renewal' AND status IN ('prepared','pending',
 	return open, err
 }
 
+// rejectUnboundSubmittedBillingRenewal prevents cancellation or detach from
+// claiming success while an external POST may already have created a payment
+// that has not yet been durably attached to its local attempt. Once the
+// provider ID is attached, reconciliation can safely classify a late result.
+func rejectUnboundSubmittedBillingRenewal(ctx context.Context, tx *sql.Tx, workspaceID string) error {
+	var unresolved bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM billing_payment_attempts
+WHERE workspace_id=$1 AND purpose='renewal'
+  AND status IN ('prepared','pending','manual_review')
+  AND provider_create_started_at IS NOT NULL
+  AND provider_payment_id IS NULL)`, workspaceID).Scan(&unresolved); err != nil {
+		return err
+	}
+	if unresolved {
+		return ErrBillingConflict
+	}
+	return nil
+}
+
 // suppressUnsubmittedBillingRenewals establishes the exact cancellation
 // cutoff. Only attempts for which no provider POST has begun are suppressed.
-// In-flight/outcome-unknown attempts remain for canonical reconciliation, but
-// never prevent the owner from disabling every future automatic charge.
+// A submitted attempt without an attached provider ID is rejected by
+// rejectUnboundSubmittedBillingRenewal before this function is called.
 func suppressUnsubmittedBillingRenewals(
 	ctx context.Context, tx *sql.Tx, workspaceID string, now time.Time,
 ) error {
@@ -1168,6 +1245,9 @@ cancel_at_period_end=FALSE,version=version+1,updated_at=$3 WHERE workspace_id=$1
 			return err
 		}
 	case "cancel_confirmed":
+		if err := rejectUnboundSubmittedBillingRenewal(ctx, tx, workspaceID); err != nil {
+			return err
+		}
 		if err := suppressUnsubmittedBillingRenewals(ctx, tx, workspaceID, now); err != nil {
 			return err
 		}
@@ -1274,14 +1354,17 @@ func billingRenewalStillCurrentTx(
 	if attempt.Purpose != "renewal" || attempt.RequestedPeriodStart == nil {
 		return false, ErrBillingConflict
 	}
-	var contractStatus, periodStatus, planCode string
+	var contractStatus, paymentMethodID, periodStatus, planCode string
+	var cancelAtPeriodEnd bool
 	var planVersion int
 	var periodEnd time.Time
-	err := tx.QueryRowContext(ctx, `SELECT c.status,p.status,p.plan_code,p.plan_version,p.period_end
+	err := tx.QueryRowContext(ctx, `SELECT c.status,c.cancel_at_period_end,c.payment_method_id,
+p.status,p.plan_code,p.plan_version,p.period_end
 FROM billing_subscription_contracts c
 JOIN billing_subscription_periods p ON p.id=c.current_period_id AND p.workspace_id=c.workspace_id
 WHERE c.workspace_id=$1 FOR UPDATE OF c,p`, attempt.WorkspaceID).Scan(
-		&contractStatus, &periodStatus, &planCode, &planVersion, &periodEnd)
+		&contractStatus, &cancelAtPeriodEnd, &paymentMethodID,
+		&periodStatus, &planCode, &planVersion, &periodEnd)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -1289,6 +1372,7 @@ WHERE c.workspace_id=$1 FOR UPDATE OF c,p`, attempt.WorkspaceID).Scan(
 		return false, err
 	}
 	return (contractStatus == "active" || contractStatus == "past_due") &&
+		!cancelAtPeriodEnd && paymentMethodID != "" &&
 		periodStatus == "active" && planCode == attempt.PlanCode && planVersion == attempt.PlanVersion &&
 		periodEnd.UTC().Equal(attempt.RequestedPeriodStart.UTC()), nil
 }
@@ -1316,17 +1400,56 @@ WHERE id=$1 AND status<>'succeeded'`, attempt.ID, now)
 	return false, fmt.Errorf("%w: paid stale renewal requires manual refund", ErrBillingIntegrity)
 }
 
-func cancelBillingAttempt(ctx context.Context, tx *sql.Tx, attempt BillingPaymentAttempt, now time.Time) error {
+func cancelBillingAttempt(
+	ctx context.Context, tx *sql.Tx, attempt BillingPaymentAttempt, cancellationReason string, now time.Time,
+) error {
+	current := true
+	if attempt.Purpose == "renewal" {
+		var err error
+		current, err = billingRenewalStillCurrentTx(ctx, tx, attempt)
+		if err != nil {
+			return err
+		}
+	}
+	cancellationReason = strings.TrimSpace(cancellationReason)
+	errorCode := "provider_canceled"
+	disablePaymentMethod := billingCancellationDisablesPaymentMethod(cancellationReason)
+	if disablePaymentMethod {
+		errorCode += "_" + cancellationReason
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE billing_payment_attempts
-SET status='canceled',error_code='provider_canceled',payment_method_snapshot='',updated_at=$2 WHERE id=$1`, attempt.ID, now); err != nil {
+SET status='canceled',error_code=$2,payment_method_snapshot='',
+worker_lease_token='',worker_lease_until=NULL,updated_at=$3 WHERE id=$1`,
+		attempt.ID, errorCode, now); err != nil {
 		return err
 	}
-	if attempt.Purpose != "renewal" {
+	if attempt.Purpose != "renewal" || !current {
 		return nil
 	}
 	var grace sql.NullTime
-	if err := tx.QueryRowContext(ctx, `SELECT grace_until FROM billing_subscription_contracts
-WHERE workspace_id=$1 FOR UPDATE`, attempt.WorkspaceID).Scan(&grace); err != nil {
+	var periodEnd time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT c.grace_until,p.period_end
+FROM billing_subscription_contracts c
+JOIN billing_subscription_periods p ON p.id=c.current_period_id AND p.workspace_id=c.workspace_id
+WHERE c.workspace_id=$1 FOR UPDATE OF c,p`, attempt.WorkspaceID).Scan(&grace, &periodEnd); err != nil {
+		return err
+	}
+	if disablePaymentMethod {
+		if _, err := tx.ExecContext(ctx, `UPDATE billing_payment_attempts SET
+payment_method_snapshot='',updated_at=$2 WHERE workspace_id=$1 AND purpose='renewal'`,
+			attempt.WorkspaceID, now); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE billing_retention_offers SET
+status='expired',consumed_at=$2 WHERE workspace_id=$1 AND status='pending'`,
+			attempt.WorkspaceID, now); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE billing_subscription_contracts SET
+payment_method_id='',cancel_at_period_end=TRUE,next_charge_at=$2,grace_until=NULL,
+next_period_discount_basis_points=0,renewal_attempts=GREATEST(renewal_attempts,$3),
+version=version+1,updated_at=$4 WHERE workspace_id=$1`, attempt.WorkspaceID,
+			periodEnd.UTC(), attempt.AttemptNumber, now)
 		return err
 	}
 	graceUntil := now.Add(billingRenewalGrace)
@@ -1338,6 +1461,15 @@ SET status='past_due',renewal_attempts=$2,next_charge_at=$3,grace_until=$4,
 version=version+1,updated_at=$5 WHERE workspace_id=$1`, attempt.WorkspaceID,
 		attempt.AttemptNumber, now.Add(billingRenewalRetry), graceUntil, now)
 	return err
+}
+
+func billingCancellationDisablesPaymentMethod(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "permission_revoked", "card_expired", "payment_method_restricted":
+		return true
+	default:
+		return false
+	}
 }
 
 func downgradeBillingWorkspaceTx(ctx context.Context, tx *sql.Tx, workspaceID string, periodID int64, now time.Time) error {
