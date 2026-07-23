@@ -204,24 +204,11 @@ func isChatNotFound(err error) bool {
 }
 
 func (c *Client) getChat(ctx context.Context, identifier string) (ChatInfo, error) {
-	var response struct {
-		ChatID            json.RawMessage `json:"chat_id"`
-		OwnerID           json.RawMessage `json:"owner_id"`
-		Type              string          `json:"type"`
-		Status            string          `json:"status"`
-		Title             string          `json:"title"`
-		Link              string          `json:"link,omitempty"`
-		Icon              ChatIcon        `json:"icon,omitempty"`
-		ParticipantsCount int             `json:"participants_count,omitempty"`
-	}
+	var response chatInfoResponse
 	if err := c.doJSON(ctx, http.MethodGet, "/chats/"+url.PathEscape(identifier), nil, nil, &response); err != nil {
 		return ChatInfo{}, err
 	}
-	chat := ChatInfo{
-		ChatID: jsonCode(response.ChatID), OwnerID: jsonCode(response.OwnerID), Type: response.Type, Status: response.Status,
-		Title: response.Title, Link: response.Link, Icon: response.Icon,
-		ParticipantsCount: response.ParticipantsCount,
-	}
+	chat := response.chatInfo()
 	if !numericID(chat.ChatID) {
 		return ChatInfo{}, errors.New("MAX chat response does not contain a numeric chat_id")
 	}
@@ -240,8 +227,9 @@ func (c *Client) EditChat(ctx context.Context, chatID string, patch ChatPatch) (
 		return ChatInfo{}, errors.New("edit MAX chat: an icon or a title is required")
 	}
 	body := struct {
-		Icon  *attachmentPayload `json:"icon,omitempty"`
-		Title *string            `json:"title,omitempty"`
+		Icon   *attachmentPayload `json:"icon,omitempty"`
+		Title  *string            `json:"title,omitempty"`
+		Notify *bool              `json:"notify,omitempty"`
 	}{}
 	if iconToken != "" {
 		body.Icon = &attachmentPayload{Token: iconToken}
@@ -253,28 +241,46 @@ func (c *Client) EditChat(ctx context.Context, chatID string, patch ChatPatch) (
 		}
 		body.Title = &title
 	}
-	var response struct {
-		ChatID            json.RawMessage `json:"chat_id"`
-		OwnerID           json.RawMessage `json:"owner_id"`
-		Type              string          `json:"type"`
-		Status            string          `json:"status"`
-		Title             string          `json:"title"`
-		Link              string          `json:"link,omitempty"`
-		Icon              ChatIcon        `json:"icon,omitempty"`
-		ParticipantsCount int             `json:"participants_count,omitempty"`
-	}
+	body.Notify = patch.Notify
+	var response chatInfoResponse
 	if err := c.doJSON(ctx, http.MethodPatch, "/chats/"+url.PathEscape(chatID), nil, body, &response); err != nil {
 		return ChatInfo{}, err
 	}
-	chat := ChatInfo{
-		ChatID: jsonCode(response.ChatID), OwnerID: jsonCode(response.OwnerID), Type: response.Type, Status: response.Status,
-		Title: response.Title, Link: response.Link, Icon: response.Icon,
-		ParticipantsCount: response.ParticipantsCount,
-	}
+	chat := response.chatInfo()
 	if !numericID(chat.ChatID) || chat.ChatID != chatID {
 		return ChatInfo{}, errors.New("MAX chat response does not match the requested chat ID")
 	}
 	return chat, nil
+}
+
+// chatInfoResponse mirrors the fields returned for a single chat. Keeping the
+// wire representation private lets public chat IDs remain lossless strings and
+// reduces the risk of GET and PATCH drifting apart as MAX adds metadata.
+type chatInfoResponse struct {
+	ChatID            json.RawMessage `json:"chat_id"`
+	OwnerID           json.RawMessage `json:"owner_id"`
+	Type              string          `json:"type"`
+	Status            string          `json:"status"`
+	Title             string          `json:"title"`
+	Description       string          `json:"description,omitempty"`
+	Link              string          `json:"link,omitempty"`
+	Icon              ChatIcon        `json:"icon,omitempty"`
+	ParticipantsCount int             `json:"participants_count,omitempty"`
+	IsPublic          bool            `json:"is_public"`
+	MessagesCount     int             `json:"messages_count,omitempty"`
+	LastEventTime     int64           `json:"last_event_time,omitempty"`
+	PinnedMessage     json.RawMessage `json:"pinned_message,omitempty"`
+}
+
+func (response chatInfoResponse) chatInfo() ChatInfo {
+	pinned := bytes.TrimSpace(response.PinnedMessage)
+	return ChatInfo{
+		ChatID: jsonCode(response.ChatID), OwnerID: jsonCode(response.OwnerID), Type: response.Type, Status: response.Status,
+		Title: response.Title, Description: response.Description, Link: response.Link, Icon: response.Icon,
+		ParticipantsCount: response.ParticipantsCount, IsPublic: response.IsPublic, MessagesCount: response.MessagesCount,
+		LastEventTime:    response.LastEventTime,
+		HasPinnedMessage: len(pinned) != 0 && !bytes.Equal(pinned, []byte("null")),
+	}
 }
 
 // GetMembership returns the bot's current membership and admin permissions.

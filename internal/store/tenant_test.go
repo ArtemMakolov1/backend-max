@@ -556,3 +556,71 @@ func TestObservedBotChatRemovalWinsEqualAndNewerEventsOnly(t *testing.T) {
 		t.Fatalf("newer add was not applied: %#v, %v", active, err)
 	}
 }
+
+func TestTouchObservedBotChatPreservesMetadataAndRemovalOrdering(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, err := Open(ctx, filepath.Join(t.TempDir(), "observed-touch.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storage.Close() })
+	eventAt := time.Now().UTC().Truncate(time.Microsecond)
+	chat := ObservedBotChat{
+		MAXChatID: "5252", PublicLink: "https://max.ru/preserved", Title: "Preserved",
+		MAXOwnerID: "88", IconURL: "https://cdn.max.ru/preserved.png", ParticipantsCount: 12,
+		Active: true, LastSeenAt: eventAt,
+	}
+	if err := storage.UpsertObservedBotChat(ctx, chat); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.TouchObservedBotChat(ctx, chat.MAXChatID, eventAt.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	preserved, err := storage.GetActiveObservedBotChat(ctx, chat.PublicLink, "")
+	if err != nil || preserved.Title != chat.Title || preserved.MAXOwnerID != chat.MAXOwnerID ||
+		preserved.IconURL != chat.IconURL || preserved.ParticipantsCount != chat.ParticipantsCount {
+		t.Fatalf("touch wiped enriched metadata: %#v, %v", preserved, err)
+	}
+	if err := storage.RefreshObservedBotChatMetadata(ctx, ObservedBotChat{
+		MAXChatID: chat.MAXChatID, Active: true, LastSeenAt: eventAt.Add(1500 * time.Millisecond),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	preserved, err = storage.GetActiveObservedBotChat(ctx, chat.PublicLink, "")
+	if err != nil || preserved.Title != chat.Title || preserved.MAXOwnerID != chat.MAXOwnerID ||
+		preserved.IconURL != chat.IconURL || preserved.ParticipantsCount != chat.ParticipantsCount {
+		t.Fatalf("partial metadata refresh wiped verified fields: %#v, %v", preserved, err)
+	}
+	removedAt := eventAt.Add(2 * time.Second)
+	if err := storage.MarkObservedBotChatRemoved(ctx, chat.MAXChatID, removedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.TouchObservedBotChat(ctx, chat.MAXChatID, removedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.GetActiveObservedBotChat(ctx, "", chat.MAXChatID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("equal-time touch resurrected removed chat: %v", err)
+	}
+	chat.Title = "Stale refresh"
+	chat.LastSeenAt = removedAt.Add(time.Second)
+	if err := storage.RefreshObservedBotChatMetadata(ctx, chat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.GetActiveObservedBotChat(ctx, "", chat.MAXChatID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("metadata refresh resurrected removed chat: %v", err)
+	}
+	if err := storage.TouchObservedBotChat(ctx, chat.MAXChatID, removedAt.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// A metadata request started before the newer bot_added can finish after it.
+	// Its owner proof must not be applied to the new lifecycle.
+	chat.MAXOwnerID = "stale-owner"
+	if err := storage.RefreshObservedBotChatMetadata(ctx, chat); err != nil {
+		t.Fatal(err)
+	}
+	readded, err := storage.GetActiveObservedBotChat(ctx, chat.PublicLink, "")
+	if err != nil || !readded.Active || readded.MAXOwnerID != "" || readded.Title != "Preserved" {
+		t.Fatalf("stale refresh changed safely reactivated inventory: %#v, %v", readded, err)
+	}
+}

@@ -21,19 +21,22 @@ import (
 )
 
 type fakeResearchClient struct {
-	mu               sync.Mutex
-	requests         []openairesearch.Request
-	result           openairesearch.Result
-	err              error
-	formatRequests   []openairesearch.FormatRequest
-	formatResult     openairesearch.FormatResult
-	formatErr        error
-	suggestRequests  []openairesearch.SuggestImagePromptRequest
-	suggestResult    openairesearch.SuggestImagePromptResult
-	suggestErr       error
-	brandKitRequests []openairesearch.SuggestBrandKitRequest
-	brandKitResult   openairesearch.SuggestBrandKitResult
-	brandKitErr      error
+	mu                  sync.Mutex
+	requests            []openairesearch.Request
+	result              openairesearch.Result
+	err                 error
+	formatRequests      []openairesearch.FormatRequest
+	formatResult        openairesearch.FormatResult
+	formatErr           error
+	suggestRequests     []openairesearch.SuggestImagePromptRequest
+	suggestResult       openairesearch.SuggestImagePromptResult
+	suggestErr          error
+	brandKitRequests    []openairesearch.SuggestBrandKitRequest
+	brandKitResult      openairesearch.SuggestBrandKitResult
+	brandKitErr         error
+	descriptionRequests []openairesearch.SuggestChannelDescriptionRequest
+	descriptionResult   openairesearch.SuggestChannelDescriptionResult
+	descriptionErr      error
 }
 
 func (f *fakeResearchClient) Generate(ctx context.Context, request openairesearch.Request) (openairesearch.Result, error) {
@@ -62,6 +65,13 @@ func (f *fakeResearchClient) SuggestBrandKit(_ context.Context, request openaire
 	f.brandKitRequests = append(f.brandKitRequests, request)
 	f.mu.Unlock()
 	return f.brandKitResult, f.brandKitErr
+}
+
+func (f *fakeResearchClient) SuggestChannelDescription(_ context.Context, request openairesearch.SuggestChannelDescriptionRequest) (openairesearch.SuggestChannelDescriptionResult, error) {
+	f.mu.Lock()
+	f.descriptionRequests = append(f.descriptionRequests, request)
+	f.mu.Unlock()
+	return f.descriptionResult, f.descriptionErr
 }
 
 func TestResearchGenerateReturnsExactContractUnderYandexSession(t *testing.T) {
@@ -199,6 +209,14 @@ func newResearchTestHandler(t *testing.T, research app.ResearchClient, _ string)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = storage.Close() })
+	if err := storage.UpsertUser(context.Background(), store.User{
+		ID: "research-user", DisplayName: "Research User",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	activatePaidWorkspaceForAPITest(
+		t, storage, "research-user", personalWorkspaceIDForTest(t, storage, "research-user"), "pro",
+	)
 	mediaStore, err := media.New(t.TempDir(), "http://localhost:8080")
 	if err != nil {
 		t.Fatal(err)

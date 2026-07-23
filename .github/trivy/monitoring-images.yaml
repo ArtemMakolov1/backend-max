@@ -1,0 +1,14 @@
+vulnerabilities:
+  - id: GHSA-hrxh-6v49-42gf
+    paths:
+      - bin/prometheus
+      - bin/promtool
+      - usr/share/grafana/bin/grafana
+    purls:
+      - pkg:golang/google.golang.org/grpc@v1.81.1
+    expired_at: 2026-08-05
+    statement: >-
+      Temporary monitoring-only exception while official upstream images are
+      rebuilt with google.golang.org/grpc 1.82.1. Prometheus tracks the fix in
+      prometheus/prometheus#19258; Grafana merged grafana/grafana#128973 after
+      the currently pinned nightly image was built.

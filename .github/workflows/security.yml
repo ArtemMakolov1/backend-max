@@ -68,15 +68,23 @@ jobs:
         include:
           - component: postgres-exporter
             image: "ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.5.1@sha256:526d3ff7f8276026715ca822d221bba0763dfea24fae7b8fa53ae1d9d3062934"
+            trivyignores: ""
           - component: pgbouncer-exporter
             image: "ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.5.1@sha256:d03dc3a1b1d4c40c1a92edc00b8cd262e4c1e7aeabfda971aeb511583ab46ede"
+            trivyignores: ""
           - component: node-exporter
             image: "prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0"
+            trivyignores: ""
           - component: prometheus
             image: "prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893"
+            trivyignores: ".github/trivy/monitoring-images.yaml"
           - component: grafana
             image: "grafana/grafana:nightly-slim@sha256:951d45bbdb8a2e909fa1315b12a7bc3f7be3835e076e40ecf304888f426b6179"
+            trivyignores: ".github/trivy/monitoring-images.yaml"
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
       - name: Log in for private MaxPosty monitoring images
         if: ${{ startsWith(matrix.image, 'ghcr.io/') }}
         shell: bash
@@ -95,6 +103,7 @@ jobs:
           vuln-type: os,library
           severity: HIGH,CRITICAL
           ignore-unfixed: "true"
+          trivyignores: ${{ matrix.trivyignores }}
           exit-code: "1"
           format: table
           timeout: 10m

@@ -97,3 +97,164 @@ WHERE w.owner_user_id='migration-new' AND w.is_personal=TRUE`).Scan(&newPlan); e
 		t.Fatalf("triggered plan=%q, want free", newPlan)
 	}
 }
+
+func TestYooKassaMigrationMovesOnlyCompliantFreeWorkspacesToV2(t *testing.T) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	billingIndex := -1
+	for index, migration := range migrations {
+		if migration.version == "021_yookassa_subscriptions.sql" {
+			billingIndex = index
+			break
+		}
+	}
+	if billingIndex <= 0 {
+		t.Fatal("021_yookassa_subscriptions.sql not found in embedded migrations")
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:billingIndex]); err != nil {
+		t.Fatalf("apply prerequisite migrations: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO users(id,display_name,created_at,updated_at) VALUES
+('migration-compliant','Compliant',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),
+('migration-overlimit','Over limit',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),
+('migration-extra-member','Extra member',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO workspace_members(
+workspace_id,user_id,role,created_by,joined_at,updated_at)
+SELECT w.id,'migration-extra-member','viewer','migration-overlimit',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+FROM workspaces w WHERE w.owner_user_id='migration-overlimit' AND w.is_personal=TRUE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO channels(
+owner_id,verified_max_owner_id,max_chat_id,title,active,workspace_id,created_at,updated_at)
+SELECT owner_user_id,'migration-overlimit','migration-legacy-one','Legacy one',TRUE,id,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+FROM workspaces WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE
+UNION ALL
+SELECT owner_user_id,'migration-overlimit','migration-legacy-two','Legacy two',TRUE,id,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+FROM workspaces WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO workspace_media_usage(workspace_id,asset_count,total_bytes,updated_at)
+SELECT id,2,2147483648,CURRENT_TIMESTAMP FROM workspaces
+WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE
+ON CONFLICT(workspace_id) DO UPDATE SET asset_count=EXCLUDED.asset_count,total_bytes=EXCLUDED.total_bytes`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, string(migrations[billingIndex].contents)); err != nil {
+		t.Fatalf("apply YooKassa migration: %v", err)
+	}
+
+	versions := make(map[string]int)
+	rows, err := db.QueryContext(ctx, `SELECT w.owner_user_id,s.plan_version
+FROM workspaces w JOIN workspace_subscriptions s ON s.workspace_id=w.id
+WHERE w.owner_user_id IN ('migration-compliant','migration-overlimit') AND w.is_personal=TRUE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var owner string
+		var version int
+		if err := rows.Scan(&owner, &version); err != nil {
+			t.Fatal(err)
+		}
+		versions[owner] = version
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if versions["migration-compliant"] != 2 {
+		t.Fatalf("compliant workspace version=%d, want 2", versions["migration-compliant"])
+	}
+	if versions["migration-overlimit"] != 1 {
+		t.Fatalf("over-limit workspace version=%d, want legacy 1", versions["migration-overlimit"])
+	}
+	var legacyLimit, compliantLimit int64
+	if err := db.QueryRowContext(ctx, `SELECT workspace_entitlement_limit(w.id,'channels')
+FROM workspaces w WHERE w.owner_user_id='migration-overlimit' AND w.is_personal=TRUE`).Scan(&legacyLimit); err != nil {
+		t.Fatal(err)
+	}
+	if legacyLimit != 1 {
+		t.Fatalf("legacy channel growth limit=%d, want 1", legacyLimit)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT workspace_entitlement_limit(w.id,'channels')
+FROM workspaces w WHERE w.owner_user_id='migration-compliant' AND w.is_personal=TRUE`).Scan(&compliantLimit); err != nil {
+		t.Fatal(err)
+	}
+	if compliantLimit != 1 {
+		t.Fatalf("compliant channel limit=%d, want 1", compliantLimit)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO posts(
+owner_id,title,content,status,workspace_id,created_at,updated_at)
+SELECT owner_user_id,'Legacy draft','Still editable','draft',id,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+FROM workspaces WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE`); err != nil {
+		t.Fatalf("legacy workspace could not continue editing posts: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE posts SET status='publishing',content='Publish still works'
+WHERE owner_id='migration-overlimit'`); err != nil {
+		t.Fatalf("legacy workspace could not continue publishing: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE channels SET active=FALSE
+WHERE max_chat_id='migration-legacy-two'`); err != nil {
+		t.Fatalf("legacy workspace could not reduce channels: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE channels SET active=TRUE
+WHERE max_chat_id='migration-legacy-two'`); err == nil {
+		t.Fatal("legacy workspace reactivated a channel beyond the nominal limit")
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE workspace_media_usage SET total_bytes=1610612736
+WHERE workspace_id=(SELECT id FROM workspaces WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE)`); err != nil {
+		t.Fatalf("legacy workspace could not reduce storage: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE workspace_media_usage SET total_bytes=1610612737
+WHERE workspace_id=(SELECT id FROM workspaces WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE)`); err == nil {
+		t.Fatal("legacy workspace increased storage while still beyond the nominal limit")
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO channels(
+owner_id,verified_max_owner_id,max_chat_id,title,active,workspace_id,created_at,updated_at)
+SELECT owner_user_id,'migration-compliant','migration-compliant-active','Active',TRUE,id,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+FROM workspaces WHERE owner_user_id='migration-compliant' AND is_personal=TRUE`); err != nil {
+		t.Fatalf("insert first compliant channel: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO channels(
+owner_id,verified_max_owner_id,max_chat_id,title,active,workspace_id,created_at,updated_at)
+SELECT owner_user_id,'migration-compliant','migration-compliant-inactive','Inactive',FALSE,id,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+FROM workspaces WHERE owner_user_id='migration-compliant' AND is_personal=TRUE`); err != nil {
+		t.Fatalf("insert inactive compliant channel: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE channels SET active=TRUE
+WHERE max_chat_id='migration-compliant-inactive'`); err == nil {
+		t.Fatal("reactivating a second channel bypassed the Free v2 limit")
+	}
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO users(id,display_name,created_at,updated_at)
+VALUES('migration-after-v2','New V2',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM workspace_members
+WHERE workspace_id=(SELECT id FROM workspaces WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE)
+  AND user_id='migration-extra-member'`); err != nil {
+		t.Fatalf("legacy workspace could not reduce seats: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO workspace_members(
+workspace_id,user_id,role,created_by,joined_at,updated_at)
+SELECT id,'migration-after-v2','viewer','migration-overlimit',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+FROM workspaces WHERE owner_user_id='migration-overlimit' AND is_personal=TRUE`); err == nil {
+		t.Fatal("legacy workspace added a member beyond the nominal limit")
+	}
+	var newVersion int
+	if err := db.QueryRowContext(ctx, `SELECT s.plan_version
+FROM workspaces w JOIN workspace_subscriptions s ON s.workspace_id=w.id
+WHERE w.owner_user_id='migration-after-v2' AND w.is_personal=TRUE`).Scan(&newVersion); err != nil {
+		t.Fatal(err)
+	}
+	if newVersion != 2 {
+		t.Fatalf("new workspace version=%d, want 2", newVersion)
+	}
+}

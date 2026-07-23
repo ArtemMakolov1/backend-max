@@ -353,10 +353,25 @@ func newAILimitTestStores(t *testing.T) (*Store, *Store) {
 	secondDB.SetMaxOpenConns(1)
 	first := &Store{db: &postgresDB{DB: firstDB}}
 	second := &Store{db: &postgresDB{DB: secondDB}}
+	if err := first.UpsertUser(context.Background(), User{ID: "test-owner", DisplayName: "Test owner"}); err != nil {
+		t.Fatal(err)
+	}
+	billingNow := time.Now().UTC()
+	periodStart := billingNow.AddDate(0, -1, 0)
+	periodEnd := billingNow.AddDate(0, 1, 0)
 	for _, userID := range []string{"user-a", "user-b"} {
 		if err := first.UpsertUser(context.Background(), User{ID: userID, DisplayName: userID}); err != nil {
 			t.Fatal(err)
 		}
+		workspaces, err := first.ListWorkspaces(context.Background(), userID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(workspaces) != 1 || !workspaces[0].Workspace.IsPersonal {
+			t.Fatalf("personal workspaces for %q = %#v", userID, workspaces)
+		}
+		seedBillingContract(t, first, workspaces[0].Workspace.ID, "pro",
+			periodStart, periodEnd, "sealed-ai-limits-"+userID)
 	}
 	t.Cleanup(func() {
 		_ = firstDB.Close()

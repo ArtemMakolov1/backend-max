@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWorkspaceBrandKitVersionRBACAndPersonalWorkspace(t *testing.T) {
@@ -17,6 +18,9 @@ func TestWorkspaceBrandKitVersionRBACAndPersonalWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, workspace.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-brand-team-method")
 	for userID, role := range map[string]string{
 		"brand-editor": WorkspaceRoleEditor,
 		"brand-viewer": WorkspaceRoleViewer,
@@ -92,6 +96,9 @@ func TestChannelTemplatePrecedenceTenantIsolationAndOptimisticDelete(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	billingNow := time.Now().UTC()
+	seedBillingContract(t, storage, first.ID, "pro",
+		billingNow.AddDate(0, -1, 0), billingNow.AddDate(0, 1, 0), "sealed-first-brand-method")
 	firstChannel, err := storage.CreateChannelForWorkspace(ctx, "test-owner", first.ID, Channel{
 		MAXChatID: "-91001", VerifiedMAXOwnerID: "owner", Title: "First channel", Active: true, IsChannel: true,
 	})

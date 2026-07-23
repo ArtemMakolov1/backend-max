@@ -72,12 +72,20 @@ if [[ "$*" == *" ps -q "* ]]; then
 fi
 
 if [[ "$*" == *" exec -T postgres-exporter "*"/metrics"* ]]; then
-  printf 'pg_up 1\n'
+  # Real exporter responses are much larger than a pipe buffer. Keep the
+  # connection metric first so a quiet grep reproduces the production SIGPIPE.
+  awk 'BEGIN {
+    print "pg_up 1"
+    for (i = 0; i < 8192; i++) print "# maxposty postgres exporter metrics padding"
+  }'
   exit 0
 fi
 
 if [[ "$*" == *" exec -T pgbouncer-exporter "*"/metrics"* ]]; then
-  printf 'pgbouncer_up 1\n'
+  awk 'BEGIN {
+    print "pgbouncer_up 1"
+    for (i = 0; i < 8192; i++) print "# maxposty pgbouncer exporter metrics padding"
+  }'
   exit 0
 fi
 

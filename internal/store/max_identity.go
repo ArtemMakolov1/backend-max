@@ -365,8 +365,9 @@ func (s *Store) ListDiscoverableChannelRefreshCandidatesForUser(ctx context.Cont
 		Owned: make([]ObservedBotChat, 0, ownedLimit), Unknown: make([]ObservedBotChat, 0, unknownLimit),
 	}
 	if ownedLimit > 0 {
-		rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id, o.public_link, o.title, o.max_owner_id,
-COALESCE(o.icon_url, ''), COALESCE(o.participants_count, 0), o.active, o.last_seen_at, o.removed_at
+		rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id, o.public_link, o.title, o.description, o.max_owner_id,
+COALESCE(o.icon_url, ''), COALESCE(o.participants_count, 0), o.is_public, o.messages_count,
+o.has_pinned_message, o.max_last_event_time, o.max_info_synced_at, o.active, o.last_seen_at, o.removed_at
 FROM max_identity_links l
 JOIN observed_bot_chats o ON o.active
 LEFT JOIN channels c ON c.max_chat_id=o.max_chat_id
@@ -386,8 +387,9 @@ LIMIT ?`, userID, ownedLimit)
 		}
 	}
 	if unknownLimit > 0 {
-		rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id, o.public_link, o.title, o.max_owner_id,
-COALESCE(o.icon_url, ''), COALESCE(o.participants_count, 0), o.active, o.last_seen_at, o.removed_at
+		rows, err := s.db.QueryContext(ctx, `SELECT o.max_chat_id, o.public_link, o.title, o.description, o.max_owner_id,
+COALESCE(o.icon_url, ''), COALESCE(o.participants_count, 0), o.is_public, o.messages_count,
+o.has_pinned_message, o.max_last_event_time, o.max_info_synced_at, o.active, o.last_seen_at, o.removed_at
 FROM max_identity_links l
 JOIN observed_bot_chats o ON o.active
 LEFT JOIN channels c ON c.max_chat_id=o.max_chat_id
@@ -413,12 +415,16 @@ func scanObservedBotChats(rows *sql.Rows, capacity int) ([]ObservedBotChat, erro
 	candidates := make([]ObservedBotChat, 0, capacity)
 	for rows.Next() {
 		var candidate ObservedBotChat
-		var removed sql.NullTime
-		if err := rows.Scan(&candidate.MAXChatID, &candidate.PublicLink, &candidate.Title, &candidate.MAXOwnerID,
-			&candidate.IconURL, &candidate.ParticipantsCount, &candidate.Active, &candidate.LastSeenAt, &removed); err != nil {
+		var maxLastEventTime, maxInfoSyncedAt, removed sql.NullTime
+		if err := rows.Scan(&candidate.MAXChatID, &candidate.PublicLink, &candidate.Title,
+			&candidate.Description, &candidate.MAXOwnerID, &candidate.IconURL, &candidate.ParticipantsCount,
+			&candidate.IsPublic, &candidate.MessagesCount, &candidate.HasPinnedMessage, &maxLastEventTime,
+			&maxInfoSyncedAt, &candidate.Active, &candidate.LastSeenAt, &removed); err != nil {
 			return nil, fmt.Errorf("scan MAX channel refresh candidate: %w", err)
 		}
 		candidate.LastSeenAt = candidate.LastSeenAt.UTC()
+		candidate.MAXLastEventTime = parseNullableTime(maxLastEventTime)
+		candidate.MAXInfoSyncedAt = parseNullableTime(maxInfoSyncedAt)
 		if removed.Valid {
 			value := removed.Time.UTC()
 			candidate.RemovedAt = &value
@@ -471,15 +477,21 @@ WHERE max_chat_id=$1 AND active FOR UPDATE`, maxChatID).Scan(&observedOwner); er
 	case lookupErr == nil && existingOwner != userID:
 		return Channel{}, ErrChannelOwned
 	case lookupErr == nil:
-		_, err = tx.ExecContext(ctx, `UPDATE channels SET verified_max_owner_id=$1, title=$2, public_link=$3,
-icon_url=$4, participants_count=$5, is_channel=TRUE, active=TRUE, updated_at=$6 WHERE id=$7 AND owner_id=$8`,
-			channel.VerifiedMAXOwnerID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount,
-			now, channelID, userID)
+		_, err = tx.ExecContext(ctx, `UPDATE channels SET verified_max_owner_id=$1, title=$2, description=$3,
+public_link=$4, icon_url=$5, participants_count=$6, is_public=$7, messages_count=$8,
+has_pinned_message=$9, max_last_event_time=$10, max_info_synced_at=$11,
+is_channel=TRUE, active=TRUE, updated_at=$12 WHERE id=$13 AND owner_id=$14`,
+			channel.VerifiedMAXOwnerID, channel.Title, channel.Description, channel.PublicLink, channel.IconURL,
+			channel.ParticipantsCount, channel.IsPublic, channel.MessagesCount, channel.HasPinnedMessage,
+			channel.MAXLastEventTime, channel.MAXInfoSyncedAt, now, channelID, userID)
 	case errors.Is(lookupErr, sql.ErrNoRows):
 		err = tx.QueryRowContext(ctx, `INSERT INTO channels(owner_id, verified_max_owner_id, max_chat_id, title,
-public_link, icon_url, participants_count, is_channel, active, created_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,TRUE,TRUE,$8,$8) RETURNING id`, userID, channel.VerifiedMAXOwnerID,
-			maxChatID, channel.Title, channel.PublicLink, channel.IconURL, channel.ParticipantsCount, now).Scan(&channelID)
+description, public_link, icon_url, participants_count, is_public, messages_count, has_pinned_message,
+max_last_event_time, max_info_synced_at, is_channel, active, created_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,TRUE,TRUE,$14,$14) RETURNING id`,
+			userID, channel.VerifiedMAXOwnerID, maxChatID, channel.Title, channel.Description, channel.PublicLink,
+			channel.IconURL, channel.ParticipantsCount, channel.IsPublic, channel.MessagesCount,
+			channel.HasPinnedMessage, channel.MAXLastEventTime, channel.MAXInfoSyncedAt, now).Scan(&channelID)
 	default:
 		return Channel{}, fmt.Errorf("lookup discovered channel ownership: %w", lookupErr)
 	}
