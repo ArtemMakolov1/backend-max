@@ -1039,9 +1039,10 @@ paths:
       operationId: completeDirectVerificationCodeConnection
       summary: Complete a verification-code Yandex Direct OAuth connection
       description: >
-        Accepts the seven-digit code shown by Yandex and the opaque one-time
-        attempt state returned by connect/start. The attempt is bound to the
-        current browser session, actor, workspace and verification-code flow.
+        Accepts the current 16-character alphanumeric code shown by Yandex
+        (or the legacy seven-digit code) and the opaque one-time attempt state
+        returned by connect/start. The attempt is bound to the current browser
+        session, actor, workspace and verification-code flow.
       security: [{sessionCookie: []}]
       requestBody:
         required: true
@@ -3016,7 +3017,7 @@ components:
       properties:
         code:
           type: string
-          pattern: '^[0-9]{7}$'
+          pattern: '^([0-9]{7}|[A-Za-z0-9]{16})$'
         state:
           type: string
           minLength: 43

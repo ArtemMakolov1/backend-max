@@ -122,7 +122,10 @@ func TestDirectVerificationCodeOAuthIsSessionWorkspaceOriginAndAttemptBound(t *t
 		t.Fatalf("unsafe start response = %s", start.Body.String())
 	}
 
-	body := fmt.Sprintf(`{"code":"1234567","state":%q}`, started.Connection.State)
+	const verificationCode = "A1b2C3d4E5f6G7h8"
+	body := fmt.Sprintf(
+		`{"code":%q,"state":%q}`, verificationCode, started.Connection.State,
+	)
 	wrongSession := fixture.handler(t, "ws-owner")
 	response := performJSONRequest(
 		wrongSession, http.MethodPost, base+"/connect/complete", body,
@@ -155,7 +158,9 @@ func TestDirectVerificationCodeOAuthIsSessionWorkspaceOriginAndAttemptBound(t *t
 	)
 	assertProblemCode(t, response, http.StatusNotFound, "not_found")
 
-	invalidCodeBody := fmt.Sprintf(`{"code":"123456","state":%q}`, started.Connection.State)
+	invalidCodeBody := fmt.Sprintf(
+		`{"code":"A1b2C3d4E5f6G7h","state":%q}`, started.Connection.State,
+	)
 	response = performJSONRequest(
 		handler, http.MethodPost, base+"/connect/complete", invalidCodeBody,
 	)
@@ -168,7 +173,7 @@ func TestDirectVerificationCodeOAuthIsSessionWorkspaceOriginAndAttemptBound(t *t
 	if response.Code != http.StatusOK {
 		t.Fatalf("complete = %d %s", response.Code, response.Body.String())
 	}
-	if provider.exchangeCalls != 1 || provider.exchangedCode != "1234567" ||
+	if provider.exchangeCalls != 1 || provider.exchangedCode != verificationCode ||
 		provider.verifier == "" {
 		t.Fatalf("provider completion = calls:%d code:%q verifier:%q",
 			provider.exchangeCalls, provider.exchangedCode, provider.verifier)
