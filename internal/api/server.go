@@ -148,6 +148,7 @@ func (s *Server) Handler() http.Handler {
 	router.Use(middleware.RequestID)
 	router.Use(s.observeHTTP)
 	router.Use(middleware.Recoverer)
+	router.Use(directOAuthCallbackHeaders)
 	router.Use(s.cors)
 	router.Use(s.requestLogger)
 	router.Get("/metrics", s.serveMetrics)
@@ -166,13 +167,14 @@ func (s *Server) Handler() http.Handler {
 		r.Delete("/auth/max/{request_id}", s.cancelMAXAuth)
 		r.Post("/auth/logout", s.logout)
 		r.Get("/observability/auth", s.observabilityAuth)
+		r.With(s.requireSession).
+			Get("/advertising/direct/oauth/callback", s.finishDirectOAuth)
 
 		r.Group(func(r chi.Router) {
 			r.Use(s.requireSession)
 
 			r.Get("/workspaces", s.listWorkspaces)
 			r.Post("/workspaces", s.createWorkspace)
-			r.Get("/advertising/direct/oauth/callback", s.finishDirectOAuth)
 			r.Post("/workspace-invitations/{token}/accept", s.acceptWorkspaceInvitation)
 			r.Route("/workspaces/{workspace_id}", func(r chi.Router) {
 				r.Get("/", s.getWorkspace)

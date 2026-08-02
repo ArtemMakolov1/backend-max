@@ -248,6 +248,17 @@ func (s *Server) completeDirectConnection(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func directOAuthCallbackHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/advertising/direct/oauth/callback" {
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Referrer-Policy", "no-referrer")
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow, noarchive")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) finishDirectOAuth(w http.ResponseWriter, r *http.Request) {
 	userID, err := authenticatedUserID(r)
 	if err != nil {

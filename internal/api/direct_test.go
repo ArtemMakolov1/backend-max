@@ -213,13 +213,39 @@ func TestDirectCallbackOAuthRemainsAvailableAndSessionBound(t *testing.T) {
 	}
 	callbackPath := "/api/v1/advertising/direct/oauth/callback?state=" +
 		url.QueryEscape(provider.state) + "&code=" + url.QueryEscape("callback-code.with_symbols~")
+	assertSecurityHeaders := func(response *httptest.ResponseRecorder) {
+		t.Helper()
+		if response.Header().Get("Cache-Control") != "no-store" ||
+			response.Header().Get("Referrer-Policy") != "no-referrer" ||
+			response.Header().Get("X-Robots-Tag") != "noindex, nofollow, noarchive" {
+			t.Fatalf("callback security headers = %v", response.Header())
+		}
+	}
+	unauthenticated := New(
+		fixture.app, fixture.logger, "http://localhost:4321", "webhook-secret",
+		AuthOptions{YandexClient: &fakeYandexOAuth{}},
+	).Handler()
+	response := performJSONRequest(unauthenticated, http.MethodGet, callbackPath, "")
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated callback = %d %s", response.Code, response.Body.String())
+	}
+	assertSecurityHeaders(response)
+	foreignRequest := httptest.NewRequest(http.MethodGet, callbackPath, nil)
+	foreignRequest.Header.Set("Origin", "https://evil.example")
+	foreignResponse := httptest.NewRecorder()
+	unauthenticated.ServeHTTP(foreignResponse, foreignRequest)
+	if foreignResponse.Code != http.StatusForbidden {
+		t.Fatalf("foreign-origin callback = %d %s", foreignResponse.Code, foreignResponse.Body.String())
+	}
+	assertSecurityHeaders(foreignResponse)
 	wrongSession := fixture.handler(t, "ws-owner")
-	response := performJSONRequest(wrongSession, http.MethodGet, callbackPath, "")
+	response = performJSONRequest(wrongSession, http.MethodGet, callbackPath, "")
 	if response.Code != http.StatusSeeOther ||
 		!strings.Contains(response.Header().Get("Location"), "direct_error=") {
 		t.Fatalf("wrong-session callback = %d location=%q",
 			response.Code, response.Header().Get("Location"))
 	}
+	assertSecurityHeaders(response)
 	if provider.exchangeCalls != 0 {
 		t.Fatalf("wrong-session callback reached provider")
 	}
@@ -228,6 +254,7 @@ func TestDirectCallbackOAuthRemainsAvailableAndSessionBound(t *testing.T) {
 		response.Header().Get("Location") != "http://localhost:4321/app/#/advertising" {
 		t.Fatalf("callback = %d location=%q", response.Code, response.Header().Get("Location"))
 	}
+	assertSecurityHeaders(response)
 	if provider.exchangeCalls != 1 ||
 		provider.exchangedCode != "callback-code.with_symbols~" {
 		t.Fatalf("callback provider completion = %#v", provider)
