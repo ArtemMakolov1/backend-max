@@ -1139,7 +1139,7 @@ func (s *Store) ReplaceDirectExternalCampaigns(
 			item, workspaceID, connectionID, syncedAt,
 		)
 		if err != nil {
-			return fmt.Errorf("%w: item %d: %v", ErrDirectValidation, index, err)
+			return fmt.Errorf("%w: item %d: %w", ErrDirectValidation, index, err)
 		}
 		if _, duplicate := seenProviderIDs[campaign.ProviderCampaignID]; duplicate {
 			return fmt.Errorf(
