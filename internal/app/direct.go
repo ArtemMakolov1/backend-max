@@ -42,11 +42,11 @@ var (
 	ErrDirectSnapshotMismatch               = errors.New("provider campaign in Yandex Direct does not match the authorized snapshot")
 	ErrDirectOAuthInvalid                   = errors.New("invalid Yandex Direct OAuth completion")
 	ErrDirectOAuthFlow                      = errors.New("completion flow for Yandex Direct OAuth does not match the configured redirect")
-	ErrDirectOAuthStateUnavailable          = errors.New("Yandex Direct OAuth state is unavailable")
-	ErrDirectOAuthCodeRejected              = errors.New("Yandex Direct OAuth code was rejected")
-	ErrDirectOAuthApplicationUnavailable    = errors.New("Yandex Direct OAuth application is unavailable")
-	ErrDirectOAuthExchangeUncertain         = errors.New("Yandex Direct OAuth exchange outcome is uncertain")
-	ErrDirectOAuthAccountVerificationFailed = errors.New("Yandex Direct OAuth account verification failed")
+	ErrDirectOAuthStateUnavailable          = errors.New("state for Yandex Direct OAuth is unavailable")
+	ErrDirectOAuthCodeRejected              = errors.New("code for Yandex Direct OAuth was rejected")
+	ErrDirectOAuthApplicationUnavailable    = errors.New("application for Yandex Direct OAuth is unavailable")
+	ErrDirectOAuthExchangeUncertain         = errors.New("token exchange outcome for Yandex Direct OAuth is uncertain")
+	ErrDirectOAuthAccountVerificationFailed = errors.New("account verification for Yandex Direct OAuth failed")
 )
 
 // DirectAccountCompatibilityError is safe to return to an authenticated API
