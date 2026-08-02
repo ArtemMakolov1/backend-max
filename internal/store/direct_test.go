@@ -909,18 +909,11 @@ func TestDirectProviderPollingQueueDoesNotStarveBeyondLimit(t *testing.T) {
 		campaign := createDirectTestCampaign(
 			t, ctx, storage, owner, workspace.ID, now.Add(time.Duration(index)*time.Second),
 		)
+		campaign = acceptDirectTestCampaign(
+			t, ctx, storage, owner, workspace.ID, campaign,
+			now.Add(time.Duration(index)*time.Minute),
+		)
 		expected[campaign.ID] = true
-		if _, _, err := storage.ClaimDirectCampaignSubmission(
-			ctx, owner, workspace.ID, campaign.ID, campaign.Version, now,
-		); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := storage.MarkDirectCampaignSubmitted(
-			ctx, owner, workspace.ID, campaign.ID, campaign.Version,
-			int64(78_000+index), "DRAFT", "OFF", now,
-		); err != nil {
-			t.Fatal(err)
-		}
 	}
 	seen := make(map[string]bool)
 	for batchIndex, expectedSize := range []int{2, 2, 1} {
@@ -941,6 +934,105 @@ func TestDirectProviderPollingQueueDoesNotStarveBeyondLimit(t *testing.T) {
 	}
 	if len(seen) != len(expected) {
 		t.Fatalf("polled %d/%d campaigns: %#v", len(seen), len(expected), seen)
+	}
+}
+
+func TestDirectLaunchAndOrdinaryObservationsExcludeProviderSyncLease(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	connection := connectDirectTestAccount(t, ctx, storage, owner, workspace.ID)
+	now := time.Date(2042, time.August, 10, 12, 0, 0, 0, time.UTC)
+	campaign := createDirectTestCampaign(t, ctx, storage, owner, workspace.ID, now)
+	campaign = acceptDirectTestCampaign(t, ctx, storage, owner, workspace.ID, campaign, now)
+
+	syncClaim, err := storage.ClaimDirectProviderSyncCampaign(
+		ctx, workspace.ID, campaign.ID, now.Add(time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	whileSyncActive := syncClaim.ClaimedAt.Add(time.Second)
+	if _, err := storage.UpdateDirectCampaignGraphModeration(
+		ctx, workspace.ID, campaign.ID, DirectGraphModerationUpdate{
+			ExpectedGraphHash:         campaign.ProviderGraphHash,
+			ExpectedRevisionID:        campaign.ProviderRevisionID,
+			Campaign:                  DirectModerationSnapshot{Status: "ACCEPTED"},
+			AdGroup:                   DirectModerationSnapshot{Status: "ACCEPTED"},
+			Ad:                        DirectModerationSnapshot{Status: "ACCEPTED"},
+			Keywords:                  campaign.KeywordModeration,
+			AggregateModerationStatus: "ACCEPTED",
+			ProviderStatus:            "ACCEPTED",
+			ProviderState:             "OFF",
+			ExpectedSyncClaimedAt:     &syncClaim.ClaimedAt,
+			CheckedAt:                 whileSyncActive,
+		},
+	); err != nil {
+		t.Fatalf("exact provider sync moderation write: %v", err)
+	}
+	if _, err := storage.ClaimDirectManualCampaignLaunch(
+		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
+		*campaign.ProviderCampaignID, connection.AccountID,
+		campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID,
+		whileSyncActive,
+	); !errors.Is(err, ErrDirectProviderOperationBusy) {
+		t.Fatalf("launch during provider sync error = %v, want busy", err)
+	}
+	if _, err := storage.SyncDirectCampaignProviderStatus(
+		ctx, workspace.ID, campaign.ID, *campaign.ProviderCampaignID,
+		"ACCEPTED", "OFF", whileSyncActive,
+	); !errors.Is(err, ErrDirectProviderOperationBusy) {
+		t.Fatalf("ordinary status write during provider sync error = %v, want busy", err)
+	}
+	if _, err := storage.UpdateDirectCampaignGraphModeration(
+		ctx, workspace.ID, campaign.ID, DirectGraphModerationUpdate{
+			ExpectedGraphHash:         campaign.ProviderGraphHash,
+			ExpectedRevisionID:        campaign.ProviderRevisionID,
+			Campaign:                  DirectModerationSnapshot{Status: "ACCEPTED"},
+			AdGroup:                   DirectModerationSnapshot{Status: "ACCEPTED"},
+			Ad:                        DirectModerationSnapshot{Status: "ACCEPTED"},
+			Keywords:                  campaign.KeywordModeration,
+			AggregateModerationStatus: "ACCEPTED",
+			ProviderStatus:            "ACCEPTED",
+			ProviderState:             "OFF",
+			CheckedAt:                 whileSyncActive,
+		},
+	); !errors.Is(err, ErrDirectProviderOperationBusy) {
+		t.Fatalf("ordinary moderation write during provider sync error = %v, want busy", err)
+	}
+
+	launchAt := syncClaim.ClaimedAt.Add(directProviderSyncClaimLease + time.Second)
+	claimed, err := storage.ClaimDirectManualCampaignLaunch(
+		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
+		*campaign.ProviderCampaignID, connection.AccountID,
+		campaign.WeeklyBudgetMinor, campaign.StartsAt, campaign.EndsAt,
+		campaign.ProviderGraphHash, campaign.ProviderRevisionID, launchAt,
+	)
+	if err != nil {
+		t.Fatalf("launch after expired provider sync lease: %v", err)
+	}
+	if claimed.Campaign.LaunchState != "launching" {
+		t.Fatalf("launch state = %q, want launching", claimed.Campaign.LaunchState)
+	}
+	if err := storage.CompleteDirectProviderSyncClaim(
+		ctx, syncClaim, launchAt.Add(time.Second),
+	); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale provider sync completion error = %v, want conflict", err)
+	}
+}
+
+func TestDirectProviderSyncConstraintRequiresCompleteLeasePair(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	storage, owner, workspace := newDirectStoreFixture(t, ctx)
+	connectDirectTestAccount(t, ctx, storage, owner, workspace.ID)
+	now := time.Date(2042, time.August, 11, 12, 0, 0, 0, time.UTC)
+	campaign := createDirectTestCampaign(t, ctx, storage, owner, workspace.ID, now)
+	if _, err := storage.db.ExecContext(ctx, `UPDATE direct_campaigns
+SET provider_sync_claimed_at=$1,provider_sync_lease_expires_at=NULL
+WHERE workspace_id=$2 AND id=$3`, now, workspace.ID, campaign.ID); err == nil {
+		t.Fatal("provider sync constraint accepted a claimed timestamp without a lease")
 	}
 }
 

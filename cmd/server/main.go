@@ -27,6 +27,7 @@ import (
 	"maxpilot/backend/internal/store"
 	"maxpilot/backend/internal/yandexauth"
 	"maxpilot/backend/internal/yandexdirect"
+	"maxpilot/backend/internal/yandexwordstat"
 	"maxpilot/backend/internal/yookassa"
 )
 
@@ -140,6 +141,23 @@ func main() {
 			"sandbox", cfg.DirectSandbox,
 			"writes_enabled", cfg.DirectWritesEnabled,
 			"auto_launch_enabled", cfg.DirectAutoLaunchEnabled)
+	}
+	if cfg.WordstatConfigured() {
+		wordstatClient, err := yandexwordstat.New(
+			cfg.WordstatAPIBaseURL, cfg.WordstatAPIKey, cfg.WordstatFolderID,
+			&http.Client{Timeout: 20 * time.Second},
+		)
+		if err != nil {
+			logger.Error("could not initialize Yandex Wordstat client", "error", err)
+			os.Exit(1)
+		}
+		if err := application.ConfigureWordstatWithProviderKey(
+			wordstatClient, cfg.WordstatAPIKey,
+		); err != nil {
+			logger.Error("could not configure Yandex Wordstat integration", "error", err)
+			os.Exit(1)
+		}
+		logger.Info("Yandex Wordstat integration configured")
 	}
 	if cfg.YooKassaConfigured() {
 		yooClient, err := yookassa.New(cfg.YooKassaShopID, cfg.YooKassaSecretKey, &http.Client{Timeout: 15 * time.Second})

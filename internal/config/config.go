@@ -32,6 +32,7 @@ const (
 	defaultOpenAIAPIBaseURL          = "https://api.openai.com"
 	defaultDirectAPIBaseURL          = "https://api.direct.yandex.com/json/v501"
 	defaultDirectSandboxAPIBaseURL   = "https://api-sandbox.direct.yandex.com/json/v5"
+	defaultWordstatAPIBaseURL        = "https://searchapi.api.cloud.yandex.net"
 	directOAuthCallbackRedirectURI   = "https://maxposty.ru/api/v1/advertising/direct/oauth/callback"
 	directOAuthVerificationCodeURI   = "https://oauth.yandex.ru/verification_code"
 	defaultOpenAIImageModel          = "gpt-image-2"
@@ -92,6 +93,9 @@ type Config struct {
 	DirectWritesEnabled       bool
 	DirectAutoLaunchEnabled   bool
 	DirectSandbox             bool
+	WordstatAPIBaseURL        string
+	WordstatAPIKey            string
+	WordstatFolderID          string
 	ObservabilityAdmins       []string
 	AuthSessionTTL            time.Duration
 	MaxOwnedTeamWorkspaces    int
@@ -281,6 +285,9 @@ func Load() (Config, error) {
 		DirectWritesEnabled:       directWritesEnabled,
 		DirectAutoLaunchEnabled:   directAutoLaunchEnabled,
 		DirectSandbox:             directSandbox,
+		WordstatAPIBaseURL:        env("YANDEX_WORDSTAT_API_BASE_URL", defaultWordstatAPIBaseURL),
+		WordstatAPIKey:            strings.TrimSpace(os.Getenv("YANDEX_WORDSTAT_API_KEY")),
+		WordstatFolderID:          strings.TrimSpace(os.Getenv("YANDEX_WORDSTAT_FOLDER_ID")),
 		ObservabilityAdmins:       splitNormalizedCSV(os.Getenv("OBSERVABILITY_ADMIN_USERS")),
 		AuthSessionTTL:            sessionTTL,
 		MaxOwnedTeamWorkspaces:    maxOwnedTeamWorkspaces,
@@ -389,6 +396,13 @@ func Load() (Config, error) {
 			directParts++
 		}
 	}
+	wordstatValues := []string{cfg.WordstatAPIKey, cfg.WordstatFolderID}
+	wordstatParts := 0
+	for _, value := range wordstatValues {
+		if value != "" {
+			wordstatParts++
+		}
+	}
 	s3Values := []string{cfg.S3Host, cfg.S3AccessKey, cfg.S3SecretKey}
 	s3Parts := 0
 	for _, value := range s3Values {
@@ -403,7 +417,8 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("S3_BUCKET and S3_REGION require S3 credentials")
 	}
 	if cfg.AuthBootstrapMode {
-		if oauthParts != 0 || directParts != 0 || cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled ||
+		if oauthParts != 0 || directParts != 0 || wordstatParts != 0 ||
+			cfg.DirectWritesEnabled || cfg.DirectAutoLaunchEnabled ||
 			!cfg.DirectSandbox ||
 			strings.TrimSuffix(cfg.DirectAPIBaseURL, "/") != defaultDirectSandboxAPIBaseURL ||
 			len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
@@ -425,6 +440,24 @@ func Load() (Config, error) {
 	}
 	if directParts != 0 && directParts != len(directValues) {
 		return Config{}, fmt.Errorf("DIRECT_OAUTH_CLIENT_ID, DIRECT_OAUTH_CLIENT_SECRET, DIRECT_OAUTH_REDIRECT_URI and DIRECT_TOKEN_DATA_KEY must be configured together")
+	}
+	if wordstatParts != 0 && wordstatParts != len(wordstatValues) {
+		return Config{}, fmt.Errorf("YANDEX_WORDSTAT_API_KEY and YANDEX_WORDSTAT_FOLDER_ID must be configured together")
+	}
+	if strings.TrimSuffix(strings.TrimSpace(cfg.WordstatAPIBaseURL), "/") != defaultWordstatAPIBaseURL {
+		return Config{}, fmt.Errorf("YANDEX_WORDSTAT_API_BASE_URL must be exactly %s", defaultWordstatAPIBaseURL)
+	}
+	cfg.WordstatAPIBaseURL = strings.TrimSuffix(strings.TrimSpace(cfg.WordstatAPIBaseURL), "/")
+	if wordstatParts == len(wordstatValues) {
+		if len(cfg.WordstatAPIKey) > 4096 {
+			return Config{}, fmt.Errorf("YANDEX_WORDSTAT_API_KEY is too long")
+		}
+		if !regexp.MustCompile(`^[a-z0-9]{1,50}$`).MatchString(cfg.WordstatFolderID) {
+			return Config{}, fmt.Errorf("YANDEX_WORDSTAT_FOLDER_ID must contain 1 to 50 lowercase letters or digits")
+		}
+		if directParts != len(directValues) {
+			return Config{}, fmt.Errorf("wordstat for Yandex requires complete Yandex Direct credentials")
+		}
 	}
 	if err := validateDirectAPIBaseURL(cfg.DirectAPIBaseURL, cfg.DirectSandbox); err != nil {
 		return Config{}, err
@@ -473,6 +506,10 @@ func (c Config) YandexAuthEnabled() bool {
 func (c Config) DirectConfigured() bool {
 	return c.DirectOAuthClientID != "" && c.DirectOAuthClientSecret != "" &&
 		c.DirectOAuthRedirectURI != "" && len(c.DirectTokenDataKey) == 32
+}
+
+func (c Config) WordstatConfigured() bool {
+	return c.WordstatAPIKey != "" && c.WordstatFolderID != ""
 }
 
 func (c Config) S3Enabled() bool {

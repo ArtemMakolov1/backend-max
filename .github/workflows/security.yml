@@ -79,8 +79,8 @@ jobs:
             image: "prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893"
             trivyignores: ".github/trivy/monitoring-images.yaml"
           - component: grafana
-            image: "grafana/grafana:nightly-slim@sha256:951d45bbdb8a2e909fa1315b12a7bc3f7be3835e076e40ecf304888f426b6179"
-            trivyignores: ".github/trivy/monitoring-images.yaml"
+            image: "grafana/grafana:nightly-slim@sha256:b07cf664959594536506b7a0f80e7c2d62e691b81c81345ced595670dd35d08c"
+            trivyignores: ""
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

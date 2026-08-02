@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/maxclient"
@@ -212,6 +213,70 @@ func TestWriteErrorTranslatesBillingCheckoutPreconditions(t *testing.T) {
 		server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 		server.writeError(response, test.err)
 		assertProblemCode(t, response, test.wantStatus, test.wantCode)
+	}
+}
+
+func TestWriteErrorTranslatesDirectProviderThrottle(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+		wantRetry  string
+	}{
+		{
+			name: "quota", err: &app.DirectProviderThrottleError{
+				Reason: "quota", RetryAfter: 61 * time.Second,
+			},
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   "direct_rate_limited", wantRetry: "61",
+		},
+		{
+			name: "concurrency", err: &app.DirectProviderThrottleError{
+				Reason: "concurrency", RetryAfter: 1500 * time.Millisecond,
+				ServiceUnavailable: true,
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "direct_concurrency_limited", wantRetry: "2",
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			response := httptest.NewRecorder()
+			server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			server.writeError(response, test.err)
+			if response.Header().Get("Retry-After") != test.wantRetry ||
+				response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("headers = %#v", response.Header())
+			}
+			assertProblemCode(t, response, test.wantStatus, test.wantCode)
+			if strings.Contains(response.Body.String(), "Yandex Direct temporarily") {
+				t.Fatalf("internal detail leaked: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestWriteErrorExposesOnlySanitizedDirectCompatibilityReason(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		reason, wantReason string
+	}{
+		{reason: "network_advertising_unavailable", wantReason: "network_advertising_unavailable"},
+		{reason: "provider-secret-detail", wantReason: "unsupported_account"},
+	} {
+		response := httptest.NewRecorder()
+		server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		server.writeError(response, &app.DirectAccountCompatibilityError{Reason: test.reason})
+		assertProblemCode(
+			t, response, http.StatusUnprocessableEntity, "direct_account_incompatible",
+		)
+		if !strings.Contains(response.Body.String(), `"reason":"`+test.wantReason+`"`) ||
+			strings.Contains(response.Body.String(), "provider-secret-detail") {
+			t.Fatalf("compatibility response = %s", response.Body.String())
+		}
 	}
 }
 

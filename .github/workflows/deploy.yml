@@ -237,6 +237,8 @@ jobs:
           DIRECT_WRITES_ENABLED: ${{ vars.DIRECT_WRITES_ENABLED || 'false' }}
           DIRECT_AUTO_LAUNCH_ENABLED: ${{ vars.DIRECT_AUTO_LAUNCH_ENABLED || 'false' }}
           DIRECT_SANDBOX: ${{ vars.DIRECT_SANDBOX || 'true' }}
+          YANDEX_WORDSTAT_API_KEY: ${{ secrets.YANDEX_WORDSTAT_API_KEY }}
+          YANDEX_WORDSTAT_FOLDER_ID: ${{ vars.YANDEX_WORDSTAT_FOLDER_ID }}
           MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
           MAX_WEBHOOK_SECRET: ${{ secrets.MAX_WEBHOOK_SECRET }}
           MAX_CA_CERT_FILE: ${{ vars.MAX_CA_CERT_FILE }}

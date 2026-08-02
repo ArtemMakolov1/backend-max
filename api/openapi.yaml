@@ -1140,6 +1140,100 @@ paths:
               schema: {$ref: '#/components/schemas/DirectCampaignEnvelope'}
         '422': {$ref: '#/components/responses/ValidationProblem'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/statistics:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/DirectCampaignId'}
+      - name: from
+        in: query
+        required: true
+        schema: {type: string, format: date}
+      - name: to
+        in: query
+        required: true
+        schema: {type: string, format: date}
+    get:
+      tags: [Advertising]
+      operationId: getDirectCampaignStatistics
+      summary: Return daily statistics for one Yandex Direct campaign
+      description: >
+        Reads a CAMPAIGN_PERFORMANCE_REPORT from Yandex Direct for an inclusive
+        period of at most 366 days. The provider report is not persisted
+        server-side and the HTTP response uses Cache-Control no-store (the
+        client UI may retain it in memory); monetary values are integer minor
+        currency units rounded from provider micros using half-away-from-zero
+        rounding.
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Daily and total campaign statistics
+          headers:
+            Cache-Control:
+              schema: {type: string, const: no-store}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectCampaignStatisticsEnvelope'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/ValidationProblem'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/bids:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/DirectCampaignId'}
+    get:
+      tags: [Advertising]
+      operationId: getDirectCampaignBids
+      summary: Read the current automatic-strategy bid ceiling and provider currency limits
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Verified campaign bid controls
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectCampaignBidsEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectCampaignBidCeiling
+      summary: Explicitly set or remove the maximum CPC for WB_MAXIMUM_CLICKS
+      description: The write uses the existing durable provider graph journal and produces a new verified graph revision.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectBidCeilingPatchRequest'}
+      responses:
+        '200':
+          description: Reconciled bid controls and new campaign revision
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectCampaignBidsEnvelope'}
+        '422': {$ref: '#/components/responses/ValidationProblem'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/keyword-suggestions:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/DirectCampaignId'}
+    post:
+      tags: [Advertising]
+      operationId: suggestDirectCampaignKeywords
+      summary: Get keyword suggestions from Yandex Cloud Search API Wordstat
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectKeywordSuggestionsRequest'}
+      responses:
+        '200':
+          description: Included and associated Wordstat phrases for the campaign regions
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectKeywordSuggestionsEnvelope'}
+        '429': {$ref: '#/components/responses/WordstatRateLimitProblem'}
+        '422': {$ref: '#/components/responses/ValidationProblem'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/auto-launch-consent:
     parameters:
       - {$ref: '#/components/parameters/WorkspaceId'}
@@ -2814,6 +2908,16 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ProblemEnvelope'
+    WordstatRateLimitProblem:
+      description: A local fair-use quota or the Yandex Wordstat provider quota was exceeded
+      headers:
+        Retry-After:
+          required: true
+          schema: {type: string, pattern: '^[1-9][0-9]*$'}
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemEnvelope'
     Post:
       description: Updated post
       content:
@@ -2937,9 +3041,14 @@ components:
         account_id: {type: string, minLength: 1}
         status: {type: string, minLength: 1}
         account_login: {type: string}
-        display_name: {type: string}
+        display_name:
+          type: string
+          description: Name of the current Direct representative from Clients.get ClientInfo; not an advertiser legal name.
         currency_code: {type: string, pattern: '^[A-Z]{3}$'}
-        timezone: {type: string, minLength: 1}
+        timezone:
+          type: string
+          const: Europe/Moscow
+          description: Fixed MaxPosty campaign scheduling policy; Clients.get does not provide an account timezone.
         read_only:
           type: boolean
           description: True when the current token or Direct account cannot perform writes.
@@ -2954,6 +3063,7 @@ components:
       type: object
       required:
         - configured
+        - wordstat_configured
         - writes_enabled
         - auto_launch_enabled
         - max_campaign_weekly_budget_minor
@@ -2963,6 +3073,9 @@ components:
         - capabilities
       properties:
         configured: {type: boolean}
+        wordstat_configured:
+          type: boolean
+          description: True when the separate Yandex Cloud Search API Wordstat credentials are configured.
         writes_enabled: {type: boolean}
         auto_launch_enabled:
           type: boolean
@@ -3086,6 +3199,7 @@ components:
         - negative_keywords
         - regions
         - weekly_budget_minor
+        - bid_ceiling_minor
         - currency_code
         - starts_at
         - ends_at
@@ -3146,6 +3260,11 @@ components:
           minimum: 30000
           maximum: 1000000
           description: Weekly budget in minor RUB units.
+        bid_ceiling_minor:
+          type: [integer, 'null']
+          format: int64
+          minimum: 1
+          description: Optional maximum CPC in minor RUB units for WB_MAXIMUM_CLICKS.
         currency_code: {type: string, const: RUB}
         starts_at: {type: string, format: date}
         ends_at: {type: string, format: date}
@@ -3181,6 +3300,114 @@ components:
       required: [campaign]
       properties:
         campaign: {$ref: '#/components/schemas/DirectCampaign'}
+    DirectCampaignBids:
+      type: object
+      required: [campaign_id, currency_code, strategy, weekly_budget_minor, bid_ceiling_minor, min_bid_minor, max_bid_minor, version, graph_hash, revision_id, updated_at]
+      properties:
+        campaign_id: {type: string, minLength: 1, maxLength: 128}
+        currency_code: {type: string, const: RUB}
+        strategy: {type: string, const: WB_MAXIMUM_CLICKS}
+        weekly_budget_minor: {type: integer, format: int64, minimum: 30000, maximum: 1000000}
+        bid_ceiling_minor: {type: [integer, 'null'], format: int64, minimum: 1}
+        min_bid_minor: {type: integer, format: int64, minimum: 1}
+        max_bid_minor: {type: integer, format: int64, minimum: 1}
+        version: {type: integer, format: int64, minimum: 1}
+        graph_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        revision_id: {type: string, pattern: '^drev_[0-9a-f]{32}$'}
+        updated_at: {type: string, format: date-time}
+    DirectCampaignBidsEnvelope:
+      type: object
+      required: [bids]
+      properties:
+        bids: {$ref: '#/components/schemas/DirectCampaignBids'}
+    DirectBidCeilingPatchRequest:
+      type: object
+      required: [bid_ceiling_minor, expected_version, expected_graph_hash, expected_revision_id, confirmation]
+      additionalProperties: false
+      properties:
+        bid_ceiling_minor: {type: [integer, 'null'], format: int64, minimum: 1}
+        expected_version: {type: integer, format: int64, minimum: 1}
+        expected_graph_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        expected_revision_id: {type: string, pattern: '^drev_[0-9a-f]{32}$'}
+        confirmation: {type: string, const: ИЗМЕНИТЬ СТАВКУ}
+    DirectKeywordSuggestionsRequest:
+      type: object
+      required: [phrase, limit]
+      additionalProperties: false
+      properties:
+        phrase: {type: string, minLength: 1, maxLength: 400}
+        limit: {type: integer, minimum: 1, maximum: 50}
+    DirectKeywordSuggestionItem:
+      type: object
+      required: [phrase, count, source]
+      properties:
+        phrase:
+          type: string
+          minLength: 1
+          maxLength: 1024
+          description: Provider response text; phrases outside Direct product limits remain copy-only in the UI.
+        count: {type: integer, format: int64, minimum: 0}
+        source: {type: string, enum: [included, association]}
+    DirectKeywordSuggestions:
+      type: object
+      required: [campaign_id, phrase, total_count, regions, items, fetched_at]
+      properties:
+        campaign_id: {type: string, minLength: 1, maxLength: 128}
+        phrase: {type: string, minLength: 1, maxLength: 400}
+        total_count: {type: integer, format: int64, minimum: 0}
+        regions:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items: {type: string, minLength: 1, maxLength: 120}
+        items:
+          type: array
+          maxItems: 50
+          items: {$ref: '#/components/schemas/DirectKeywordSuggestionItem'}
+        fetched_at: {type: string, format: date-time}
+    DirectKeywordSuggestionsEnvelope:
+      type: object
+      required: [suggestions]
+      properties:
+        suggestions: {$ref: '#/components/schemas/DirectKeywordSuggestions'}
+    DirectCampaignStatisticsValues:
+      type: object
+      required: [impressions, clicks, cost_minor, conversions]
+      properties:
+        impressions: {type: integer, format: int64, minimum: 0}
+        clicks: {type: integer, format: int64, minimum: 0}
+        cost_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Spend in integer minor currency units.
+        conversions: {type: number, format: double, minimum: 0}
+    DirectCampaignDailyStatistics:
+      allOf:
+        - {$ref: '#/components/schemas/DirectCampaignStatisticsValues'}
+        - type: object
+          required: [date]
+          properties:
+            date: {type: string, format: date}
+    DirectCampaignStatistics:
+      type: object
+      required: [campaign_id, from, to, currency_code, totals, daily, updated_at]
+      properties:
+        campaign_id: {type: string, minLength: 1, maxLength: 128}
+        from: {type: string, format: date}
+        to: {type: string, format: date}
+        currency_code: {type: string, pattern: '^[A-Z]{3}$'}
+        totals: {$ref: '#/components/schemas/DirectCampaignStatisticsValues'}
+        daily:
+          type: array
+          maxItems: 366
+          items: {$ref: '#/components/schemas/DirectCampaignDailyStatistics'}
+        updated_at: {type: string, format: date-time}
+    DirectCampaignStatisticsEnvelope:
+      type: object
+      required: [statistics]
+      properties:
+        statistics: {$ref: '#/components/schemas/DirectCampaignStatistics'}
     DirectCampaignListEnvelope:
       type: object
       required: [items]
@@ -3777,7 +4004,7 @@ components:
           const: yookassa-recurring-v2
         recurring_consent_terms_version:
           type: string
-          const: '2026-07-23'
+          const: '2026-08-02'
     BillingCheckout:
       type: object
       required: [checkout_id, status]

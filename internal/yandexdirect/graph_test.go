@@ -74,6 +74,33 @@ func TestResolveRegionNamesUsesExactNamesAndPreservesOrder(t *testing.T) {
 	}
 }
 
+func TestResolveRegionNamesCachesExactDictionaryResult(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = fmt.Fprint(w, `{"result":{"GeoRegions":[{"GeoRegionId":213,"GeoRegionName":"Москва","ParentGeoRegionNames":{"Items":["Россия"]}}]}}`)
+	}))
+	defer server.Close()
+	client, err := New(
+		server.URL+"/json/v501", "client", "secret", CallbackRedirectURI, server.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 2; index++ {
+		regions, resolveErr := client.ResolveRegionNames(
+			context.Background(), "token", "", []string{"Москва"},
+		)
+		if resolveErr != nil || len(regions) != 1 || regions[0].ID != 213 {
+			t.Fatalf("resolve %d = %#v, %v", index, regions, resolveErr)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("dictionary provider calls = %d, want 1", got)
+	}
+}
+
 func TestResolveRegionNamesFailsOnAmbiguousOrMissingExactMatch(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1106,8 +1133,13 @@ func TestGetGraphCampaignRequestsAndNormalizesConsentSensitiveFields(t *testing.
 		}
 		requireContainsAll(t, request.Params.FieldNames, []string{
 			"Id", "Name", "Type", "TimeZone", "NegativeKeywords", "BlockedIps",
-			"ExcludedSites", "TimeTargeting", "DailyBudget",
+			"ExcludedSites", "TimeTargeting",
 		})
+		for _, field := range request.Params.FieldNames {
+			if field == "DailyBudget" {
+				t.Fatal("deprecated DailyBudget must not be requested")
+			}
+		}
 		requireContainsAll(t, request.Params.UnifiedCampaignFieldNames, []string{
 			"BiddingStrategy", "Settings", "CounterIds", "PriorityGoals",
 			"NegativeKeywordSharedSetIds", "TrackingParams", "AttributionModel", "PackageBiddingStrategy",
@@ -1129,7 +1161,6 @@ func TestGetGraphCampaignRequestsAndNormalizesConsentSensitiveFields(t *testing.
 "ExcludedSites":{"Items":["B.EXAMPLE","a.example"]},
 "TimeTargeting":{"Schedule":{"Items":["2,100","1,100"]},"ConsiderWorkingWeekends":"NO",
 "HolidaysSchedule":{"SuspendOnHolidays":"YES","BidPercent":100,"StartHour":8,"EndHour":23}},
-"DailyBudget":null,
 "UnifiedCampaign":{
  "BiddingStrategy":{
   "Search":{"BiddingStrategyType":"SERVING_OFF",
@@ -1168,7 +1199,7 @@ func TestGetGraphCampaignRequestsAndNormalizesConsentSensitiveFields(t *testing.
 	}
 }
 
-func TestGetGraphCampaignFailsClosedOnUnsupportedBudgetOrPackageStrategy(t *testing.T) {
+func TestGetGraphCampaignFailsClosedOnUnsupportedPackageStrategyOrIncompleteResponse(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name     string
@@ -1176,16 +1207,9 @@ func TestGetGraphCampaignFailsClosedOnUnsupportedBudgetOrPackageStrategy(t *test
 		wantCode string
 	}{
 		{
-			name: "daily budget",
-			response: `{"result":{"Campaigns":[{
-"Id":1,"DailyBudget":{"Amount":1000000},"UnifiedCampaign":{}
-}]}}`,
-			wantCode: "unsupported_campaign_daily_budget",
-		},
-		{
 			name: "package strategy",
 			response: `{"result":{"Campaigns":[{
-"Id":1,"DailyBudget":null,
+"Id":1,
 "UnifiedCampaign":{"PackageBiddingStrategy":{"StrategyId":77}}
 }]}}`,
 			wantCode: "unsupported_package_bidding_strategy",
@@ -1197,7 +1221,6 @@ func TestGetGraphCampaignFailsClosedOnUnsupportedBudgetOrPackageStrategy(t *test
 "StartDate":"2044-01-01","EndDate":"2044-02-01","TimeZone":"Europe/Moscow",
 "NegativeKeywords":null,"BlockedIps":null,"ExcludedSites":null,
 "TimeTargeting":{"Schedule":{"Items":[]},"ConsiderWorkingWeekends":"NO"},
-"DailyBudget":null,
 "UnifiedCampaign":{"BiddingStrategy":{},"Settings":[],"CounterIds":null,
 "TrackingParams":null,"AttributionModel":"AUTO",
 "PackageBiddingStrategy":null}
@@ -1211,7 +1234,6 @@ func TestGetGraphCampaignFailsClosedOnUnsupportedBudgetOrPackageStrategy(t *test
 "StartDate":"2044-01-01","EndDate":"2044-02-01","TimeZone":"Europe/Moscow",
 "NegativeKeywords":null,"BlockedIps":null,"ExcludedSites":null,
 "TimeTargeting":{"Schedule":{"Items":["1,100"]},"ConsiderWorkingWeekends":"NO"},
-"DailyBudget":null,
 "UnifiedCampaign":{
  "BiddingStrategy":{
   "Search":{"BiddingStrategyType":"SERVING_OFF","PlacementTypes":{"SearchResults":"NO","ProductGallery":"NO","DynamicPlaces":"NO","Maps":"NO","SearchOrganizationList":"NO"}},

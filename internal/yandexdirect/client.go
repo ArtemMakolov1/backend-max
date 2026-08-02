@@ -43,6 +43,9 @@ type Client struct {
 	sandbox       bool
 	unified       bool
 	oauthTokenURL string
+	transport     *directTransport
+	regionCache   *directRegionCache
+	currencyCache *directCurrencyCache
 }
 
 type Error struct {
@@ -51,6 +54,8 @@ type Error struct {
 	Code         string
 	Message      string
 	RequestID    string
+	RetryAfter   time.Duration
+	Units        *UnitsUsage
 }
 
 func (e *Error) Error() string {
@@ -64,13 +69,37 @@ func (e *Error) Error() string {
 }
 
 type Account struct {
-	ID           string
-	Login        string
-	DisplayName  string
-	CurrencyCode string
-	Timezone     string
-	ReadOnly     bool
+	ID                 string
+	Login              string
+	RepresentativeName string
+	CurrencyCode       string
+	ReadOnly           bool
 }
+
+// CampaignTimeZonePolicy is a MaxPosty product policy used for every campaign
+// created by this integration. Clients.get does not return an account time
+// zone, so callers must not present this value as provider-owned metadata.
+const CampaignTimeZonePolicy = "Europe/Moscow"
+
+// AccountCompatibilityError is returned before OAuth credentials are
+// persisted when the selected Direct account cannot run the exact campaign
+// graph supported by MaxPosty. Reason is one of the constants below and is
+// safe to expose to an authenticated client; provider details are omitted.
+type AccountCompatibilityError struct {
+	Reason string
+}
+
+func (e *AccountCompatibilityError) Error() string {
+	return "Yandex Direct account is incompatible with this integration"
+}
+
+const (
+	AccountIncompatibleType            = "unsupported_account_type"
+	AccountIncompatibleCurrency        = "unsupported_account_currency"
+	AccountIncompatibleArchived        = "account_archived"
+	AccountIncompatibleNetwork         = "network_advertising_unavailable"
+	AccountIncompatibleUnifiedCampaign = "unified_campaign_unavailable"
+)
 
 type OAuthToken struct {
 	AccessToken      string
@@ -81,10 +110,13 @@ type OAuthToken struct {
 type CampaignDraft struct {
 	Name              string
 	WeeklyBudgetMinor int64
-	StartsAt          time.Time
-	EndsAt            time.Time
-	TimeZone          string
-	OperationMarker   string
+	// BidCeilingMinor is an optional maximum CPC for the automatic
+	// WB_MAXIMUM_CLICKS strategy. Zero leaves the provider default in place.
+	BidCeilingMinor int64
+	StartsAt        time.Time
+	EndsAt          time.Time
+	TimeZone        string
+	OperationMarker string
 }
 
 type Campaign struct {
@@ -93,6 +125,7 @@ type Campaign struct {
 	Status            string
 	State             string
 	WeeklyBudgetMinor int64
+	BidCeilingMinor   int64
 	StartsAt          time.Time
 	EndsAt            time.Time
 	TimeZone          string
@@ -121,9 +154,53 @@ func SafeUnifiedCampaignSettings() []GraphCampaignSetting {
 // graph integration creates. Search is explicitly disabled and the network
 // strategy is bounded by the exact weekly budget, with Maps disabled.
 func SafeUnifiedCampaignBiddingStrategy(weeklyBudgetMinor int64) (json.RawMessage, error) {
+	return SafeUnifiedCampaignBiddingStrategyWithCeiling(weeklyBudgetMinor, 0)
+}
+
+// SafeUnifiedCampaignBiddingStrategyWithCeiling returns the supported
+// automatic network strategy with an optional provider-enforced maximum CPC.
+// Both monetary values use the application's minor-unit representation.
+func SafeUnifiedCampaignBiddingStrategyWithCeiling(
+	weeklyBudgetMinor, bidCeilingMinor int64,
+) (json.RawMessage, error) {
+	return safeUnifiedCampaignBiddingStrategy(
+		weeklyBudgetMinor, bidCeilingMinor, false,
+	)
+}
+
+// SafeUnifiedCampaignBiddingStrategyUpdateWithCeiling returns the supported
+// strategy in update form. Yandex Direct nullable fields use an explicit JSON
+// null to remove an existing value; omitting BidCeiling would leave the old
+// ceiling unchanged.
+func SafeUnifiedCampaignBiddingStrategyUpdateWithCeiling(
+	weeklyBudgetMinor, bidCeilingMinor int64,
+) (json.RawMessage, error) {
+	return safeUnifiedCampaignBiddingStrategy(
+		weeklyBudgetMinor, bidCeilingMinor, true,
+	)
+}
+
+func safeUnifiedCampaignBiddingStrategy(
+	weeklyBudgetMinor, bidCeilingMinor int64, includeNullCeiling bool,
+) (json.RawMessage, error) {
 	weeklyBudgetMicros, err := MinorToMicros(weeklyBudgetMinor)
 	if err != nil {
 		return nil, err
+	}
+	maximumClicks := map[string]any{
+		"WeeklySpendLimit": weeklyBudgetMicros,
+	}
+	if bidCeilingMinor < 0 {
+		return nil, errors.New("bid ceiling must not be negative")
+	}
+	if bidCeilingMinor != 0 {
+		bidCeilingMicros, convertErr := MinorToMicros(bidCeilingMinor)
+		if convertErr != nil {
+			return nil, convertErr
+		}
+		maximumClicks["BidCeiling"] = bidCeilingMicros
+	} else if includeNullCeiling {
+		maximumClicks["BidCeiling"] = nil
 	}
 	return json.Marshal(map[string]any{
 		"Search": map[string]any{
@@ -142,9 +219,7 @@ func SafeUnifiedCampaignBiddingStrategy(weeklyBudgetMinor int64) (json.RawMessag
 				"Maps":    "NO",
 				"Network": "YES",
 			},
-			"WbMaximumClicks": map[string]any{
-				"WeeklySpendLimit": weeklyBudgetMicros,
-			},
+			"WbMaximumClicks": maximumClicks,
 		},
 	})
 }
@@ -218,11 +293,14 @@ func New(
 	safeHTTPClient.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
+	directHTTPTransport := newDirectTransport(safeHTTPClient.Transport)
+	safeHTTPClient.Transport = directHTTPTransport
 	return &Client{
 		baseURL: baseURL, clientID: strings.TrimSpace(clientID), clientSecret: clientSecret,
 		redirectURI: redirect.String(), oauthFlow: oauthFlow, http: &safeHTTPClient,
 		sandbox: host == "api-sandbox.direct.yandex.com", unified: unified,
-		oauthTokenURL: oauthExchangeEndpoint,
+		oauthTokenURL: oauthExchangeEndpoint, transport: directHTTPTransport,
+		regionCache: newDirectRegionCache(), currencyCache: newDirectCurrencyCache(),
 	}, nil
 }
 
@@ -233,6 +311,15 @@ func (c *Client) OAuthFlow() OAuthFlow {
 		return ""
 	}
 	return c.oauthFlow
+}
+
+// UnitsUsage returns the most recent provider quota snapshot observed for an
+// advertiser. It never performs a provider request.
+func (c *Client) UnitsUsage(clientLogin string) (UnitsUsage, bool) {
+	if c == nil || c.transport == nil {
+		return UnitsUsage{}, false
+	}
+	return c.transport.usage(clientLogin)
 }
 
 func (c *Client) AuthorizationURL(state, codeChallenge string) string {
@@ -334,16 +421,15 @@ func (c *Client) GetAccount(
 ) (Account, error) {
 	var response struct {
 		Clients []struct {
-			ClientID        int64  `json:"ClientId"`
-			Login           string `json:"Login"`
-			ClientInfo      string `json:"ClientInfo"`
-			Currency        string `json:"Currency"`
-			Type            string `json:"Type"`
-			Representatives []struct {
-				Login string `json:"Login"`
-				Role  string `json:"Role"`
-			} `json:"Representatives"`
-			Grants []struct {
+			ClientID              int64   `json:"ClientId"`
+			Login                 string  `json:"Login"`
+			ClientInfo            string  `json:"ClientInfo"`
+			Currency              *string `json:"Currency"`
+			Type                  *string `json:"Type"`
+			Archived              *string `json:"Archived"`
+			ForbiddenPlatform     *string `json:"ForbiddenPlatform"`
+			AvailableCampaignType *string `json:"AvailableCampaignTypes"`
+			Grants                []struct {
 				Privilege string `json:"Privilege"`
 				Value     string `json:"Value"`
 			} `json:"Grants"`
@@ -354,7 +440,8 @@ func (c *Client) GetAccount(
 		"params": map[string]any{
 			"FieldNames": []string{
 				"ClientId", "Login", "ClientInfo", "Currency", "Type",
-				"Representatives", "Grants",
+				"Archived", "ForbiddenPlatform", "AvailableCampaignTypes",
+				"Grants",
 			},
 		},
 	}, &response)
@@ -365,11 +452,32 @@ func (c *Client) GetAccount(
 		return Account{}, &Error{Code: "direct_account_not_found"}
 	}
 	item := response.Clients[0]
-	chiefVerified := false
-	for _, representative := range item.Representatives {
-		if strings.EqualFold(representative.Login, item.Login) &&
-			strings.EqualFold(representative.Role, "CHIEF") {
-			chiefVerified = true
+	if item.Type == nil || item.Currency == nil || item.Archived == nil ||
+		item.ForbiddenPlatform == nil || item.AvailableCampaignType == nil {
+		return Account{}, &Error{Code: "invalid_direct_account_response"}
+	}
+	accountType := strings.ToUpper(strings.TrimSpace(*item.Type))
+	currency := strings.ToUpper(strings.TrimSpace(*item.Currency))
+	archived := strings.ToUpper(strings.TrimSpace(*item.Archived))
+	forbiddenPlatform := strings.ToUpper(strings.TrimSpace(*item.ForbiddenPlatform))
+	availableCampaignType := strings.ToUpper(strings.TrimSpace(*item.AvailableCampaignType))
+	if (archived != "YES" && archived != "NO") ||
+		(forbiddenPlatform != "SEARCH" && forbiddenPlatform != "NETWORK" &&
+			forbiddenPlatform != "NONE") || !validAvailableCampaignType(availableCampaignType) {
+		return Account{}, &Error{Code: "invalid_direct_account_response"}
+	}
+	for _, compatibility := range []struct {
+		unsupported bool
+		reason      string
+	}{
+		{accountType != "CLIENT", AccountIncompatibleType},
+		{currency != "RUB", AccountIncompatibleCurrency},
+		{archived != "NO", AccountIncompatibleArchived},
+		{forbiddenPlatform == "NETWORK", AccountIncompatibleNetwork},
+		{availableCampaignType != "UNIFIED_CAMPAIGN", AccountIncompatibleUnifiedCampaign},
+	} {
+		if compatibility.unsupported {
+			return Account{}, &AccountCompatibilityError{Reason: compatibility.reason}
 		}
 	}
 	editCampaigns := false
@@ -379,16 +487,26 @@ func (c *Client) GetAccount(
 			editCampaigns = true
 		}
 	}
-	// The MVP does not implement AgencyClients selection and cannot safely
-	// infer permissions for agencies, delegates, or unknown account types.
-	// Default to read-only unless every provider assertion is explicit.
-	readOnly := !strings.EqualFold(strings.TrimSpace(item.Type), "CLIENT") ||
-		!chiefVerified || !editCampaigns
+	// EDIT_CAMPAIGNS is the provider-owned capability for both chief and
+	// full-access delegate representatives. Missing or unknown grants default
+	// to read-only without trying to infer the current role from Representatives.
+	readOnly := !editCampaigns
 	return Account{
 		ID: strconv.FormatInt(item.ClientID, 10), Login: item.Login,
-		DisplayName: item.ClientInfo, CurrencyCode: item.Currency,
-		Timezone: "Europe/Moscow", ReadOnly: readOnly,
+		RepresentativeName: item.ClientInfo, CurrencyCode: currency,
+		ReadOnly: readOnly,
 	}, nil
+}
+
+func validAvailableCampaignType(value string) bool {
+	switch value {
+	case "TEXT_CAMPAIGN", "MOBILE_APP_CAMPAIGN", "DYNAMIC_TEXT_CAMPAIGN",
+		"CPM_BANNER_CAMPAIGN", "SMART_CAMPAIGN", "CONTENT_PROMOTION",
+		"BILLING_AGGREGATE", "UNIFIED_CAMPAIGN":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Client) CreateCampaignDraft(
@@ -398,9 +516,19 @@ func (c *Client) CreateCampaignDraft(
 	if err != nil {
 		return Campaign{}, err
 	}
+	if campaign.BidCeilingMinor < 0 {
+		return Campaign{}, errors.New("bid ceiling must not be negative")
+	}
+	var bidCeilingMicros int64
+	if campaign.BidCeilingMinor != 0 {
+		bidCeilingMicros, err = MinorToMicros(campaign.BidCeilingMinor)
+		if err != nil {
+			return Campaign{}, err
+		}
+	}
 	timeZone := strings.TrimSpace(campaign.TimeZone)
 	if timeZone == "" {
-		timeZone = "Europe/Moscow"
+		timeZone = CampaignTimeZonePolicy
 	}
 	if utf8.RuneCountInString(timeZone) > 128 {
 		return Campaign{}, errors.New("campaign time zone is too long")
@@ -447,6 +575,12 @@ func (c *Client) CreateCampaignDraft(
 		}
 		campaignDetails["Settings"] = settingsPayload
 		campaignDetails["AttributionModel"] = "AUTO"
+		maximumClicks := map[string]any{
+			"WeeklySpendLimit": weeklyBudgetMicros,
+		}
+		if bidCeilingMicros != 0 {
+			maximumClicks["BidCeiling"] = bidCeilingMicros
+		}
 		campaignDetails["BiddingStrategy"] = map[string]any{
 			"Search": map[string]any{
 				"BiddingStrategyType": "SERVING_OFF",
@@ -464,9 +598,7 @@ func (c *Client) CreateCampaignDraft(
 					"Maps":    "NO",
 					"Network": "YES",
 				},
-				"WbMaximumClicks": map[string]any{
-					"WeeklySpendLimit": weeklyBudgetMicros,
-				},
+				"WbMaximumClicks": maximumClicks,
 			},
 		}
 		if operationMarker != "" {
@@ -511,7 +643,8 @@ func (c *Client) CreateCampaignDraft(
 	return Campaign{
 		ID: response.AddResults[0].ID, Name: strings.TrimSpace(campaign.Name),
 		Status: "DRAFT", State: "OFF", WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
-		StartsAt: dateOnly(campaign.StartsAt), EndsAt: dateOnly(campaign.EndsAt),
+		BidCeilingMinor: campaign.BidCeilingMinor,
+		StartsAt:        dateOnly(campaign.StartsAt), EndsAt: dateOnly(campaign.EndsAt),
 		TimeZone: timeZone, TrackingParams: trackingParams,
 		Warnings: exportProviderIssues(response.AddResults[0].Warnings),
 	}, nil
@@ -574,10 +707,26 @@ func (c *Client) GetCampaign(
 	if err != nil {
 		return Campaign{}, &Error{Code: "campaign_budget_invalid"}
 	}
+	ceilingMinor := int64(0)
+	if c.unified {
+		var details struct {
+			BiddingStrategy json.RawMessage `json:"BiddingStrategy"`
+		}
+		if json.Unmarshal(campaignDetails, &details) != nil {
+			return Campaign{}, &Error{Code: "invalid_campaign_response"}
+		}
+		strategyBudgetMinor, strategyCeilingMinor, strategyErr :=
+			supportedAutomaticBidStrategy(details.BiddingStrategy)
+		if strategyErr != nil || strategyBudgetMinor != budgetMinor {
+			return Campaign{}, &Error{Code: "campaign_budget_invalid"}
+		}
+		ceilingMinor = strategyCeilingMinor
+	}
 	return Campaign{
 		ID: envelope.ID, Name: envelope.Name, Status: strings.ToUpper(envelope.Status),
 		State: strings.ToUpper(envelope.State), WeeklyBudgetMinor: budgetMinor,
-		StartsAt: dateOnly(startsAt), EndsAt: dateOnly(endsAt),
+		BidCeilingMinor: ceilingMinor,
+		StartsAt:        dateOnly(startsAt), EndsAt: dateOnly(endsAt),
 	}, nil
 }
 
@@ -646,6 +795,29 @@ func (c *Client) call(
 	if err != nil {
 		return err
 	}
+	var methodEnvelope struct {
+		Method string `json:"method"`
+	}
+	_ = json.Unmarshal(encoded, &methodEnvelope)
+	retrySafe := directReadMethod(methodEnvelope.Method)
+	for attempt := 0; ; attempt++ {
+		err = c.callOnce(ctx, service, token, clientLogin, encoded, result)
+		if err == nil || !retrySafe {
+			return err
+		}
+		delay, ok := directReadRetryDelay(err, attempt)
+		if !ok {
+			return err
+		}
+		if waitErr := waitDirectRetry(ctx, delay); waitErr != nil {
+			return waitErr
+		}
+	}
+}
+
+func (c *Client) callOnce(
+	ctx context.Context, service, token, clientLogin string, encoded []byte, result any,
+) error {
 	endpoint := *c.baseURL
 	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/" + service
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(encoded))
@@ -669,6 +841,13 @@ func (c *Client) call(
 		return err
 	}
 	requestID := response.Header.Get("RequestId")
+	usage, hasUsage := parseUnitsUsage(response.Header.Get("Units"))
+	if hasUsage {
+		usage.UsedLogin = strings.TrimSpace(response.Header.Get("Units-Used-Login"))
+		usage.RequestID = requestID
+		usage.ObservedAt = time.Now().UTC()
+	}
+	retryDelay := retryAfter(response.Header, time.Now().UTC())
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
 		Error  *struct {
@@ -678,7 +857,14 @@ func (c *Client) call(
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return &Error{StatusCode: response.StatusCode, Code: "invalid_api_response", RequestID: requestID}
+		providerErr := &Error{
+			StatusCode: response.StatusCode, Code: "invalid_api_response",
+			RequestID: requestID, RetryAfter: retryDelay,
+		}
+		if hasUsage {
+			providerErr.Units = &usage
+		}
+		return providerErr
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || envelope.Error != nil {
 		code := "api_request_failed"
@@ -695,18 +881,48 @@ func (c *Client) call(
 		if envelope.Error != nil {
 			apiErrorCode = envelope.Error.Code
 		}
-		return &Error{
+		providerErr := &Error{
 			StatusCode: response.StatusCode, APIErrorCode: apiErrorCode,
-			Code: code, Message: message, RequestID: requestID,
+			Code: code, Message: message, RequestID: requestID, RetryAfter: retryDelay,
 		}
+		if hasUsage {
+			providerErr.Units = &usage
+		}
+		if c.transport != nil {
+			c.transport.noteAPIError(clientLogin, apiErrorCode)
+		}
+		return providerErr
 	}
 	if len(envelope.Result) == 0 || string(envelope.Result) == "null" {
-		return &Error{StatusCode: response.StatusCode, Code: "missing_api_result", RequestID: requestID}
+		providerErr := &Error{
+			StatusCode: response.StatusCode, Code: "missing_api_result",
+			RequestID: requestID, RetryAfter: retryDelay,
+		}
+		if hasUsage {
+			providerErr.Units = &usage
+		}
+		return providerErr
 	}
 	if err := json.Unmarshal(envelope.Result, result); err != nil {
-		return &Error{StatusCode: response.StatusCode, Code: "invalid_api_result", RequestID: requestID}
+		providerErr := &Error{
+			StatusCode: response.StatusCode, Code: "invalid_api_result",
+			RequestID: requestID, RetryAfter: retryDelay,
+		}
+		if hasUsage {
+			providerErr.Units = &usage
+		}
+		return providerErr
 	}
 	return nil
+}
+
+func directReadMethod(method string) bool {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "get", "check", "checkcampaigns", "checkdictionaries":
+		return true
+	default:
+		return false
+	}
 }
 
 func findWeeklySpendLimit(raw json.RawMessage) (int64, bool) {

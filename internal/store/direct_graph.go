@@ -38,6 +38,7 @@ const (
 	directMaxKeywordRunes        = 4096
 	directMaxKeywordWords        = 7
 	directMaxKeywordWordRunes    = 35
+	directImplicitAutotargeting  = "---autotargeting"
 )
 
 var directProviderOperationMarkerPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
@@ -83,6 +84,7 @@ type DirectCampaignDesiredGraph struct {
 	LandingURL        string    `json:"landing_url"`
 	Regions           []string  `json:"regions"`
 	WeeklyBudgetMinor int64     `json:"weekly_budget_minor"`
+	BidCeilingMinor   int64     `json:"bid_ceiling_minor,omitempty"`
 	CurrencyCode      string    `json:"currency_code"`
 	StartsAt          time.Time `json:"starts_at"`
 	EndsAt            time.Time `json:"ends_at"`
@@ -213,6 +215,7 @@ type DirectGraphModerationUpdate struct {
 	ProviderStatus                   string
 	ProviderState                    string
 	StatusClarification              string
+	ExpectedSyncClaimedAt            *time.Time
 	CheckedAt                        time.Time
 }
 
@@ -275,6 +278,23 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`,
 		workspaceID, campaignID))
 	if err != nil {
 		return DirectGraphSubmissionMaterial{}, err
+	}
+	var providerSyncClaimedAt, providerSyncLeaseExpiresAt sql.NullTime
+	if err := tx.QueryRowContext(ctx, `SELECT provider_sync_claimed_at,provider_sync_lease_expires_at
+FROM direct_campaigns WHERE workspace_id=$1 AND id=$2`, workspaceID, campaignID).Scan(
+		&providerSyncClaimedAt, &providerSyncLeaseExpiresAt,
+	); err != nil {
+		return DirectGraphSubmissionMaterial{}, err
+	}
+	if providerSyncLeaseExpiresAt.Valid && providerSyncLeaseExpiresAt.Time.After(now) {
+		return DirectGraphSubmissionMaterial{}, ErrDirectProviderOperationBusy
+	}
+	if providerSyncClaimedAt.Valid {
+		if _, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
+SET provider_sync_claimed_at=NULL,provider_sync_lease_expires_at=NULL,updated_at=$1
+WHERE workspace_id=$2 AND id=$3`, now, workspaceID, campaignID); err != nil {
+			return DirectGraphSubmissionMaterial{}, err
+		}
 	}
 	operationMarker = strings.TrimSpace(operationMarker)
 	if campaign.SubmissionOperationID != "" {
@@ -673,6 +693,8 @@ func (s *Store) ClaimDirectCampaignGraphRecoveryCandidates(
     WHERE o.completed_at IS NULL
       AND o.stage NOT IN ('completed','failed')
       AND o.lease_expires_at <= $1
+      AND (c.provider_sync_lease_expires_at IS NULL OR
+           c.provider_sync_lease_expires_at <= $1)
     ORDER BY o.lease_expires_at,o.id
     FOR UPDATE OF c,o SKIP LOCKED
     LIMIT $2
@@ -687,7 +709,9 @@ func (s *Store) ClaimDirectCampaignGraphRecoveryCandidates(
     RETURNING o.*
 ), refreshed AS (
     UPDATE direct_campaigns c
-    SET submission_claimed_at=$1,submission_lease_expires_at=$3,updated_at=$1
+    SET submission_claimed_at=$1,submission_lease_expires_at=$3,
+        provider_sync_claimed_at=NULL,provider_sync_lease_expires_at=NULL,
+        updated_at=$1
     FROM leased l
     WHERE c.workspace_id=l.workspace_id
       AND c.id=l.campaign_id
@@ -1105,15 +1129,17 @@ WHERE workspace_id=$1 AND campaign_id=$2 AND id=$3 FOR SHARE`,
 		}
 		result, updateErr := tx.ExecContext(ctx, `UPDATE direct_campaigns
 SET name=$1,landing_url=$2,regions=$3,titles=$4,texts=$5,keywords=$6,
-    negative_keywords=$7,weekly_budget_minor=$8,starts_at=$9,ends_at=$10,
-    provider_campaign_id=$11,provider_ad_group_id=$12,provider_ad_id=$13,
-    provider_keyword_ids=$14,provider_keyword_mappings=$15,version=version+1,
-    updated_at=$16
-WHERE workspace_id=$17 AND id=$18 AND version=$19
-  AND submission_operation_id=$20`,
+    negative_keywords=$7,weekly_budget_minor=$8,bid_ceiling_minor=$9,
+    starts_at=$10,ends_at=$11,
+    provider_campaign_id=$12,provider_ad_group_id=$13,provider_ad_id=$14,
+    provider_keyword_ids=$15,provider_keyword_mappings=$16,version=version+1,
+    updated_at=$17
+WHERE workspace_id=$18 AND id=$19 AND version=$20
+  AND submission_operation_id=$21`,
 			desiredCampaign.Name, desiredCampaign.LandingURL, string(regionsJSON),
 			titlesJSON, textsJSON, keywordsJSON, negativeKeywordsJSON,
-			desiredCampaign.WeeklyBudgetMinor, dateOnly(desiredCampaign.StartsAt),
+			desiredCampaign.WeeklyBudgetMinor, desiredCampaign.BidCeilingMinor,
+			dateOnly(desiredCampaign.StartsAt),
 			dateOnly(desiredCampaign.EndsAt), input.ProviderCampaignID,
 			input.ProviderAdGroupID, input.ProviderAdID, string(keywordIDsJSON),
 			string(mappingsJSON), input.ObservedAt, workspaceID, campaignID,
@@ -1293,6 +1319,38 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`,
 		campaign.ProviderRevisionID != update.ExpectedRevisionID {
 		return DirectCampaign{}, ErrDirectConsentMismatch
 	}
+	var expectedSyncClaimedAt any
+	if update.ExpectedSyncClaimedAt != nil {
+		value := update.ExpectedSyncClaimedAt.UTC().Truncate(time.Microsecond)
+		if value.IsZero() {
+			return DirectCampaign{}, ErrConflict
+		}
+		var observed, leaseExpiresAt sql.NullTime
+		if err := tx.QueryRowContext(ctx, `SELECT provider_sync_claimed_at,provider_sync_lease_expires_at
+FROM direct_campaigns WHERE workspace_id=$1 AND id=$2`,
+			workspaceID, campaignID).Scan(&observed, &leaseExpiresAt); err != nil {
+			return DirectCampaign{}, err
+		}
+		if !observed.Valid ||
+			!observed.Time.UTC().Truncate(time.Microsecond).Equal(value) {
+			return DirectCampaign{}, ErrConflict
+		}
+		if !leaseExpiresAt.Valid ||
+			!leaseExpiresAt.Time.UTC().After(update.CheckedAt) ||
+			campaign.LaunchState == "launching" || campaign.LaunchState == "reconciling" {
+			return DirectCampaign{}, ErrConflict
+		}
+		expectedSyncClaimedAt = value
+	} else {
+		if campaign.LaunchState == "launching" || campaign.LaunchState == "reconciling" {
+			return DirectCampaign{}, ErrConflict
+		}
+		if err := ensureDirectProviderSyncIdleTx(
+			ctx, tx, workspaceID, campaignID, update.CheckedAt,
+		); err != nil {
+			return DirectCampaign{}, err
+		}
+	}
 	if err := validateDirectKeywordMappings(
 		update.Keywords, campaign.Keywords, true,
 	); err != nil {
@@ -1352,15 +1410,19 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`,
 	result, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
 SET moderation_status=$1,moderation_clarification=$2,campaign_moderation=$3,
     ad_group_moderation=$4,ad_moderation=$5,keyword_moderation=$6,
-    provider_status=$7,provider_state=$8,status=$9,provider_next_check_at=$10,
-    updated_at=$10
+    provider_status=$7,provider_state=$8,status=$9,updated_at=$10
 WHERE workspace_id=$11 AND id=$12 AND provider_graph_hash=$13
-  AND provider_revision_id=$14 AND graph_verified_at IS NOT NULL`,
+  AND provider_revision_id=$14 AND graph_verified_at IS NOT NULL
+  AND (($15::timestamptz IS NULL AND provider_sync_claimed_at IS NULL)
+       OR ($15::timestamptz IS NOT NULL
+           AND provider_sync_claimed_at=$15
+           AND provider_sync_lease_expires_at>$10
+           AND launch_state NOT IN ('launching','reconciling')))`,
 		moderationStatus, moderationClarification, string(campaignModerationJSON),
 		string(adGroupModerationJSON), string(adModerationJSON),
 		string(keywordModerationJSON), providerStatus, providerState, status,
 		update.CheckedAt, workspaceID, campaignID, update.ExpectedGraphHash,
-		update.ExpectedRevisionID)
+		update.ExpectedRevisionID, expectedSyncClaimedAt)
 	if err != nil {
 		return DirectCampaign{}, err
 	}
@@ -1592,6 +1654,9 @@ func applyDirectCampaignChanges(campaign *DirectCampaign, changes DirectCampaign
 	if changes.WeeklyBudgetMinor != nil {
 		campaign.WeeklyBudgetMinor = *changes.WeeklyBudgetMinor
 	}
+	if changes.BidCeilingMinor != nil {
+		campaign.BidCeilingMinor = *changes.BidCeilingMinor
+	}
 	if changes.StartsAt != nil {
 		campaign.StartsAt = *changes.StartsAt
 	}
@@ -1635,6 +1700,7 @@ func directDesiredGraphFromCampaign(campaign DirectCampaign) DirectCampaignDesir
 		LandingURL:        campaign.LandingURL,
 		Regions:           append([]string(nil), campaign.Regions...),
 		WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
+		BidCeilingMinor:   campaign.BidCeilingMinor,
 		CurrencyCode:      campaign.CurrencyCode,
 		StartsAt:          dateOnly(campaign.StartsAt),
 		EndsAt:            dateOnly(campaign.EndsAt),
@@ -1675,6 +1741,7 @@ func directDesiredCampaignFromJSON(
 	base.LandingURL = desired.LandingURL
 	base.Regions = append([]string(nil), desired.Regions...)
 	base.WeeklyBudgetMinor = desired.WeeklyBudgetMinor
+	base.BidCeilingMinor = desired.BidCeilingMinor
 	base.CurrencyCode = desired.CurrencyCode
 	base.StartsAt = desired.StartsAt
 	base.EndsAt = desired.EndsAt
@@ -1747,16 +1814,20 @@ func validateDirectObservedGraphStructure(
 			AdGroupID  int64 `json:"ad_group_id"`
 		} `json:"ads"`
 		Keywords []struct {
-			ID         int64  `json:"id"`
-			CampaignID int64  `json:"campaign_id"`
-			AdGroupID  int64  `json:"ad_group_id"`
-			Keyword    string `json:"keyword"`
+			ID               int64  `json:"id"`
+			CampaignID       int64  `json:"campaign_id"`
+			AdGroupID        int64  `json:"ad_group_id"`
+			Keyword          string `json:"keyword"`
+			UserParam1       string `json:"user_param_1"`
+			UserParam2       string `json:"user_param_2"`
+			StrategyPriority string `json:"strategy_priority"`
+			State            string `json:"state"`
 		} `json:"keywords"`
 	}
 	if err := json.Unmarshal(observedGraph, &observed); err != nil ||
 		observed.Campaign.ID <= 0 ||
 		len(observed.AdGroups) != 1 || len(observed.Ads) != 1 ||
-		len(observed.Keywords) != len(mappings) {
+		len(observed.Keywords) != len(mappings)+1 {
 		return ErrDirectGraphUnverified
 	}
 	if observed.Campaign.ID != providerCampaignID ||
@@ -1780,20 +1851,36 @@ func validateDirectObservedGraphStructure(
 		expectedKeywords[mapping.ProviderKeywordID] = keyword
 	}
 	seenKeywords := make(map[int64]struct{}, len(observed.Keywords))
+	userKeywordCount := 0
+	autotargetingCount := 0
 	for _, keyword := range observed.Keywords {
 		if keyword.ID <= 0 || keyword.CampaignID != providerCampaignID ||
 			keyword.AdGroupID != providerAdGroupID ||
-			directGraphText(keyword.Keyword) != keyword.Keyword {
+			directGraphText(keyword.Keyword) != keyword.Keyword ||
+			strings.ToUpper(strings.TrimSpace(keyword.StrategyPriority)) != "NORMAL" ||
+			keyword.UserParam1 != "" || keyword.UserParam2 != "" {
 			return ErrDirectGraphUnverified
-		}
-		expected, exists := expectedKeywords[keyword.ID]
-		if !exists || expected != keyword.Keyword {
-			return ErrDirectConsentMismatch
 		}
 		if _, duplicate := seenKeywords[keyword.ID]; duplicate {
 			return ErrDirectGraphUnverified
 		}
 		seenKeywords[keyword.ID] = struct{}{}
+		if keyword.Keyword == directImplicitAutotargeting {
+			autotargetingCount++
+			if autotargetingCount != 1 ||
+				strings.ToUpper(strings.TrimSpace(keyword.State)) != "OFF" {
+				return ErrDirectGraphUnverified
+			}
+			continue
+		}
+		expected, exists := expectedKeywords[keyword.ID]
+		if !exists || expected != keyword.Keyword {
+			return ErrDirectConsentMismatch
+		}
+		userKeywordCount++
+	}
+	if autotargetingCount != 1 || userKeywordCount != len(mappings) {
+		return ErrDirectGraphUnverified
 	}
 	return nil
 }

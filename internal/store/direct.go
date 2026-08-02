@@ -28,9 +28,26 @@ const (
 )
 
 const directLaunchRecoveryLease = 2 * time.Minute
-const directProviderPollLease = time.Minute
+const directAutoLaunchClaimLease = time.Minute
 const directOAuthCompletionRetention = 5 * time.Minute
 const directTokenRefreshLease = 2 * time.Minute
+const directProviderSyncClaimLease = 2 * time.Minute
+const directProviderSyncErrorBackoff = time.Minute
+
+func directProviderNextCheckAt(status string, now time.Time) time.Time {
+	delay := 15 * time.Minute
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "moderation":
+		delay = 5 * time.Minute
+	case "active":
+		delay = 30 * time.Minute
+	case "suspended":
+		delay = time.Hour
+	case "rejected":
+		delay = 6 * time.Hour
+	}
+	return now.UTC().Add(delay)
+}
 
 var directIdentifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 var directOAuthStateHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -57,8 +74,8 @@ timezone,read_only,token_ciphertext,token_key_version,status,connected_by,last_v
 created_at,updated_at,revoked_at,token_refresh_claimed_at`
 
 const directCampaignColumns = `id,workspace_id,connection_id,provider_campaign_id,name,
-objective,landing_url,brief,regions,weekly_budget_minor,currency_code,starts_at,ends_at,
-status,provider_status,provider_state,provider_next_check_at,auto_launch_next_attempt_at,
+objective,landing_url,brief,regions,weekly_budget_minor,bid_ceiling_minor,currency_code,starts_at,ends_at,
+status,provider_status,provider_state,provider_changes_timestamp,provider_next_check_at,auto_launch_next_attempt_at,
 version,created_by,submitted_at,launch_claimed_at,
 launch_state,launch_mode,launch_attempt_count,launch_reconcile_after,launched_at,
 launch_failed_at,launch_failure_code,created_at,updated_at,
@@ -125,12 +142,14 @@ type DirectCampaign struct {
 	Keywords                       []string                 `json:"keywords"`
 	NegativeKeywords               []string                 `json:"negative_keywords"`
 	WeeklyBudgetMinor              int64                    `json:"weekly_budget_minor"`
+	BidCeilingMinor                int64                    `json:"bid_ceiling_minor"`
 	CurrencyCode                   string                   `json:"currency_code"`
 	StartsAt                       time.Time                `json:"starts_at"`
 	EndsAt                         time.Time                `json:"ends_at"`
 	Status                         string                   `json:"status"`
 	ProviderStatus                 string                   `json:"provider_status,omitempty"`
 	ProviderState                  string                   `json:"provider_state,omitempty"`
+	ProviderChangesTimestamp       *time.Time               `json:"-"`
 	ProviderNextCheckAt            time.Time                `json:"-"`
 	AutoLaunchNextAttemptAt        time.Time                `json:"-"`
 	Version                        int64                    `json:"version"`
@@ -181,9 +200,12 @@ type DirectCampaignChanges struct {
 	Keywords          *[]string
 	NegativeKeywords  *[]string
 	WeeklyBudgetMinor *int64
-	StartsAt          *time.Time
-	EndsAt            *time.Time
-	ExpectedVersion   int64
+	// BidCeilingMinor uses zero to remove the optional provider ceiling. A nil
+	// pointer means the field is not part of this change.
+	BidCeilingMinor *int64
+	StartsAt        *time.Time
+	EndsAt          *time.Time
+	ExpectedVersion int64
 }
 
 type DirectAutoLaunchConsent struct {
@@ -248,6 +270,12 @@ type DirectLaunchMaterial struct {
 type DirectLaunchRecoveryCandidate struct {
 	WorkspaceID string
 	CampaignID  string
+}
+
+type DirectProviderSyncCandidate struct {
+	WorkspaceID string
+	CampaignID  string
+	ClaimedAt   time.Time
 }
 
 func (s *Store) CreateDirectOAuthState(
@@ -870,15 +898,16 @@ FROM direct_connections WHERE workspace_id=$1 AND revoked_at IS NULL FOR SHARE`,
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO direct_campaigns(
 	id,workspace_id,connection_id,name,objective,landing_url,brief,regions,
-	titles,texts,keywords,negative_keywords,weekly_budget_minor,currency_code,
+	titles,texts,keywords,negative_keywords,weekly_budget_minor,bid_ceiling_minor,currency_code,
 	starts_at,ends_at,status,provider_status,provider_state,version,created_by,
 	created_at,updated_at)
-	VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-	'draft','','',1,$17,$18,$18)`,
+	VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+	'draft','','',1,$18,$19,$19)`,
 		campaign.ID, workspaceID, connection.ID, campaign.Name, campaign.Objective,
 		campaign.LandingURL, campaign.Brief, string(regionsJSON), titlesJSON, textsJSON,
 		keywordsJSON, negativeKeywordsJSON, campaign.WeeklyBudgetMinor,
-		campaign.CurrencyCode, dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
+		campaign.BidCeilingMinor, campaign.CurrencyCode,
+		dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
 		actorUserID, now)
 	if err != nil {
 		return DirectCampaign{}, mapWorkspaceWriteError("create Direct campaign", err)
@@ -993,6 +1022,9 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 	if changes.WeeklyBudgetMinor != nil {
 		campaign.WeeklyBudgetMinor = *changes.WeeklyBudgetMinor
 	}
+	if changes.BidCeilingMinor != nil {
+		campaign.BidCeilingMinor = *changes.BidCeilingMinor
+	}
 	if changes.StartsAt != nil {
 		campaign.StartsAt = *changes.StartsAt
 	}
@@ -1015,11 +1047,13 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 	result, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
 SET name=$1,objective=$2,landing_url=$3,brief=$4,regions=$5,titles=$6,
     texts=$7,keywords=$8,negative_keywords=$9,weekly_budget_minor=$10,
-    starts_at=$11,ends_at=$12,version=version+1,updated_at=$13
-WHERE workspace_id=$14 AND id=$15 AND version=$16 AND status='draft'`,
+    bid_ceiling_minor=$11,starts_at=$12,ends_at=$13,
+    version=version+1,updated_at=$14
+WHERE workspace_id=$15 AND id=$16 AND version=$17 AND status='draft'`,
 		campaign.Name, campaign.Objective, campaign.LandingURL, campaign.Brief, string(regionsJSON),
 		titlesJSON, textsJSON, keywordsJSON, negativeKeywordsJSON,
-		campaign.WeeklyBudgetMinor, dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
+		campaign.WeeklyBudgetMinor, campaign.BidCeilingMinor,
+		dateOnly(campaign.StartsAt), dateOnly(campaign.EndsAt),
 		now, workspaceID, campaignID, changes.ExpectedVersion)
 	if err != nil {
 		return DirectCampaign{}, err
@@ -1218,6 +1252,10 @@ func (s *Store) syncDirectCampaignProviderStatus(
 	providerStatus, providerState string, expectedLaunchClaimedAt *time.Time,
 	now time.Time,
 ) (DirectCampaign, error) {
+	now = now.UTC().Truncate(time.Microsecond)
+	if now.IsZero() {
+		now = time.Now().UTC().Truncate(time.Microsecond)
+	}
 	providerStatus = normalizeDirectProviderStatus(providerStatus)
 	providerState = strings.ToUpper(strings.TrimSpace(providerState))
 	status := directCampaignStatusFromProviderLifecycle(providerStatus, providerState)
@@ -1238,6 +1276,11 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 AND provider_campaign_id=$
 		return DirectCampaign{}, ErrNotFound
 	}
 	if err != nil {
+		return DirectCampaign{}, err
+	}
+	if err := ensureDirectProviderSyncIdleTx(
+		ctx, tx, workspaceID, campaignID, now,
+	); err != nil {
 		return DirectCampaign{}, err
 	}
 	if expectedLaunchClaimedAt != nil {
@@ -1279,7 +1322,7 @@ SET status='active',provider_status=$1,provider_state=$2,
     launch_failure_code='',updated_at=$4
 WHERE workspace_id=$5 AND id=$6
   AND launch_state IN ('failed','launching','reconciling')`,
-			providerStatus, providerState, now.UTC().Add(directProviderPollLease),
+			providerStatus, providerState, directProviderNextCheckAt("active", now.UTC()),
 			now.UTC(), workspaceID, campaignID)
 		if updateErr != nil {
 			return DirectCampaign{}, updateErr
@@ -1301,7 +1344,7 @@ WHERE workspace_id=$5 AND id=$6
 SET status=$1,provider_status=$2,provider_state=$3,
     provider_next_check_at=$4,updated_at=$5
 WHERE workspace_id=$6 AND id=$7`, status, providerStatus, providerState,
-			now.UTC().Add(directProviderPollLease), now.UTC(), workspaceID, campaignID); err != nil {
+			directProviderNextCheckAt(status, now.UTC()), now.UTC(), workspaceID, campaignID); err != nil {
 			return DirectCampaign{}, err
 		}
 		if err := appendAuditEventTx(ctx, tx, AuditEvent{
@@ -1323,6 +1366,39 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2`, workspaceID, campaignID)
 	}
 	campaign.AutoLaunch, err = s.getDirectAutoLaunchSummary(ctx, workspaceID, campaign)
 	return campaign, err
+}
+
+// ensureDirectProviderSyncIdleTx gives ordinary provider observations and
+// launch transitions mutual exclusion with the leased lifecycle worker. The
+// caller must already hold the direct_campaigns row lock. An expired claim is
+// cleared under that lock, which also invalidates every late exact-generation
+// write made by its former owner.
+func ensureDirectProviderSyncIdleTx(
+	ctx context.Context, tx *sql.Tx, workspaceID, campaignID string, now time.Time,
+) error {
+	var claimedAt, leaseExpiresAt sql.NullTime
+	if err := tx.QueryRowContext(ctx, `SELECT provider_sync_claimed_at,provider_sync_lease_expires_at
+FROM direct_campaigns WHERE workspace_id=$1 AND id=$2`, workspaceID, campaignID).Scan(
+		&claimedAt, &leaseExpiresAt,
+	); err != nil {
+		return err
+	}
+	if !claimedAt.Valid && !leaseExpiresAt.Valid {
+		return nil
+	}
+	if leaseExpiresAt.Valid && leaseExpiresAt.Time.UTC().After(now.UTC()) {
+		return ErrDirectProviderOperationBusy
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
+SET provider_sync_claimed_at=NULL,provider_sync_lease_expires_at=NULL
+WHERE workspace_id=$1 AND id=$2`, workspaceID, campaignID)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrDirectProviderOperationBusy
+	}
+	return nil
 }
 
 func (s *Store) GrantDirectAutoLaunchConsent(
@@ -1500,7 +1576,22 @@ func (s *Store) SetDirectCampaignProviderSnapshotMismatch(
 	ctx context.Context, workspaceID, campaignID string, mismatch bool, now time.Time,
 ) error {
 	return s.setDirectCampaignProviderSnapshotMismatch(
-		ctx, workspaceID, campaignID, mismatch, nil, now,
+		ctx, workspaceID, campaignID, mismatch, nil, nil, now,
+	)
+}
+
+// SetDirectCampaignProviderSnapshotMismatchForSync fences lifecycle evidence
+// against the exact provider-sync generation that observed it.
+func (s *Store) SetDirectCampaignProviderSnapshotMismatchForSync(
+	ctx context.Context, workspaceID, campaignID string, mismatch bool,
+	expectedSyncClaimedAt, now time.Time,
+) error {
+	expectedSyncClaimedAt = expectedSyncClaimedAt.UTC().Truncate(time.Microsecond)
+	if expectedSyncClaimedAt.IsZero() {
+		return ErrConflict
+	}
+	return s.setDirectCampaignProviderSnapshotMismatch(
+		ctx, workspaceID, campaignID, mismatch, nil, &expectedSyncClaimedAt, now,
 	)
 }
 
@@ -1516,13 +1607,13 @@ func (s *Store) SetDirectCampaignProviderSnapshotMismatchForLaunch(
 		return ErrConflict
 	}
 	return s.setDirectCampaignProviderSnapshotMismatch(
-		ctx, workspaceID, campaignID, mismatch, &expectedLaunchClaimedAt, now,
+		ctx, workspaceID, campaignID, mismatch, &expectedLaunchClaimedAt, nil, now,
 	)
 }
 
 func (s *Store) setDirectCampaignProviderSnapshotMismatch(
 	ctx context.Context, workspaceID, campaignID string, mismatch bool,
-	expectedLaunchClaimedAt *time.Time, now time.Time,
+	expectedLaunchClaimedAt, expectedSyncClaimedAt *time.Time, now time.Time,
 ) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1531,10 +1622,13 @@ func (s *Store) setDirectCampaignProviderSnapshotMismatch(
 	defer func() { _ = tx.Rollback() }()
 	var launchState string
 	var launchClaimedAt sql.NullTime
-	err = tx.QueryRowContext(ctx, `SELECT launch_state,launch_claimed_at
+	var syncClaimedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `SELECT launch_state,launch_claimed_at,provider_sync_claimed_at
 FROM direct_campaigns
 WHERE workspace_id=$1 AND id=$2
-FOR UPDATE`, workspaceID, campaignID).Scan(&launchState, &launchClaimedAt)
+FOR UPDATE`, workspaceID, campaignID).Scan(
+		&launchState, &launchClaimedAt, &syncClaimedAt,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -1550,6 +1644,11 @@ FOR UPDATE`, workspaceID, campaignID).Scan(&launchState, &launchClaimedAt)
 	} else if launchState == "launching" || launchState == "reconciling" {
 		// Launch workers must use the fenced entry point. Ordinary lifecycle
 		// polling never owns an in-flight launch transition.
+		return ErrConflict
+	}
+	if expectedSyncClaimedAt != nil && (!syncClaimedAt.Valid ||
+		!syncClaimedAt.Time.UTC().Truncate(time.Microsecond).
+			Equal(*expectedSyncClaimedAt)) {
 		return ErrConflict
 	}
 	if mismatch {
@@ -1621,7 +1720,7 @@ UPDATE direct_campaigns c
 SET auto_launch_next_attempt_at=$3,updated_at=$1
 FROM candidates x
 WHERE c.workspace_id=x.workspace_id AND c.id=x.id
-RETURNING c.id`, now, limit, now.Add(directProviderPollLease))
+RETURNING c.id`, now, limit, now.Add(directAutoLaunchClaimLease))
 	if err != nil {
 		return nil, err
 	}
@@ -1639,7 +1738,7 @@ RETURNING c.id`, now, limit, now.Add(directProviderPollLease))
 
 func (s *Store) ClaimDirectProviderSyncCandidates(
 	ctx context.Context, now time.Time, limit int,
-) ([]DirectLaunchRecoveryCandidate, error) {
+) ([]DirectProviderSyncCandidate, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 10
 	}
@@ -1653,30 +1752,179 @@ func (s *Store) ClaimDirectProviderSyncCandidates(
     WHERE c.status IN ('provider_draft','moderation','accepted','rejected','active','suspended')
       AND c.launch_state NOT IN ('launching','reconciling')
       AND c.provider_campaign_id IS NOT NULL
+      AND c.graph_verified_at IS NOT NULL
+      AND c.provider_graph_hash <> ''
+      AND c.provider_revision_id IS NOT NULL
       AND c.provider_next_check_at <= $1
+      AND (c.provider_sync_lease_expires_at IS NULL OR
+           c.provider_sync_lease_expires_at <= $1)
+      AND NOT EXISTS (
+          SELECT 1 FROM direct_provider_operations o
+          WHERE o.workspace_id=c.workspace_id AND o.campaign_id=c.id
+            AND o.completed_at IS NULL
+      )
       AND cn.status='active' AND cn.revoked_at IS NULL
     ORDER BY c.provider_next_check_at,c.id
     FOR UPDATE OF c SKIP LOCKED
     LIMIT $2
 )
 UPDATE direct_campaigns c
-SET provider_next_check_at=$3,updated_at=$1
+SET provider_sync_claimed_at=GREATEST(
+        $1,
+        COALESCE(c.provider_sync_claimed_at + INTERVAL '1 microsecond',$1)
+    ),
+    provider_sync_lease_expires_at=$3,
+    updated_at=$1
 FROM candidates x
 WHERE c.workspace_id=x.workspace_id AND c.id=x.id
-RETURNING c.workspace_id,c.id`, now, limit, now.Add(directProviderPollLease))
+RETURNING c.workspace_id,c.id,c.provider_sync_claimed_at`,
+		now, limit, now.Add(directProviderSyncClaimLease))
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	result := make([]DirectLaunchRecoveryCandidate, 0)
+	result := make([]DirectProviderSyncCandidate, 0)
 	for rows.Next() {
-		var candidate DirectLaunchRecoveryCandidate
-		if err := rows.Scan(&candidate.WorkspaceID, &candidate.CampaignID); err != nil {
+		var candidate DirectProviderSyncCandidate
+		if err := rows.Scan(
+			&candidate.WorkspaceID, &candidate.CampaignID, &candidate.ClaimedAt,
+		); err != nil {
 			return nil, err
 		}
+		candidate.ClaimedAt = candidate.ClaimedAt.UTC()
 		result = append(result, candidate)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) ClaimDirectProviderSyncCampaign(
+	ctx context.Context, workspaceID, campaignID string, now time.Time,
+) (DirectProviderSyncCandidate, error) {
+	now = now.UTC().Truncate(time.Microsecond)
+	var candidate DirectProviderSyncCandidate
+	err := s.db.QueryRowContext(ctx, `UPDATE direct_campaigns c
+SET provider_sync_claimed_at=GREATEST(
+        $1,
+        COALESCE(c.provider_sync_claimed_at + INTERVAL '1 microsecond',$1)
+    ),
+    provider_sync_lease_expires_at=$4,
+    updated_at=$1
+WHERE c.workspace_id=$2 AND c.id=$3
+  AND c.status IN ('provider_draft','moderation','accepted','rejected','active','suspended')
+  AND c.launch_state NOT IN ('launching','reconciling')
+  AND c.provider_campaign_id IS NOT NULL
+  AND c.graph_verified_at IS NOT NULL
+  AND c.provider_graph_hash <> ''
+  AND c.provider_revision_id IS NOT NULL
+  AND (c.provider_sync_lease_expires_at IS NULL OR
+       c.provider_sync_lease_expires_at <= $1)
+  AND NOT EXISTS (
+      SELECT 1 FROM direct_provider_operations o
+      WHERE o.workspace_id=c.workspace_id AND o.campaign_id=c.id
+        AND o.completed_at IS NULL
+  )
+RETURNING c.workspace_id,c.id,c.provider_sync_claimed_at`,
+		now, workspaceID, campaignID, now.Add(directProviderSyncClaimLease)).Scan(
+		&candidate.WorkspaceID, &candidate.CampaignID, &candidate.ClaimedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DirectProviderSyncCandidate{}, ErrConflict
+	}
+	if err != nil {
+		return DirectProviderSyncCandidate{}, err
+	}
+	candidate.ClaimedAt = candidate.ClaimedAt.UTC()
+	return candidate, nil
+}
+
+func (s *Store) ReleaseDirectProviderSyncClaim(
+	ctx context.Context, candidate DirectProviderSyncCandidate, now time.Time,
+) error {
+	claimedAt := candidate.ClaimedAt.UTC().Truncate(time.Microsecond)
+	if candidate.WorkspaceID == "" || candidate.CampaignID == "" || claimedAt.IsZero() {
+		return ErrConflict
+	}
+	now = now.UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE direct_campaigns
+SET provider_sync_claimed_at=NULL,provider_sync_lease_expires_at=NULL,
+    provider_next_check_at=$1,updated_at=$2
+WHERE workspace_id=$3 AND id=$4 AND provider_sync_claimed_at=$5`,
+		now.Add(directProviderSyncErrorBackoff), now,
+		candidate.WorkspaceID, candidate.CampaignID, claimedAt)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (s *Store) CompleteDirectProviderSyncClaim(
+	ctx context.Context, candidate DirectProviderSyncCandidate, now time.Time,
+) error {
+	claimedAt := candidate.ClaimedAt.UTC().Truncate(time.Microsecond)
+	if candidate.WorkspaceID == "" || candidate.CampaignID == "" || claimedAt.IsZero() {
+		return ErrConflict
+	}
+	now = now.UTC()
+	result, err := s.db.ExecContext(ctx, `UPDATE direct_campaigns
+SET provider_sync_claimed_at=NULL,provider_sync_lease_expires_at=NULL,
+    provider_next_check_at=$1::timestamptz + CASE status
+        WHEN 'moderation' THEN INTERVAL '5 minutes'
+        WHEN 'provider_draft' THEN INTERVAL '15 minutes'
+        WHEN 'accepted' THEN INTERVAL '15 minutes'
+        WHEN 'active' THEN INTERVAL '30 minutes'
+        WHEN 'suspended' THEN INTERVAL '1 hour'
+        WHEN 'rejected' THEN INTERVAL '6 hours'
+        ELSE INTERVAL '15 minutes'
+    END,
+    updated_at=$1
+WHERE workspace_id=$2 AND id=$3 AND provider_sync_claimed_at=$4
+  AND graph_verified_at IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM direct_provider_operations o
+      WHERE o.workspace_id=direct_campaigns.workspace_id
+        AND o.campaign_id=direct_campaigns.id AND o.completed_at IS NULL
+  )`, now, candidate.WorkspaceID, candidate.CampaignID, claimedAt)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// AdvanceDirectCampaignChangesCursor persists provider time only after the
+// graph state corresponding to that cursor has been safely observed.
+func (s *Store) AdvanceDirectCampaignChangesCursor(
+	ctx context.Context, workspaceID, campaignID string, providerCampaignID int64,
+	expectedSyncClaimedAt, timestamp, now time.Time,
+) error {
+	expectedSyncClaimedAt = expectedSyncClaimedAt.UTC().Truncate(time.Microsecond)
+	timestamp = timestamp.UTC().Truncate(time.Second)
+	now = now.UTC()
+	if expectedSyncClaimedAt.IsZero() || timestamp.IsZero() || providerCampaignID <= 0 {
+		return ErrDirectValidation
+	}
+	result, err := s.db.ExecContext(ctx, `UPDATE direct_campaigns
+SET provider_changes_timestamp=CASE
+        WHEN provider_changes_timestamp IS NULL OR provider_changes_timestamp < $1 THEN $1
+        ELSE provider_changes_timestamp
+    END,
+    updated_at=$2
+WHERE workspace_id=$3 AND id=$4 AND provider_campaign_id=$5
+  AND graph_verified_at IS NOT NULL AND provider_sync_claimed_at=$6`,
+		timestamp, now, workspaceID, campaignID, providerCampaignID,
+		expectedSyncClaimedAt)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) ClaimDirectLaunchRecoveryCandidates(
@@ -1803,6 +2051,38 @@ WHERE workspace_id=$1 AND id=$2 AND launch_state IN ('launching','reconciling')`
 	}, nil
 }
 
+func (s *Store) GetDirectClaimedLifecycleMaterial(
+	ctx context.Context, candidate DirectProviderSyncCandidate,
+) (DirectLaunchMaterial, error) {
+	campaign, err := scanDirectCampaign(s.db.QueryRowContext(ctx, `SELECT `+directCampaignColumns+`
+FROM direct_campaigns
+WHERE workspace_id=$1 AND id=$2
+  AND status IN ('provider_draft','moderation','accepted','rejected','active','suspended')
+  AND provider_campaign_id IS NOT NULL
+  AND graph_verified_at IS NOT NULL
+  AND provider_graph_hash <> '' AND provider_revision_id IS NOT NULL
+  AND provider_sync_claimed_at=$3
+  AND NOT EXISTS (
+      SELECT 1 FROM direct_provider_operations o
+      WHERE o.workspace_id=direct_campaigns.workspace_id
+        AND o.campaign_id=direct_campaigns.id AND o.completed_at IS NULL
+  )`, candidate.WorkspaceID, candidate.CampaignID,
+		candidate.ClaimedAt.UTC().Truncate(time.Microsecond)))
+	if err != nil {
+		return DirectLaunchMaterial{}, err
+	}
+	connection, err := s.getDirectConnectionForWorker(
+		ctx, candidate.WorkspaceID, campaign.ConnectionID,
+	)
+	if err != nil || connection.Status != "active" || connection.TokenCiphertext == "" {
+		return DirectLaunchMaterial{}, ErrDirectConnectionRequired
+	}
+	return DirectLaunchMaterial{
+		Campaign: campaign, Connection: connection,
+		TokenCiphertext: connection.TokenCiphertext, TokenKeyVersion: connection.TokenKeyVersion,
+	}, nil
+}
+
 func (s *Store) GetDirectLifecycleMaterial(
 	ctx context.Context, workspaceID, campaignID string,
 ) (DirectLaunchMaterial, error) {
@@ -1810,11 +2090,20 @@ func (s *Store) GetDirectLifecycleMaterial(
 FROM direct_campaigns
 WHERE workspace_id=$1 AND id=$2
   AND status IN ('provider_draft','moderation','accepted','rejected','active','suspended')
-  AND provider_campaign_id IS NOT NULL`, workspaceID, campaignID))
+  AND provider_campaign_id IS NOT NULL
+  AND graph_verified_at IS NOT NULL
+  AND provider_graph_hash <> '' AND provider_revision_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM direct_provider_operations o
+      WHERE o.workspace_id=direct_campaigns.workspace_id
+        AND o.campaign_id=direct_campaigns.id AND o.completed_at IS NULL
+  )`, workspaceID, campaignID))
 	if err != nil {
 		return DirectLaunchMaterial{}, err
 	}
-	connection, err := s.getDirectConnectionForWorker(ctx, workspaceID, campaign.ConnectionID)
+	connection, err := s.getDirectConnectionForWorker(
+		ctx, workspaceID, campaign.ConnectionID,
+	)
 	if err != nil || connection.Status != "active" || connection.TokenCiphertext == "" {
 		return DirectLaunchMaterial{}, ErrDirectConnectionRequired
 	}
@@ -1890,6 +2179,11 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, workspaceID, 
 		if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner); err != nil {
 			return DirectLaunchMaterial{}, err
 		}
+	}
+	if err := ensureDirectProviderSyncIdleTx(
+		ctx, tx, workspaceID, campaignID, now,
+	); err != nil {
+		return DirectLaunchMaterial{}, err
 	}
 	canClaim := campaign.LaunchState == "idle" ||
 		(launchMode == "manual" && campaign.LaunchState == "failed")
@@ -2157,10 +2451,12 @@ func (s *Store) CompleteDirectCampaignLaunch(
 	result, err := tx.ExecContext(ctx, `UPDATE direct_campaigns
 SET status='active',provider_status='ACCEPTED',provider_state='ON',
     launch_state='confirmed',launched_at=$1,
-    launch_reconcile_after=NULL,launch_failed_at=NULL,launch_failure_code='',updated_at=$1
+    launch_reconcile_after=NULL,launch_failed_at=NULL,launch_failure_code='',
+    provider_next_check_at=$5,updated_at=$1
 WHERE workspace_id=$2 AND id=$3 AND status IN ('accepted','active')
   AND launch_state IN ('launching','reconciling') AND launch_claimed_at=$4`,
-		now.UTC(), workspaceID, campaignID, expectedLaunchClaimedAt)
+		now.UTC(), workspaceID, campaignID, expectedLaunchClaimedAt,
+		directProviderNextCheckAt("active", now.UTC()))
 	if err != nil {
 		return err
 	}
@@ -2294,6 +2590,9 @@ func validateDirectCampaignDraft(campaign *DirectCampaign) error {
 	if campaign.WeeklyBudgetMinor > DirectMaxCampaignWeeklyBudgetMinor {
 		return ErrDirectBudgetCapExceeded
 	}
+	if campaign.BidCeilingMinor < 0 {
+		return errors.New("bid_ceiling_minor must not be negative")
+	}
 	if campaign.StartsAt.IsZero() || campaign.EndsAt.IsZero() || campaign.EndsAt.Before(campaign.StartsAt) {
 		return errors.New("direct campaign dates are invalid")
 	}
@@ -2396,6 +2695,7 @@ func directConsentMatches(
 func directCampaignAuditMetadata(campaign DirectCampaign) json.RawMessage {
 	return mustJSON(map[string]any{
 		"weekly_budget_minor": campaign.WeeklyBudgetMinor,
+		"bid_ceiling_minor":   campaign.BidCeilingMinor,
 		"currency_code":       campaign.CurrencyCode,
 		"starts_at":           dateOnly(campaign.StartsAt).Format(time.DateOnly),
 		"ends_at":             dateOnly(campaign.EndsAt).Format(time.DateOnly),
@@ -2441,8 +2741,10 @@ func scanDirectCampaign(row scanner) (DirectCampaign, error) {
 	err := row.Scan(&campaign.ID, &campaign.WorkspaceID, &campaign.ConnectionID,
 		&providerCampaignID, &campaign.Name, &campaign.Objective, &campaign.LandingURL,
 		&campaign.Brief, &regionsJSON, &campaign.WeeklyBudgetMinor,
+		&campaign.BidCeilingMinor,
 		&campaign.CurrencyCode, &campaign.StartsAt, &campaign.EndsAt,
 		&campaign.Status, &campaign.ProviderStatus, &campaign.ProviderState,
+		&campaign.ProviderChangesTimestamp,
 		&campaign.ProviderNextCheckAt, &campaign.AutoLaunchNextAttemptAt,
 		&campaign.Version, &campaign.CreatedBy,
 		&campaign.SubmittedAt, &campaign.LaunchClaimedAt,
@@ -2567,6 +2869,10 @@ func normalizeDirectCampaign(campaign *DirectCampaign) {
 	campaign.UpdatedAt = campaign.UpdatedAt.UTC()
 	campaign.ProviderNextCheckAt = campaign.ProviderNextCheckAt.UTC()
 	campaign.AutoLaunchNextAttemptAt = campaign.AutoLaunchNextAttemptAt.UTC()
+	if campaign.ProviderChangesTimestamp != nil {
+		value := campaign.ProviderChangesTimestamp.UTC()
+		campaign.ProviderChangesTimestamp = &value
+	}
 	if campaign.SubmittedAt != nil {
 		value := campaign.SubmittedAt.UTC()
 		campaign.SubmittedAt = &value

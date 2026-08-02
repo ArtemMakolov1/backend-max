@@ -215,6 +215,9 @@ services:
       DIRECT_WRITES_ENABLED: ${DIRECT_WRITES_ENABLED}
       DIRECT_AUTO_LAUNCH_ENABLED: ${DIRECT_AUTO_LAUNCH_ENABLED}
       DIRECT_SANDBOX: ${DIRECT_SANDBOX}
+      YANDEX_WORDSTAT_API_BASE_URL: ${YANDEX_WORDSTAT_API_BASE_URL}
+      YANDEX_WORDSTAT_API_KEY: ${YANDEX_WORDSTAT_API_KEY}
+      YANDEX_WORDSTAT_FOLDER_ID: ${YANDEX_WORDSTAT_FOLDER_ID}
       OBSERVABILITY_ADMIN_USERS: ${OBSERVABILITY_ADMIN_USERS}
       AUTH_SESSION_TTL: ${AUTH_SESSION_TTL}
       WORKSPACE_MAX_OWNED_TEAM_WORKSPACES: ${WORKSPACE_MAX_OWNED_TEAM_WORKSPACES}
@@ -502,7 +505,7 @@ services:
     # The stable 13.1.0 image was blocked by the release CVE gate. This clean
     # official build is pinned by digest, so the mutable nightly tag can never
     # change what production pulls.
-    image: grafana/grafana:nightly-slim@sha256:951d45bbdb8a2e909fa1315b12a7bc3f7be3835e076e40ecf304888f426b6179
+    image: grafana/grafana:nightly-slim@sha256:b07cf664959594536506b7a0f80e7c2d62e691b81c81345ced595670dd35d08c
     restart: unless-stopped
     environment:
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}

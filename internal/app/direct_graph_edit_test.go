@@ -113,6 +113,10 @@ func newDirectProviderEditFixture(t *testing.T) directProviderEditFixture {
 			ID: 402, CampaignID: campaignID, AdGroupID: adGroupID,
 			Keyword: "ведение канала", StrategyPriority: "NORMAL",
 			Status: "ACCEPTED", State: "OFF", ServingStatus: "ELIGIBLE",
+		}, {
+			ID: 403, CampaignID: campaignID, AdGroupID: adGroupID,
+			Keyword:          yandexdirect.AutotargetingKeyword,
+			StrategyPriority: "NORMAL", Status: "ACCEPTED", State: "OFF",
 		}},
 	}
 	hash, err := base.Fingerprint()
@@ -331,8 +335,13 @@ func directProviderEditDesiredKeywords(
 	graph yandexdirect.CampaignGraph, fixture directProviderEditFixture,
 ) yandexdirect.CampaignGraph {
 	graph.Keywords = append([]yandexdirect.Keyword(nil), graph.Keywords...)
+	desiredIndex := 0
 	for index := range graph.Keywords {
-		graph.Keywords[index].Keyword = fixture.material.DesiredCampaign.Keywords[index]
+		if graph.Keywords[index].Keyword == yandexdirect.AutotargetingKeyword {
+			continue
+		}
+		graph.Keywords[index].Keyword = fixture.material.DesiredCampaign.Keywords[desiredIndex]
+		desiredIndex++
 	}
 	return graph
 }

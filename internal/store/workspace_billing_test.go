@@ -142,7 +142,7 @@ owner_id,document,version,accepted_at,source) VALUES
 	}
 	var storedVersion, storedText, storedTermsVersion, acceptedTermsVersion, effectiveTermsVersion, storedTermsURL string
 	if err := storage.db.QueryRowContext(ctx, `SELECT consent_version,consent_text,terms_version,
-accepted_terms_version,COALESCE(accepted_terms_version,terms_version),terms_url
+accepted_terms_version_v2,COALESCE(accepted_terms_version_v2,accepted_terms_version,terms_version),terms_url
 FROM billing_recurring_consents WHERE payment_attempt_id=$1`, attempt.ID).Scan(
 		&storedVersion, &storedText, &storedTermsVersion, &acceptedTermsVersion, &effectiveTermsVersion, &storedTermsURL,
 	); err != nil {

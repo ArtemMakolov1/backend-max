@@ -56,6 +56,18 @@ func TestDirectSafeBiddingStrategyPinsEverySearchPlacementOff(t *testing.T) {
 	if err := validateDirectSafeBiddingStrategy(unsafe, 30_000); err == nil {
 		t.Fatal("search placement drift was accepted")
 	}
+
+	strategyWithProviderNull, err := yandexdirect.SafeUnifiedCampaignBiddingStrategyUpdateWithCeiling(
+		30_000, 0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDirectSafeBiddingStrategy(
+		strategyWithProviderNull, 30_000, 0,
+	); err != nil {
+		t.Fatalf("provider null ceiling rejected: %v", err)
+	}
 }
 
 func TestDirectKeywordEditPlanRejectsUnknownExternalPhrase(t *testing.T) {
@@ -113,8 +125,11 @@ func TestDirectGraphDeliveryReadinessRejectsSuspendedChild(t *testing.T) {
 			ID: 2, State: "ON", Status: "ACCEPTED",
 		}},
 		Keywords: []yandexdirect.Keyword{{
-			ID: 3, State: "ON", Status: "ACCEPTED",
+			ID: 3, Keyword: "managed phrase", State: "ON", Status: "ACCEPTED",
 			ServingStatus: "ELIGIBLE",
+		}, {
+			ID: 4, Keyword: yandexdirect.AutotargetingKeyword,
+			State: "OFF", Status: "ACCEPTED",
 		}},
 	}
 	if !directGraphDeliveryReady(graph) {
@@ -123,6 +138,11 @@ func TestDirectGraphDeliveryReadinessRejectsSuspendedChild(t *testing.T) {
 	graph.Keywords[0].State = "OFF"
 	if directGraphDeliveryReady(graph) {
 		t.Fatal("suspended keyword was accepted for launch")
+	}
+	graph.Keywords[0].State = "ON"
+	graph.Keywords[1].State = "ON"
+	if directGraphDeliveryReady(graph) {
+		t.Fatal("enabled implicit autotargeting was accepted for launch")
 	}
 }
 
@@ -156,7 +176,8 @@ func TestDirectCampaignFromImmutableDesiredGraphIgnoresClaimMaterial(t *testing.
 	base := store.DirectCampaignDesiredGraph{
 		Name: "Base campaign", LandingURL: "https://maxposty.ru/base",
 		Regions: []string{"Moscow"}, WeeklyBudgetMinor: 30_000,
-		CurrencyCode: "RUB", StartsAt: start,
+		BidCeilingMinor: 2_500,
+		CurrencyCode:    "RUB", StartsAt: start,
 		EndsAt: start.AddDate(0, 1, 0), Titles: []string{"Base title"},
 		Texts: []string{"Base text"}, Keywords: []string{"base keyword"},
 		NegativeKeywords: []string{"negative"},
@@ -169,6 +190,7 @@ func TestDirectCampaignFromImmutableDesiredGraphIgnoresClaimMaterial(t *testing.
 		Name: "Desired campaign", LandingURL: "https://maxposty.ru/desired",
 		Regions: []string{"Saint Petersburg"}, Titles: []string{"Desired title"},
 		Texts: []string{"Desired text"}, Keywords: []string{"desired keyword"},
+		BidCeilingMinor: 9_900,
 	}
 	restored, err := directCampaignFromImmutableDesiredGraph(claimed, raw)
 	if err != nil {
@@ -179,7 +201,8 @@ func TestDirectCampaignFromImmutableDesiredGraphIgnoresClaimMaterial(t *testing.
 		!reflect.DeepEqual(restored.Regions, base.Regions) ||
 		!reflect.DeepEqual(restored.Titles, base.Titles) ||
 		!reflect.DeepEqual(restored.Texts, base.Texts) ||
-		!reflect.DeepEqual(restored.Keywords, base.Keywords) {
+		!reflect.DeepEqual(restored.Keywords, base.Keywords) ||
+		restored.BidCeilingMinor != base.BidCeilingMinor {
 		t.Fatalf("immutable base campaign = %#v", restored)
 	}
 }
@@ -291,6 +314,11 @@ func TestDirectProviderEditPrefixAllowsOnlyOwnedKeywordTransition(t *testing.T) 
 				ID: 15, CampaignID: 11, AdGroupID: 12, Keyword: "old two",
 				StrategyPriority: "NORMAL", Status: "ACCEPTED", State: "ON",
 			},
+			{
+				ID: 16, CampaignID: 11, AdGroupID: 12,
+				Keyword:          yandexdirect.AutotargetingKeyword,
+				StrategyPriority: "NORMAL", Status: "ACCEPTED", State: "OFF",
+			},
 		},
 	}
 	baseHash, err := baseGraph.Fingerprint()
@@ -324,12 +352,53 @@ func TestDirectProviderEditPrefixAllowsOnlyOwnedKeywordTransition(t *testing.T) 
 		t.Fatalf("owned partial keyword transition was rejected: %v", err)
 	}
 	current.Keywords = append(current.Keywords, yandexdirect.Keyword{
-		ID: 16, CampaignID: 11, AdGroupID: 12, Keyword: "external drift",
+		ID: 17, CampaignID: 11, AdGroupID: 12, Keyword: "external drift",
 		StrategyPriority: "NORMAL",
 	})
 	if _, err := directVerifyProviderEditPrefix(
 		current, material, baseline, "ad_updated",
 	); !errors.Is(err, ErrDirectSnapshotMismatch) {
 		t.Fatalf("external keyword drift error = %v", err)
+	}
+}
+
+func TestDirectAutotargetingIsRequiredDisabledAndNeverEdited(t *testing.T) {
+	t.Parallel()
+	auto := yandexdirect.Keyword{
+		ID: 90, CampaignID: 7, AdGroupID: 8,
+		Keyword:          yandexdirect.AutotargetingKeyword,
+		StrategyPriority: "NORMAL", Status: "ACCEPTED", State: "OFF",
+	}
+	managed := yandexdirect.Keyword{
+		ID: 91, CampaignID: 7, AdGroupID: 8, Keyword: "old phrase",
+		StrategyPriority: "NORMAL", Status: "ACCEPTED", State: "ON",
+	}
+	values := []yandexdirect.Keyword{auto, managed}
+	mappings, missing, err := directSubmissionKeywordState(
+		values, []string{"old phrase"}, 7, 8,
+	)
+	if err != nil || len(missing) != 0 || len(mappings) != 1 ||
+		mappings[0].ProviderKeywordID != managed.ID {
+		t.Fatalf("disabled autotargeting graph = %#v %#v %v", mappings, missing, err)
+	}
+	updates, deletes, adds, err := directKeywordEditPlan(
+		values, []string{"old phrase"}, []string{"new phrase"}, 7, 8,
+	)
+	if err != nil || len(updates) != 1 || updates[0].ID != managed.ID ||
+		len(deletes) != 0 || len(adds) != 0 {
+		t.Fatalf("edit plan touched implicit node: %#v %#v %#v %v",
+			updates, deletes, adds, err)
+	}
+
+	for _, invalid := range [][]yandexdirect.Keyword{
+		{managed},
+		{auto, auto, managed},
+		{func() yandexdirect.Keyword { value := auto; value.State = "ON"; return value }(), managed},
+	} {
+		if _, _, err := directSubmissionKeywordState(
+			invalid, []string{"old phrase"}, 7, 8,
+		); !errors.Is(err, ErrDirectSnapshotMismatch) {
+			t.Fatalf("unsafe autotargeting accepted: %#v error=%v", invalid, err)
+		}
 	}
 }

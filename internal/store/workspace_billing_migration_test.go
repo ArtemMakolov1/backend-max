@@ -401,3 +401,67 @@ WHERE conrelid='billing_recurring_consents'::regclass`).Scan(
 			legacyValidated, acceptedValidated)
 	}
 }
+
+func TestRecurringTerms20260802MigrationAllowsOnlyKnownEffectiveVersions(t *testing.T) {
+	ctx := context.Background()
+	testURL, db := newMigrationTestSchema(t)
+	migrations, err := loadEmbeddedMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentIndex := -1
+	for index, migration := range migrations {
+		if migration.version == "031_billing_recurring_terms_20260802.sql" {
+			currentIndex = index
+			break
+		}
+	}
+	if currentIndex <= 0 {
+		t.Fatal("031_billing_recurring_terms_20260802.sql not found in embedded migrations")
+	}
+	if err := runMigrationSet(ctx, testURL, migrations[:currentIndex+1]); err != nil {
+		t.Fatalf("apply migrations through current recurring terms: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO users(id,display_name,created_at,updated_at)
+VALUES('terms-20260802-owner','Terms migration',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`); err != nil {
+		t.Fatal(err)
+	}
+	var workspaceID string
+	if err := db.QueryRowContext(ctx, `SELECT id FROM workspaces
+WHERE owner_user_id='terms-20260802-owner' AND is_personal=TRUE`).Scan(&workspaceID); err != nil {
+		t.Fatal(err)
+	}
+	insertAttempt := func(id, key string) {
+		t.Helper()
+		if _, err := db.ExecContext(ctx, `INSERT INTO billing_payment_attempts(
+id,workspace_id,requested_by_user_id,purpose,idempotency_key,plan_code,plan_version,
+amount_minor,currency_code,status,provider_description,provider_return_url,
+create_deadline,next_attempt_at,created_at,updated_at)
+VALUES($1,$2,'terms-20260802-owner','checkout',$3,'solo',2,99000,'RUB','failed',
+'Terms migration checkout','https://maxposty.ru/app/',
+CURRENT_TIMESTAMP+INTERVAL '1 day',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`,
+			id, workspaceID, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertConsent := func(attemptID, acceptedVersion string) error {
+		_, err := db.ExecContext(ctx, `INSERT INTO billing_recurring_consents(
+payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,
+accepted_terms_version_v2,terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
+VALUES($1,$2,'terms-20260802-owner','yookassa-recurring-v2','Immutable consent','2026-07-22',
+$3,'https://maxposty.ru/terms/','solo',2,99000,'RUB',CURRENT_TIMESTAMP)`,
+			attemptID, workspaceID, acceptedVersion)
+		return err
+	}
+
+	currentAttemptID := "dddddddddddddddddddddddddddddddd"
+	insertAttempt(currentAttemptID, "44444444-4444-4444-4444-444444444444")
+	if err := insertConsent(currentAttemptID, "2026-08-02"); err != nil {
+		t.Fatalf("insert current accepted terms version: %v", err)
+	}
+	unknownAttemptID := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	insertAttempt(unknownAttemptID, "55555555-5555-5555-5555-555555555555")
+	if err := insertConsent(unknownAttemptID, "2026-08-03"); err == nil {
+		t.Fatal("unknown future accepted terms version passed the current CHECK")
+	}
+}

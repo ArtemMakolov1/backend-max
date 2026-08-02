@@ -599,6 +599,57 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		})
 		return
 	}
+	var wordstatLimitErr *app.WordstatRateLimitError
+	if errors.As(err, &wordstatLimitErr) {
+		retryAfter := retryAfterSeconds(wordstatLimitErr.RetryAfter)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+		s.problem(w, http.StatusTooManyRequests, "wordstat_rate_limited",
+			"Лимит запросов к Вордстату временно исчерпан. Попробуйте позже.", map[string]any{
+				"reason": wordstatLimitErr.Reason, "retry_after_seconds": retryAfter,
+			})
+		return
+	}
+	var directCompatibilityErr *app.DirectAccountCompatibilityError
+	if errors.As(err, &directCompatibilityErr) {
+		reason := directCompatibilityErr.Reason
+		message := "Этот кабинет Яндекс Директа не поддерживается текущей рекламной интеграцией."
+		switch reason {
+		case "unsupported_account_type":
+			message = "Подключить можно только кабинет прямого рекламодателя Яндекс Директа."
+		case "unsupported_account_currency":
+			message = "Подключить можно только кабинет Яндекс Директа с валютой RUB."
+		case "account_archived":
+			message = "Архивный кабинет Яндекс Директа нельзя подключить."
+		case "network_advertising_unavailable":
+			message = "В этом кабинете запрещены показы в Рекламной сети Яндекса."
+		case "unified_campaign_unavailable":
+			message = "Для этого логина недоступны Единые перфоманс-кампании."
+		default:
+			reason = "unsupported_account"
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		s.problem(w, http.StatusUnprocessableEntity, "direct_account_incompatible",
+			message, map[string]any{"reason": reason})
+		return
+	}
+	if directThrottle, ok := app.DirectProviderThrottle(err); ok {
+		retryAfter := retryAfterSeconds(directThrottle.RetryAfter)
+		status := http.StatusTooManyRequests
+		code := "direct_rate_limited"
+		message := "Лимит запросов к Яндекс Директу временно исчерпан. Попробуйте позже."
+		if directThrottle.ServiceUnavailable {
+			status = http.StatusServiceUnavailable
+			code = "direct_concurrency_limited"
+			message = "Яндекс Директ временно ограничил число одновременных запросов. Попробуйте позже."
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+		s.problem(w, status, code, message, map[string]any{
+			"reason": directThrottle.Reason, "retry_after_seconds": retryAfter,
+		})
+		return
+	}
 	var statsCooldownErr *app.MAXStatsCooldownError
 	if errors.As(err, &statsCooldownErr) {
 		retryAfter := retryAfterSeconds(statsCooldownErr.RetryAfter)
@@ -685,6 +736,15 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, app.ErrDirectGraphUnsupported):
 		s.problem(w, http.StatusServiceUnavailable, "direct_graph_unsupported",
 			"Безопасное создание полного графа кампании в Яндекс Директе временно недоступно.", nil)
+	case errors.Is(err, app.ErrDirectBidsUnavailable):
+		s.problem(w, http.StatusServiceUnavailable, "direct_bids_unavailable",
+			"Управление ставками Яндекс Директа временно недоступно.", nil)
+	case errors.Is(err, app.ErrWordstatNotConfigured):
+		s.problem(w, http.StatusServiceUnavailable, "wordstat_not_configured",
+			"Подбор ключевых фраз через Вордстат пока не настроен.", nil)
+	case errors.Is(err, app.ErrWordstatProvider):
+		s.problem(w, http.StatusBadGateway, "wordstat_provider_error",
+			"Вордстат временно не ответил. Попробуйте позже.", nil)
 	case errors.Is(err, app.ErrDirectAutoLaunchOff):
 		s.problem(w, http.StatusServiceUnavailable, "direct_auto_launch_disabled",
 			"Автозапуск кампаний временно отключён.", nil)

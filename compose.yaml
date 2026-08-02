@@ -148,6 +148,9 @@ services:
       DIRECT_API_BASE_URL: ${DIRECT_API_BASE_URL:-https://api-sandbox.direct.yandex.com/json/v5}
       DIRECT_WRITES_ENABLED: ${DIRECT_WRITES_ENABLED:-false}
       DIRECT_AUTO_LAUNCH_ENABLED: ${DIRECT_AUTO_LAUNCH_ENABLED:-false}
+      YANDEX_WORDSTAT_API_BASE_URL: ${YANDEX_WORDSTAT_API_BASE_URL:-https://searchapi.api.cloud.yandex.net}
+      YANDEX_WORDSTAT_API_KEY: ${YANDEX_WORDSTAT_API_KEY:-}
+      YANDEX_WORDSTAT_FOLDER_ID: ${YANDEX_WORDSTAT_FOLDER_ID:-}
       OBSERVABILITY_ADMIN_USERS: ${OBSERVABILITY_ADMIN_USERS:-}
       AUTH_SESSION_TTL: ${AUTH_SESSION_TTL:-12h}
       WORKSPACE_MAX_OWNED_TEAM_WORKSPACES: ${WORKSPACE_MAX_OWNED_TEAM_WORKSPACES:-5}
@@ -360,7 +363,7 @@ services:
       - monitoring
 
   grafana:
-    image: grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
+    image: grafana/grafana:nightly-slim@sha256:b07cf664959594536506b7a0f80e7c2d62e691b81c81345ced595670dd35d08c
     restart: unless-stopped
     environment:
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000/}

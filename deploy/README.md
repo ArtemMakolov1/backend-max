@@ -415,22 +415,37 @@ Set these production Environment variables:
 - `DIRECT_WRITES_ENABLED=false`
 - `DIRECT_AUTO_LAUNCH_ENABLED=false`
 
+Wordstat uses the separate Yandex Cloud Search API v2, not the Direct OAuth
+token. To enable the user-triggered keyword-suggestion tab, create a service
+account/API key with `yc.search-api.execute` and access to Search API, then set
+both `YANDEX_WORDSTAT_API_KEY` and `YANDEX_WORDSTAT_FOLDER_ID`. Leave both empty
+to keep the feature fail-closed. `YANDEX_WORDSTAT_API_BASE_URL` must remain
+`https://searchapi.api.cloud.yandex.net`. Migration `030_wordstat_quota.sql`
+must be applied before enabling the feature: it coordinates the shared-key
+rolling quota across replicas. The application reserves 3 logical calls/second
+and 33/hour (up to three provider attempts each), plus 2/second and 20/hour per
+workspace and 1/second and 10/hour per user/workspace. Cache hits and collapsed
+duplicate calls do not consume another reservation; quota responses expose
+HTTP 429 with `Retry-After`.
+
 Use this staged rollout:
 
 1. Deploy the fail-closed sandbox configuration above. Verify OAuth, advertiser
-   identity, existing-campaign reads, and logs; campaign creation is
-   intentionally unavailable while writes are disabled.
-2. In a separate sandbox deployment set `DIRECT_WRITES_ENABLED=true`, keep
+   identity, compatible v5 reads and secret-safe logs; campaign graph writes are
+   intentionally unavailable. The Direct sandbox does not expose the full v501
+   UnifiedCampaign contract and must not be used as proof of that workflow.
+2. After the Direct application is approved, switch together to
+   `DIRECT_SANDBOX=false` and
+   `DIRECT_API_BASE_URL=https://api.direct.yandex.com/json/v501`, keeping both
+   write flags disabled. Verify account identity, graph reads, Changes, Reports,
+   Units telemetry and rate-limit behavior on a controlled advertiser.
+3. Set `DIRECT_WRITES_ENABLED=true` only for a controlled live test, keep
    auto-launch disabled, and verify campaign creation, manual launch, provider
-   status polling, and ambiguous-launch recovery.
-3. Switch together to `DIRECT_SANDBOX=false` and
-    `DIRECT_API_BASE_URL=https://api.direct.yandex.com/json/v501`, initially
-    keeping auto-launch disabled while the live account and manual workflow are
-    verified.
-4. Leave `DIRECT_AUTO_LAUNCH_ENABLED=false`. The runtime additionally keeps the
-   effective value false until the provider campaign graph (groups, ads,
-   creatives, keywords and moderation state) is stored and verified. Turning on
-   only the environment flag cannot bypass this fail-closed guard.
+   status polling, bid-ceiling edits and ambiguous-write reconciliation.
+4. Enable `DIRECT_AUTO_LAUNCH_ENABLED` only after a separate production review.
+   Runtime still requires a complete verified provider graph, an immutable
+   revision and a separate exact consent; the environment flag cannot bypass
+   these guards.
 
 Do not point a production OAuth credential at an unapproved custom API origin.
 Disabling write flags is an emergency kill switch for provider mutations;
@@ -438,12 +453,21 @@ read-only status reconciliation remains active so an ambiguous launch can
 still be observed and recorded safely.
 
 Auto-launch consent snapshots the provider campaign ID, campaign name, weekly
-budget, dates, account, and local version, but it cannot snapshot every ad and
-creative edited directly in Yandex Direct. The owner must review the actual
-provider-side ads immediately before consent. Campaign API responses expose
-`setup_warning_code=provider_graph_unverified` while that gap remains. Keep
-`DIRECT_AUTO_LAUNCH_ENABLED=false` until provider-graph verification is
-implemented, tested and separately approved.
+budget, dates, account, local version, verified graph hash and immutable
+revision ID. The verified graph contains the campaign strategy/settings,
+group, responsive ad and keywords. An external provider edit invalidates the
+snapshot and blocks launch until a new authoritative graph has been read,
+validated and explicitly confirmed.
+
+Lifecycle polling uses an adaptive queue: 5 minutes during moderation,
+15 minutes for provider draft/accepted, 30 minutes for active, 1 hour for
+suspended and 6 hours for rejected campaigns. Each due check calls
+`Changes.check` first and downloads the full graph only when its composition
+changed. The Direct transport allows four simultaneous requests per advertiser
+against Yandex's limit of five, records `Units`, `Units-Used-Login` and
+`RequestId`, and retries only read methods. Full method sequences, retry rules
+and copy-ready API moderation text are maintained in
+`docs/yandex-direct-api-moderation.md`.
 
 The backend enforces two non-configurable safety limits in minor currency units:
 

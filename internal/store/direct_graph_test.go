@@ -21,17 +21,28 @@ func directObservedGraphFixture(
 	ad DirectModerationSnapshot,
 ) json.RawMessage {
 	t.Helper()
-	keywords := make([]map[string]any, len(mappings))
-	for index, mapping := range mappings {
-		keywords[index] = map[string]any{
-			"id":          mapping.ProviderKeywordID,
-			"campaign_id": providerCampaignID,
-			"ad_group_id": providerAdGroupID,
-			"keyword":     mapping.Keyword,
-			"status":      mapping.Moderation.Status,
-			"state":       mapping.Moderation.State,
+	keywords := make([]map[string]any, 0, len(mappings)+1)
+	autotargetingID := providerAdID + 1
+	for _, mapping := range mappings {
+		if mapping.ProviderKeywordID >= autotargetingID {
+			autotargetingID = mapping.ProviderKeywordID + 1
 		}
+		keywords = append(keywords, map[string]any{
+			"id":                mapping.ProviderKeywordID,
+			"campaign_id":       providerCampaignID,
+			"ad_group_id":       providerAdGroupID,
+			"keyword":           mapping.Keyword,
+			"strategy_priority": "NORMAL",
+			"status":            mapping.Moderation.Status,
+			"state":             mapping.Moderation.State,
+		})
 	}
+	keywords = append(keywords, map[string]any{
+		"id": autotargetingID, "campaign_id": providerCampaignID,
+		"ad_group_id":       providerAdGroupID,
+		"keyword":           directImplicitAutotargeting,
+		"strategy_priority": "NORMAL", "state": "OFF",
+	})
 	observed, err := canonicalDirectJSONObject(mustJSON(map[string]any{
 		"campaign": map[string]any{
 			"id": providerCampaignID, "status": campaign.Status,
@@ -59,15 +70,25 @@ func directYandexProviderGraphFixture(
 	mappings []DirectKeywordMapping,
 ) (json.RawMessage, string) {
 	t.Helper()
-	keywords := make([]yandexdirect.Keyword, len(mappings))
-	for index, mapping := range mappings {
-		keywords[index] = yandexdirect.Keyword{
+	keywords := make([]yandexdirect.Keyword, 0, len(mappings)+1)
+	autotargetingID := providerAdID + 1
+	for _, mapping := range mappings {
+		if mapping.ProviderKeywordID >= autotargetingID {
+			autotargetingID = mapping.ProviderKeywordID + 1
+		}
+		keywords = append(keywords, yandexdirect.Keyword{
 			ID: mapping.ProviderKeywordID, CampaignID: providerCampaignID,
 			AdGroupID: providerAdGroupID, Keyword: mapping.Keyword,
 			StrategyPriority: "NORMAL", Status: mapping.Moderation.Status,
 			State: "OFF",
-		}
+		})
 	}
+	keywords = append(keywords, yandexdirect.Keyword{
+		ID: autotargetingID, CampaignID: providerCampaignID,
+		AdGroupID:        providerAdGroupID,
+		Keyword:          yandexdirect.AutotargetingKeyword,
+		StrategyPriority: "NORMAL", State: "OFF",
+	})
 	graph := yandexdirect.CampaignGraph{
 		Campaign: yandexdirect.GraphCampaign{
 			ID: providerCampaignID, Name: "Campaign graph fixture",
@@ -768,6 +789,90 @@ func TestDirectObservedGraphStructureAcceptsStatusIndependentFingerprint(
 	}
 	if directGraphHash(draft) == directGraphHash(accepted) {
 		t.Fatal("status change did not alter full observed JSON hash")
+	}
+}
+
+func TestDirectObservedGraphStructureRequiresOneDisabledImplicitAutotargeting(
+	t *testing.T,
+) {
+	t.Parallel()
+	mappings := []DirectKeywordMapping{{
+		Keyword: "ведение канала", ProviderKeywordID: 104,
+		Moderation: DirectModerationSnapshot{Status: "DRAFT", State: "OFF"},
+	}}
+	base := directObservedGraphFixture(
+		t, 101, 102, 103, mappings,
+		DirectModerationSnapshot{Status: "DRAFT", State: "OFF"},
+		DirectModerationSnapshot{Status: "DRAFT"},
+		DirectModerationSnapshot{Status: "DRAFT", State: "OFF"},
+	)
+	mutate := func(change func([]any) []any) json.RawMessage {
+		t.Helper()
+		var document map[string]any
+		if err := json.Unmarshal(base, &document); err != nil {
+			t.Fatal(err)
+		}
+		keywords, ok := document["keywords"].([]any)
+		if !ok {
+			t.Fatalf("keywords = %#v", document["keywords"])
+		}
+		document["keywords"] = change(keywords)
+		payload, err := json.Marshal(document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+	tests := []struct {
+		name  string
+		graph json.RawMessage
+		want  error
+	}{
+		{
+			name: "missing implicit autotargeting",
+			graph: mutate(func(keywords []any) []any {
+				return keywords[:len(keywords)-1]
+			}),
+			want: ErrDirectGraphUnverified,
+		},
+		{
+			name: "multiple implicit autotargeting",
+			graph: mutate(func(keywords []any) []any {
+				return append(keywords, map[string]any{
+					"id": 106, "campaign_id": 101, "ad_group_id": 102,
+					"keyword":           directImplicitAutotargeting,
+					"strategy_priority": "NORMAL", "state": "OFF",
+				})
+			}),
+			want: ErrDirectGraphUnverified,
+		},
+		{
+			name: "enabled implicit autotargeting",
+			graph: mutate(func(keywords []any) []any {
+				keywords[len(keywords)-1].(map[string]any)["state"] = "ON"
+				return keywords
+			}),
+			want: ErrDirectGraphUnverified,
+		},
+		{
+			name: "user mapping mismatch",
+			graph: mutate(func(keywords []any) []any {
+				keywords[0].(map[string]any)["keyword"] = "другая фраза"
+				return keywords
+			}),
+			want: ErrDirectConsentMismatch,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := validateDirectObservedGraphStructure(
+				test.graph, 101, 102, 103, mappings,
+			); !errors.Is(err, test.want) {
+				t.Fatalf("validation error = %v, want %v", err, test.want)
+			}
+		})
 	}
 }
 

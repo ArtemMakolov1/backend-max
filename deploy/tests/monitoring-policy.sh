@@ -34,15 +34,15 @@ if [[ $(grep -c '^  - id:' "$monitoring_trivy_ignore") -ne 1 ]] ||
   echo "Monitoring Trivy exception must remain singular, version-scoped, and time-limited" >&2
   exit 1
 fi
-for target in bin/prometheus bin/promtool usr/share/grafana/bin/grafana; do
+for target in bin/prometheus bin/promtool; do
   grep -Fx "      - $target" "$monitoring_trivy_ignore" >/dev/null || {
     echo "Monitoring Trivy exception is missing exact target: $target" >&2
     exit 1
   }
 done
-if [[ $(grep -Fc 'trivyignores: ".github/trivy/monitoring-images.yaml"' "$security_workflow") -ne 2 ]] ||
+if [[ $(grep -Fc 'trivyignores: ".github/trivy/monitoring-images.yaml"' "$security_workflow") -ne 1 ]] ||
   [[ $(grep -Fc 'trivyignores: ${{ matrix.trivyignores }}' "$security_workflow") -ne 1 ]]; then
-  echo "Temporary Trivy exception must apply only to Prometheus and Grafana image scans" >&2
+  echo "Temporary Trivy exception must apply only to the Prometheus image scan" >&2
   exit 1
 fi
 

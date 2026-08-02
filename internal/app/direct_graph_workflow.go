@@ -384,6 +384,7 @@ func directCampaignFromImmutableDesiredGraph(
 	campaign.LandingURL = desired.LandingURL
 	campaign.Regions = append([]string(nil), desired.Regions...)
 	campaign.WeeklyBudgetMinor = desired.WeeklyBudgetMinor
+	campaign.BidCeilingMinor = desired.BidCeilingMinor
 	campaign.CurrencyCode = desired.CurrencyCode
 	campaign.StartsAt = desired.StartsAt
 	campaign.EndsAt = desired.EndsAt
@@ -566,6 +567,7 @@ func (a *App) directCreateOrReconcileCampaign(
 			ctx, token, material.Connection.ClientLogin, yandexdirect.CampaignDraft{
 				Name:              material.DesiredCampaign.Name,
 				WeeklyBudgetMinor: material.DesiredCampaign.WeeklyBudgetMinor,
+				BidCeilingMinor:   material.DesiredCampaign.BidCeilingMinor,
 				StartsAt:          material.DesiredCampaign.StartsAt,
 				EndsAt:            material.DesiredCampaign.EndsAt,
 				TimeZone:          material.Connection.Timezone,
@@ -792,8 +794,9 @@ func (a *App) directUpdateOrReconcileCampaign(
 	}
 	warnings := append([]store.DirectProviderIssue(nil), material.Operation.ProviderWarnings...)
 	if !state.CampaignDesired {
-		strategy, strategyErr := yandexdirect.SafeUnifiedCampaignBiddingStrategy(
+		strategy, strategyErr := yandexdirect.SafeUnifiedCampaignBiddingStrategyUpdateWithCeiling(
 			material.DesiredCampaign.WeeklyBudgetMinor,
+			material.DesiredCampaign.BidCeilingMinor,
 		)
 		if strategyErr != nil {
 			return material, strategyErr
@@ -914,7 +917,10 @@ func (a *App) directUpdateOrReconcileAd(
 	if material.Operation.ProviderCampaignID == nil ||
 		material.Operation.ProviderAdGroupID == nil ||
 		material.Operation.ProviderAdID == nil {
-		return material, store.ErrDirectGraphUnverified
+		return material, fmt.Errorf(
+			"%w: graph observation requires complete provider object ids",
+			store.ErrDirectGraphUnverified,
+		)
 	}
 	graph, err := a.directGraph.GetCampaignGraph(
 		ctx, token, material.Connection.ClientLogin,
@@ -1099,7 +1105,10 @@ func (a *App) directObserveOperationGraph(
 	if material.Operation.ProviderCampaignID == nil ||
 		material.Operation.ProviderAdGroupID == nil ||
 		material.Operation.ProviderAdID == nil {
-		return material, store.ErrDirectGraphUnverified
+		return material, fmt.Errorf(
+			"%w: graph revision requires complete provider object ids",
+			store.ErrDirectGraphUnverified,
+		)
 	}
 	graph, err := a.directGraph.GetCampaignGraph(
 		ctx, token, material.Connection.ClientLogin,
@@ -1197,7 +1206,10 @@ func (a *App) directRequestModeration(
 ) (store.DirectGraphSubmissionMaterial, error) {
 	if material.Operation.ProviderCampaignID == nil ||
 		material.Operation.ProviderAdID == nil {
-		return material, store.ErrDirectGraphUnverified
+		return material, fmt.Errorf(
+			"%w: moderation requires provider campaign and ad ids",
+			store.ErrDirectGraphUnverified,
+		)
 	}
 	graph, err := a.directGraph.GetCampaignGraph(
 		ctx, token, material.Connection.ClientLogin,
@@ -1291,7 +1303,7 @@ func (a *App) launchDirectCampaignVerified(
 		return store.DirectCampaign{}, store.ErrDirectModerationNotReady
 	}
 	if err := a.persistDirectGraphModeration(
-		ctx, material, graph, verified,
+		ctx, material, graph, verified, nil,
 	); err != nil {
 		return store.DirectCampaign{}, err
 	}
@@ -1338,7 +1350,7 @@ func (a *App) launchDirectAutoCampaignVerified(
 		return store.ErrDirectModerationNotReady
 	}
 	if err := a.persistDirectGraphModeration(
-		ctx, material, graph, verified,
+		ctx, material, graph, verified, nil,
 	); err != nil {
 		return err
 	}
@@ -1504,10 +1516,33 @@ func (a *App) reconcileDirectCampaignLaunch(
 func (a *App) syncDirectCampaignLifecycle(
 	ctx context.Context, workspaceID, campaignID string,
 ) error {
+	candidate, err := a.store.ClaimDirectProviderSyncCampaign(
+		ctx, workspaceID, campaignID, a.now().UTC(),
+	)
+	if err != nil {
+		return err
+	}
+	return a.syncClaimedDirectCampaignLifecycle(ctx, candidate)
+}
+
+func (a *App) syncClaimedDirectCampaignLifecycle(
+	ctx context.Context, candidate store.DirectProviderSyncCandidate,
+) (resultErr error) {
+	workspaceID, campaignID := candidate.WorkspaceID, candidate.CampaignID
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		_ = a.store.ReleaseDirectProviderSyncClaim(
+			releaseCtx, candidate, a.now().UTC(),
+		)
+	}()
 	if a.directGraph == nil || !a.directProviderGraphVerified {
 		return ErrDirectGraphUnsupported
 	}
-	material, err := a.store.GetDirectLifecycleMaterial(ctx, workspaceID, campaignID)
+	material, err := a.store.GetDirectClaimedLifecycleMaterial(ctx, candidate)
 	if err != nil {
 		return err
 	}
@@ -1519,6 +1554,40 @@ func (a *App) syncDirectCampaignLifecycle(
 	token, err := a.directAccessToken(ctx, material.Connection)
 	if err != nil {
 		return err
+	}
+	var changesCursor *time.Time
+	if a.directChanges != nil && material.Campaign.ProviderChangesTimestamp == nil {
+		providerTimestamp, timestampErr := a.directChanges.CurrentChangesTimestamp(
+			ctx, token, material.Connection.ClientLogin,
+		)
+		if timestampErr != nil {
+			return a.directGraphProviderError(
+				ctx, material.Connection, timestampErr,
+			)
+		}
+		changesCursor = &providerTimestamp
+	} else if a.directChanges != nil {
+		changes, checkErr := a.directChanges.CheckCampaignChanges(
+			ctx, token, material.Connection.ClientLogin,
+			*material.Campaign.ProviderCampaignID,
+			*material.Campaign.ProviderChangesTimestamp,
+		)
+		if checkErr != nil {
+			return a.directGraphProviderError(ctx, material.Connection, checkErr)
+		}
+		changesCursor = &changes.Timestamp
+		if !changes.GraphModified {
+			if err := a.store.AdvanceDirectCampaignChangesCursor(
+				ctx, workspaceID, campaignID,
+				*material.Campaign.ProviderCampaignID, candidate.ClaimedAt,
+				changes.Timestamp, a.now().UTC(),
+			); err != nil {
+				return err
+			}
+			return a.store.CompleteDirectProviderSyncClaim(
+				ctx, candidate, a.now().UTC(),
+			)
+		}
 	}
 	regionIDs, err := a.resolveDirectRegionIDs(
 		ctx, token, material.Connection, material.Campaign.Regions,
@@ -1540,22 +1609,36 @@ func (a *App) syncDirectCampaignLifecycle(
 		material.Campaign.ProviderAdID, false,
 	)
 	if err != nil || verified.GraphHash != material.Campaign.ProviderGraphHash {
-		_ = a.store.SetDirectCampaignProviderSnapshotMismatch(
-			ctx, workspaceID, campaignID, true, a.now().UTC(),
+		_ = a.store.SetDirectCampaignProviderSnapshotMismatchForSync(
+			ctx, workspaceID, campaignID, true, candidate.ClaimedAt, a.now().UTC(),
 		)
 		return errors.Join(ErrDirectSnapshotMismatch, err)
 	}
-	if err := a.store.SetDirectCampaignProviderSnapshotMismatch(
-		ctx, workspaceID, campaignID, false, a.now().UTC(),
+	if err := a.store.SetDirectCampaignProviderSnapshotMismatchForSync(
+		ctx, workspaceID, campaignID, false, candidate.ClaimedAt, a.now().UTC(),
 	); err != nil {
 		return err
 	}
-	return a.persistDirectGraphModeration(ctx, material, graph, verified)
+	if err := a.persistDirectGraphModeration(
+		ctx, material, graph, verified, &candidate.ClaimedAt,
+	); err != nil {
+		return err
+	}
+	if changesCursor != nil {
+		if err := a.store.AdvanceDirectCampaignChangesCursor(
+			ctx, workspaceID, campaignID, *material.Campaign.ProviderCampaignID,
+			candidate.ClaimedAt, *changesCursor, a.now().UTC(),
+		); err != nil {
+			return err
+		}
+	}
+	return a.store.CompleteDirectProviderSyncClaim(ctx, candidate, a.now().UTC())
 }
 
 func (a *App) persistDirectGraphModeration(
 	ctx context.Context, material store.DirectLaunchMaterial,
 	graph yandexdirect.CampaignGraph, verified directVerifiedProviderGraph,
+	expectedSyncClaimedAt *time.Time,
 ) error {
 	_, err := a.store.UpdateDirectCampaignGraphModeration(
 		ctx, material.Campaign.WorkspaceID, material.Campaign.ID,
@@ -1571,6 +1654,7 @@ func (a *App) persistDirectGraphModeration(
 			ProviderStatus:                   graph.Campaign.Status,
 			ProviderState:                    graph.Campaign.State,
 			StatusClarification:              verified.Clarification,
+			ExpectedSyncClaimedAt:            expectedSyncClaimedAt,
 			CheckedAt:                        a.now().UTC(),
 		},
 	)
@@ -1690,6 +1774,7 @@ func directCampaignNodeMatches(
 	return validateDirectSafeCampaignSettings(provider.Settings) == nil &&
 		validateDirectSafeBiddingStrategy(
 			provider.BiddingStrategy, campaign.WeeklyBudgetMinor,
+			campaign.BidCeilingMinor,
 		) == nil
 }
 
@@ -1827,6 +1912,7 @@ func directSubmissionKeywordState(
 	values []yandexdirect.Keyword, desired []string, campaignID, groupID int64,
 ) ([]store.DirectKeywordMapping, []string, error) {
 	byKeyword := make(map[string]yandexdirect.Keyword, len(values))
+	autotargetingCount := 0
 	desiredSet := make(map[string]struct{}, len(desired))
 	for _, value := range desired {
 		desiredSet[strings.ToLower(strings.TrimSpace(value))] = struct{}{}
@@ -1838,6 +1924,14 @@ func directSubmissionKeywordState(
 			value.UserParam1 != "" || value.UserParam2 != "" {
 			return nil, nil, errDirectProviderGraphMismatch
 		}
+		if value.Keyword == yandexdirect.AutotargetingKeyword {
+			autotargetingCount++
+			if autotargetingCount != 1 ||
+				strings.ToUpper(strings.TrimSpace(value.State)) != "OFF" {
+				return nil, nil, errDirectProviderGraphMismatch
+			}
+			continue
+		}
 		if _, wanted := desiredSet[key]; !wanted {
 			return nil, nil, errDirectProviderGraphMismatch
 		}
@@ -1845,6 +1939,9 @@ func directSubmissionKeywordState(
 			return nil, nil, errDirectProviderGraphMismatch
 		}
 		byKeyword[key] = value
+	}
+	if autotargetingCount != 1 {
+		return nil, nil, errDirectProviderGraphMismatch
 	}
 	mappings := make([]store.DirectKeywordMapping, 0, len(desired))
 	missing := make([]string, 0)
@@ -1884,11 +1981,20 @@ func directKeywordEditPlan(
 	}
 	matched := make(map[string]struct{}, len(desired))
 	unmatched := make([]yandexdirect.Keyword, 0)
+	autotargetingCount := 0
 	for _, keyword := range current {
 		if keyword.ID <= 0 || keyword.CampaignID != campaignID ||
 			keyword.AdGroupID != groupID || keyword.StrategyPriority != "NORMAL" ||
 			keyword.UserParam1 != "" || keyword.UserParam2 != "" {
 			return nil, nil, nil, errDirectProviderGraphMismatch
+		}
+		if keyword.Keyword == yandexdirect.AutotargetingKeyword {
+			autotargetingCount++
+			if autotargetingCount != 1 ||
+				strings.ToUpper(strings.TrimSpace(keyword.State)) != "OFF" {
+				return nil, nil, nil, errDirectProviderGraphMismatch
+			}
+			continue
 		}
 		key := strings.ToLower(strings.TrimSpace(keyword.Keyword))
 		if _, allowed := allowedExisting[key]; !allowed {
@@ -1903,6 +2009,9 @@ func directKeywordEditPlan(
 			continue
 		}
 		unmatched = append(unmatched, keyword)
+	}
+	if autotargetingCount != 1 {
+		return nil, nil, nil, errDirectProviderGraphMismatch
 	}
 	missing := make([]string, 0)
 	for _, phrase := range desired {
@@ -1957,11 +2066,19 @@ func directGraphDeliveryReady(graph yandexdirect.CampaignGraph) bool {
 		strings.ToUpper(strings.TrimSpace(graph.Ads[0].State)) != "ON" {
 		return false
 	}
+	autotargetingCount := 0
 	for _, keyword := range graph.Keywords {
+		if keyword.Keyword == yandexdirect.AutotargetingKeyword {
+			autotargetingCount++
+			if strings.ToUpper(strings.TrimSpace(keyword.State)) != "OFF" {
+				return false
+			}
+			continue
+		}
 		if strings.ToUpper(strings.TrimSpace(keyword.State)) != "ON" ||
 			!eligible(keyword.ServingStatus) {
 			return false
 		}
 	}
-	return true
+	return autotargetingCount == 1
 }

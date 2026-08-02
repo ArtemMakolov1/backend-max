@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -29,6 +30,7 @@ type directConnectionResponse struct {
 
 type directIntegrationResponse struct {
 	Configured                    bool                      `json:"configured"`
+	WordstatConfigured            bool                      `json:"wordstat_configured"`
 	WritesEnabled                 bool                      `json:"writes_enabled"`
 	AutoLaunchEnabled             bool                      `json:"auto_launch_enabled"`
 	MaxCampaignWeeklyBudgetMinor  int64                     `json:"max_campaign_weekly_budget_minor"`
@@ -52,6 +54,7 @@ type directCampaignResponse struct {
 	NegativeKeywords    []string                      `json:"negative_keywords"`
 	Regions             []string                      `json:"regions"`
 	WeeklyBudgetMinor   int64                         `json:"weekly_budget_minor"`
+	BidCeilingMinor     *int64                        `json:"bid_ceiling_minor"`
 	CurrencyCode        string                        `json:"currency_code"`
 	StartsAt            string                        `json:"starts_at"`
 	EndsAt              string                        `json:"ends_at"`
@@ -146,6 +149,10 @@ func (s *Server) registerDirectAdvertisingRoutes(r chi.Router) {
 		r.Post("/campaigns", s.createDirectCampaign)
 		r.Post("/campaigns/suggest", s.suggestDirectCampaign)
 		r.Patch("/campaigns/{campaign_id}", s.updateDirectCampaign)
+		r.Get("/campaigns/{campaign_id}/bids", s.getDirectCampaignBids)
+		r.Patch("/campaigns/{campaign_id}/bids", s.updateDirectCampaignBidCeiling)
+		r.Post("/campaigns/{campaign_id}/keyword-suggestions", s.suggestDirectCampaignKeywords)
+		r.Get("/campaigns/{campaign_id}/statistics", s.getDirectCampaignStatistics)
 		r.Post("/campaigns/{campaign_id}/auto-launch-consent", s.grantDirectConsent)
 		r.Delete("/campaigns/{campaign_id}/auto-launch-consent", s.revokeDirectConsent)
 		r.Post("/campaigns/{campaign_id}/submit", s.submitDirectCampaign)
@@ -166,7 +173,8 @@ func (s *Server) getDirectIntegration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := directIntegrationResponse{
-		Configured: status.Configured, WritesEnabled: status.WritesEnabled,
+		Configured: status.Configured, WordstatConfigured: status.WordstatConfigured,
+		WritesEnabled:                 status.WritesEnabled,
 		AutoLaunchEnabled:             status.AutoLaunchEnabled,
 		MaxCampaignWeeklyBudgetMinor:  store.DirectMaxCampaignWeeklyBudgetMinor,
 		MaxWorkspaceWeeklyBudgetMinor: store.DirectMaxWorkspaceWeeklyBudgetMinor,
@@ -262,7 +270,12 @@ func (s *Server) finishDirectOAuth(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		s.logger.Warn("Yandex Direct OAuth callback failed", "error", err)
-		http.Redirect(w, r, directOAuthErrorRedirect(s.frontendOrigin, "connect_failed"), http.StatusSeeOther)
+		code := "connect_failed"
+		var compatibilityErr *app.DirectAccountCompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			code = "account_incompatible_" + compatibilityErr.Reason
+		}
+		http.Redirect(w, r, directOAuthErrorRedirect(s.frontendOrigin, code), http.StatusSeeOther)
 		return
 	}
 	http.Redirect(w, r, s.frontendOrigin+completion.ReturnTo, http.StatusSeeOther)
@@ -610,6 +623,11 @@ func publicDirectCampaign(campaign store.DirectCampaign) directCampaignResponse 
 		providerID = &value
 	}
 	var moderationStatus, providerState, clarification, graphHash, revisionID, setupWarning *string
+	var bidCeiling *int64
+	if campaign.BidCeilingMinor != 0 {
+		value := campaign.BidCeilingMinor
+		bidCeiling = &value
+	}
 	if value := strings.TrimSpace(campaign.ProviderState); value != "" {
 		providerState = &value
 	}
@@ -653,7 +671,8 @@ func publicDirectCampaign(campaign store.DirectCampaign) directCampaignResponse 
 		Titles: campaign.Titles, Texts: campaign.Texts, Keywords: campaign.Keywords,
 		NegativeKeywords: campaign.NegativeKeywords,
 		Regions:          campaign.Regions, WeeklyBudgetMinor: campaign.WeeklyBudgetMinor,
-		CurrencyCode: campaign.CurrencyCode, StartsAt: campaign.StartsAt.Format(time.DateOnly),
+		BidCeilingMinor: bidCeiling,
+		CurrencyCode:    campaign.CurrencyCode, StartsAt: campaign.StartsAt.Format(time.DateOnly),
 		EndsAt: campaign.EndsAt.Format(time.DateOnly), Status: campaign.Status,
 		LaunchState:        campaign.LaunchState,
 		ProviderCampaignID: providerID, ProviderState: providerState,

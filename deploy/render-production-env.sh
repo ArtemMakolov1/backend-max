@@ -66,6 +66,8 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_direct_oauth_redirect_uri=''
   rendered_direct_token_data_key=''
   rendered_direct_api_base_url=https://api-sandbox.direct.yandex.com/json/v5
+  rendered_wordstat_api_key=''
+  rendered_wordstat_folder_id=''
   direct_writes_enabled=false
   direct_auto_launch_enabled=false
   direct_sandbox=true
@@ -101,6 +103,8 @@ else
   rendered_direct_oauth_client_secret=${DIRECT_OAUTH_CLIENT_SECRET:-}
   rendered_direct_oauth_redirect_uri=${DIRECT_OAUTH_REDIRECT_URI:-}
   rendered_direct_token_data_key=${DIRECT_TOKEN_DATA_KEY:-}
+  rendered_wordstat_api_key=${YANDEX_WORDSTAT_API_KEY:-}
+  rendered_wordstat_folder_id=${YANDEX_WORDSTAT_FOLDER_ID:-}
   if [[ "$direct_sandbox" == "true" ]]; then
     rendered_direct_api_base_url=${DIRECT_API_BASE_URL:-https://api-sandbox.direct.yandex.com/json/v5}
   else
@@ -170,6 +174,9 @@ fi
   printf 'DIRECT_WRITES_ENABLED=%s\n' "$direct_writes_enabled"
   printf 'DIRECT_AUTO_LAUNCH_ENABLED=%s\n' "$direct_auto_launch_enabled"
   printf 'DIRECT_SANDBOX=%s\n' "$direct_sandbox"
+  printf 'YANDEX_WORDSTAT_API_BASE_URL=https://searchapi.api.cloud.yandex.net\n'
+  printf 'YANDEX_WORDSTAT_API_KEY=%s\n' "$rendered_wordstat_api_key"
+  printf 'YANDEX_WORDSTAT_FOLDER_ID=%s\n' "$rendered_wordstat_folder_id"
   printf 'MAX_API_BASE_URL=https://platform-api2.max.ru\n'
   printf 'MAX_BOT_TOKEN=%s\n' "$rendered_bot_token"
   printf 'MAX_WEBHOOK_SECRET=%s\n' "$rendered_webhook_secret"

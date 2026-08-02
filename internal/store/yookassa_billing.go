@@ -228,7 +228,7 @@ AND a.status IN ('prepared','pending','manual_review') FOR UPDATE`, workspaceID)
 		var acceptedConsentVersion, acceptedTermsVersion, acceptedCurrencyCode string
 		var acceptedPlanVersion int
 		var acceptedMonthlyPriceMinor int64
-		err = tx.QueryRowContext(ctx, `SELECT consent_version,COALESCE(accepted_terms_version,terms_version),plan_version,
+		err = tx.QueryRowContext(ctx, `SELECT consent_version,COALESCE(accepted_terms_version_v2,accepted_terms_version,terms_version),plan_version,
 monthly_price_minor,currency_code FROM billing_recurring_consents WHERE payment_attempt_id=$1`,
 			openAttempt.ID).Scan(&acceptedConsentVersion, &acceptedTermsVersion, &acceptedPlanVersion,
 			&acceptedMonthlyPriceMinor, &acceptedCurrencyCode)
@@ -268,7 +268,7 @@ monthly_price_minor,currency_code FROM billing_recurring_consents WHERE payment_
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO billing_recurring_consents(
 payment_attempt_id,workspace_id,actor_user_id,consent_version,consent_text,terms_version,
-accepted_terms_version,terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
+accepted_terms_version_v2,terms_url,plan_code,plan_version,monthly_price_minor,currency_code,accepted_at)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, attempt.ID, workspaceID, actorUserID,
 		consent.Version, consent.Text, billingRecurringLegacyTermsVersion, consent.TermsVersion, consent.TermsURL,
 		plan.Code, plan.Version, plan.MonthlyPriceMinor, plan.CurrencyCode, now); err != nil {

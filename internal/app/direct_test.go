@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -76,6 +77,7 @@ func (f *fakeDirectProvider) CreateCampaignDraft(
 ) (yandexdirect.Campaign, error) {
 	f.campaign.Name = draft.Name
 	f.campaign.WeeklyBudgetMinor = draft.WeeklyBudgetMinor
+	f.campaign.BidCeilingMinor = draft.BidCeilingMinor
 	f.campaign.StartsAt = draft.StartsAt
 	f.campaign.EndsAt = draft.EndsAt
 	if f.campaign.ID == 0 {
@@ -101,6 +103,30 @@ func (f *fakeDirectProvider) GetCampaign(
 		return yandexdirect.Campaign{}, f.getErr
 	}
 	return f.campaign, nil
+}
+
+func (f *fakeDirectProvider) GetCampaignBidConfiguration(
+	_ context.Context, _, _ string, campaignID int64,
+) (yandexdirect.CampaignBidConfiguration, error) {
+	if f.campaign.ID != campaignID {
+		return yandexdirect.CampaignBidConfiguration{}, &yandexdirect.Error{Code: "not_found"}
+	}
+	return yandexdirect.CampaignBidConfiguration{
+		CampaignID: campaignID, WeeklyBudgetMinor: f.campaign.WeeklyBudgetMinor,
+		BidCeilingMinor: f.campaign.BidCeilingMinor,
+	}, nil
+}
+
+func (f *fakeDirectProvider) GetCurrencyBidLimits(
+	_ context.Context, _, _, currency string,
+) (yandexdirect.CurrencyBidLimits, error) {
+	if currency != "RUB" {
+		return yandexdirect.CurrencyBidLimits{}, &yandexdirect.Error{Code: "currency_not_found"}
+	}
+	return yandexdirect.CurrencyBidLimits{
+		CurrencyCode: "RUB", MinimumBidMinor: 30,
+		MaximumBidMinor: 2_500_000, BidIncrementMinor: 10,
+	}, nil
 }
 func (f *fakeDirectProvider) ResumeCampaign(context.Context, string, string, int64) error {
 	f.resumeCalls++
@@ -140,6 +166,11 @@ func (f *fakeDirectProvider) CreateUnifiedAdGroup(
 		NegativeKeywords: append([]string(nil), draft.NegativeKeywords...),
 		OfferRetargeting: "NO", Status: "DRAFT",
 	}
+	f.keywords = append(f.keywords, yandexdirect.Keyword{
+		ID: f.nextID(), CampaignID: draft.CampaignID, AdGroupID: id,
+		Keyword: yandexdirect.AutotargetingKeyword, StrategyPriority: "NORMAL",
+		Status: "DRAFT", State: "OFF",
+	})
 	return yandexdirect.MutationResult{ID: id}, nil
 }
 
@@ -326,6 +357,21 @@ func (f *fakeDirectProvider) UpdateUnifiedCampaigns(
 		if value.ID == f.campaign.ID {
 			f.campaign.Name = value.Name
 			f.campaign.WeeklyBudgetMinor = value.WeeklyBudgetMinor
+			var strategy struct {
+				Network struct {
+					WbMaximumClicks struct {
+						BidCeiling *int64 `json:"BidCeiling"`
+					} `json:"WbMaximumClicks"`
+				} `json:"Network"`
+			}
+			if json.Unmarshal(value.BiddingStrategy, &strategy) == nil &&
+				strategy.Network.WbMaximumClicks.BidCeiling != nil {
+				f.campaign.BidCeilingMinor, _ = yandexdirect.MicrosToMinor(
+					*strategy.Network.WbMaximumClicks.BidCeiling,
+				)
+			} else {
+				f.campaign.BidCeilingMinor = 0
+			}
 			f.campaign.StartsAt = value.StartsAt
 			f.campaign.EndsAt = value.EndsAt
 			f.campaign.TrackingParams = value.TrackingParams
@@ -347,8 +393,8 @@ func (f *fakeDirectProvider) GetCampaignGraph(
 	if f.campaign.ID != campaignID {
 		return yandexdirect.CampaignGraph{}, &yandexdirect.Error{Code: "not_found"}
 	}
-	strategy, err := yandexdirect.SafeUnifiedCampaignBiddingStrategy(
-		f.campaign.WeeklyBudgetMinor,
+	strategy, err := yandexdirect.SafeUnifiedCampaignBiddingStrategyWithCeiling(
+		f.campaign.WeeklyBudgetMinor, f.campaign.BidCeilingMinor,
 	)
 	if err != nil {
 		return yandexdirect.CampaignGraph{}, err
@@ -408,7 +454,11 @@ func (f *fakeDirectProvider) graphChildren() (
 		}
 		for index := range keywords {
 			keywords[index].Status = "ACCEPTED"
-			keywords[index].State = "ON"
+			if keywords[index].Keyword == yandexdirect.AutotargetingKeyword {
+				keywords[index].State = "OFF"
+			} else {
+				keywords[index].State = "ON"
+			}
 			keywords[index].ServingStatus = "ELIGIBLE"
 		}
 	}
@@ -486,10 +536,12 @@ func TestDirectAutoLaunchAmbiguousSuccessIsReconciledWithoutSecondWrite(t *testi
 	application, storage, provider, owner, workspace, connection, clock :=
 		newDirectAppFixture(t, ctx, true)
 	campaign := createDirectAppCampaign(t, ctx, application, owner, workspace.ID, *clock)
-	if _, err := application.SubmitDirectCampaign(
+	if submitted, err := application.SubmitDirectCampaign(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
 	); err != nil {
 		t.Fatal(err)
+	} else {
+		*clock = submitted.ProviderNextCheckAt.Add(time.Second)
 	}
 	provider.campaign.Status = "ACCEPTED"
 	provider.campaign.State = "OFF"
@@ -555,10 +607,12 @@ func TestDirectReconciliationConfirmsProviderONAndRecordsSnapshotDrift(t *testin
 	application, storage, provider, owner, workspace, connection, clock :=
 		newDirectAppFixture(t, ctx, true)
 	campaign := createDirectAppCampaign(t, ctx, application, owner, workspace.ID, *clock)
-	if _, err := application.SubmitDirectCampaign(
+	if submitted, err := application.SubmitDirectCampaign(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
 	); err != nil {
 		t.Fatal(err)
+	} else {
+		*clock = submitted.ProviderNextCheckAt.Add(time.Second)
 	}
 	provider.campaign.Status = "ACCEPTED"
 	provider.campaign.State = "OFF"
@@ -680,10 +734,12 @@ func TestDirectAutomationCycleBoundsProviderContext(t *testing.T) {
 	application, _, provider, owner, workspace, _, clock :=
 		newDirectAppFixture(t, ctx, false)
 	campaign := createDirectAppCampaign(t, ctx, application, owner, workspace.ID, *clock)
-	if _, err := application.SubmitDirectCampaign(
+	if submitted, err := application.SubmitDirectCampaign(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
 	); err != nil {
 		t.Fatal(err)
+	} else {
+		*clock = submitted.ProviderNextCheckAt.Add(time.Second)
 	}
 	provider.campaign.Status = "ACCEPTED"
 	provider.campaign.State = "OFF"
@@ -708,10 +764,12 @@ func TestDirectAutoLaunchInvalidatesConsentOnProviderStrategyDrift(t *testing.T)
 	application, storage, provider, owner, workspace, connection, clock :=
 		newDirectAppFixture(t, ctx, true)
 	campaign := createDirectAppCampaign(t, ctx, application, owner, workspace.ID, *clock)
-	if _, err := application.SubmitDirectCampaign(
+	if submitted, err := application.SubmitDirectCampaign(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
 	); err != nil {
 		t.Fatal(err)
+	} else {
+		*clock = submitted.ProviderNextCheckAt.Add(time.Second)
 	}
 	provider.campaign.Status = "ACCEPTED"
 	provider.campaign.State = "OFF"
@@ -752,10 +810,12 @@ func TestDirectAutoLaunchInvalidatesConsentOnProviderSnapshotDrift(t *testing.T)
 	application, storage, provider, owner, workspace, connection, clock :=
 		newDirectAppFixture(t, ctx, true)
 	campaign := createDirectAppCampaign(t, ctx, application, owner, workspace.ID, *clock)
-	if _, err := application.SubmitDirectCampaign(
+	if submitted, err := application.SubmitDirectCampaign(
 		ctx, owner, workspace.ID, campaign.ID, campaign.Version,
 	); err != nil {
 		t.Fatal(err)
+	} else {
+		*clock = submitted.ProviderNextCheckAt.Add(time.Second)
 	}
 	provider.campaign.Status = "ACCEPTED"
 	provider.campaign.State = "OFF"
@@ -783,6 +843,7 @@ func TestDirectAutoLaunchInvalidatesConsentOnProviderSnapshotDrift(t *testing.T)
 	}
 
 	provider.campaign.Name = "Changed directly in Yandex"
+	*clock = campaign.ProviderNextCheckAt.Add(time.Second)
 	application.RunDirectAutoLaunchOnce(ctx, 10)
 	campaign, err = storage.GetDirectCampaign(ctx, owner, workspace.ID, campaign.ID)
 	if err != nil {
@@ -901,6 +962,53 @@ func TestDirectProviderAuthorizationErrorRequiresAuthoritativeProviderSignal(t *
 	}
 	if directProviderAuthorizationError(context.DeadlineExceeded) {
 		t.Fatal("ambiguous transport error was treated as an expired credential")
+	}
+}
+
+func TestDirectProviderThrottlePreservesQuotaClassAndBoundsRetryAfter(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name            string
+		provider        *yandexdirect.Error
+		wantReason      string
+		wantRetryAfter  time.Duration
+		wantUnavailable bool
+	}{
+		{
+			name: "HTTP 429", provider: &yandexdirect.Error{
+				StatusCode: http.StatusTooManyRequests, RetryAfter: 17 * time.Second,
+			},
+			wantReason: "rate_limit", wantRetryAfter: 17 * time.Second,
+		},
+		{
+			name: "units 152 default", provider: &yandexdirect.Error{APIErrorCode: 152},
+			wantReason: "quota", wantRetryAfter: time.Minute,
+		},
+		{
+			name: "connections 506", provider: &yandexdirect.Error{
+				APIErrorCode: 506, RetryAfter: 12 * time.Hour,
+			},
+			wantReason: "concurrency", wantRetryAfter: directProviderRetryAfterLimit,
+			wantUnavailable: true,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			classified, ok := DirectProviderThrottle(
+				fmt.Errorf("%w: %w", ErrDirectProvider, test.provider),
+			)
+			if !ok || classified.Reason != test.wantReason ||
+				classified.RetryAfter != test.wantRetryAfter ||
+				classified.ServiceUnavailable != test.wantUnavailable {
+				t.Fatalf("classified = %#v, ok=%v", classified, ok)
+			}
+		})
+	}
+	if _, ok := DirectProviderThrottle(&yandexdirect.Error{
+		StatusCode: http.StatusTooManyRequests,
+	}); ok {
+		t.Fatal("unowned raw provider error was classified")
 	}
 }
 
@@ -1092,8 +1200,8 @@ func newDirectAppFixture(
 	provider := &fakeDirectProvider{
 		graphSupported: true,
 		account: yandexdirect.Account{
-			ID: "account-123", Login: "direct-login", DisplayName: "Direct account",
-			CurrencyCode: "RUB", Timezone: "Europe/Moscow",
+			ID: "account-123", Login: "direct-login",
+			RepresentativeName: "Direct representative", CurrencyCode: "RUB",
 		},
 		campaign: yandexdirect.Campaign{ID: 98_001},
 	}
@@ -1122,8 +1230,9 @@ func newDirectAppFixture(
 	}
 	connection, err := storage.ReplaceDirectConnection(ctx, owner, workspace.ID, store.DirectConnection{
 		AccountID: provider.account.ID, ClientLogin: provider.account.Login,
-		AccountName: provider.account.DisplayName, CurrencyCode: provider.account.CurrencyCode,
-		Timezone: provider.account.Timezone, TokenCiphertext: ciphertext,
+		AccountName:  provider.account.RepresentativeName,
+		CurrencyCode: provider.account.CurrencyCode,
+		Timezone:     yandexdirect.CampaignTimeZonePolicy, TokenCiphertext: ciphertext,
 		TokenKeyVersion: 1, CreatedAt: now,
 	})
 	if err != nil {

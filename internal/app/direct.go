@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ const (
 	directTokenRefreshSkew        = 5 * time.Minute
 	directTokenFallbackSkew       = 30 * time.Second
 	directTokenMaximumLifetime    = 100 * 365 * 24 * time.Hour
+	directProviderRetryAfterLimit = 5 * time.Minute
 )
 
 var (
@@ -41,6 +43,89 @@ var (
 	ErrDirectOAuthInvalid     = errors.New("invalid Yandex Direct OAuth completion")
 	ErrDirectOAuthFlow        = errors.New("completion flow for Yandex Direct OAuth does not match the configured redirect")
 )
+
+// DirectAccountCompatibilityError is safe to return to an authenticated API
+// client. It contains only a bounded product-owned reason code, never a
+// provider message, login, token, or request identifier.
+type DirectAccountCompatibilityError struct {
+	Reason string
+}
+
+// DirectProviderThrottleError is a sanitized classification of a Direct
+// quota/concurrency response. API layers may expose its bounded delay without
+// leaking the provider message or RequestId.
+type DirectProviderThrottleError struct {
+	RetryAfter         time.Duration
+	Reason             string
+	ServiceUnavailable bool
+}
+
+func (e *DirectProviderThrottleError) Error() string {
+	return "Yandex Direct temporarily limited the request"
+}
+
+func (e *DirectProviderThrottleError) Unwrap() error {
+	return ErrDirectProvider
+}
+
+// DirectProviderThrottle classifies only errors already owned by the Direct
+// application boundary. It deliberately ignores an unrelated raw provider
+// error and clamps Retry-After before the value reaches an HTTP response.
+func DirectProviderThrottle(err error) (*DirectProviderThrottleError, bool) {
+	var classified *DirectProviderThrottleError
+	if errors.As(err, &classified) {
+		result := *classified
+		result.RetryAfter = boundedDirectProviderRetryAfter(result.RetryAfter, time.Second)
+		return &result, true
+	}
+	if !errors.Is(err, ErrDirectProvider) {
+		return nil, false
+	}
+	var providerErr *yandexdirect.Error
+	if !errors.As(err, &providerErr) {
+		return nil, false
+	}
+	apiCode := providerErr.APIErrorCode
+	if apiCode == 0 {
+		apiCode, _ = strconv.Atoi(strings.TrimSpace(providerErr.Code))
+	}
+	switch {
+	case apiCode == 506:
+		return &DirectProviderThrottleError{
+			RetryAfter: boundedDirectProviderRetryAfter(providerErr.RetryAfter, 2*time.Second),
+			Reason:     "concurrency", ServiceUnavailable: true,
+		}, true
+	case apiCode == 152:
+		return &DirectProviderThrottleError{
+			RetryAfter: boundedDirectProviderRetryAfter(providerErr.RetryAfter, time.Minute),
+			Reason:     "quota",
+		}, true
+	case providerErr.StatusCode == http.StatusTooManyRequests:
+		return &DirectProviderThrottleError{
+			RetryAfter: boundedDirectProviderRetryAfter(providerErr.RetryAfter, time.Second),
+			Reason:     "rate_limit",
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func boundedDirectProviderRetryAfter(value, fallback time.Duration) time.Duration {
+	if value <= 0 {
+		value = fallback
+	}
+	if value < time.Second {
+		return time.Second
+	}
+	if value > directProviderRetryAfterLimit {
+		return directProviderRetryAfterLimit
+	}
+	return value
+}
+
+func (e *DirectAccountCompatibilityError) Error() string {
+	return "Yandex Direct account is incompatible with this integration"
+}
 
 type DirectProvider interface {
 	OAuthFlow() yandexdirect.OAuthFlow
@@ -102,6 +187,17 @@ type DirectGraphProvider interface {
 	GetCampaignGraph(context.Context, string, string, int64) (yandexdirect.CampaignGraph, error)
 }
 
+// DirectChangesProvider allows lifecycle polling to advance a cheap provider
+// cursor before downloading and verifying the complete campaign graph.
+type DirectChangesProvider interface {
+	CurrentChangesTimestamp(
+		context.Context, string, string,
+	) (time.Time, error)
+	CheckCampaignChanges(
+		context.Context, string, string, int64, time.Time,
+	) (yandexdirect.CampaignChanges, error)
+}
+
 type DirectCampaignSuggester interface {
 	SuggestDirectCampaign(
 		context.Context, openairesearch.SuggestDirectCampaignRequest,
@@ -135,12 +231,13 @@ type DirectOAuthCompletion struct {
 }
 
 type DirectIntegrationStatus struct {
-	Configured        bool
-	WritesEnabled     bool
-	AutoLaunchEnabled bool
-	Sandbox           bool
-	Connected         bool
-	Connection        *store.DirectConnection
+	Configured         bool
+	WordstatConfigured bool
+	WritesEnabled      bool
+	AutoLaunchEnabled  bool
+	Sandbox            bool
+	Connected          bool
+	Connection         *store.DirectConnection
 }
 
 func (a *App) ConfigureDirect(provider DirectProvider, dataKey []byte) error {
@@ -164,10 +261,14 @@ func (a *App) ConfigureDirect(provider DirectProvider, dataKey []byte) error {
 	}
 	a.direct = provider
 	a.directGraph = nil
+	a.directChanges = nil
 	a.directProviderGraphVerified = false
 	if graph, ok := provider.(DirectGraphProvider); ok && graph.SupportsUnifiedGraph() {
 		a.directGraph = graph
 		a.directProviderGraphVerified = true
+	}
+	if changes, ok := provider.(DirectChangesProvider); ok {
+		a.directChanges = changes
 	}
 	a.directCipher = &directTokenCipher{aead: aead}
 	a.directSandbox = provider.Sandbox()
@@ -217,7 +318,8 @@ func (a *App) GetDirectIntegrationStatus(
 	ctx context.Context, actorUserID, workspaceID string,
 ) (DirectIntegrationStatus, error) {
 	status := DirectIntegrationStatus{
-		Configured: a.DirectConfigured(), WritesEnabled: a.DirectWritesEnabled(),
+		Configured: a.DirectConfigured(), WordstatConfigured: a.WordstatConfigured(),
+		WritesEnabled:     a.DirectWritesEnabled(),
 		AutoLaunchEnabled: a.DirectAutoLaunchEnabled(), Sandbox: a.directSandbox,
 	}
 	connection, err := a.store.GetDirectConnection(ctx, actorUserID, workspaceID)
@@ -336,6 +438,12 @@ func (a *App) completeDirectOAuth(
 	}
 	account, err := a.direct.GetAccount(ctx, oauthToken.AccessToken, stored.ClientLogin)
 	if err != nil {
+		var compatibilityErr *yandexdirect.AccountCompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			return DirectOAuthCompletion{}, &DirectAccountCompatibilityError{
+				Reason: sanitizedDirectAccountCompatibilityReason(compatibilityErr.Reason),
+			}
+		}
 		return DirectOAuthCompletion{}, fmt.Errorf("%w: %w", ErrDirectProvider, err)
 	}
 	clientLogin := strings.TrimSpace(stored.ClientLogin)
@@ -354,8 +462,10 @@ func (a *App) completeDirectOAuth(
 	}
 	connection, err := a.store.ReplaceDirectConnectionFromOAuthAttempt(
 		ctx, actorUserID, stored.WorkspaceID, stored.StateHash, store.DirectConnection{
-			AccountID: account.ID, ClientLogin: clientLogin, AccountName: account.DisplayName,
-			CurrencyCode: account.CurrencyCode, Timezone: account.Timezone, ReadOnly: account.ReadOnly,
+			AccountID: account.ID, ClientLogin: clientLogin,
+			AccountName:  account.RepresentativeName,
+			CurrencyCode: account.CurrencyCode,
+			Timezone:     yandexdirect.CampaignTimeZonePolicy, ReadOnly: account.ReadOnly,
 			TokenCiphertext: ciphertext, TokenKeyVersion: 1, CreatedAt: a.now().UTC(),
 		})
 	if err != nil {
@@ -364,6 +474,19 @@ func (a *App) completeDirectOAuth(
 	return DirectOAuthCompletion{
 		WorkspaceID: stored.WorkspaceID, ReturnTo: stored.ReturnTo, Connection: connection,
 	}, nil
+}
+
+func sanitizedDirectAccountCompatibilityReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case yandexdirect.AccountIncompatibleType,
+		yandexdirect.AccountIncompatibleCurrency,
+		yandexdirect.AccountIncompatibleArchived,
+		yandexdirect.AccountIncompatibleNetwork,
+		yandexdirect.AccountIncompatibleUnifiedCampaign:
+		return strings.TrimSpace(reason)
+	default:
+		return "unsupported_account"
+	}
 }
 
 func (a *App) RevokeDirectConnection(
@@ -607,9 +730,7 @@ func (a *App) RunDirectAutoLaunchOnce(ctx context.Context, limit int) {
 		return
 	}
 	for _, candidate := range lifecycleCandidates {
-		if err := a.syncDirectCampaignLifecycle(
-			ctx, candidate.WorkspaceID, candidate.CampaignID,
-		); err != nil {
+		if err := a.syncClaimedDirectCampaignLifecycle(ctx, candidate); err != nil {
 			a.logger.Error("Yandex Direct lifecycle sync failed",
 				"workspace_id", candidate.WorkspaceID,
 				"campaign_id", candidate.CampaignID, "error", err)

@@ -220,6 +220,13 @@ type App struct {
 	billingManualReviewLastLog   time.Time
 	direct                       DirectProvider
 	directGraph                  DirectGraphProvider
+	directChanges                DirectChangesProvider
+	wordstat                     WordstatProvider
+	wordstatQuota                WordstatQuotaStore
+	wordstatProviderKeyHash      string
+	wordstatRequests             singleflight.Group
+	wordstatCacheMu              sync.Mutex
+	wordstatCache                map[string]wordstatCacheEntry
 	directCipher                 *directTokenCipher
 	directWritesEnabled          bool
 	directAutoLaunchEnabled      bool
@@ -245,6 +252,8 @@ func NewWithMetrics(storage *store.Store, mediaStore *media.Store, max MAXClient
 		store: storage, media: mediaStore, max: max, images: images, research: research,
 		logger: logger, metrics: metrics, now: time.Now,
 		discoverableRefreshes: make(map[string]discoverableRefreshState),
+		wordstatQuota:         storage,
+		wordstatCache:         make(map[string]wordstatCacheEntry),
 		mediaPolicy: MediaPolicy{
 			MaxFiles: defaultMediaMaxFiles, MaxBytes: defaultMediaMaxBytes,
 			OrphanGrace: defaultMediaOrphanGrace, CleanupInterval: defaultMediaCleanupInterval,

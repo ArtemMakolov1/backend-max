@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,6 +110,7 @@ func verifyDirectProviderGraphState(
 	}
 	if err := validateDirectSafeBiddingStrategy(
 		providerCampaign.BiddingStrategy, campaign.WeeklyBudgetMinor,
+		campaign.BidCeilingMinor,
 	); err != nil {
 		return directVerifiedProviderGraph{}, err
 	}
@@ -148,34 +150,11 @@ func verifyDirectProviderGraphState(
 		return mismatch("responsive ad href")
 	}
 
-	byKeyword := make(map[string]yandexdirect.Keyword, len(graph.Keywords))
-	for _, keyword := range graph.Keywords {
-		if keyword.CampaignID != providerCampaign.ID || keyword.AdGroupID != group.ID ||
-			keyword.ID <= 0 || keyword.StrategyPriority != "NORMAL" ||
-			keyword.UserParam1 != "" || keyword.UserParam2 != "" {
-			return mismatch("keyword")
-		}
-		key := strings.ToLower(strings.TrimSpace(keyword.Keyword))
-		if _, duplicate := byKeyword[key]; duplicate {
-			return mismatch("duplicate keyword")
-		}
-		byKeyword[key] = keyword
-	}
-	if len(byKeyword) != len(campaign.Keywords) {
-		return mismatch("keyword count")
-	}
-	keywordMappings := make([]store.DirectKeywordMapping, 0, len(campaign.Keywords))
-	for _, desiredKeyword := range campaign.Keywords {
-		keyword, ok := byKeyword[strings.ToLower(strings.TrimSpace(desiredKeyword))]
-		if !ok || keyword.Keyword != desiredKeyword {
-			return mismatch("keyword content")
-		}
-		keywordMappings = append(keywordMappings, store.DirectKeywordMapping{
-			Keyword: desiredKeyword, ProviderKeywordID: keyword.ID,
-			Moderation: directModerationSnapshot(
-				keyword.Status, keyword.State, keyword.ServingStatus, "",
-			),
-		})
+	keywordMappings, missingKeywords, keywordErr := directSubmissionKeywordState(
+		graph.Keywords, campaign.Keywords, providerCampaign.ID, group.ID,
+	)
+	if keywordErr != nil || len(missingKeywords) != 0 {
+		return mismatch("keyword content")
 	}
 
 	hash, err := graph.Fingerprint()
@@ -241,7 +220,16 @@ func validateDirectSafeCampaignSettings(settings []yandexdirect.GraphCampaignSet
 	return nil
 }
 
-func validateDirectSafeBiddingStrategy(raw json.RawMessage, budgetMinor int64) error {
+func validateDirectSafeBiddingStrategy(
+	raw json.RawMessage, budgetMinor int64, expectedBidCeilingMinor ...int64,
+) error {
+	wantBidCeilingMinor := int64(0)
+	if len(expectedBidCeilingMinor) > 1 {
+		return fmt.Errorf("%w: bid ceiling", errDirectProviderGraphMismatch)
+	}
+	if len(expectedBidCeilingMinor) == 1 {
+		wantBidCeilingMinor = expectedBidCeilingMinor[0]
+	}
 	var strategy map[string]json.RawMessage
 	if json.Unmarshal(raw, &strategy) != nil || len(strategy) != 2 {
 		return fmt.Errorf("%w: bidding strategy", errDirectProviderGraphMismatch)
@@ -275,7 +263,8 @@ func validateDirectSafeBiddingStrategy(raw json.RawMessage, budgetMinor int64) e
 		BiddingStrategyType string            `json:"BiddingStrategyType"`
 		PlacementTypes      map[string]string `json:"PlacementTypes"`
 		WbMaximumClicks     struct {
-			WeeklySpendLimit int64 `json:"WeeklySpendLimit"`
+			WeeklySpendLimit int64  `json:"WeeklySpendLimit"`
+			BidCeiling       *int64 `json:"BidCeiling"`
 		} `json:"WbMaximumClicks"`
 	}
 	if json.Unmarshal(strategy["Network"], &network) != nil ||
@@ -289,6 +278,20 @@ func validateDirectSafeBiddingStrategy(raw json.RawMessage, budgetMinor int64) e
 	if err != nil || network.WbMaximumClicks.WeeklySpendLimit != wantMicros {
 		return fmt.Errorf("%w: network budget", errDirectProviderGraphMismatch)
 	}
+	if wantBidCeilingMinor < 0 {
+		return fmt.Errorf("%w: bid ceiling", errDirectProviderGraphMismatch)
+	}
+	if wantBidCeilingMinor == 0 {
+		if network.WbMaximumClicks.BidCeiling != nil {
+			return fmt.Errorf("%w: unexpected bid ceiling", errDirectProviderGraphMismatch)
+		}
+	} else {
+		wantBidCeilingMicros, convertErr := yandexdirect.MinorToMicros(wantBidCeilingMinor)
+		if convertErr != nil || network.WbMaximumClicks.BidCeiling == nil ||
+			*network.WbMaximumClicks.BidCeiling != wantBidCeilingMicros {
+			return fmt.Errorf("%w: bid ceiling", errDirectProviderGraphMismatch)
+		}
+	}
 	var networkFields map[string]json.RawMessage
 	if json.Unmarshal(strategy["Network"], &networkFields) != nil ||
 		len(networkFields) != 3 ||
@@ -299,7 +302,18 @@ func validateDirectSafeBiddingStrategy(raw json.RawMessage, budgetMinor int64) e
 	}
 	var clickFields map[string]json.RawMessage
 	if json.Unmarshal(networkFields["WbMaximumClicks"], &clickFields) != nil ||
-		len(clickFields) != 1 || clickFields["WeeklySpendLimit"] == nil {
+		(len(clickFields) != 1 && len(clickFields) != 2) ||
+		clickFields["WeeklySpendLimit"] == nil {
+		return fmt.Errorf("%w: click strategy", errDirectProviderGraphMismatch)
+	}
+	bidCeilingRaw, bidCeilingPresent := clickFields["BidCeiling"]
+	bidCeilingNull := bidCeilingPresent && bytes.Equal(
+		bytes.TrimSpace(bidCeilingRaw), []byte("null"),
+	)
+	if (wantBidCeilingMinor == 0 && bidCeilingPresent &&
+		!bidCeilingNull) ||
+		(wantBidCeilingMinor != 0 && (!bidCeilingPresent ||
+			bidCeilingNull)) {
 		return fmt.Errorf("%w: click strategy", errDirectProviderGraphMismatch)
 	}
 	return nil
@@ -338,6 +352,9 @@ func directGraphModerationStatus(
 		}
 	}
 	for _, keyword := range graph.Keywords {
+		if keyword.Keyword == yandexdirect.AutotargetingKeyword {
+			continue
+		}
 		statuses = append(statuses, keyword.Status)
 	}
 	pending := false

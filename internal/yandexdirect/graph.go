@@ -223,6 +223,11 @@ type Keyword struct {
 	ServingStatus    string `json:"serving_status,omitempty"`
 }
 
+// AutotargetingKeyword is the implicit criterion Direct creates for every ad
+// group. MaxPosty keeps this criterion present but disabled for NETWORK-only
+// delivery and never treats it as a user-managed phrase.
+const AutotargetingKeyword = "---autotargeting"
+
 // GraphCampaignSetting is one explicitly returned UnifiedCampaign option.
 // Unknown future options remain part of the graph instead of being discarded.
 type GraphCampaignSetting struct {
@@ -323,6 +328,9 @@ func (c *Client) ResolveRegionNames(
 	if err != nil {
 		return nil, err
 	}
+	if cached, ok := c.regionCache.get(normalizedNames); ok {
+		return cached, nil
+	}
 	var response struct {
 		LimitedBy *int64 `json:"LimitedBy"`
 		Regions   []struct {
@@ -388,6 +396,7 @@ func (c *Client) ResolveRegionNames(
 			return nil, &Error{Code: "region_name_ambiguous", Message: name}
 		}
 	}
+	c.regionCache.put(normalizedNames, resolved)
 	return resolved, nil
 }
 
@@ -1360,7 +1369,7 @@ func (c *Client) GetGraphCampaign(
 			"FieldNames": []string{
 				"Id", "Name", "Status", "State", "Type", "StartDate", "EndDate",
 				"TimeZone", "NegativeKeywords", "BlockedIps", "ExcludedSites",
-				"TimeTargeting", "DailyBudget",
+				"TimeTargeting",
 			},
 			"UnifiedCampaignFieldNames": []string{
 				"BiddingStrategy", "Settings", "CounterIds", "PriorityGoals",
@@ -1396,7 +1405,6 @@ func (c *Client) GetGraphCampaign(
 		BlockedIPs       *graphStringItems `json:"BlockedIps"`
 		ExcludedSites    *graphStringItems `json:"ExcludedSites"`
 		TimeTargeting    json.RawMessage   `json:"TimeTargeting"`
-		DailyBudget      json.RawMessage   `json:"DailyBudget"`
 		UnifiedCampaign  json.RawMessage   `json:"UnifiedCampaign"`
 	}
 	if err := json.Unmarshal(response.Campaigns[0], &envelope); err != nil {
@@ -1405,9 +1413,6 @@ func (c *Client) GetGraphCampaign(
 	var campaignFields map[string]json.RawMessage
 	if err := json.Unmarshal(response.Campaigns[0], &campaignFields); err != nil {
 		return GraphCampaign{}, &Error{Code: "invalid_campaign_response"}
-	}
-	if rawJSONPresent(envelope.DailyBudget) {
-		return GraphCampaign{}, &Error{Code: "unsupported_campaign_daily_budget"}
 	}
 	var unified struct {
 		BiddingStrategy json.RawMessage `json:"BiddingStrategy"`
@@ -1442,7 +1447,7 @@ func (c *Client) GetGraphCampaign(
 	if !rawJSONHasKeys(campaignFields, []string{
 		"Id", "Name", "Status", "State", "Type", "StartDate", "EndDate",
 		"TimeZone", "NegativeKeywords", "BlockedIps", "ExcludedSites",
-		"TimeTargeting", "DailyBudget", "UnifiedCampaign",
+		"TimeTargeting", "UnifiedCampaign",
 	}) || !rawJSONHasKeys(unifiedFields, []string{
 		"BiddingStrategy", "Settings", "CounterIds", "PriorityGoals",
 		"NegativeKeywordSharedSetIds", "TrackingParams", "AttributionModel",
@@ -2492,7 +2497,7 @@ func normalizeKeyword(keyword Keyword, expectedCampaignID int64) (Keyword, error
 
 func normalizeKeywordText(raw string, allowAutotargeting bool) (string, error) {
 	raw = graphText(raw)
-	if raw == "---autotargeting" {
+	if raw == AutotargetingKeyword {
 		if allowAutotargeting {
 			return raw, nil
 		}

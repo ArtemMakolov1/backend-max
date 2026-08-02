@@ -60,6 +60,42 @@ func TestOAuthRedirectAllowlistAndVerificationCodeFlow(t *testing.T) {
 	}
 }
 
+func TestSafeUnifiedCampaignUpdateExplicitlyClearsBidCeiling(t *testing.T) {
+	t.Parallel()
+	strategy, err := SafeUnifiedCampaignBiddingStrategyUpdateWithCeiling(30_000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Network struct {
+			WbMaximumClicks map[string]json.RawMessage `json:"WbMaximumClicks"`
+		} `json:"Network"`
+	}
+	if err := json.Unmarshal(strategy, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	value, present := decoded.Network.WbMaximumClicks["BidCeiling"]
+	if !present || string(value) != "null" {
+		t.Fatalf("update BidCeiling = %s, present=%v; want explicit null", value, present)
+	}
+
+	addStrategy, err := SafeUnifiedCampaignBiddingStrategyWithCeiling(30_000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedAdd struct {
+		Network struct {
+			WbMaximumClicks map[string]json.RawMessage `json:"WbMaximumClicks"`
+		} `json:"Network"`
+	}
+	if err := json.Unmarshal(addStrategy, &decodedAdd); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := decodedAdd.Network.WbMaximumClicks["BidCeiling"]; present {
+		t.Fatal("campaign add strategy must omit an unset BidCeiling")
+	}
+}
+
 func TestCreateCampaignDraftPreservesPerItemRejectionBeforeMissingID(
 	t *testing.T,
 ) {
@@ -635,34 +671,47 @@ func TestFindWeeklySpendLimitUsesExactJSONNumber(t *testing.T) {
 	}
 }
 
-func TestGetAccountFailsClosedForAgencyUnknownOrNonChiefActors(t *testing.T) {
+func TestGetAccountRequiresSupportedDirectAccount(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name     string
-		itemType string
-		role     string
-		grant    string
-		readOnly bool
+		name                  string
+		itemType              string
+		currency              string
+		archived              string
+		forbiddenPlatform     string
+		availableCampaignType string
+		wantReason            string
 	}{
 		{
-			name: "direct chief with explicit edit grant", itemType: "CLIENT",
-			role: "CHIEF", grant: "YES", readOnly: false,
+			name: "supported direct RUB network account", itemType: "CLIENT",
+			currency: "RUB", archived: "NO", forbiddenPlatform: "NONE",
+			availableCampaignType: "UNIFIED_CAMPAIGN",
 		},
 		{
-			name: "agency is unsupported", itemType: "AGENCY",
-			role: "CHIEF", grant: "YES", readOnly: true,
+			name: "agency", itemType: "AGENCY", currency: "RUB", archived: "NO",
+			forbiddenPlatform: "NONE", availableCampaignType: "UNIFIED_CAMPAIGN",
+			wantReason: AccountIncompatibleType,
 		},
 		{
-			name: "unknown account type", itemType: "",
-			role: "CHIEF", grant: "YES", readOnly: true,
+			name: "non RUB currency", itemType: "CLIENT", currency: "USD", archived: "NO",
+			forbiddenPlatform: "NONE", availableCampaignType: "UNIFIED_CAMPAIGN",
+			wantReason: AccountIncompatibleCurrency,
 		},
 		{
-			name: "delegate actor", itemType: "CLIENT",
-			role: "DELEGATE", grant: "YES", readOnly: true,
+			name: "archived", itemType: "CLIENT", currency: "RUB", archived: "YES",
+			forbiddenPlatform: "NONE", availableCampaignType: "UNIFIED_CAMPAIGN",
+			wantReason: AccountIncompatibleArchived,
 		},
 		{
-			name: "missing edit grant", itemType: "CLIENT",
-			role: "CHIEF", grant: "", readOnly: true,
+			name: "network forbidden", itemType: "CLIENT", currency: "RUB", archived: "NO",
+			forbiddenPlatform: "NETWORK", availableCampaignType: "UNIFIED_CAMPAIGN",
+			wantReason: AccountIncompatibleNetwork,
+		},
+		{
+			name: "unified campaign unavailable", itemType: "CLIENT", currency: "RUB",
+			archived: "NO", forbiddenPlatform: "NONE",
+			availableCampaignType: "TEXT_CAMPAIGN",
+			wantReason:            AccountIncompatibleUnifiedCampaign,
 		},
 	}
 	for _, test := range tests {
@@ -679,18 +728,74 @@ func TestGetAccountFailsClosedForAgencyUnknownOrNonChiefActors(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				foundType := false
+				found := map[string]bool{}
 				for _, field := range payload.Params.FieldNames {
-					foundType = foundType || field == "Type"
+					found[field] = true
 				}
-				if !foundType {
-					t.Error("Clients.get did not request the account Type")
+				for _, required := range []string{
+					"Type", "Archived", "ForbiddenPlatform", "AvailableCampaignTypes",
+				} {
+					if !found[required] {
+						t.Errorf("Clients.get did not request %s", required)
+					}
 				}
 				_, _ = fmt.Fprintf(w, `{"result":{"Clients":[{
-"ClientId":7003,"Login":"client-login","ClientInfo":"Direct client","Currency":"RUB",
-"Type":%q,"Representatives":[{"Login":"client-login","Role":%q}],
+"ClientId":7003,"Login":"client-login","ClientInfo":"Direct client",
+"Type":%q,"Currency":%q,"Archived":%q,"ForbiddenPlatform":%q,
+"AvailableCampaignTypes":%q,
+"Representatives":[{"Login":"client-login","Role":"CHIEF"}],
+"Grants":[{"Privilege":"EDIT_CAMPAIGNS","Value":"YES"}]
+}]}}`, test.itemType, test.currency, test.archived, test.forbiddenPlatform,
+					test.availableCampaignType)
+			}))
+			defer server.Close()
+			client, err := New(
+				server.URL+"/json/v501", "client-id", "secret",
+				CallbackRedirectURI, server.Client(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			account, err := client.GetAccount(context.Background(), "token", "")
+			if test.wantReason != "" {
+				var compatibilityErr *AccountCompatibilityError
+				if !errors.As(err, &compatibilityErr) || compatibilityErr.Reason != test.wantReason {
+					t.Fatalf("error = %#v, want compatibility reason %q", err, test.wantReason)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if account.ReadOnly || account.CurrencyCode != "RUB" ||
+				account.RepresentativeName != "Direct client" {
+				t.Fatalf("account = %#v", account)
+			}
+		})
+	}
+}
+
+func TestGetAccountKeepsPermissionLimitedRepresentativeReadOnly(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name, role, grant string
+		wantReadOnly      bool
+	}{
+		{name: "chief editor", role: "CHIEF", grant: "YES"},
+		{name: "delegate editor", role: "DELEGATE", grant: "YES"},
+		{name: "no edit grant", role: "CHIEF", grant: "NO", wantReadOnly: true},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprintf(w, `{"result":{"Clients":[{
+"ClientId":7003,"Login":"client-login","ClientInfo":"Representative","Currency":"RUB",
+"Type":"CLIENT","Archived":"NO","ForbiddenPlatform":"SEARCH",
+"AvailableCampaignTypes":"UNIFIED_CAMPAIGN",
+"Representatives":[{"Login":"client-login","Role":%q}],
 "Grants":[{"Privilege":"EDIT_CAMPAIGNS","Value":%q}]
-}]}}`, test.itemType, test.role, test.grant)
+}]}}`, test.role, test.grant)
 			}))
 			defer server.Close()
 			client, err := New(
@@ -704,9 +809,43 @@ func TestGetAccountFailsClosedForAgencyUnknownOrNonChiefActors(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if account.ReadOnly != test.readOnly {
-				t.Fatalf("account read_only = %t, want %t: %#v",
-					account.ReadOnly, test.readOnly, account)
+			if account.ReadOnly != test.wantReadOnly {
+				t.Fatalf("account read_only = %t, want %t", account.ReadOnly, test.wantReadOnly)
+			}
+		})
+	}
+}
+
+func TestGetAccountRejectsMissingOrMalformedCompatibilityMetadata(t *testing.T) {
+	t.Parallel()
+	for _, response := range []string{
+		`{"result":{"Clients":[{"ClientId":1,"Type":"CLIENT","Currency":"RUB",` +
+			`"ForbiddenPlatform":"NONE","AvailableCampaignTypes":"UNIFIED_CAMPAIGN"}]}}`,
+		`{"result":{"Clients":[{"ClientId":1,"Type":"CLIENT","Currency":"RUB",` +
+			`"Archived":"NO","ForbiddenPlatform":"ALL","AvailableCampaignTypes":"UNIFIED_CAMPAIGN"}]}}`,
+		`{"result":{"Clients":[{"ClientId":1,"Type":"CLIENT","Currency":"RUB",` +
+			`"Archived":"NO","ForbiddenPlatform":"NONE","AvailableCampaignTypes":["UNIFIED_CAMPAIGN"]}]}}`,
+	} {
+		response := response
+		t.Run(strconv.Itoa(len(response)), func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = fmt.Fprint(w, response)
+			}))
+			defer server.Close()
+			client, err := New(
+				server.URL+"/json/v501", "client-id", "secret",
+				CallbackRedirectURI, server.Client(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.GetAccount(context.Background(), "token", "")
+			var providerErr *Error
+			if !errors.As(err, &providerErr) ||
+				(providerErr.Code != "invalid_direct_account_response" &&
+					providerErr.Code != "invalid_api_result") {
+				t.Fatalf("error = %#v", err)
 			}
 		})
 	}

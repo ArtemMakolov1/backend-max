@@ -31,6 +31,11 @@ for direct_flag in DIRECT_WRITES_ENABLED DIRECT_AUTO_LAUNCH_ENABLED; do
 done
 grep -F "          DIRECT_SANDBOX: \${{ vars.DIRECT_SANDBOX || 'true' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
 grep -F '      DIRECT_SANDBOX: ${DIRECT_SANDBOX}' "$repo_root/deploy/compose.production.yaml" >/dev/null
+grep -F '          YANDEX_WORDSTAT_API_KEY: ${{ secrets.YANDEX_WORDSTAT_API_KEY }}' "$repo_root/.github/workflows/deploy.yml" >/dev/null
+grep -F '          YANDEX_WORDSTAT_FOLDER_ID: ${{ vars.YANDEX_WORDSTAT_FOLDER_ID }}' "$repo_root/.github/workflows/deploy.yml" >/dev/null
+for wordstat_key in YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID; do
+  grep -F "      $wordstat_key: \${$wordstat_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
 
 render_production() {
   local output=$1
@@ -86,6 +91,9 @@ grep -Fx 'DIRECT_API_BASE_URL=https://api-sandbox.direct.yandex.com/json/v5' "$p
 grep -Fx 'DIRECT_WRITES_ENABLED=false' "$production_env" >/dev/null
 grep -Fx 'DIRECT_AUTO_LAUNCH_ENABLED=false' "$production_env" >/dev/null
 grep -Fx 'DIRECT_SANDBOX=true' "$production_env" >/dev/null
+grep -Fx 'YANDEX_WORDSTAT_API_BASE_URL=https://searchapi.api.cloud.yandex.net' "$production_env" >/dev/null
+grep -Fx 'YANDEX_WORDSTAT_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'YANDEX_WORDSTAT_FOLDER_ID=' "$production_env" >/dev/null
 grep -Fx 'BILLING_ENFORCEMENT_ENABLED=false' "$production_env" >/dev/null
 grep -Fx 'BILLING_LIVE_ENABLED=false' "$production_env" >/dev/null
 grep -Fx 'YOOKASSA_RECEIPTS_CONFIRMED=false' "$production_env" >/dev/null
@@ -192,6 +200,24 @@ render_production "$configured_direct_verification_env" \
 grep -Fx 'DIRECT_OAUTH_REDIRECT_URI=https://oauth.yandex.ru/verification_code' \
   "$configured_direct_verification_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_direct_verification_env"
+
+configured_wordstat_env="$sandbox/configured-wordstat.env"
+render_production "$configured_wordstat_env" \
+  DIRECT_OAUTH_CLIENT_ID=direct-client-id \
+  DIRECT_OAUTH_CLIENT_SECRET=direct-client-secret \
+  DIRECT_OAUTH_REDIRECT_URI=https://oauth.yandex.ru/verification_code \
+  DIRECT_TOKEN_DATA_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= \
+  YANDEX_WORDSTAT_API_KEY=wordstat-api-key \
+  YANDEX_WORDSTAT_FOLDER_ID=b1g1234567890abcdefg
+grep -Fx 'YANDEX_WORDSTAT_API_KEY=wordstat-api-key' "$configured_wordstat_env" >/dev/null
+grep -Fx 'YANDEX_WORDSTAT_FOLDER_ID=b1g1234567890abcdefg' "$configured_wordstat_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_wordstat_env"
+
+if render_production "$sandbox/partial-wordstat.env" \
+  YANDEX_WORDSTAT_API_KEY=wordstat-api-key >/dev/null 2>&1; then
+  echo "Production render accepted partial Wordstat credentials" >&2
+  exit 1
+fi
 
 if render_production "$sandbox/unsafe-direct-redirect.env" \
   DIRECT_OAUTH_CLIENT_ID=direct-client-id \
@@ -348,6 +374,8 @@ env \
   DIRECT_WRITES_ENABLED=true \
   DIRECT_AUTO_LAUNCH_ENABLED=true \
   DIRECT_SANDBOX=false \
+  YANDEX_WORDSTAT_API_KEY=must-not-leak \
+  YANDEX_WORDSTAT_FOLDER_ID=must-not-leak \
   OBSERVABILITY_ADMIN_USERS=must-not-leak \
   MAX_BOT_TOKEN=must-not-leak \
   S3_HOST=must-not-leak \
@@ -362,7 +390,7 @@ env \
   SMTP_FROM_EMAIL=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

@@ -181,6 +181,89 @@ func TestLoadAcceptsCompleteEncryptedYandexDirectConfiguration(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsWordstatOnlyWithCompleteDirectConfiguration(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("DIRECT_OAUTH_CLIENT_ID", "direct-client-id")
+	t.Setenv("DIRECT_OAUTH_CLIENT_SECRET", "direct-client-secret")
+	t.Setenv("DIRECT_OAUTH_REDIRECT_URI", directOAuthCallbackRedirectURI)
+	t.Setenv("DIRECT_TOKEN_DATA_KEY", base64.StdEncoding.EncodeToString(
+		[]byte("0123456789abcdef0123456789abcdef"),
+	))
+	t.Setenv("YANDEX_WORDSTAT_API_KEY", "wordstat-secret")
+	t.Setenv("YANDEX_WORDSTAT_FOLDER_ID", "b1g123abc")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.WordstatConfigured() || cfg.WordstatAPIBaseURL != defaultWordstatAPIBaseURL {
+		t.Fatalf("unexpected Wordstat config: %#v", cfg)
+	}
+}
+
+func TestLoadRejectsIncompleteOrUnsafeWordstatConfiguration(t *testing.T) {
+	validDirect := map[string]string{
+		"DIRECT_OAUTH_CLIENT_ID":     "direct-client-id",
+		"DIRECT_OAUTH_CLIENT_SECRET": "direct-client-secret",
+		"DIRECT_OAUTH_REDIRECT_URI":  directOAuthCallbackRedirectURI,
+		"DIRECT_TOKEN_DATA_KEY": base64.StdEncoding.EncodeToString(
+			[]byte("0123456789abcdef0123456789abcdef"),
+		),
+	}
+	tests := []struct {
+		name  string
+		envs  map[string]string
+		match string
+	}{
+		{
+			name:  "partial credentials",
+			envs:  map[string]string{"YANDEX_WORDSTAT_API_KEY": "wordstat-secret"},
+			match: "must be configured together",
+		},
+		{
+			name: "without Direct",
+			envs: map[string]string{
+				"YANDEX_WORDSTAT_API_KEY":   "wordstat-secret",
+				"YANDEX_WORDSTAT_FOLDER_ID": "b1g123abc",
+			},
+			match: "requires complete Yandex Direct credentials",
+		},
+		{
+			name: "foreign endpoint",
+			envs: map[string]string{
+				"YANDEX_WORDSTAT_API_BASE_URL": "https://wordstat.example.com",
+			},
+			match: "YANDEX_WORDSTAT_API_BASE_URL",
+		},
+		{
+			name: "invalid folder",
+			envs: map[string]string{
+				"YANDEX_WORDSTAT_API_KEY":   "wordstat-secret",
+				"YANDEX_WORDSTAT_FOLDER_ID": "Folder_with_spaces",
+			},
+			match: "YANDEX_WORDSTAT_FOLDER_ID",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			if tt.name != "without Direct" {
+				for name, value := range validDirect {
+					t.Setenv(name, value)
+				}
+			}
+			for name, value := range tt.envs {
+				t.Setenv(name, value)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tt.match) {
+				t.Fatalf("Load() error = %v, want containing %q", err, tt.match)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsIncompleteOrUnsafeYandexDirectConfiguration(t *testing.T) {
 	validKey := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	tests := []struct {
@@ -695,6 +778,7 @@ func clearAuthEnv(t *testing.T) {
 		"YANDEX_ALLOWED_USERS", "OBSERVABILITY_ADMIN_USERS", "AUTH_SESSION_TTL", "ALLOW_INSECURE_NO_AUTH", "AUTH_BOOTSTRAP_MODE", "OAUTH_TRUST_X_REAL_IP",
 		"DIRECT_OAUTH_CLIENT_ID", "DIRECT_OAUTH_CLIENT_SECRET", "DIRECT_OAUTH_REDIRECT_URI",
 		"DIRECT_TOKEN_DATA_KEY", "DIRECT_API_BASE_URL", "DIRECT_WRITES_ENABLED", "DIRECT_AUTO_LAUNCH_ENABLED", "DIRECT_SANDBOX",
+		"YANDEX_WORDSTAT_API_BASE_URL", "YANDEX_WORDSTAT_API_KEY", "YANDEX_WORDSTAT_FOLDER_ID",
 		"OAUTH_RATE_LIMIT_AT_EDGE", "AI_GLOBAL_MAX_CONCURRENT", "AI_USER_MAX_CONCURRENT",
 		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",

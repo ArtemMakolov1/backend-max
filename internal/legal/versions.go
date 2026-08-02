@@ -1,6 +1,6 @@
 package legal
 
 const (
-	CurrentTermsVersion        = "2026-07-23"
-	CurrentPersonalDataVersion = "2026-07-23"
+	CurrentTermsVersion        = "2026-08-02"
+	CurrentPersonalDataVersion = "2026-08-02"
 )

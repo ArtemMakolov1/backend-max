@@ -92,6 +92,8 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 		"/workspaces/{workspace_id}/advertising/direct/campaigns":                                   {"get", "post"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/suggest":                           {"post"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}":                     {"patch"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/statistics":          {"get"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/keyword-suggestions": {"post"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/auto-launch-consent": {"post", "delete"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/submit":              {"post"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/launch":              {"post"},
@@ -192,6 +194,10 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/auto-launch-consent", "post", "#/components/schemas/DirectAutoLaunchConsentRequest")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/submit", "post", "#/components/schemas/DirectVersionRequest")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/launch", "post", "#/components/schemas/DirectLaunchRequest")
+	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/statistics", "get", "200", "#/components/schemas/DirectCampaignStatisticsEnvelope")
+	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/keyword-suggestions", "post", "#/components/schemas/DirectKeywordSuggestionsRequest")
+	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/keyword-suggestions", "post", "200", "#/components/schemas/DirectKeywordSuggestionsEnvelope")
+	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/keyword-suggestions", "post", "429", "#/components/responses/WordstatRateLimitProblem")
 	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns", "post", "422", "#/components/responses/ValidationProblem")
 	assertResponseRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}", "patch", "422", "#/components/responses/ValidationProblem")
 	assertSchemaRequiredProperty(t, document, "DirectIntegration", "auto_launch_enabled")

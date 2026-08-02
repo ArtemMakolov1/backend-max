@@ -24,6 +24,7 @@ type fakeDirectOAuthProvider struct {
 	exchangeCalls int
 	exchangedCode string
 	verifier      string
+	accountErr    error
 }
 
 func (f *fakeDirectOAuthProvider) OAuthFlow() yandexdirect.OAuthFlow { return f.flow }
@@ -61,9 +62,12 @@ func (f *fakeDirectOAuthProvider) RefreshToken(
 func (f *fakeDirectOAuthProvider) GetAccount(
 	context.Context, string, string,
 ) (yandexdirect.Account, error) {
+	if f.accountErr != nil {
+		return yandexdirect.Account{}, f.accountErr
+	}
 	return yandexdirect.Account{
-		ID: "direct-oauth-account", Login: "owner-login", DisplayName: "Safe account",
-		CurrencyCode: "RUB", Timezone: "Europe/Moscow",
+		ID: "direct-oauth-account", Login: "owner-login",
+		RepresentativeName: "Safe representative", CurrencyCode: "RUB",
 	}, nil
 }
 
