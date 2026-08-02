@@ -62,8 +62,8 @@ jobs:
             printf '%s=%s@%s\n' "${component//-/_}" "$repository" "$digest" >>"$GITHUB_OUTPUT"
           }
 
-          build_image postgres-exporter v0.20.1-go1.26.5.1 docker/monitoring/postgres-exporter.Dockerfile
-          build_image pgbouncer-exporter v0.12.1-go1.26.5.1 docker/monitoring/pgbouncer-exporter.Dockerfile
+          build_image postgres-exporter v0.20.1-go1.26.5.2 docker/monitoring/postgres-exporter.Dockerfile
+          build_image pgbouncer-exporter v0.12.1-go1.26.5.2 docker/monitoring/pgbouncer-exporter.Dockerfile
       - name: Remove registry credentials
         if: ${{ always() }}
         shell: bash

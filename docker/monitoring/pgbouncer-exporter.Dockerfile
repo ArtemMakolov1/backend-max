@@ -12,22 +12,22 @@ RUN wget -q "https://github.com/prometheus-community/pgbouncer_exporter/archive/
     && echo "${SOURCE_SHA256}  /tmp/source.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/source.tar.gz --strip-components=1 \
     && rm /tmp/source.tar.gz
-# The upstream release predates the coordinated Go/x-crypto security update.
-# Keep the source tag fixed and override only the vulnerable dependency.
-RUN go get golang.org/x/crypto@v0.52.0 \
+# The upstream release predates coordinated x/crypto and x/text security
+# updates. Keep the source tag fixed and override only those dependencies.
+RUN go get golang.org/x/crypto@v0.52.0 golang.org/x/text@v0.39.0 \
     && go mod tidy \
     && go mod download \
     && go mod verify \
     && go test ./...
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath \
-      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.12.1-maxposty.1 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.12.1" \
+      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.12.1-maxposty.2 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.12.1" \
       -o /out/pgbouncer_exporter .
 
 FROM busybox:1.37.0-uclibc@sha256:39e0df8c4d65953b55c344f017e1ff2e0031a7454b3c24e6b76d402f207e315a
 
 LABEL org.opencontainers.image.source="https://github.com/prometheus-community/pgbouncer_exporter" \
-      org.opencontainers.image.version="0.12.1-maxposty.1" \
+      org.opencontainers.image.version="0.12.1-maxposty.2" \
       org.opencontainers.image.revision="2a70ffdb35b6fbd3413ac5abf07c4ddf6dde3067"
 
 COPY --from=build /out/pgbouncer_exporter /bin/pgbouncer_exporter

@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 production_compose="$repo_root/deploy/compose.production.yaml"
 local_compose="$repo_root/compose.yaml"
-prometheus_image='prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893'
+prometheus_image='prom/prometheus:v3.13.2@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69'
 security_workflow="$repo_root/.github/workflows/security.yml"
 monitoring_trivy_ignore="$repo_root/.github/trivy/monitoring-images.yaml"
 
@@ -15,7 +15,7 @@ if [[ $(grep -c '^    ports:$' "$production_compose") -ne 1 ]] ||
 fi
 
 for image in \
-  'prom/prometheus:v3.13.1@sha256:' \
+  'prom/prometheus:v3.13.2@sha256:' \
   'prom/alertmanager:v0.33.1@sha256:' \
   'grafana/grafana:nightly-slim@sha256:' \
   'ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.5.1@sha256:' \
@@ -27,22 +27,14 @@ for image in \
   }
 done
 
-if [[ $(grep -c '^  - id:' "$monitoring_trivy_ignore") -ne 1 ]] ||
-  ! grep -Fx '  - id: GHSA-hrxh-6v49-42gf' "$monitoring_trivy_ignore" >/dev/null ||
-  ! grep -Fx '    expired_at: 2026-08-05' "$monitoring_trivy_ignore" >/dev/null ||
-  ! grep -Fx '      - pkg:golang/google.golang.org/grpc@v1.81.1' "$monitoring_trivy_ignore" >/dev/null; then
-  echo "Monitoring Trivy exception must remain singular, version-scoped, and time-limited" >&2
+if ! grep -Fx 'vulnerabilities: []' "$monitoring_trivy_ignore" >/dev/null ||
+  grep -F 'trivyignores: ".github/trivy/monitoring-images.yaml"' "$security_workflow" >/dev/null; then
+  echo "Fixed monitoring images must not retain vulnerability exceptions" >&2
   exit 1
 fi
-for target in bin/prometheus bin/promtool; do
-  grep -Fx "      - $target" "$monitoring_trivy_ignore" >/dev/null || {
-    echo "Monitoring Trivy exception is missing exact target: $target" >&2
-    exit 1
-  }
-done
-if [[ $(grep -Fc 'trivyignores: ".github/trivy/monitoring-images.yaml"' "$security_workflow") -ne 1 ]] ||
+if [[ $(grep -Fc 'trivyignores: ""' "$security_workflow") -ne 5 ]] ||
   [[ $(grep -Fc 'trivyignores: ${{ matrix.trivyignores }}' "$security_workflow") -ne 1 ]]; then
-  echo "Temporary Trivy exception must apply only to the Prometheus image scan" >&2
+  echo "Every monitoring image scan must run without a vulnerability exception" >&2
   exit 1
 fi
 

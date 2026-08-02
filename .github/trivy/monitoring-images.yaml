@@ -1,12 +1,1 @@
-vulnerabilities:
-  - id: GHSA-hrxh-6v49-42gf
-    paths:
-      - bin/prometheus
-      - bin/promtool
-    purls:
-      - pkg:golang/google.golang.org/grpc@v1.81.1
-    expired_at: 2026-08-05
-    statement: >-
-      Temporary Prometheus-only exception while the official upstream image is
-      rebuilt with google.golang.org/grpc 1.82.1. Prometheus tracks the fix in
-      prometheus/prometheus#19258.
+vulnerabilities: []

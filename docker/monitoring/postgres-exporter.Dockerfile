@@ -12,18 +12,23 @@ RUN wget -q "https://github.com/prometheus-community/postgres_exporter/archive/$
     && echo "${SOURCE_SHA256}  /tmp/source.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/source.tar.gz --strip-components=1 \
     && rm /tmp/source.tar.gz
-RUN go mod download \
+# The fixed source release still resolves an x/text version affected by
+# CVE-2026-56852. Keep the source commit immutable and update only the fixed
+# dependency before building the static exporter.
+RUN go get golang.org/x/text@v0.39.0 \
+    && go mod tidy \
+    && go mod download \
     && go mod verify \
     && go test ./...
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath \
-      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.20.1-maxposty.1 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.20.1" \
+      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.20.1-maxposty.2 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.20.1" \
       -o /out/postgres_exporter ./cmd/postgres_exporter
 
 FROM busybox:1.37.0-uclibc@sha256:39e0df8c4d65953b55c344f017e1ff2e0031a7454b3c24e6b76d402f207e315a
 
 LABEL org.opencontainers.image.source="https://github.com/prometheus-community/postgres_exporter" \
-      org.opencontainers.image.version="0.20.1-maxposty.1" \
+      org.opencontainers.image.version="0.20.1-maxposty.2" \
       org.opencontainers.image.revision="867fbcac31cd18c143e244190ea9168cca069827"
 
 COPY --from=build /out/postgres_exporter /bin/postgres_exporter
