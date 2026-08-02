@@ -21,22 +21,27 @@ import (
 )
 
 type fakeDirectProvider struct {
-	account         yandexdirect.Account
-	campaign        yandexdirect.Campaign
-	graphSupported  bool
-	operationMarker string
-	group           yandexdirect.UnifiedAdGroup
-	ad              yandexdirect.ResponsiveAd
-	keywords        []yandexdirect.Keyword
-	nextGraphID     int64
-	oauthFlow       yandexdirect.OAuthFlow
-	resumeCalls     int
-	resume          func(*fakeDirectProvider) error
-	getErr          error
-	getContext      func(context.Context)
-	refreshCalls    int
-	refreshErr      error
-	refreshResult   yandexdirect.OAuthToken
+	account            yandexdirect.Account
+	campaign           yandexdirect.Campaign
+	graphSupported     bool
+	operationMarker    string
+	group              yandexdirect.UnifiedAdGroup
+	ad                 yandexdirect.ResponsiveAd
+	keywords           []yandexdirect.Keyword
+	nextGraphID        int64
+	oauthFlow          yandexdirect.OAuthFlow
+	resumeCalls        int
+	resume             func(*fakeDirectProvider) error
+	getErr             error
+	getContext         func(context.Context)
+	refreshCalls       int
+	refreshErr         error
+	refreshResult      yandexdirect.OAuthToken
+	listedCampaigns    []yandexdirect.CampaignSummary
+	listCampaignsErr   error
+	listCampaignsCalls int
+	listCampaignsToken string
+	listCampaignsLogin string
 }
 
 func (f *fakeDirectProvider) OAuthFlow() yandexdirect.OAuthFlow {
@@ -71,6 +76,17 @@ func (f *fakeDirectProvider) RefreshToken(
 }
 func (f *fakeDirectProvider) GetAccount(context.Context, string, string) (yandexdirect.Account, error) {
 	return f.account, nil
+}
+func (f *fakeDirectProvider) ListCampaigns(
+	_ context.Context, token, clientLogin string,
+) ([]yandexdirect.CampaignSummary, error) {
+	f.listCampaignsCalls++
+	f.listCampaignsToken = token
+	f.listCampaignsLogin = clientLogin
+	if f.listCampaignsErr != nil {
+		return nil, f.listCampaignsErr
+	}
+	return append([]yandexdirect.CampaignSummary(nil), f.listedCampaigns...), nil
 }
 func (f *fakeDirectProvider) CreateCampaignDraft(
 	_ context.Context, _, _ string, draft yandexdirect.CampaignDraft,
@@ -527,6 +543,105 @@ func TestDirectAutoLaunchStaysFailClosedWithoutVerifiedProviderGraph(t *testing.
 			"writes=%v auto=%v, want both disabled without graph verification",
 			application.DirectWritesEnabled(), application.DirectAutoLaunchEnabled(),
 		)
+	}
+}
+
+func TestSyncDirectExternalCampaignsPersistsProviderSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	application, _, provider, owner, workspace, connection, clock :=
+		newDirectAppFixture(t, ctx, false)
+	endDate := "2043-07-07"
+	provider.listedCampaigns = []yandexdirect.CampaignSummary{
+		{
+			ID: 7_654_321, Name: "Existing provider campaign",
+			Type: "TEXT_CAMPAIGN", Status: "ACCEPTED", State: "ON",
+			StatusPayment: "ALLOWED", StartDate: "2043-06-07",
+			EndDate: &endDate, TimeZone: "Europe/Moscow",
+		},
+	}
+
+	snapshot, err := application.SyncDirectExternalCampaigns(
+		ctx, owner, workspace.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.listCampaignsCalls != 1 ||
+		provider.listCampaignsToken != "access-token" ||
+		provider.listCampaignsLogin != "direct-login" {
+		t.Fatalf(
+			"Campaigns.get call = count %d token %q login %q",
+			provider.listCampaignsCalls, provider.listCampaignsToken,
+			provider.listCampaignsLogin,
+		)
+	}
+	if len(snapshot.Items) != 1 || snapshot.Items[0].ConnectionID != connection.ID ||
+		snapshot.Items[0].ProviderCampaignID != 7_654_321 ||
+		snapshot.Items[0].Name != "Existing provider campaign" ||
+		snapshot.Items[0].EndsAt == nil || snapshot.Items[0].SyncedAt != clock.UTC() ||
+		snapshot.SyncedAt == nil || *snapshot.SyncedAt != clock.UTC() {
+		t.Fatalf("external campaign snapshot = %#v", snapshot)
+	}
+	if _, err := application.SyncDirectExternalCampaigns(
+		ctx, owner, workspace.ID,
+	); !errors.Is(err, store.ErrDirectExternalSyncCooldown) {
+		t.Fatalf("immediate repeat sync error = %v, want cooldown", err)
+	}
+	if provider.listCampaignsCalls != 1 {
+		t.Fatalf("cooldown reached provider %d times", provider.listCampaignsCalls)
+	}
+
+	persisted, err := application.ListDirectExternalCampaigns(
+		ctx, owner, workspace.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.Items) != 1 ||
+		persisted.Items[0].ProviderCampaignID != 7_654_321 ||
+		persisted.SyncedAt == nil {
+		t.Fatalf("persisted external campaigns = %#v", persisted)
+	}
+
+	*clock = clock.Add(time.Hour)
+	provider.listedCampaigns = nil
+	snapshot, err = application.SyncDirectExternalCampaigns(ctx, owner, workspace.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Items) != 0 || snapshot.SyncedAt == nil ||
+		*snapshot.SyncedAt != clock.UTC() {
+		t.Fatalf("external snapshot after empty provider result = %#v", snapshot)
+	}
+}
+
+func TestListDirectExternalCampaignsRejectsConnectionRequiringAuthorization(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	application, storage, _, owner, workspace, connection, clock :=
+		newDirectAppFixture(t, ctx, false)
+	if err := storage.MarkDirectConnectionAuthorizationRequired(
+		ctx, workspace.ID, connection.ID, clock.UTC(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.ListDirectExternalCampaigns(
+		ctx, owner, workspace.ID,
+	); !errors.Is(err, store.ErrDirectConnectionRequired) {
+		t.Fatalf("list error = %v, want connection required", err)
+	}
+}
+
+func TestDirectExternalCampaignMappingRejectsInvalidProviderDates(t *testing.T) {
+	t.Parallel()
+	_, err := directExternalCampaignFromProvider(yandexdirect.CampaignSummary{
+		ID: 1, Name: "Invalid date", Type: "TEXT_CAMPAIGN", Status: "DRAFT",
+		State: "OFF", StatusPayment: "ALLOWED", StartDate: "2043-02-30",
+		TimeZone: "Europe/Moscow",
+	})
+	if err == nil {
+		t.Fatal("invalid provider start date was accepted")
 	}
 }
 

@@ -542,6 +542,14 @@ func TestDirectAdvertisingRoutesUseDedicatedCapabilities(t *testing.T) {
 	)
 	assertProblemCode(t, response, http.StatusServiceUnavailable, "direct_not_configured")
 	response = performJSONRequest(
+		fixture.handler(t, "ws-editor"), http.MethodPost, base+"/campaigns/sync", "",
+	)
+	assertProblemCode(t, response, http.StatusForbidden, "workspace_forbidden")
+	response = performJSONRequest(
+		fixture.handler(t, "ws-owner"), http.MethodPost, base+"/campaigns/sync", "",
+	)
+	assertProblemCode(t, response, http.StatusServiceUnavailable, "direct_not_configured")
+	response = performJSONRequest(
 		fixture.handler(t, "ws-viewer"), http.MethodPost, base+"/campaigns",
 		`{"name":"No","objective":"traffic","landing_url":"https://maxposty.ru/",`+
 			`"brief":"Viewer cannot create","regions":["225"],"weekly_budget_minor":10000,`+
@@ -785,6 +793,18 @@ func TestDirectProviderErrorMessageDoesNotPromiseLaunchReconciliation(t *testing
 	if strings.Contains(body, "запуск") || strings.Contains(body, "сверен") ||
 		strings.Contains(body, "reconcil") {
 		t.Fatalf("generic provider error promises launch reconciliation: %s", response.Body.String())
+	}
+}
+
+func TestDirectExternalSyncCooldownIsPublic429(t *testing.T) {
+	t.Parallel()
+	response := httptest.NewRecorder()
+	(&Server{}).writeError(response, store.ErrDirectExternalSyncCooldown)
+	assertProblemCode(
+		t, response, http.StatusTooManyRequests, "direct_external_sync_cooldown",
+	)
+	if response.Header().Get("Retry-After") != "30" {
+		t.Fatalf("Retry-After = %q", response.Header().Get("Retry-After"))
 	}
 }
 

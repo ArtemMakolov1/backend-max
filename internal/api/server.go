@@ -832,6 +832,10 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, app.ErrDirectProvider):
 		s.problem(w, http.StatusBadGateway, "direct_provider_error",
 			"Не удалось выполнить запрос к Яндекс Директу. Попробуйте позже или обновите данные.", nil)
+	case errors.Is(err, store.ErrDirectExternalSyncCooldown):
+		w.Header().Set("Retry-After", strconv.Itoa(int(app.DirectExternalCampaignSyncCooldown/time.Second)))
+		s.problem(w, http.StatusTooManyRequests, "direct_external_sync_cooldown",
+			"Кампании Яндекс Директа уже обновлялись недавно. Повторите через несколько секунд.", nil)
 	case errors.Is(err, app.ErrDirectSnapshotMismatch),
 		errors.Is(err, store.ErrDirectConsentMismatch),
 		errors.Is(err, store.ErrDirectConsentRequired),

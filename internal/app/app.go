@@ -235,6 +235,7 @@ type App struct {
 	// prove that ad groups, ads and keywords match the user's consent.
 	directProviderGraphVerified bool
 	directTokenRefresh          singleflight.Group
+	directCampaignSync          singleflight.Group
 }
 
 func New(storage *store.Store, mediaStore *media.Store, max MAXClient, images ImageClient, research ResearchClient, logger *slog.Logger) *App {

@@ -176,6 +176,13 @@ type DirectProvider interface {
 	Sandbox() bool
 }
 
+// DirectCampaignListingProvider is separate from DirectProvider because
+// importing existing provider-owned campaigns is read-only and optional for
+// legacy or sandbox provider implementations.
+type DirectCampaignListingProvider interface {
+	ListCampaigns(context.Context, string, string) ([]yandexdirect.CampaignSummary, error)
+}
+
 // DirectGraphProvider is deliberately separate from DirectProvider so OAuth
 // and read-only status can remain available on legacy/sandbox endpoints while
 // every spend-capable write stays fail-closed unless the complete v501 graph

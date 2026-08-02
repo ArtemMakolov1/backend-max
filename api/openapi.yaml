@@ -1098,6 +1098,35 @@ paths:
               schema: {$ref: '#/components/schemas/DirectCampaignEnvelope'}
         '422': {$ref: '#/components/responses/ValidationProblem'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    get:
+      tags: [Advertising]
+      operationId: listDirectExternalCampaigns
+      summary: List the persisted read-only snapshot of provider-owned campaigns
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Campaigns created in Yandex Direct and not managed by MaxPosty
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectExternalCampaignListEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/sync:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [Advertising]
+      operationId: syncDirectExternalCampaigns
+      summary: Refresh the read-only provider campaign snapshot with Campaigns.get
+      description: Does not edit, submit, launch, or delete campaigns in Yandex Direct or MaxPosty.
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Refreshed provider-owned campaign snapshot
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DirectExternalCampaignListEnvelope'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/advertising/direct/campaigns/suggest:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
     post:
@@ -3415,6 +3444,45 @@ components:
         items:
           type: array
           items: {$ref: '#/components/schemas/DirectCampaign'}
+    DirectExternalCampaign:
+      type: object
+      required:
+        - provider_campaign_id
+        - name
+        - campaign_type
+        - provider_status
+        - provider_state
+        - provider_status_payment
+        - starts_at
+        - ends_at
+        - timezone
+        - synced_at
+      properties:
+        provider_campaign_id:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+          description: Decimal string to preserve the full provider identifier in JavaScript.
+        name: {type: string, minLength: 1, maxLength: 255}
+        campaign_type: {type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$'}
+        provider_status: {type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$'}
+        provider_state: {type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$'}
+        provider_status_payment: {type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$'}
+        starts_at: {type: string, format: date}
+        ends_at: {type: [string, 'null'], format: date}
+        timezone: {type: string, minLength: 1, maxLength: 128}
+        synced_at: {type: string, format: date-time}
+    DirectExternalCampaignListEnvelope:
+      type: object
+      required: [items, synced_at]
+      properties:
+        items:
+          type: array
+          maxItems: 10000
+          items: {$ref: '#/components/schemas/DirectExternalCampaign'}
+        synced_at:
+          type: [string, 'null']
+          format: date-time
+          description: Last successful provider snapshot time; null until the first successful sync.
     DirectCampaignDraftRequest:
       type: object
       required:

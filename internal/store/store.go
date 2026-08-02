@@ -53,7 +53,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "031_billing_recurring_terms_20260802.sql"
+const RequiredSchemaVersion = "032_direct_external_campaigns.sql"
 
 type schemaMigration struct {
 	version        string

@@ -90,6 +90,8 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 		"/workspaces/{workspace_id}/advertising/direct/connect/complete":                            {"post"},
 		"/workspaces/{workspace_id}/advertising/direct/connection":                                  {"delete"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns":                                   {"get", "post"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/external":                          {"get"},
+		"/workspaces/{workspace_id}/advertising/direct/campaigns/sync":                              {"post"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/suggest":                           {"post"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}":                     {"patch"},
 		"/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/statistics":          {"get"},
@@ -189,6 +191,8 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/connect/complete", "post", "#/components/schemas/DirectOAuthCompleteRequest")
 	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/connect/complete", "post", "200", "#/components/schemas/DirectOAuthCompleteEnvelope")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns", "post", "#/components/schemas/DirectCampaignDraftRequest")
+	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/external", "get", "200", "#/components/schemas/DirectExternalCampaignListEnvelope")
+	assertResponseSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/sync", "post", "200", "#/components/schemas/DirectExternalCampaignListEnvelope")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/suggest", "post", "#/components/schemas/DirectCampaignSuggestionRequest")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}", "patch", "#/components/schemas/DirectCampaignPatchRequest")
 	assertRequestSchemaRef(t, document, "/workspaces/{workspace_id}/advertising/direct/campaigns/{campaign_id}/auto-launch-consent", "post", "#/components/schemas/DirectAutoLaunchConsentRequest")
@@ -213,6 +217,10 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	assertSchemaRequiredProperty(t, document, "DirectCampaign", "provider_campaign_id")
 	assertSchemaRequiredProperty(t, document, "DirectCampaign", "launch_state")
 	assertSchemaRequiredProperty(t, document, "DirectCampaign", "setup_warning_code")
+	assertSchemaRequiredProperty(t, document, "DirectExternalCampaign", "provider_campaign_id")
+	assertSchemaRequiredProperty(t, document, "DirectExternalCampaign", "provider_status_payment")
+	assertSchemaRequiredProperty(t, document, "DirectExternalCampaign", "ends_at")
+	assertSchemaRequiredProperty(t, document, "DirectExternalCampaignListEnvelope", "synced_at")
 	assertSchemaEnumValue(t, document, "DirectCampaignStatus", "provider_draft")
 	assertSchemaEnumValue(t, document, "DirectLaunchState", "failed")
 	for _, capability := range []string{
@@ -224,6 +232,11 @@ func TestOpenAPIContainsBrowserRoutes(t *testing.T) {
 	}
 	assertSchemaPropertyType(t, document, "DirectCampaign", "provider_campaign_id", "string")
 	assertSchemaPropertyType(t, document, "DirectCampaign", "provider_campaign_id", "null")
+	assertSchemaPropertyType(t, document, "DirectExternalCampaign", "provider_campaign_id", "string")
+	assertSchemaPropertyType(t, document, "DirectExternalCampaign", "ends_at", "string")
+	assertSchemaPropertyType(t, document, "DirectExternalCampaign", "ends_at", "null")
+	assertSchemaPropertyType(t, document, "DirectExternalCampaignListEnvelope", "synced_at", "string")
+	assertSchemaPropertyType(t, document, "DirectExternalCampaignListEnvelope", "synced_at", "null")
 	assertSchemaRequiredProperty(t, document, "WorkspaceBilling", "monthly_enforcement_enabled")
 	assertSchemaRequiredProperty(t, document, "WorkspaceBilling", "image_credit_costs")
 	assertSchemaRequiredProperty(t, document, "WorkspaceBilling", "checkout_enabled")

@@ -50,6 +50,7 @@ func directProviderNextCheckAt(status string, now time.Time) time.Time {
 }
 
 var directIdentifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+var directProviderEnumPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 var directOAuthStateHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 var (
@@ -66,12 +67,13 @@ var (
 	ErrDirectModerationNotReady     = errors.New("direct provider graph moderation is not accepted")
 	ErrDirectProviderOperationBusy  = errors.New("direct provider operation is already in progress")
 	ErrDirectProviderOperationStale = errors.New("direct provider operation lease is stale")
+	ErrDirectExternalSyncCooldown   = errors.New("direct external campaign sync cooldown is active")
 	ErrDirectValidation             = errors.New("invalid Yandex Direct campaign")
 )
 
 const directConnectionColumns = `id,workspace_id,account_id,client_login,account_name,currency_code,
 timezone,read_only,token_ciphertext,token_key_version,status,connected_by,last_verified_at,error_code,
-created_at,updated_at,revoked_at,token_refresh_claimed_at`
+created_at,updated_at,revoked_at,token_refresh_claimed_at,external_campaigns_synced_at`
 
 const directCampaignColumns = `id,workspace_id,connection_id,provider_campaign_id,name,
 objective,landing_url,brief,regions,weekly_budget_minor,bid_ceiling_minor,currency_code,starts_at,ends_at,
@@ -107,24 +109,62 @@ type DirectOAuthState struct {
 }
 
 type DirectConnection struct {
-	ID                    string     `json:"id"`
+	ID                        string     `json:"id"`
+	WorkspaceID               string     `json:"workspace_id"`
+	AccountID                 string     `json:"account_id"`
+	ClientLogin               string     `json:"client_login,omitempty"`
+	AccountName               string     `json:"account_name,omitempty"`
+	CurrencyCode              string     `json:"currency_code"`
+	Timezone                  string     `json:"timezone"`
+	ReadOnly                  bool       `json:"read_only"`
+	TokenCiphertext           string     `json:"-"`
+	TokenKeyVersion           int        `json:"-"`
+	Status                    string     `json:"status"`
+	ConnectedBy               string     `json:"connected_by"`
+	LastVerifiedAt            *time.Time `json:"last_verified_at,omitempty"`
+	ExternalCampaignsSyncedAt *time.Time `json:"external_campaigns_synced_at,omitempty"`
+	ErrorCode                 string     `json:"error_code,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	UpdatedAt                 time.Time  `json:"updated_at"`
+	RevokedAt                 *time.Time `json:"revoked_at,omitempty"`
+	TokenRefreshClaimedAt     *time.Time `json:"-"`
+}
+
+// DirectExternalCampaign is a provider-owned campaign visible in the connected
+// Yandex Direct account but not yet managed by MaxPosty.
+type DirectExternalCampaign struct {
 	WorkspaceID           string     `json:"workspace_id"`
-	AccountID             string     `json:"account_id"`
-	ClientLogin           string     `json:"client_login,omitempty"`
-	AccountName           string     `json:"account_name,omitempty"`
-	CurrencyCode          string     `json:"currency_code"`
+	ConnectionID          string     `json:"connection_id"`
+	ProviderCampaignID    int64      `json:"provider_campaign_id"`
+	Name                  string     `json:"name"`
+	CampaignType          string     `json:"campaign_type"`
+	ProviderStatus        string     `json:"provider_status"`
+	ProviderState         string     `json:"provider_state"`
+	ProviderStatusPayment string     `json:"provider_status_payment"`
+	StartsAt              time.Time  `json:"starts_at"`
+	EndsAt                *time.Time `json:"ends_at,omitempty"`
 	Timezone              string     `json:"timezone"`
-	ReadOnly              bool       `json:"read_only"`
-	TokenCiphertext       string     `json:"-"`
-	TokenKeyVersion       int        `json:"-"`
-	Status                string     `json:"status"`
-	ConnectedBy           string     `json:"connected_by"`
-	LastVerifiedAt        *time.Time `json:"last_verified_at,omitempty"`
-	ErrorCode             string     `json:"error_code,omitempty"`
-	CreatedAt             time.Time  `json:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at"`
-	RevokedAt             *time.Time `json:"revoked_at,omitempty"`
-	TokenRefreshClaimedAt *time.Time `json:"-"`
+	SyncedAt              time.Time  `json:"synced_at"`
+}
+
+// DirectExternalCampaignSnapshot is a transactionally consistent view of the
+// active connection metadata and its latest provider-owned campaign rows.
+type DirectExternalCampaignSnapshot struct {
+	ConnectionID string
+	Items        []DirectExternalCampaign
+	SyncedAt     *time.Time
+}
+
+type directExternalCampaignSnapshotRow struct {
+	ProviderCampaignID    int64   `json:"provider_campaign_id"`
+	Name                  string  `json:"name"`
+	CampaignType          string  `json:"campaign_type"`
+	ProviderStatus        string  `json:"provider_status"`
+	ProviderState         string  `json:"provider_state"`
+	ProviderStatusPayment string  `json:"provider_status_payment"`
+	StartsAt              string  `json:"starts_at"`
+	EndsAt                *string `json:"ends_at"`
+	Timezone              string  `json:"timezone"`
 }
 
 type DirectCampaign struct {
@@ -564,8 +604,13 @@ WHERE workspace_id=$1 AND connection_id=$2
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE direct_connections
 SET status='revoked',token_ciphertext='',token_refresh_claimed_at=NULL,
+    external_campaigns_sync_claimed_at=NULL,
     revoked_at=$1,updated_at=$1,error_code=''
 WHERE workspace_id=$2 AND revoked_at IS NULL`, now, workspaceID); err != nil {
+		return DirectConnection{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM direct_external_campaigns
+WHERE workspace_id=$1 AND connection_id=$2`, workspaceID, currentConnectionID); err != nil {
 		return DirectConnection{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
@@ -722,7 +767,7 @@ func (s *Store) MarkDirectConnectionRefreshAuthorizationRequired(
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `UPDATE direct_connections
 SET status='error',error_code='authorization_required',
-    token_refresh_claimed_at=NULL,updated_at=$1
+    token_refresh_claimed_at=NULL,external_campaigns_sync_claimed_at=NULL,updated_at=$1
 WHERE workspace_id=$2 AND id=$3 AND status='active' AND revoked_at IS NULL
   AND token_ciphertext=$4 AND token_refresh_claimed_at=$5`,
 		now, workspaceID, connectionID, expectedCiphertext, claimedAt.UTC())
@@ -761,7 +806,7 @@ func (s *Store) MarkDirectConnectionAuthorizationRequired(
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.ExecContext(ctx, `UPDATE direct_connections
 SET status='error',error_code='authorization_required',
-    token_refresh_claimed_at=NULL,updated_at=$1
+    token_refresh_claimed_at=NULL,external_campaigns_sync_claimed_at=NULL,updated_at=$1
 WHERE workspace_id=$2 AND id=$3 AND status IN ('active','error') AND revoked_at IS NULL`,
 		now, workspaceID, connectionID)
 	if err != nil {
@@ -799,6 +844,9 @@ func (s *Store) RevokeDirectConnection(
 	if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner); err != nil {
 		return err
 	}
+	if err := lockActiveWorkspaceForDirectConnectionWrite(ctx, tx, workspaceID); err != nil {
+		return err
+	}
 	var connectionID string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM direct_connections
 WHERE workspace_id=$1 AND revoked_at IS NULL FOR UPDATE`, workspaceID).Scan(&connectionID)
@@ -828,8 +876,13 @@ WHERE workspace_id=$1 AND connection_id=$2
 	now = now.UTC()
 	if _, err := tx.ExecContext(ctx, `UPDATE direct_connections
 SET status='revoked',token_ciphertext='',token_refresh_claimed_at=NULL,
+    external_campaigns_sync_claimed_at=NULL,
     revoked_at=$1,updated_at=$1,error_code=''
 WHERE workspace_id=$2 AND id=$3`, now, workspaceID, connectionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM direct_external_campaigns
+WHERE workspace_id=$1 AND connection_id=$2`, workspaceID, connectionID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE direct_auto_launch_consents_v2
@@ -950,6 +1003,385 @@ FROM direct_campaigns WHERE workspace_id=$1 ORDER BY updated_at DESC,id`, worksp
 		result = append(result, campaign)
 	}
 	return result, rows.Err()
+}
+
+// ClaimDirectExternalCampaignSync starts a rate-limited, recoverable provider
+// read. The returned generation fences its eventual snapshot write from all
+// older and subsequently recovered attempts.
+func (s *Store) ClaimDirectExternalCampaignSync(
+	ctx context.Context,
+	actorUserID, workspaceID, connectionID string,
+	now time.Time,
+	cooldown, lease time.Duration,
+) (int64, error) {
+	if strings.TrimSpace(workspaceID) == "" || strings.TrimSpace(connectionID) == "" || now.IsZero() {
+		return 0, fmt.Errorf("%w: workspace_id, connection_id and now are required", ErrDirectValidation)
+	}
+	if cooldown < 0 || lease <= 0 {
+		return 0, fmt.Errorf("%w: cooldown must not be negative and lease must be positive", ErrDirectValidation)
+	}
+	now = now.UTC().Truncate(time.Microsecond)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID); err != nil {
+		return 0, err
+	}
+	if err := lockActiveWorkspaceForDirectConnectionWrite(ctx, tx, workspaceID); err != nil {
+		return 0, err
+	}
+	var startedAt, claimedAt sql.NullTime
+	var generation int64
+	err = tx.QueryRowContext(ctx, `SELECT external_campaigns_sync_started_at,
+       external_campaigns_sync_claimed_at,COALESCE(external_campaigns_sync_generation,0)
+FROM direct_connections
+WHERE workspace_id=$1 AND id=$2 AND status='active' AND revoked_at IS NULL
+FOR UPDATE`, workspaceID, connectionID).Scan(&startedAt, &claimedAt, &generation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrDirectConnectionRequired
+	}
+	if err != nil {
+		return 0, fmt.Errorf("lock active Direct connection for external campaign sync: %w", err)
+	}
+	if claimedAt.Valid && claimedAt.Time.UTC().After(now.Add(-lease)) {
+		return 0, ErrDirectProviderOperationBusy
+	}
+	if startedAt.Valid && startedAt.Time.UTC().After(now.Add(-cooldown)) {
+		return 0, ErrDirectExternalSyncCooldown
+	}
+	var nextGeneration int64
+	err = tx.QueryRowContext(ctx, `UPDATE direct_connections
+SET external_campaigns_sync_started_at=$1,
+    external_campaigns_sync_claimed_at=$1,
+    external_campaigns_sync_generation=COALESCE(external_campaigns_sync_generation,0)+1
+WHERE workspace_id=$2 AND id=$3 AND COALESCE(external_campaigns_sync_generation,0)=$4
+RETURNING external_campaigns_sync_generation`, now, workspaceID, connectionID, generation).Scan(
+		&nextGeneration,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrConflict
+	}
+	if err != nil {
+		return 0, fmt.Errorf("claim Direct external campaign sync: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit Direct external campaign sync claim: %w", err)
+	}
+	return nextGeneration, nil
+}
+
+// ReleaseDirectExternalCampaignSync releases only the exact current
+// generation. Its started timestamp deliberately remains durable so provider
+// failures cannot bypass the request cooldown.
+func (s *Store) ReleaseDirectExternalCampaignSync(
+	ctx context.Context,
+	actorUserID, workspaceID, connectionID string,
+	generation int64,
+) error {
+	if generation <= 0 {
+		return ErrConflict
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID); err != nil {
+		return err
+	}
+	if err := lockActiveWorkspaceForDirectConnectionWrite(ctx, tx, workspaceID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE direct_connections
+SET external_campaigns_sync_claimed_at=NULL
+WHERE workspace_id=$1 AND id=$2
+  AND external_campaigns_sync_generation=$3
+  AND external_campaigns_sync_claimed_at IS NOT NULL`, workspaceID, connectionID, generation)
+	if err != nil {
+		return fmt.Errorf("release Direct external campaign sync: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrConflict
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit Direct external campaign sync release: %w", err)
+	}
+	return nil
+}
+
+// ReplaceDirectExternalCampaigns atomically completes the exact claimed
+// generation and replaces the latest provider snapshot for one connection.
+// Campaigns already managed by MaxPosty are not retained in this external-only
+// snapshot.
+func (s *Store) ReplaceDirectExternalCampaigns(
+	ctx context.Context,
+	actorUserID, workspaceID, connectionID string,
+	generation int64,
+	items []DirectExternalCampaign,
+	syncedAt time.Time,
+) error {
+	if strings.TrimSpace(workspaceID) == "" || strings.TrimSpace(connectionID) == "" {
+		return fmt.Errorf("%w: workspace_id and connection_id are required", ErrDirectValidation)
+	}
+	if syncedAt.IsZero() {
+		return fmt.Errorf("%w: synced_at is required", ErrDirectValidation)
+	}
+	if generation <= 0 {
+		return ErrConflict
+	}
+	syncedAt = syncedAt.UTC()
+	normalized := make([]DirectExternalCampaign, 0, len(items))
+	seenProviderIDs := make(map[int64]struct{}, len(items))
+	for index, item := range items {
+		campaign, err := normalizeDirectExternalCampaign(
+			item, workspaceID, connectionID, syncedAt,
+		)
+		if err != nil {
+			return fmt.Errorf("%w: item %d: %v", ErrDirectValidation, index, err)
+		}
+		if _, duplicate := seenProviderIDs[campaign.ProviderCampaignID]; duplicate {
+			return fmt.Errorf(
+				"%w: item %d: duplicate provider_campaign_id",
+				ErrDirectValidation, index,
+			)
+		}
+		seenProviderIDs[campaign.ProviderCampaignID] = struct{}{}
+		normalized = append(normalized, campaign)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID); err != nil {
+		return err
+	}
+	if err := lockActiveWorkspaceForDirectConnectionWrite(ctx, tx, workspaceID); err != nil {
+		return err
+	}
+	var currentGeneration int64
+	var claimedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(external_campaigns_sync_generation,0),
+       external_campaigns_sync_claimed_at
+FROM direct_connections
+WHERE workspace_id=$1 AND id=$2 AND status='active' AND revoked_at IS NULL
+FOR UPDATE`, workspaceID, connectionID).Scan(&currentGeneration, &claimedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrDirectConnectionRequired
+	}
+	if err != nil {
+		return fmt.Errorf("lock active Direct connection: %w", err)
+	}
+	if currentGeneration != generation || !claimedAt.Valid {
+		return ErrConflict
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM direct_external_campaigns
+WHERE workspace_id=$1 AND connection_id=$2`, workspaceID, connectionID); err != nil {
+		return fmt.Errorf("clear Direct external campaign snapshot: %w", err)
+	}
+
+	payload := make([]directExternalCampaignSnapshotRow, 0, len(normalized))
+	for _, campaign := range normalized {
+		var endsAt *string
+		if campaign.EndsAt != nil {
+			value := campaign.EndsAt.Format(time.DateOnly)
+			endsAt = &value
+		}
+		payload = append(payload, directExternalCampaignSnapshotRow{
+			ProviderCampaignID:    campaign.ProviderCampaignID,
+			Name:                  campaign.Name,
+			CampaignType:          campaign.CampaignType,
+			ProviderStatus:        campaign.ProviderStatus,
+			ProviderState:         campaign.ProviderState,
+			ProviderStatusPayment: campaign.ProviderStatusPayment,
+			StartsAt:              campaign.StartsAt.Format(time.DateOnly),
+			EndsAt:                endsAt,
+			Timezone:              campaign.Timezone,
+		})
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode Direct external campaign snapshot: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO direct_external_campaigns(
+workspace_id,connection_id,provider_campaign_id,name,campaign_type,provider_status,
+provider_state,provider_status_payment,starts_at,ends_at,timezone,synced_at)
+SELECT $1,$2,item.provider_campaign_id,item.name,item.campaign_type,item.provider_status,
+       item.provider_state,item.provider_status_payment,item.starts_at::date,
+       item.ends_at::date,item.timezone,$4
+FROM jsonb_to_recordset($3::jsonb) AS item(
+    provider_campaign_id BIGINT,
+    name TEXT,
+    campaign_type TEXT,
+    provider_status TEXT,
+    provider_state TEXT,
+    provider_status_payment TEXT,
+    starts_at TEXT,
+    ends_at TEXT,
+    timezone TEXT
+)
+WHERE NOT EXISTS (
+    SELECT 1 FROM direct_campaigns managed
+    WHERE managed.workspace_id=$1
+      AND managed.provider_campaign_id=item.provider_campaign_id
+)
+`, workspaceID, connectionID, string(payloadJSON), syncedAt)
+	if err != nil {
+		return fmt.Errorf("store Direct external campaign snapshot: %w", err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count stored Direct external campaigns: %w", err)
+	}
+	storedCount := int(rowsAffected)
+	result, err = tx.ExecContext(ctx, `UPDATE direct_connections
+SET external_campaigns_synced_at=$1,external_campaigns_sync_claimed_at=NULL
+WHERE workspace_id=$2 AND id=$3
+  AND external_campaigns_sync_generation=$4
+  AND external_campaigns_sync_claimed_at IS NOT NULL`,
+		syncedAt, workspaceID, connectionID, generation)
+	if err != nil {
+		return fmt.Errorf("mark Direct external campaign snapshot synced: %w", err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 1 {
+		return ErrConflict
+	}
+	if err := appendAuditEventTx(ctx, tx, AuditEvent{
+		WorkspaceID: workspaceID,
+		ActorUserID: actorUserID,
+		Action:      "direct.campaigns.external_synced",
+		EntityType:  "direct_connection",
+		EntityID:    connectionID,
+		Metadata: mustJSON(map[string]any{
+			"received_count":         len(normalized),
+			"stored_count":           storedCount,
+			"excluded_managed_count": len(normalized) - storedCount,
+			"generation":             generation,
+			"synced_at":              syncedAt,
+		}),
+		CreatedAt: syncedAt,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("replace Direct external campaign snapshot: %w", err)
+	}
+	return nil
+}
+
+// lockActiveWorkspaceForDirectConnectionWrite establishes the same
+// parent-first lock order used by connection replacement. Child-table guards
+// take this lock implicitly, but doing so before locking direct_connections
+// prevents sync or revoke racing a reconnect from forming a
+// workspace/connection deadlock cycle.
+func lockActiveWorkspaceForDirectConnectionWrite(
+	ctx context.Context, tx *sql.Tx, workspaceID string,
+) error {
+	var lockedWorkspaceID string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM workspaces
+WHERE id=$1 AND archived_at IS NULL
+FOR KEY SHARE`, workspaceID).Scan(&lockedWorkspaceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("lock workspace for Direct connection write: %w", err)
+	}
+	return nil
+}
+
+// GetDirectExternalCampaignSnapshot returns one transactionally consistent
+// view of the active connection's sync timestamp and provider-owned campaign
+// rows. Repeatable read prevents a concurrent sync or revoke from mixing two
+// different snapshots in one API response. When expectedConnectionID is set,
+// reconnecting to another account fails closed instead of returning its data.
+func (s *Store) GetDirectExternalCampaignSnapshot(
+	ctx context.Context,
+	actorUserID, workspaceID, expectedConnectionID string,
+) (DirectExternalCampaignSnapshot, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return DirectExternalCampaignSnapshot{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID); err != nil {
+		return DirectExternalCampaignSnapshot{}, err
+	}
+	snapshot := DirectExternalCampaignSnapshot{
+		Items: make([]DirectExternalCampaign, 0),
+	}
+	var syncedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `SELECT id,external_campaigns_synced_at
+FROM direct_connections
+WHERE workspace_id=$1 AND status='active' AND revoked_at IS NULL
+  AND ($2='' OR id=$2)
+ORDER BY created_at DESC,id DESC
+LIMIT 1`, workspaceID, expectedConnectionID).Scan(&snapshot.ConnectionID, &syncedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DirectExternalCampaignSnapshot{}, ErrDirectConnectionRequired
+	}
+	if err != nil {
+		return DirectExternalCampaignSnapshot{}, err
+	}
+	if syncedAt.Valid {
+		value := syncedAt.Time.UTC()
+		snapshot.SyncedAt = &value
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT external.workspace_id,external.connection_id,
+external.provider_campaign_id,external.name,external.campaign_type,external.provider_status,
+external.provider_state,external.provider_status_payment,external.starts_at,external.ends_at,
+external.timezone,external.synced_at
+FROM direct_external_campaigns external
+WHERE external.workspace_id=$1 AND external.connection_id=$2
+  AND NOT EXISTS (
+      SELECT 1 FROM direct_campaigns managed
+      WHERE managed.workspace_id=external.workspace_id
+        AND managed.provider_campaign_id=external.provider_campaign_id
+	)
+ORDER BY external.starts_at DESC,external.provider_campaign_id DESC`,
+		workspaceID, snapshot.ConnectionID)
+	if err != nil {
+		return DirectExternalCampaignSnapshot{}, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		campaign, scanErr := scanDirectExternalCampaign(rows)
+		if scanErr != nil {
+			return DirectExternalCampaignSnapshot{}, scanErr
+		}
+		snapshot.Items = append(snapshot.Items, campaign)
+	}
+	if err := rows.Err(); err != nil {
+		return DirectExternalCampaignSnapshot{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return DirectExternalCampaignSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DirectExternalCampaignSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+// ListDirectExternalCampaigns is the item-only store view used by lower-level
+// callers. API code should use GetDirectExternalCampaignSnapshot so the items
+// and top-level synced_at always come from the same database snapshot.
+func (s *Store) ListDirectExternalCampaigns(
+	ctx context.Context, actorUserID, workspaceID, connectionID string,
+) ([]DirectExternalCampaign, error) {
+	snapshot, err := s.GetDirectExternalCampaignSnapshot(
+		ctx, actorUserID, workspaceID, connectionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Items, nil
 }
 
 func (s *Store) GetDirectCampaign(
@@ -2702,6 +3134,62 @@ func directCampaignAuditMetadata(campaign DirectCampaign) json.RawMessage {
 	})
 }
 
+func normalizeDirectExternalCampaign(
+	campaign DirectExternalCampaign,
+	workspaceID, connectionID string,
+	syncedAt time.Time,
+) (DirectExternalCampaign, error) {
+	if campaign.WorkspaceID != "" && campaign.WorkspaceID != workspaceID {
+		return DirectExternalCampaign{}, errors.New("workspace_id does not match the snapshot scope")
+	}
+	if campaign.ConnectionID != "" && campaign.ConnectionID != connectionID {
+		return DirectExternalCampaign{}, errors.New("connection_id does not match the snapshot scope")
+	}
+	campaign.WorkspaceID = workspaceID
+	campaign.ConnectionID = connectionID
+	campaign.Name = norm.NFC.String(strings.TrimSpace(campaign.Name))
+	campaign.CampaignType = strings.ToUpper(strings.TrimSpace(campaign.CampaignType))
+	campaign.ProviderStatus = strings.ToUpper(strings.TrimSpace(campaign.ProviderStatus))
+	campaign.ProviderState = strings.ToUpper(strings.TrimSpace(campaign.ProviderState))
+	campaign.ProviderStatusPayment = strings.ToUpper(strings.TrimSpace(campaign.ProviderStatusPayment))
+	campaign.Timezone = norm.NFC.String(strings.TrimSpace(campaign.Timezone))
+	campaign.StartsAt = dateOnly(campaign.StartsAt)
+	campaign.SyncedAt = syncedAt.UTC()
+	if campaign.ProviderCampaignID <= 0 {
+		return DirectExternalCampaign{}, errors.New("provider_campaign_id must be positive")
+	}
+	if campaign.Name == "" || utf8.RuneCountInString(campaign.Name) > 255 {
+		return DirectExternalCampaign{}, errors.New("name must contain 1 to 255 characters")
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"campaign_type", campaign.CampaignType},
+		{"provider_status", campaign.ProviderStatus},
+		{"provider_state", campaign.ProviderState},
+		{"provider_status_payment", campaign.ProviderStatusPayment},
+	} {
+		if !directProviderEnumPattern.MatchString(field.value) {
+			return DirectExternalCampaign{}, fmt.Errorf("%s is invalid", field.name)
+		}
+	}
+	if campaign.StartsAt.IsZero() {
+		return DirectExternalCampaign{}, errors.New("starts_at is required")
+	}
+	if campaign.EndsAt != nil {
+		endsAt := dateOnly(*campaign.EndsAt)
+		if endsAt.IsZero() || endsAt.Before(campaign.StartsAt) {
+			return DirectExternalCampaign{}, errors.New("ends_at is invalid")
+		}
+		campaign.EndsAt = &endsAt
+	}
+	if campaign.Timezone == "" || utf8.RuneCountInString(campaign.Timezone) > 128 {
+		return DirectExternalCampaign{}, errors.New("timezone must contain 1 to 128 characters")
+	}
+	return campaign, nil
+}
+
 func dateOnly(value time.Time) time.Time {
 	if value.IsZero() {
 		return time.Time{}
@@ -2721,7 +3209,7 @@ func scanDirectConnection(row scanner) (DirectConnection, error) {
 		&connection.Timezone, &connection.ReadOnly, &connection.TokenCiphertext, &connection.TokenKeyVersion, &connection.Status,
 		&connection.ConnectedBy, &connection.LastVerifiedAt, &connection.ErrorCode,
 		&connection.CreatedAt, &connection.UpdatedAt, &connection.RevokedAt,
-		&connection.TokenRefreshClaimedAt)
+		&connection.TokenRefreshClaimedAt, &connection.ExternalCampaignsSyncedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DirectConnection{}, ErrNotFound
 	}
@@ -2730,6 +3218,38 @@ func scanDirectConnection(row scanner) (DirectConnection, error) {
 	}
 	normalizeDirectConnection(&connection)
 	return connection, nil
+}
+
+func scanDirectExternalCampaign(row scanner) (DirectExternalCampaign, error) {
+	var campaign DirectExternalCampaign
+	var endsAt sql.NullTime
+	err := row.Scan(
+		&campaign.WorkspaceID,
+		&campaign.ConnectionID,
+		&campaign.ProviderCampaignID,
+		&campaign.Name,
+		&campaign.CampaignType,
+		&campaign.ProviderStatus,
+		&campaign.ProviderState,
+		&campaign.ProviderStatusPayment,
+		&campaign.StartsAt,
+		&endsAt,
+		&campaign.Timezone,
+		&campaign.SyncedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DirectExternalCampaign{}, ErrNotFound
+	}
+	if err != nil {
+		return DirectExternalCampaign{}, err
+	}
+	campaign.StartsAt = dateOnly(campaign.StartsAt)
+	if endsAt.Valid {
+		value := dateOnly(endsAt.Time)
+		campaign.EndsAt = &value
+	}
+	campaign.SyncedAt = campaign.SyncedAt.UTC()
+	return campaign, nil
 }
 
 func scanDirectCampaign(row scanner) (DirectCampaign, error) {
@@ -2859,6 +3379,10 @@ func normalizeDirectConnection(connection *DirectConnection) {
 	if connection.TokenRefreshClaimedAt != nil {
 		value := connection.TokenRefreshClaimedAt.UTC()
 		connection.TokenRefreshClaimedAt = &value
+	}
+	if connection.ExternalCampaignsSyncedAt != nil {
+		value := connection.ExternalCampaignsSyncedAt.UTC()
+		connection.ExternalCampaignsSyncedAt = &value
 	}
 }
 

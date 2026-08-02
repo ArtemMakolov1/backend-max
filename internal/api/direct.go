@@ -147,6 +147,8 @@ func (s *Server) registerDirectAdvertisingRoutes(r chi.Router) {
 		r.Delete("/connection", s.revokeDirectConnection)
 		r.Get("/campaigns", s.listDirectCampaigns)
 		r.Post("/campaigns", s.createDirectCampaign)
+		r.Get("/campaigns/external", s.listDirectExternalCampaigns)
+		r.Post("/campaigns/sync", s.syncDirectExternalCampaigns)
 		r.Post("/campaigns/suggest", s.suggestDirectCampaign)
 		r.Patch("/campaigns/{campaign_id}", s.updateDirectCampaign)
 		r.Get("/campaigns/{campaign_id}/bids", s.getDirectCampaignBids)
