@@ -635,6 +635,45 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			message, map[string]any{"reason": reason})
 		return
 	}
+	for _, directOAuthFailure := range []struct {
+		err     error
+		status  int
+		code    string
+		message string
+	}{
+		{
+			err: app.ErrDirectOAuthStateUnavailable, status: http.StatusConflict,
+			code:    "direct_oauth_state_unavailable",
+			message: "Сеанс подключения уже использован, истёк или был заменён. Начните подключение заново.",
+		},
+		{
+			err: app.ErrDirectOAuthCodeRejected, status: http.StatusBadRequest,
+			code:    "direct_oauth_code_rejected",
+			message: "Яндекс отклонил одноразовый код: он неверен, истёк или уже использован. Начните подключение заново.",
+		},
+		{
+			err: app.ErrDirectOAuthApplicationUnavailable, status: http.StatusServiceUnavailable,
+			code:    "direct_oauth_application_unavailable",
+			message: "Приложение Яндекс Директа пока не может завершить авторизацию. Начните подключение заново позже.",
+		},
+		{
+			err: app.ErrDirectOAuthExchangeUncertain, status: http.StatusBadGateway,
+			code:    "direct_oauth_exchange_uncertain",
+			message: "Яндекс не подтвердил обмен одноразового кода. Не отправляйте этот код повторно; начните подключение заново.",
+		},
+		{
+			err: app.ErrDirectOAuthAccountVerificationFailed, status: http.StatusBadGateway,
+			code:    "direct_oauth_account_verification_failed",
+			message: "Код принят, но проверить рекламный кабинет не удалось. Начните подключение заново.",
+		},
+	} {
+		if errors.Is(err, directOAuthFailure.err) {
+			w.Header().Set("Cache-Control", "no-store")
+			s.problem(w, directOAuthFailure.status, directOAuthFailure.code,
+				directOAuthFailure.message, nil)
+			return
+		}
+	}
 	if directThrottle, ok := app.DirectProviderThrottle(err); ok {
 		retryAfter := retryAfterSeconds(directThrottle.RetryAfter)
 		status := http.StatusTooManyRequests

@@ -24,6 +24,8 @@ type fakeDirectOAuthProvider struct {
 	exchangeCalls int
 	exchangedCode string
 	verifier      string
+	exchangeErr   error
+	accountCalls  int
 	accountErr    error
 }
 
@@ -43,6 +45,9 @@ func (f *fakeDirectOAuthProvider) ExchangeCode(
 ) (yandexdirect.OAuthToken, error) {
 	f.exchangeCalls++
 	f.exchangedCode, f.verifier = code, verifier
+	if f.exchangeErr != nil {
+		return yandexdirect.OAuthToken{}, f.exchangeErr
+	}
 	return yandexdirect.OAuthToken{
 		AccessToken: "provider-access-token", RefreshToken: "provider-refresh-token",
 		ExpiresInSeconds: int64((24 * time.Hour) / time.Second),
@@ -62,6 +67,7 @@ func (f *fakeDirectOAuthProvider) RefreshToken(
 func (f *fakeDirectOAuthProvider) GetAccount(
 	context.Context, string, string,
 ) (yandexdirect.Account, error) {
+	f.accountCalls++
 	if f.accountErr != nil {
 		return yandexdirect.Account{}, f.accountErr
 	}
@@ -134,7 +140,7 @@ func TestDirectVerificationCodeOAuthIsSessionWorkspaceOriginAndAttemptBound(t *t
 	response := performJSONRequest(
 		wrongSession, http.MethodPost, base+"/connect/complete", body,
 	)
-	assertProblemCode(t, response, http.StatusNotFound, "not_found")
+	assertProblemCode(t, response, http.StatusConflict, "direct_oauth_state_unavailable")
 
 	credentialed, ok := handler.(credentialedTestHandler)
 	if !ok {
@@ -160,7 +166,7 @@ func TestDirectVerificationCodeOAuthIsSessionWorkspaceOriginAndAttemptBound(t *t
 		handler, http.MethodPost,
 		"/api/v1/workspaces/"+otherWorkspace.ID+"/advertising/direct/connect/complete", body,
 	)
-	assertProblemCode(t, response, http.StatusNotFound, "not_found")
+	assertProblemCode(t, response, http.StatusConflict, "direct_oauth_state_unavailable")
 
 	invalidCodeBody := fmt.Sprintf(
 		`{"code":"A1b2C3d4E5f6G7h","state":%q}`, started.Connection.State,
@@ -187,9 +193,134 @@ func TestDirectVerificationCodeOAuthIsSessionWorkspaceOriginAndAttemptBound(t *t
 		t.Fatalf("completion leaked a secret: %s", response.Body.String())
 	}
 	response = performJSONRequest(handler, http.MethodPost, base+"/connect/complete", body)
-	assertProblemCode(t, response, http.StatusNotFound, "not_found")
+	assertProblemCode(t, response, http.StatusConflict, "direct_oauth_state_unavailable")
 	if provider.exchangeCalls != 1 {
 		t.Fatalf("replayed completion reached provider %d times", provider.exchangeCalls)
+	}
+}
+
+func TestDirectVerificationOAuthClassifiesCompletionFailuresWithoutProviderReplay(t *testing.T) {
+	tests := []struct {
+		name         string
+		exchangeErr  error
+		accountErr   error
+		wantStatus   int
+		wantCode     string
+		wantAccounts int
+		providerText string
+	}{
+		{
+			name: "invalid grant", exchangeErr: &yandexdirect.Error{
+				StatusCode: http.StatusBadRequest, Code: "invalid_grant",
+			},
+			wantStatus: http.StatusBadRequest, wantCode: "direct_oauth_code_rejected",
+			providerText: "invalid_grant",
+		},
+		{
+			name: "bad verification code", exchangeErr: &yandexdirect.Error{
+				StatusCode: http.StatusBadRequest, Code: "bad_verification_code",
+			},
+			wantStatus: http.StatusBadRequest, wantCode: "direct_oauth_code_rejected",
+			providerText: "bad_verification_code",
+		},
+		{
+			name: "invalid client", exchangeErr: &yandexdirect.Error{
+				StatusCode: http.StatusBadRequest, Code: "invalid_client",
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "direct_oauth_application_unavailable", providerText: "invalid_client",
+		},
+		{
+			name: "unauthorized client", exchangeErr: &yandexdirect.Error{
+				StatusCode: http.StatusBadRequest, Code: "unauthorized_client",
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "direct_oauth_application_unavailable", providerText: "unauthorized_client",
+		},
+		{
+			name: "invalid scope", exchangeErr: &yandexdirect.Error{
+				StatusCode: http.StatusBadRequest, Code: "invalid_scope",
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "direct_oauth_application_unavailable", providerText: "invalid_scope",
+		},
+		{
+			name: "uncertain exchange", exchangeErr: fmt.Errorf("provider transport secret"),
+			wantStatus: http.StatusBadGateway, wantCode: "direct_oauth_exchange_uncertain",
+			providerText: "provider transport secret",
+		},
+		{
+			name: "unexpected OAuth response", exchangeErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, Code: "invalid_oauth_response",
+			},
+			wantStatus: http.StatusBadGateway, wantCode: "direct_oauth_exchange_uncertain",
+			providerText: "invalid_oauth_response",
+		},
+		{
+			name: "account verification", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusServiceUnavailable, Code: "provider_account_secret",
+			},
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "direct_oauth_account_verification_failed", wantAccounts: 1,
+			providerText: "provider_account_secret",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newWorkspaceAPIFixture(t)
+			provider := &fakeDirectOAuthProvider{
+				flow:        yandexdirect.OAuthFlowVerificationCode,
+				exchangeErr: test.exchangeErr, accountErr: test.accountErr,
+			}
+			if err := fixture.app.ConfigureDirect(
+				provider, []byte("0123456789abcdef0123456789abcdef"),
+			); err != nil {
+				t.Fatal(err)
+			}
+			handler := fixture.handler(t, "ws-owner")
+			base := "/api/v1/workspaces/" + fixture.workspace.ID + "/advertising/direct"
+			start := performJSONRequest(handler, http.MethodPost, base+"/connect/start", "")
+			if start.Code != http.StatusOK {
+				t.Fatalf("start = %d %s", start.Code, start.Body.String())
+			}
+			var started struct {
+				Connection struct {
+					State string `json:"state"`
+				} `json:"connection"`
+			}
+			if err := json.Unmarshal(start.Body.Bytes(), &started); err != nil {
+				t.Fatal(err)
+			}
+			body := fmt.Sprintf(
+				`{"code":"A1b2C3d4E5f6G7h8","state":%q}`,
+				started.Connection.State,
+			)
+			response := performJSONRequest(
+				handler, http.MethodPost, base+"/connect/complete", body,
+			)
+			assertProblemCode(t, response, test.wantStatus, test.wantCode)
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("completion Cache-Control = %q", response.Header().Get("Cache-Control"))
+			}
+			if strings.Contains(response.Body.String(), test.providerText) ||
+				strings.Contains(response.Body.String(), started.Connection.State) {
+				t.Fatalf("completion exposed provider/state details: %s", response.Body.String())
+			}
+			if provider.exchangeCalls != 1 || provider.accountCalls != test.wantAccounts {
+				t.Fatalf("provider calls after failure: exchange=%d account=%d",
+					provider.exchangeCalls, provider.accountCalls)
+			}
+
+			replay := performJSONRequest(
+				handler, http.MethodPost, base+"/connect/complete", body,
+			)
+			assertProblemCode(t, replay, http.StatusConflict, "direct_oauth_state_unavailable")
+			if provider.exchangeCalls != 1 || provider.accountCalls != test.wantAccounts {
+				t.Fatalf("replay reached provider: exchange=%d account=%d",
+					provider.exchangeCalls, provider.accountCalls)
+			}
+		})
 	}
 }
 

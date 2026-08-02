@@ -216,6 +216,7 @@ func (s *Server) startDirectConnection(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) completeDirectConnection(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if r.Header.Get("Origin") != s.frontendOrigin {
 		s.problem(w, http.StatusForbidden, "origin_required",
 			"An exact frontend Origin is required to complete Yandex Direct authorization", nil)
@@ -239,10 +240,10 @@ func (s *Server) completeDirectConnection(w http.ResponseWriter, r *http.Request
 		request.State, request.Code,
 	)
 	if err != nil {
+		s.logDirectOAuthCompletionFailure("Yandex Direct OAuth verification failed", err)
 		s.writeError(w, err)
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"connection": publicDirectConnection(completion.Connection),
 	})
@@ -280,7 +281,7 @@ func (s *Server) finishDirectOAuth(w http.ResponseWriter, r *http.Request) {
 		r.Context(), userID, sessionBinding, state, code,
 	)
 	if err != nil {
-		s.logger.Warn("Yandex Direct OAuth callback failed", "error", err)
+		s.logDirectOAuthCompletionFailure("Yandex Direct OAuth callback failed", err)
 		code := "connect_failed"
 		var compatibilityErr *app.DirectAccountCompatibilityError
 		if errors.As(err, &compatibilityErr) {
@@ -290,6 +291,27 @@ func (s *Server) finishDirectOAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, s.frontendOrigin+completion.ReturnTo, http.StatusSeeOther)
+}
+
+func (s *Server) logDirectOAuthCompletionFailure(message string, err error) {
+	stage, reason := "", ""
+	switch {
+	case errors.Is(err, app.ErrDirectOAuthStateUnavailable):
+		stage, reason = "state", "unavailable"
+	case errors.Is(err, app.ErrDirectOAuthCodeRejected):
+		stage, reason = "token_exchange", "code_rejected"
+	case errors.Is(err, app.ErrDirectOAuthApplicationUnavailable):
+		stage, reason = "token_exchange", "application_unavailable"
+	case errors.Is(err, app.ErrDirectOAuthExchangeUncertain):
+		stage, reason = "token_exchange", "outcome_uncertain"
+	case errors.Is(err, app.ErrDirectOAuthAccountVerificationFailed):
+		stage, reason = "account_verification", "provider_failed"
+	}
+	if stage != "" {
+		s.logger.Warn(message, "stage", stage, "reason", reason)
+		return
+	}
+	s.logger.Warn(message, "error", err)
 }
 
 func (s *Server) revokeDirectConnection(w http.ResponseWriter, r *http.Request) {

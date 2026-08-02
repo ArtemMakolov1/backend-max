@@ -34,14 +34,19 @@ const (
 )
 
 var (
-	ErrDirectNotConfigured    = errors.New("integration with Yandex Direct is not configured")
-	ErrDirectGraphUnsupported = errors.New("provider for Yandex Direct does not support the verified v501 campaign graph")
-	ErrDirectWritesDisabled   = errors.New("writes to Yandex Direct are disabled")
-	ErrDirectAutoLaunchOff    = errors.New("auto-launch for Yandex Direct is disabled")
-	ErrDirectProvider         = errors.New("provider request to Yandex Direct failed")
-	ErrDirectSnapshotMismatch = errors.New("provider campaign in Yandex Direct does not match the authorized snapshot")
-	ErrDirectOAuthInvalid     = errors.New("invalid Yandex Direct OAuth completion")
-	ErrDirectOAuthFlow        = errors.New("completion flow for Yandex Direct OAuth does not match the configured redirect")
+	ErrDirectNotConfigured                  = errors.New("integration with Yandex Direct is not configured")
+	ErrDirectGraphUnsupported               = errors.New("provider for Yandex Direct does not support the verified v501 campaign graph")
+	ErrDirectWritesDisabled                 = errors.New("writes to Yandex Direct are disabled")
+	ErrDirectAutoLaunchOff                  = errors.New("auto-launch for Yandex Direct is disabled")
+	ErrDirectProvider                       = errors.New("provider request to Yandex Direct failed")
+	ErrDirectSnapshotMismatch               = errors.New("provider campaign in Yandex Direct does not match the authorized snapshot")
+	ErrDirectOAuthInvalid                   = errors.New("invalid Yandex Direct OAuth completion")
+	ErrDirectOAuthFlow                      = errors.New("completion flow for Yandex Direct OAuth does not match the configured redirect")
+	ErrDirectOAuthStateUnavailable          = errors.New("Yandex Direct OAuth state is unavailable")
+	ErrDirectOAuthCodeRejected              = errors.New("Yandex Direct OAuth code was rejected")
+	ErrDirectOAuthApplicationUnavailable    = errors.New("Yandex Direct OAuth application is unavailable")
+	ErrDirectOAuthExchangeUncertain         = errors.New("Yandex Direct OAuth exchange outcome is uncertain")
+	ErrDirectOAuthAccountVerificationFailed = errors.New("Yandex Direct OAuth account verification failed")
 )
 
 // DirectAccountCompatibilityError is safe to return to an authenticated API
@@ -430,11 +435,14 @@ func (a *App) completeDirectOAuth(
 		)
 	}
 	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) {
+			return DirectOAuthCompletion{}, ErrDirectOAuthStateUnavailable
+		}
 		return DirectOAuthCompletion{}, err
 	}
 	oauthToken, err := a.direct.ExchangeCode(ctx, code, stored.PKCEVerifier)
 	if err != nil {
-		return DirectOAuthCompletion{}, fmt.Errorf("%w: %w", ErrDirectProvider, err)
+		return DirectOAuthCompletion{}, classifyDirectOAuthExchangeFailure(err)
 	}
 	account, err := a.direct.GetAccount(ctx, oauthToken.AccessToken, stored.ClientLogin)
 	if err != nil {
@@ -444,7 +452,7 @@ func (a *App) completeDirectOAuth(
 				Reason: sanitizedDirectAccountCompatibilityReason(compatibilityErr.Reason),
 			}
 		}
-		return DirectOAuthCompletion{}, fmt.Errorf("%w: %w", ErrDirectProvider, err)
+		return DirectOAuthCompletion{}, ErrDirectOAuthAccountVerificationFailed
 	}
 	clientLogin := strings.TrimSpace(stored.ClientLogin)
 	if clientLogin == "" {
@@ -474,6 +482,21 @@ func (a *App) completeDirectOAuth(
 	return DirectOAuthCompletion{
 		WorkspaceID: stored.WorkspaceID, ReturnTo: stored.ReturnTo, Connection: connection,
 	}, nil
+}
+
+func classifyDirectOAuthExchangeFailure(err error) error {
+	var providerErr *yandexdirect.Error
+	if !errors.As(err, &providerErr) {
+		return ErrDirectOAuthExchangeUncertain
+	}
+	switch strings.ToLower(strings.TrimSpace(providerErr.Code)) {
+	case "invalid_grant", "bad_verification_code":
+		return ErrDirectOAuthCodeRejected
+	case "invalid_client", "unauthorized_client", "invalid_scope":
+		return ErrDirectOAuthApplicationUnavailable
+	default:
+		return ErrDirectOAuthExchangeUncertain
+	}
 }
 
 func sanitizedDirectAccountCompatibilityReason(reason string) string {
