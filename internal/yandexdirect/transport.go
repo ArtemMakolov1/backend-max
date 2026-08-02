@@ -10,7 +10,14 @@ import (
 	"time"
 )
 
-const directMaxConcurrentPerAdvertiser = 4
+const (
+	directMaxConcurrentPerAdvertiser = 4
+	// Direct Reports allows 20 requests in any 10-second window per user.
+	// Serializing report requests and spacing their starts by one second keeps
+	// MaxPosty at no more than 10 requests in that window, including polling a
+	// queued report, while leaving capacity for the regular Direct services.
+	directReportRequestMinInterval = time.Second
+)
 
 // UnitsUsage is the provider quota snapshot returned in the Direct Units
 // response header. Direct documents the values as spent/remaining/daily.
@@ -27,19 +34,23 @@ type UnitsUsage struct {
 
 type directAccountTransportState struct {
 	semaphore            chan struct{}
+	reportSemaphore      chan struct{}
 	mu                   sync.Mutex
 	usage                UnitsUsage
 	hasUsage             bool
 	cooldown             time.Time
 	cooldownStatusCode   int
 	cooldownAPIErrorCode int
+	nextReportRequestAt  time.Time
 }
 
 type directTransport struct {
-	base http.RoundTripper
-	now  func() time.Time
-	mu   sync.Mutex
-	byID map[string]*directAccountTransportState
+	base              http.RoundTripper
+	now               func() time.Time
+	wait              func(context.Context, time.Duration) error
+	reportMinInterval time.Duration
+	mu                sync.Mutex
+	byID              map[string]*directAccountTransportState
 }
 
 func newDirectTransport(base http.RoundTripper) *directTransport {
@@ -47,9 +58,9 @@ func newDirectTransport(base http.RoundTripper) *directTransport {
 		base = http.DefaultTransport
 	}
 	return &directTransport{
-		base: base,
-		now:  time.Now,
-		byID: make(map[string]*directAccountTransportState),
+		base: base, now: time.Now, wait: waitDirectRetry,
+		reportMinInterval: directReportRequestMinInterval,
+		byID:              make(map[string]*directAccountTransportState),
 	}
 }
 
@@ -59,10 +70,21 @@ func (t *directTransport) RoundTrip(request *http.Request) (*http.Response, erro
 	}
 	key := directAdvertiserKey(request.Header.Get("Client-Login"))
 	state := t.account(key)
+	if isDirectReportsRequest(request) {
+		if err := acquireDirectSemaphore(request.Context(), state.reportSemaphore); err != nil {
+			return nil, err
+		}
+		defer func() { <-state.reportSemaphore }()
+	}
 	if err := t.acquire(request.Context(), state); err != nil {
 		return nil, err
 	}
 	defer func() { <-state.semaphore }()
+	if isDirectReportsRequest(request) {
+		if err := t.waitForReportSlot(request.Context(), state); err != nil {
+			return nil, err
+		}
+	}
 
 	response, err := t.base.RoundTrip(request)
 	if err != nil {
@@ -86,7 +108,8 @@ func (t *directTransport) account(key string) *directAccountTransportState {
 	state := t.byID[key]
 	if state == nil {
 		state = &directAccountTransportState{
-			semaphore: make(chan struct{}, directMaxConcurrentPerAdvertiser),
+			semaphore:       make(chan struct{}, directMaxConcurrentPerAdvertiser),
+			reportSemaphore: make(chan struct{}, 1),
 		}
 		t.byID[key] = state
 	}
@@ -111,11 +134,41 @@ func (t *directTransport) acquire(
 			Code: "direct_request_cooldown", RetryAfter: cooldown.Sub(now),
 		}
 	}
+	return acquireDirectSemaphore(ctx, state.semaphore)
+}
+
+func acquireDirectSemaphore(ctx context.Context, semaphore chan struct{}) error {
 	select {
-	case state.semaphore <- struct{}{}:
+	case semaphore <- struct{}{}:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func (t *directTransport) waitForReportSlot(
+	ctx context.Context, state *directAccountTransportState,
+) error {
+	if t.reportMinInterval <= 0 {
+		return nil
+	}
+	for {
+		now := t.now().UTC()
+		state.mu.Lock()
+		availableAt := state.nextReportRequestAt
+		if !availableAt.After(now) {
+			state.nextReportRequestAt = now.Add(t.reportMinInterval)
+			state.mu.Unlock()
+			return nil
+		}
+		state.mu.Unlock()
+		wait := t.wait
+		if wait == nil {
+			wait = waitDirectRetry
+		}
+		if err := wait(ctx, availableAt.Sub(now)); err != nil {
+			return err
+		}
 	}
 }
 
@@ -187,6 +240,14 @@ func isDirectAPIRequest(request *http.Request) bool {
 	path := strings.ToLower(request.URL.Path)
 	return strings.Contains(path, "/json/v5/") ||
 		strings.Contains(path, "/json/v501/")
+}
+
+func isDirectReportsRequest(request *http.Request) bool {
+	if !isDirectAPIRequest(request) {
+		return false
+	}
+	path := strings.TrimRight(strings.ToLower(request.URL.Path), "/")
+	return strings.HasSuffix(path, "/reports")
 }
 
 func parseUnitsUsage(value string) (UnitsUsage, bool) {

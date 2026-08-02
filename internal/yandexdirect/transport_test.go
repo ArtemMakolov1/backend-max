@@ -112,6 +112,124 @@ func TestDirectTransportLimitsConcurrencyAndTracksUnits(t *testing.T) {
 	}
 }
 
+func TestDirectTransportSpacesReportRequestsPerAdvertiser(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	var waits []time.Duration
+	var calls atomic.Int64
+	transport := newDirectTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader("Date\\tCampaignId\\n")), Request: request,
+		}, nil
+	}))
+	transport.now = func() time.Time { return now }
+	transport.wait = func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		now = now.Add(delay)
+		return nil
+	}
+
+	for index := 0; index < 3; index++ {
+		request, err := http.NewRequest(
+			http.MethodPost, "https://api.direct.yandex.com/json/v501/reports", nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := transport.RoundTrip(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+	}
+	regularRequest, err := http.NewRequest(
+		http.MethodPost, "https://api.direct.yandex.com/json/v501/campaigns", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	regularResponse, err := transport.RoundTrip(regularRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = regularResponse.Body.Close()
+
+	if calls.Load() != 4 {
+		t.Fatalf("provider calls = %d, want 4", calls.Load())
+	}
+	if len(waits) != 2 || waits[0] != time.Second || waits[1] != time.Second {
+		t.Fatalf("report waits = %v, want [1s 1s]", waits)
+	}
+}
+
+func TestDirectTransportSerializesReportRequestsPerAdvertiser(t *testing.T) {
+	t.Parallel()
+	var current atomic.Int64
+	var maximum atomic.Int64
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	transport := newDirectTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		active := current.Add(1)
+		defer current.Add(-1)
+		for {
+			observed := maximum.Load()
+			if active <= observed || maximum.CompareAndSwap(observed, active) {
+				break
+			}
+		}
+		started <- struct{}{}
+		<-release
+		return &http.Response{
+			StatusCode: http.StatusOK, Header: make(http.Header),
+			Body: io.NopCloser(strings.NewReader("Date\\tCampaignId\\n")), Request: request,
+		}, nil
+	}))
+	transport.reportMinInterval = 0
+
+	var group sync.WaitGroup
+	errorsSeen := make(chan error, 2)
+	for index := 0; index < 2; index++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			request, err := http.NewRequest(
+				http.MethodPost, "https://api.direct.yandex.com/json/v501/reports", nil,
+			)
+			if err == nil {
+				var response *http.Response
+				response, err = transport.RoundTrip(request)
+				if response != nil {
+					_ = response.Body.Close()
+				}
+			}
+			errorsSeen <- err
+		}()
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first report request did not enter the transport")
+	}
+	select {
+	case <-started:
+		t.Fatal("report requests were not serialized")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	group.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if maximum.Load() != 1 {
+		t.Fatalf("maximum report concurrency = %d, want 1", maximum.Load())
+	}
+}
+
 func TestDirectTransportFailsFastDuringProviderCooldown(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
