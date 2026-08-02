@@ -425,15 +425,15 @@ func (c *Client) GetAccount(
 ) (Account, error) {
 	var response struct {
 		Clients []struct {
-			ClientID              int64   `json:"ClientId"`
-			Login                 string  `json:"Login"`
-			ClientInfo            string  `json:"ClientInfo"`
-			Currency              *string `json:"Currency"`
-			Type                  *string `json:"Type"`
-			Archived              *string `json:"Archived"`
-			ForbiddenPlatform     *string `json:"ForbiddenPlatform"`
-			AvailableCampaignType *string `json:"AvailableCampaignTypes"`
-			Grants                []struct {
+			ClientID               int64                  `json:"ClientId"`
+			Login                  string                 `json:"Login"`
+			ClientInfo             string                 `json:"ClientInfo"`
+			Currency               *string                `json:"Currency"`
+			Type                   *string                `json:"Type"`
+			Archived               *string                `json:"Archived"`
+			ForbiddenPlatform      *string                `json:"ForbiddenPlatform"`
+			AvailableCampaignTypes availableCampaignTypes `json:"AvailableCampaignTypes"`
+			Grants                 []struct {
 				Privilege string `json:"Privilege"`
 				Value     string `json:"Value"`
 			} `json:"Grants"`
@@ -476,18 +476,23 @@ func (c *Client) GetAccount(
 	default:
 		return Account{}, &Error{Code: "invalid_direct_account_response"}
 	}
-	if item.Currency == nil || item.Archived == nil ||
-		item.ForbiddenPlatform == nil || item.AvailableCampaignType == nil {
+	if item.Currency == nil || item.Archived == nil || item.ForbiddenPlatform == nil {
 		return Account{}, &Error{Code: "invalid_direct_account_response"}
 	}
 	currency := strings.ToUpper(strings.TrimSpace(*item.Currency))
 	archived := strings.ToUpper(strings.TrimSpace(*item.Archived))
 	forbiddenPlatform := strings.ToUpper(strings.TrimSpace(*item.ForbiddenPlatform))
-	availableCampaignType := strings.ToUpper(strings.TrimSpace(*item.AvailableCampaignType))
 	if (archived != "YES" && archived != "NO") ||
 		(forbiddenPlatform != "SEARCH" && forbiddenPlatform != "NETWORK" &&
-			forbiddenPlatform != "NONE") || !validAvailableCampaignType(availableCampaignType) {
+			forbiddenPlatform != "NONE") {
 		return Account{}, &Error{Code: "invalid_direct_account_response"}
+	}
+	hasUnifiedCampaign := false
+	for _, campaignType := range item.AvailableCampaignTypes {
+		if strings.EqualFold(strings.TrimSpace(campaignType), "UNIFIED_CAMPAIGN") {
+			hasUnifiedCampaign = true
+			break
+		}
 	}
 	for _, compatibility := range []struct {
 		unsupported bool
@@ -496,7 +501,7 @@ func (c *Client) GetAccount(
 		{currency != "RUB", AccountIncompatibleCurrency},
 		{archived != "NO", AccountIncompatibleArchived},
 		{forbiddenPlatform == "NETWORK", AccountIncompatibleNetwork},
-		{availableCampaignType != "UNIFIED_CAMPAIGN", AccountIncompatibleUnifiedCampaign},
+		{!hasUnifiedCampaign, AccountIncompatibleUnifiedCampaign},
 	} {
 		if compatibility.unsupported {
 			return Account{}, &AccountCompatibilityError{Reason: compatibility.reason}
@@ -520,15 +525,25 @@ func (c *Client) GetAccount(
 	}, nil
 }
 
-func validAvailableCampaignType(value string) bool {
-	switch value {
-	case "TEXT_CAMPAIGN", "MOBILE_APP_CAMPAIGN", "DYNAMIC_TEXT_CAMPAIGN",
-		"CPM_BANNER_CAMPAIGN", "SMART_CAMPAIGN", "CONTENT_PROMOTION",
-		"BILLING_AGGREGATE", "UNIFIED_CAMPAIGN":
-		return true
-	default:
-		return false
+// availableCampaignTypes follows the live v501 WSDL, where the field is
+// repeated (maxOccurs="unbounded") and therefore represented as a JSON array.
+// The public HTML reference currently illustrates a scalar, so accepting both
+// shapes keeps account verification compatible without weakening the exact
+// UNIFIED_CAMPAIGN capability check.
+type availableCampaignTypes []string
+
+func (types *availableCampaignTypes) UnmarshalJSON(data []byte) error {
+	var list []string
+	if err := json.Unmarshal(data, &list); err == nil {
+		*types = list
+		return nil
 	}
+	var scalar string
+	if err := json.Unmarshal(data, &scalar); err != nil {
+		return errors.New("invalid AvailableCampaignTypes value")
+	}
+	*types = []string{scalar}
+	return nil
 }
 
 func (c *Client) CreateCampaignDraft(

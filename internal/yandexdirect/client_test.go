@@ -675,44 +675,52 @@ func TestFindWeeklySpendLimitUsesExactJSONNumber(t *testing.T) {
 func TestGetAccountRequiresSupportedDirectAccount(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name                  string
-		itemType              string
-		currency              string
-		archived              string
-		forbiddenPlatform     string
-		availableCampaignType string
-		wantReason            string
+		name                   string
+		itemType               string
+		currency               string
+		archived               string
+		forbiddenPlatform      string
+		availableCampaignTypes []string
+		wantReason             string
 	}{
 		{
 			name: "supported direct RUB network account", itemType: "CLIENT",
 			currency: "RUB", archived: "NO", forbiddenPlatform: "NONE",
-			availableCampaignType: "UNIFIED_CAMPAIGN",
+			availableCampaignTypes: []string{
+				"TEXT_CAMPAIGN", "FUTURE_CAMPAIGN", "UNIFIED_CAMPAIGN",
+			},
 		},
 		{
 			name: "agency", itemType: "AGENCY", currency: "RUB", archived: "NO",
-			forbiddenPlatform: "NONE", availableCampaignType: "UNIFIED_CAMPAIGN",
+			forbiddenPlatform: "NONE", availableCampaignTypes: []string{"UNIFIED_CAMPAIGN"},
 			wantReason: AccountIncompatibleType,
 		},
 		{
 			name: "non RUB currency", itemType: "CLIENT", currency: "USD", archived: "NO",
-			forbiddenPlatform: "NONE", availableCampaignType: "UNIFIED_CAMPAIGN",
+			forbiddenPlatform: "NONE", availableCampaignTypes: []string{"UNIFIED_CAMPAIGN"},
 			wantReason: AccountIncompatibleCurrency,
 		},
 		{
 			name: "archived", itemType: "CLIENT", currency: "RUB", archived: "YES",
-			forbiddenPlatform: "NONE", availableCampaignType: "UNIFIED_CAMPAIGN",
+			forbiddenPlatform: "NONE", availableCampaignTypes: []string{"UNIFIED_CAMPAIGN"},
 			wantReason: AccountIncompatibleArchived,
 		},
 		{
 			name: "network forbidden", itemType: "CLIENT", currency: "RUB", archived: "NO",
-			forbiddenPlatform: "NETWORK", availableCampaignType: "UNIFIED_CAMPAIGN",
+			forbiddenPlatform: "NETWORK", availableCampaignTypes: []string{"UNIFIED_CAMPAIGN"},
 			wantReason: AccountIncompatibleNetwork,
 		},
 		{
 			name: "unified campaign unavailable", itemType: "CLIENT", currency: "RUB",
 			archived: "NO", forbiddenPlatform: "NONE",
-			availableCampaignType: "TEXT_CAMPAIGN",
-			wantReason:            AccountIncompatibleUnifiedCampaign,
+			availableCampaignTypes: []string{"TEXT_CAMPAIGN"},
+			wantReason:             AccountIncompatibleUnifiedCampaign,
+		},
+		{
+			name: "campaign type list empty", itemType: "CLIENT", currency: "RUB",
+			archived: "NO", forbiddenPlatform: "NONE",
+			availableCampaignTypes: []string{},
+			wantReason:             AccountIncompatibleUnifiedCampaign,
 		},
 	}
 	for _, test := range tests {
@@ -740,14 +748,19 @@ func TestGetAccountRequiresSupportedDirectAccount(t *testing.T) {
 						t.Errorf("Clients.get did not request %s", required)
 					}
 				}
+				availableCampaignTypes, err := json.Marshal(test.availableCampaignTypes)
+				if err != nil {
+					t.Error(err)
+					return
+				}
 				_, _ = fmt.Fprintf(w, `{"result":{"Clients":[{
 "ClientId":7003,"Login":"client-login","ClientInfo":"Direct client",
 "Type":%q,"Currency":%q,"Archived":%q,"ForbiddenPlatform":%q,
-"AvailableCampaignTypes":%q,
+"AvailableCampaignTypes":%s,
 "Representatives":[{"Login":"client-login","Role":"CHIEF"}],
 "Grants":[{"Privilege":"EDIT_CAMPAIGNS","Value":"YES"}]
 }]}}`, test.itemType, test.currency, test.archived, test.forbiddenPlatform,
-					test.availableCampaignType)
+					availableCampaignTypes)
 			}))
 			defer server.Close()
 			client, err := New(
@@ -773,6 +786,83 @@ func TestGetAccountRequiresSupportedDirectAccount(t *testing.T) {
 				t.Fatalf("account = %#v", account)
 			}
 		})
+	}
+}
+
+func TestGetAccountAcceptsMinimalLiveArrayResponse(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"result":{"Clients":[{
+"ClientId":7003,"Type":"CLIENT","Currency":"RUB","Archived":"NO",
+"ForbiddenPlatform":"NONE",
+"AvailableCampaignTypes":["TEXT_CAMPAIGN","UNIFIED_CAMPAIGN"]
+}]}}`)
+	}))
+	defer server.Close()
+	client, err := New(
+		server.URL+"/json/v501", "client-id", "secret",
+		CallbackRedirectURI, server.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := client.GetAccount(context.Background(), "token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.ID != "7003" || account.CurrencyCode != "RUB" || !account.ReadOnly {
+		t.Fatalf("account = %#v", account)
+	}
+}
+
+func TestGetAccountTreatsMissingCampaignTypesAsUnavailable(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"result":{"Clients":[{
+"ClientId":7003,"Type":"CLIENT","Currency":"RUB","Archived":"NO",
+"ForbiddenPlatform":"NONE"
+}]}}`)
+	}))
+	defer server.Close()
+	client, err := New(
+		server.URL+"/json/v501", "client-id", "secret",
+		CallbackRedirectURI, server.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetAccount(context.Background(), "token", "")
+	var compatibilityErr *AccountCompatibilityError
+	if !errors.As(err, &compatibilityErr) ||
+		compatibilityErr.Reason != AccountIncompatibleUnifiedCampaign {
+		t.Fatalf("error = %#v, want unified campaign unavailable", err)
+	}
+}
+
+func TestGetAccountAcceptsDocumentedScalarCampaignType(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"result":{"Clients":[{
+"ClientId":7003,"Login":"client-login","ClientInfo":"Direct client","Currency":"RUB",
+"Type":"CLIENT","Archived":"NO","ForbiddenPlatform":"NONE",
+"AvailableCampaignTypes":"UNIFIED_CAMPAIGN",
+"Grants":[{"Privilege":"EDIT_CAMPAIGNS","Value":"YES"}]
+}]}}`)
+	}))
+	defer server.Close()
+	client, err := New(
+		server.URL+"/json/v501", "client-id", "secret",
+		CallbackRedirectURI, server.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := client.GetAccount(context.Background(), "token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.ID != "7003" || account.ReadOnly {
+		t.Fatalf("account = %#v", account)
 	}
 }
 
@@ -816,7 +906,7 @@ func TestGetAccountKeepsPermissionLimitedRepresentativeReadOnly(t *testing.T) {
 				_, _ = fmt.Fprintf(w, `{"result":{"Clients":[{
 "ClientId":7003,"Login":"client-login","ClientInfo":"Representative","Currency":"RUB",
 "Type":"CLIENT","Archived":"NO","ForbiddenPlatform":"SEARCH",
-"AvailableCampaignTypes":"UNIFIED_CAMPAIGN",
+"AvailableCampaignTypes":["UNIFIED_CAMPAIGN"],
 "Representatives":[{"Login":"client-login","Role":%q}],
 "Grants":[{"Privilege":"EDIT_CAMPAIGNS","Value":%q}]
 }]}}`, test.role, test.grant)
@@ -844,11 +934,11 @@ func TestGetAccountRejectsMissingOrMalformedCompatibilityMetadata(t *testing.T) 
 	t.Parallel()
 	for _, response := range []string{
 		`{"result":{"Clients":[{"ClientId":1,"Type":"CLIENT","Currency":"RUB",` +
-			`"ForbiddenPlatform":"NONE","AvailableCampaignTypes":"UNIFIED_CAMPAIGN"}]}}`,
+			`"ForbiddenPlatform":"NONE","AvailableCampaignTypes":["UNIFIED_CAMPAIGN"]}]}}`,
 		`{"result":{"Clients":[{"ClientId":1,"Type":"CLIENT","Currency":"RUB",` +
-			`"Archived":"NO","ForbiddenPlatform":"ALL","AvailableCampaignTypes":"UNIFIED_CAMPAIGN"}]}}`,
+			`"Archived":"NO","ForbiddenPlatform":"ALL","AvailableCampaignTypes":["UNIFIED_CAMPAIGN"]}]}}`,
 		`{"result":{"Clients":[{"ClientId":1,"Type":"CLIENT","Currency":"RUB",` +
-			`"Archived":"NO","ForbiddenPlatform":"NONE","AvailableCampaignTypes":["UNIFIED_CAMPAIGN"]}]}}`,
+			`"Archived":"NO","ForbiddenPlatform":"NONE","AvailableCampaignTypes":{"unexpected":true}}]}}`,
 	} {
 		response := response
 		t.Run(strconv.Itoa(len(response)), func(t *testing.T) {
