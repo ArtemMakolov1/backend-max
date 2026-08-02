@@ -298,7 +298,13 @@ func directReadRetryDelay(err error, attempt int) (time.Duration, bool) {
 		if providerErr.APIErrorCode == 152 || providerErr.Code == "152" {
 			return 0, false
 		}
-		retryable := providerErr.APIErrorCode == 506 || providerErr.Code == "506" ||
+		apiCode := providerErr.APIErrorCode
+		if apiCode == 0 {
+			apiCode, _ = strconv.Atoi(strings.TrimSpace(providerErr.Code))
+		}
+		retryableAPIError := apiCode == 52 || apiCode == 506 ||
+			(apiCode >= 1000 && apiCode <= 1002)
+		retryable := retryableAPIError ||
 			providerErr.StatusCode == http.StatusTooManyRequests ||
 			providerErr.StatusCode == http.StatusInternalServerError ||
 			providerErr.StatusCode == http.StatusBadGateway ||

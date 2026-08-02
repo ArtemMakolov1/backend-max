@@ -43,7 +43,8 @@ func TestOAuthRedirectAllowlistAndVerificationCodeFlow(t *testing.T) {
 			t.Fatalf("authorization redirect_uri = %q, want %q", got, test.redirect)
 		}
 		if authorizationURL.Query().Get("state") != "opaque-state" ||
-			authorizationURL.Query().Get("code_challenge") != "pkce-challenge" {
+			authorizationURL.Query().Get("code_challenge") != "pkce-challenge" ||
+			authorizationURL.Query().Get("force_confirm") != "yes" {
 			t.Fatalf("authorization query = %v", authorizationURL.Query())
 		}
 	}
@@ -772,6 +773,29 @@ func TestGetAccountRequiresSupportedDirectAccount(t *testing.T) {
 				t.Fatalf("account = %#v", account)
 			}
 		})
+	}
+}
+
+func TestGetAccountClassifiesAgencyBeforeAdvertiserOnlyFields(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, `{"result":{"Clients":[{
+"ClientId":7004,"Login":"agency-login","ClientInfo":"Agency","Type":"AGENCY"
+}]}}`)
+	}))
+	defer server.Close()
+	client, err := New(
+		server.URL+"/json/v501", "client-id", "secret",
+		CallbackRedirectURI, server.Client(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.GetAccount(context.Background(), "token", "")
+	var compatibilityErr *AccountCompatibilityError
+	if !errors.As(err, &compatibilityErr) ||
+		compatibilityErr.Reason != AccountIncompatibleType {
+		t.Fatalf("error = %#v, want unsupported account type", err)
 	}
 }
 

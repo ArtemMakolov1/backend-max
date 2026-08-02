@@ -1,9 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -206,6 +208,8 @@ func TestDirectVerificationOAuthClassifiesCompletionFailuresWithoutProviderRepla
 		accountErr   error
 		wantStatus   int
 		wantCode     string
+		wantReason   string
+		wantRetry    string
 		wantAccounts int
 		providerText string
 	}{
@@ -257,12 +261,78 @@ func TestDirectVerificationOAuthClassifiesCompletionFailuresWithoutProviderRepla
 			providerText: "invalid_oauth_response",
 		},
 		{
-			name: "account verification", accountErr: &yandexdirect.Error{
+			name: "provider unavailable during account verification", accountErr: &yandexdirect.Error{
 				StatusCode: http.StatusServiceUnavailable, Code: "provider_account_secret",
+				RequestID: "provider-request-secret",
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonProviderUnavailable, wantAccounts: 1,
+			providerText: "provider_account_secret",
+		},
+		{
+			name: "Direct account is missing", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, APIErrorCode: 513, Code: "No Direct account",
+			},
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonAccountMissing, wantAccounts: 1,
+			providerText: "No Direct account",
+		},
+		{
+			name: "selected agency client is missing", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, APIErrorCode: 8800, Code: "Object not found",
+			},
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonAccountNotFound, wantAccounts: 1,
+			providerText: "Object not found",
+		},
+		{
+			name: "Direct application is not active", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, APIErrorCode: 58, Code: "Incomplete registration",
+			},
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonApplicationPending, wantAccounts: 1,
+			providerText: "Incomplete registration",
+		},
+		{
+			name: "Direct access is denied", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, APIErrorCode: 3000, Code: "No API access",
+			},
+			wantStatus: http.StatusForbidden,
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonAccessDenied, wantAccounts: 1,
+			providerText: "No API access",
+		},
+		{
+			name: "Direct token is invalid", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, APIErrorCode: 53, Code: "Authorization error",
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonTokenInvalid, wantAccounts: 1,
+			providerText: "Authorization error",
+		},
+		{
+			name: "Direct response is invalid", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, Code: "invalid_api_result",
 			},
 			wantStatus: http.StatusBadGateway,
-			wantCode:   "direct_oauth_account_verification_failed", wantAccounts: 1,
-			providerText: "provider_account_secret",
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonInvalidResponse, wantAccounts: 1,
+			providerText: "invalid_api_result",
+		},
+		{
+			name: "Direct account lookup quota is exhausted", accountErr: &yandexdirect.Error{
+				StatusCode: http.StatusOK, APIErrorCode: 152, Code: "Units exhausted",
+				RetryAfter: 75 * time.Second,
+			},
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   "direct_oauth_account_verification_failed",
+			wantReason: app.DirectOAuthAccountReasonRateLimited, wantRetry: "75",
+			wantAccounts: 1, providerText: "Units exhausted",
 		},
 	}
 
@@ -300,10 +370,31 @@ func TestDirectVerificationOAuthClassifiesCompletionFailuresWithoutProviderRepla
 				handler, http.MethodPost, base+"/connect/complete", body,
 			)
 			assertProblemCode(t, response, test.wantStatus, test.wantCode)
+			if response.Header().Get("Retry-After") != test.wantRetry {
+				t.Fatalf("Retry-After = %q, want %q",
+					response.Header().Get("Retry-After"), test.wantRetry)
+			}
+			if test.wantReason != "" {
+				var problem struct {
+					Error struct {
+						Details struct {
+							Reason string `json:"reason"`
+						} `json:"details"`
+					} `json:"error"`
+				}
+				if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+					t.Fatal(err)
+				}
+				if problem.Error.Details.Reason != test.wantReason {
+					t.Fatalf("verification reason = %q, want %q: %s",
+						problem.Error.Details.Reason, test.wantReason, response.Body.String())
+				}
+			}
 			if response.Header().Get("Cache-Control") != "no-store" {
 				t.Fatalf("completion Cache-Control = %q", response.Header().Get("Cache-Control"))
 			}
 			if strings.Contains(response.Body.String(), test.providerText) ||
+				strings.Contains(response.Body.String(), "provider-request-secret") ||
 				strings.Contains(response.Body.String(), started.Connection.State) {
 				t.Fatalf("completion exposed provider/state details: %s", response.Body.String())
 			}
@@ -321,6 +412,34 @@ func TestDirectVerificationOAuthClassifiesCompletionFailuresWithoutProviderRepla
 					provider.exchangeCalls, provider.accountCalls)
 			}
 		})
+	}
+}
+
+func TestDirectOAuthVerificationLogKeepsOnlyBoundedProviderMetadata(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	server := &Server{logger: slog.New(slog.NewJSONHandler(&output, nil))}
+	server.logDirectOAuthCompletionFailure("verification failed",
+		&app.DirectOAuthAccountVerificationError{
+			Reason:       app.DirectOAuthAccountReasonApplicationPending,
+			ProviderCode: 58, StatusCode: http.StatusOK, RequestID: "request-123",
+		})
+	logged := output.String()
+	for _, expected := range []string{
+		`"stage":"account_verification"`, `"reason":"application_not_ready"`,
+		`"provider_code":58`, `"provider_status":200`,
+		`"provider_request_id":"request-123"`,
+	} {
+		if !strings.Contains(logged, expected) {
+			t.Fatalf("log = %s, missing %s", logged, expected)
+		}
+	}
+	output.Reset()
+	server.logDirectOAuthCompletionFailure("verification failed",
+		&app.DirectOAuthAccountVerificationError{Reason: "provider-secret-reason"})
+	if logged = output.String(); !strings.Contains(logged, `"reason":"provider_failed"`) ||
+		strings.Contains(logged, "provider-secret-reason") {
+		t.Fatalf("unsafe fallback log = %s", logged)
 	}
 }
 

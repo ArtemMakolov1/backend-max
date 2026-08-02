@@ -295,6 +295,24 @@ func (s *Server) finishDirectOAuth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) logDirectOAuthCompletionFailure(message string, err error) {
 	stage, reason := "", ""
+	var verificationErr *app.DirectOAuthAccountVerificationError
+	if errors.As(err, &verificationErr) {
+		verificationReason := safeDirectOAuthAccountVerificationReason(verificationErr.Reason)
+		arguments := []any{
+			"stage", "account_verification", "reason", verificationReason,
+		}
+		if verificationErr.ProviderCode != 0 {
+			arguments = append(arguments, "provider_code", verificationErr.ProviderCode)
+		}
+		if verificationErr.StatusCode != 0 {
+			arguments = append(arguments, "provider_status", verificationErr.StatusCode)
+		}
+		if verificationErr.RequestID != "" {
+			arguments = append(arguments, "provider_request_id", verificationErr.RequestID)
+		}
+		s.logger.Warn(message, arguments...)
+		return
+	}
 	switch {
 	case errors.Is(err, app.ErrDirectOAuthStateUnavailable):
 		stage, reason = "state", "unavailable"
@@ -312,6 +330,23 @@ func (s *Server) logDirectOAuthCompletionFailure(message string, err error) {
 		return
 	}
 	s.logger.Warn(message, "error", err)
+}
+
+func safeDirectOAuthAccountVerificationReason(reason string) string {
+	switch strings.TrimSpace(reason) {
+	case app.DirectOAuthAccountReasonTokenInvalid,
+		app.DirectOAuthAccountReasonApplicationPending,
+		app.DirectOAuthAccountReasonAccessDenied,
+		app.DirectOAuthAccountReasonAccountMissing,
+		app.DirectOAuthAccountReasonAccountNotFound,
+		app.DirectOAuthAccountReasonRateLimited,
+		app.DirectOAuthAccountReasonProviderUnavailable,
+		app.DirectOAuthAccountReasonInvalidResponse,
+		app.DirectOAuthAccountReasonProviderFailed:
+		return strings.TrimSpace(reason)
+	default:
+		return app.DirectOAuthAccountReasonProviderFailed
+	}
 }
 
 func (s *Server) revokeDirectConnection(w http.ResponseWriter, r *http.Request) {

@@ -49,6 +49,38 @@ var (
 	ErrDirectOAuthAccountVerificationFailed = errors.New("account verification for Yandex Direct OAuth failed")
 )
 
+const (
+	DirectOAuthAccountReasonTokenInvalid        = "token_invalid"
+	DirectOAuthAccountReasonApplicationPending  = "application_not_ready"
+	DirectOAuthAccountReasonAccessDenied        = "access_denied"
+	DirectOAuthAccountReasonAccountMissing      = "account_not_connected"
+	DirectOAuthAccountReasonAccountNotFound     = "account_not_found"
+	DirectOAuthAccountReasonRateLimited         = "rate_limited"
+	DirectOAuthAccountReasonProviderUnavailable = "provider_unavailable"
+	DirectOAuthAccountReasonInvalidResponse     = "invalid_response"
+	DirectOAuthAccountReasonProviderFailed      = "provider_failed"
+)
+
+// DirectOAuthAccountVerificationError retains only bounded metadata needed to
+// diagnose Clients.get after an OAuth exchange. Provider messages, logins and
+// tokens are deliberately discarded. RequestID is retained for operator logs
+// and is never returned by the HTTP API.
+type DirectOAuthAccountVerificationError struct {
+	Reason       string
+	ProviderCode int
+	StatusCode   int
+	RequestID    string
+	RetryAfter   time.Duration
+}
+
+func (e *DirectOAuthAccountVerificationError) Error() string {
+	return ErrDirectOAuthAccountVerificationFailed.Error()
+}
+
+func (e *DirectOAuthAccountVerificationError) Unwrap() error {
+	return ErrDirectOAuthAccountVerificationFailed
+}
+
 // DirectAccountCompatibilityError is safe to return to an authenticated API
 // client. It contains only a bounded product-owned reason code, never a
 // provider message, login, token, or request identifier.
@@ -452,7 +484,7 @@ func (a *App) completeDirectOAuth(
 				Reason: sanitizedDirectAccountCompatibilityReason(compatibilityErr.Reason),
 			}
 		}
-		return DirectOAuthCompletion{}, ErrDirectOAuthAccountVerificationFailed
+		return DirectOAuthCompletion{}, classifyDirectOAuthAccountVerificationFailure(err)
 	}
 	clientLogin := strings.TrimSpace(stored.ClientLogin)
 	if clientLogin == "" {
@@ -497,6 +529,67 @@ func classifyDirectOAuthExchangeFailure(err error) error {
 	default:
 		return ErrDirectOAuthExchangeUncertain
 	}
+}
+
+func classifyDirectOAuthAccountVerificationFailure(err error) error {
+	classified := &DirectOAuthAccountVerificationError{
+		Reason: DirectOAuthAccountReasonProviderFailed,
+	}
+	var providerErr *yandexdirect.Error
+	if !errors.As(err, &providerErr) {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			classified.Reason = DirectOAuthAccountReasonProviderUnavailable
+		}
+		return classified
+	}
+	classified.ProviderCode = providerErr.APIErrorCode
+	if classified.ProviderCode == 0 {
+		classified.ProviderCode, _ = strconv.Atoi(strings.TrimSpace(providerErr.Code))
+	}
+	if providerErr.StatusCode >= 100 && providerErr.StatusCode <= 599 {
+		classified.StatusCode = providerErr.StatusCode
+	}
+	classified.RequestID = strings.TrimSpace(providerErr.RequestID)
+	if len(classified.RequestID) > 128 {
+		classified.RequestID = ""
+	}
+	switch classified.ProviderCode {
+	case 53:
+		classified.Reason = DirectOAuthAccountReasonTokenInvalid
+	case 58:
+		classified.Reason = DirectOAuthAccountReasonApplicationPending
+	case 54, 3000:
+		classified.Reason = DirectOAuthAccountReasonAccessDenied
+	case 513:
+		classified.Reason = DirectOAuthAccountReasonAccountMissing
+	case 8800:
+		classified.Reason = DirectOAuthAccountReasonAccountNotFound
+	case 152:
+		classified.Reason = DirectOAuthAccountReasonRateLimited
+		classified.RetryAfter = boundedDirectProviderRetryAfter(
+			providerErr.RetryAfter, time.Minute,
+		)
+	case 52, 506, 1000, 1001, 1002:
+		classified.Reason = DirectOAuthAccountReasonProviderUnavailable
+	default:
+		switch strings.ToLower(strings.TrimSpace(providerErr.Code)) {
+		case "direct_account_not_found":
+			classified.Reason = DirectOAuthAccountReasonAccountNotFound
+		case "invalid_direct_account_response", "invalid_api_response",
+			"invalid_api_result", "missing_api_result":
+			classified.Reason = DirectOAuthAccountReasonInvalidResponse
+		default:
+			if providerErr.StatusCode == http.StatusTooManyRequests {
+				classified.Reason = DirectOAuthAccountReasonRateLimited
+				classified.RetryAfter = boundedDirectProviderRetryAfter(
+					providerErr.RetryAfter, time.Second,
+				)
+			} else if providerErr.StatusCode >= http.StatusInternalServerError {
+				classified.Reason = DirectOAuthAccountReasonProviderUnavailable
+			}
+		}
+	}
+	return classified
 }
 
 func sanitizedDirectAccountCompatibilityReason(reason string) string {

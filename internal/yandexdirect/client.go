@@ -324,10 +324,14 @@ func (c *Client) UnitsUsage(clientLogin string) (UnitsUsage, bool) {
 
 func (c *Client) AuthorizationURL(state, codeChallenge string) string {
 	query := url.Values{
-		"response_type":         {"code"},
-		"client_id":             {c.clientID},
-		"redirect_uri":          {c.redirectURI},
-		"scope":                 {"direct:api"},
+		"response_type": {"code"},
+		"client_id":     {c.clientID},
+		"redirect_uri":  {c.redirectURI},
+		"scope":         {"direct:api"},
+		// Direct access belongs to a Yandex account, not to the MaxPosty
+		// session. Always show the account chooser so an existing OAuth grant
+		// cannot silently issue a token for another signed-in Yandex account.
+		"force_confirm":         {"yes"},
 		"state":                 {state},
 		"code_challenge":        {codeChallenge},
 		"code_challenge_method": {"S256"},
@@ -452,11 +456,30 @@ func (c *Client) GetAccount(
 		return Account{}, &Error{Code: "direct_account_not_found"}
 	}
 	item := response.Clients[0]
-	if item.Type == nil || item.Currency == nil || item.Archived == nil ||
-		item.ForbiddenPlatform == nil || item.AvailableCampaignType == nil {
+	if item.Type == nil {
 		return Account{}, &Error{Code: "invalid_direct_account_response"}
 	}
 	accountType := strings.ToUpper(strings.TrimSpace(*item.Type))
+	switch accountType {
+	case "AGENCY":
+		// Clients.get does not return advertiser-only fields for an agency.
+		// Classify the account type before requiring those fields so the API
+		// can explain the product limitation instead of reporting a malformed
+		// provider response.
+		return Account{}, &AccountCompatibilityError{Reason: AccountIncompatibleType}
+	case "SUBCLIENT":
+		// The current campaign integration is intentionally limited to direct
+		// advertisers; agency-client selection is a separate OAuth flow.
+		return Account{}, &AccountCompatibilityError{Reason: AccountIncompatibleType}
+	case "CLIENT":
+		// Continue with advertiser compatibility checks below.
+	default:
+		return Account{}, &Error{Code: "invalid_direct_account_response"}
+	}
+	if item.Currency == nil || item.Archived == nil ||
+		item.ForbiddenPlatform == nil || item.AvailableCampaignType == nil {
+		return Account{}, &Error{Code: "invalid_direct_account_response"}
+	}
 	currency := strings.ToUpper(strings.TrimSpace(*item.Currency))
 	archived := strings.ToUpper(strings.TrimSpace(*item.Archived))
 	forbiddenPlatform := strings.ToUpper(strings.TrimSpace(*item.ForbiddenPlatform))
@@ -470,7 +493,6 @@ func (c *Client) GetAccount(
 		unsupported bool
 		reason      string
 	}{
-		{accountType != "CLIENT", AccountIncompatibleType},
 		{currency != "RUB", AccountIncompatibleCurrency},
 		{archived != "NO", AccountIncompatibleArchived},
 		{forbiddenPlatform == "NETWORK", AccountIncompatibleNetwork},

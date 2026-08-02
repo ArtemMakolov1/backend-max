@@ -3,6 +3,7 @@ package yandexdirect
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -291,13 +292,19 @@ func TestDirectTransportPreservesConnectionLimitCooldownClass(t *testing.T) {
 func TestDirectReadRetriesTransientHTTPButMutationDoesNot(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		name      string
-		method    string
-		wantCalls int64
-		wantError bool
+		name          string
+		method        string
+		failureStatus int
+		failureCode   int
+		wantCalls     int64
+		wantError     bool
 	}{
-		{name: "read", method: "get", wantCalls: 2},
-		{name: "mutation", method: "update", wantCalls: 1, wantError: true},
+		{name: "read HTTP failure", method: "get", failureStatus: http.StatusBadGateway,
+			failureCode: 500, wantCalls: 2},
+		{name: "read API auth service failure", method: "get", failureStatus: http.StatusOK,
+			failureCode: 52, wantCalls: 2},
+		{name: "mutation", method: "update", failureStatus: http.StatusBadGateway,
+			failureCode: 500, wantCalls: 1, wantError: true},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
@@ -305,8 +312,9 @@ func TestDirectReadRetriesTransientHTTPButMutationDoesNot(t *testing.T) {
 			var calls atomic.Int64
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				if calls.Add(1) == 1 {
-					w.WriteHeader(http.StatusBadGateway)
-					_, _ = w.Write([]byte(`{"error":{"error_code":500,"error_string":"server"}}`))
+					w.WriteHeader(test.failureStatus)
+					_, _ = fmt.Fprintf(w,
+						`{"error":{"error_code":%d,"error_string":"server"}}`, test.failureCode)
 					return
 				}
 				w.Header().Set("Units", "1/99/100")

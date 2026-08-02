@@ -635,6 +635,46 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			message, map[string]any{"reason": reason})
 		return
 	}
+	var directVerificationErr *app.DirectOAuthAccountVerificationError
+	if errors.As(err, &directVerificationErr) {
+		reason := safeDirectOAuthAccountVerificationReason(directVerificationErr.Reason)
+		status := http.StatusBadGateway
+		message := "Код принят, но проверить рекламный кабинет не удалось. Получите новый код и попробуйте ещё раз."
+		switch reason {
+		case app.DirectOAuthAccountReasonTokenInvalid:
+			status = http.StatusBadRequest
+			message = "Яндекс Директ не принял выданный токен. Получите новый код и выберите нужный аккаунт Яндекса."
+		case app.DirectOAuthAccountReasonApplicationPending:
+			status = http.StatusServiceUnavailable
+			message = "Доступ приложения MaxPosty к API Яндекс Директа ещё не активен. Проверьте, что одобрена заявка именно для этого приложения, и повторите позже."
+		case app.DirectOAuthAccountReasonAccessDenied:
+			status = http.StatusForbidden
+			message = "Яндекс Директ не разрешил доступ к кабинету. Проверьте программный доступ, соглашение API и ограничения по IP в настройках Директа."
+		case app.DirectOAuthAccountReasonAccountMissing,
+			app.DirectOAuthAccountReasonAccountNotFound:
+			status = http.StatusUnprocessableEntity
+			message = "Выбранный аккаунт Яндекса не подключён к рекламному кабинету Директа. Получите новый код и выберите аккаунт с кабинетом."
+		case app.DirectOAuthAccountReasonRateLimited:
+			status = http.StatusTooManyRequests
+			message = "Лимит проверки кабинета в Яндекс Директе временно исчерпан. Подождите и затем получите новый код."
+			retryAfter := retryAfterSeconds(directVerificationErr.RetryAfter)
+			w.Header().Set("Retry-After", strconv.FormatInt(retryAfter, 10))
+		case app.DirectOAuthAccountReasonProviderUnavailable:
+			status = http.StatusServiceUnavailable
+			message = "Яндекс Директ временно не подтвердил кабинет. Получите новый код и повторите подключение позже."
+		case app.DirectOAuthAccountReasonInvalidResponse:
+			message = "Яндекс Директ вернул неполные данные кабинета. Получите новый код и повторите подключение."
+		case app.DirectOAuthAccountReasonProviderFailed:
+			// Keep the bounded generic response.
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		details := map[string]any{"reason": reason}
+		if reason == app.DirectOAuthAccountReasonRateLimited {
+			details["retry_after_seconds"] = retryAfterSeconds(directVerificationErr.RetryAfter)
+		}
+		s.problem(w, status, "direct_oauth_account_verification_failed", message, details)
+		return
+	}
 	for _, directOAuthFailure := range []struct {
 		err     error
 		status  int
