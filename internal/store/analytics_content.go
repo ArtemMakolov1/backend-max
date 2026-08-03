@@ -631,10 +631,14 @@ func duplicateAnalyticsRepeatDraftTx(
 owner_id,workspace_id,title,content,format,status,channel_id,image_url,image_path,image_prompt,link_buttons,
 notify,disable_link_preview,scheduled_at,max_message_id,max_message_url,max_views,max_stats_synced_at,
 max_is_pinned,last_error,published_at,created_at,updated_at)
-SELECT owner_id,workspace_id,trim(title || ' (копия)'),content,format,$1,channel_id,image_url,image_path,image_prompt,link_buttons,
+SELECT owner_id,workspace_id,trim(title || ' (копия)'),content,format,$1,channel_id,
+       CASE WHEN origin=$6 THEN '' ELSE image_url END,
+       CASE WHEN origin=$6 THEN '' ELSE image_path END,
+       image_prompt,link_buttons,
        notify,disable_link_preview,NULL,'','',NULL,NULL,FALSE,'',NULL,$2,$2
 FROM posts WHERE workspace_id=$3 AND id=$4 AND status<>$5
-RETURNING id,title,content,format,channel_id`, PostStatusDraft, now, workspaceID, sourcePostID, PostStatusPublishing).Scan(
+RETURNING id,title,content,format,channel_id`, PostStatusDraft, now, workspaceID, sourcePostID,
+		PostStatusPublishing, PostOriginMAXHistory).Scan(
 		&draftID, &title, &content, &format, &channelID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -657,7 +661,7 @@ WHERE workspace_id=$1 AND id=$2`, workspaceID, sourcePostID).Scan(&status); erro
 owner_id,workspace_id,post_id,type,position,storage_key,processing_status,size_bytes,mime_type,
 width,height,duration_ms,provider_token,provider_token_expires_at,provider_meta,error_code,created_at,updated_at)
 SELECT owner_id,workspace_id,$1,type,position,storage_key,'ready',size_bytes,mime_type,
-       width,height,duration_ms,'',NULL,'{}','',$2,$2
+	   width,height,duration_ms,'',NULL,'{}'::jsonb,'',$2,$2
 FROM post_attachments WHERE workspace_id=$3 AND post_id=$4
 ORDER BY position,id`, draftID, now, workspaceID, sourcePostID); err != nil {
 		return 0, "", "", "", 0, fmt.Errorf("duplicate analytics repeat attachments: %w", err)

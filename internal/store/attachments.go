@@ -24,7 +24,7 @@ func (s *Store) AddPostAttachmentForUser(ctx context.Context, userID string, pos
 	if err != nil {
 		return Post{}, err
 	}
-	if err := validateAttachmentWriteState(state.status); err != nil {
+	if err := validateAttachmentWriteState(state); err != nil {
 		return Post{}, err
 	}
 	if err := validateAttachmentObject(ctx, tx, userID, attachment); err != nil {
@@ -84,7 +84,7 @@ func (s *Store) ReplacePostAttachmentForUser(ctx context.Context, userID string,
 	if err != nil {
 		return Post{}, err
 	}
-	if err := validateAttachmentWriteState(state.status); err != nil {
+	if err := validateAttachmentWriteState(state); err != nil {
 		return Post{}, err
 	}
 	if err := validateAttachmentObject(ctx, tx, userID, replacement); err != nil {
@@ -154,7 +154,7 @@ func (s *Store) ReplaceFirstImageAttachmentAndPromptIfUnchanged(
 	if err != nil {
 		return Post{}, err
 	}
-	if err := validateAttachmentWriteState(state.status); err != nil {
+	if err := validateAttachmentWriteState(state); err != nil {
 		return Post{}, err
 	}
 	if state.status != current.Status || !state.updatedAt.UTC().Equal(current.UpdatedAt.UTC()) {
@@ -243,7 +243,7 @@ func (s *Store) ReorderPostAttachmentsForUser(ctx context.Context, userID string
 	if err != nil {
 		return Post{}, err
 	}
-	if err := validateAttachmentWriteState(state.status); err != nil {
+	if err := validateAttachmentWriteState(state); err != nil {
 		return Post{}, err
 	}
 	currentIDs, err := listAttachmentIDsTx(ctx, tx, userID, postID)
@@ -275,7 +275,7 @@ func (s *Store) DeletePostAttachmentForUser(ctx context.Context, userID string, 
 	if err != nil {
 		return Post{}, err
 	}
-	if err := validateAttachmentWriteState(state.status); err != nil {
+	if err := validateAttachmentWriteState(state); err != nil {
 		return Post{}, err
 	}
 	result, err := tx.ExecContext(ctx, bindSQL(`DELETE FROM post_attachments
@@ -372,11 +372,25 @@ type attachmentRows interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
+const postAttachmentInventorySQL = `
+SELECT id,owner_id,post_id,type,position,storage_key,
+       'upload'::text AS source,''::text AS remote_url,
+       processing_status,size_bytes,mime_type,width,height,duration_ms,
+       provider_token,provider_token_expires_at,provider_meta,error_code,created_at,updated_at
+FROM post_attachments
+UNION ALL
+SELECT id,owner_id,post_id,type,position,NULL::text AS storage_key,
+       'max_history'::text AS source,remote_url,
+       processing_status,size_bytes,mime_type,width,height,duration_ms,
+       provider_token,NULL::timestamptz AS provider_token_expires_at,
+       provider_meta,error_code,created_at,updated_at
+FROM max_history_post_attachments`
+
 func queryPostAttachments(ctx context.Context, queryer attachmentRows, suffix string, args ...any) ([]PostAttachment, error) {
-	rows, err := queryer.QueryContext(ctx, bindSQL(`SELECT id, owner_id, post_id, type, position, storage_key,
-processing_status, size_bytes, mime_type, width, height, duration_ms, provider_token,
-provider_token_expires_at, provider_meta, error_code, created_at, updated_at
-FROM post_attachments `+suffix), args...)
+	rows, err := queryer.QueryContext(ctx, bindSQL(`SELECT id,owner_id,post_id,type,position,storage_key,source,remote_url,
+processing_status,size_bytes,mime_type,width,height,duration_ms,provider_token,
+provider_token_expires_at,provider_meta,error_code,created_at,updated_at
+FROM (`+postAttachmentInventorySQL+`) post_attachment_inventory `+suffix), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list post attachments: %w", err)
 	}
@@ -394,17 +408,21 @@ FROM post_attachments `+suffix), args...)
 
 func scanPostAttachment(row scanner) (PostAttachment, error) {
 	var attachment PostAttachment
+	var storageKey sql.NullString
 	var width, height, duration sql.NullInt64
 	var providerExpires sql.NullTime
 	var providerMeta []byte
 	if err := row.Scan(&attachment.ID, &attachment.OwnerID, &attachment.PostID, &attachment.Type, &attachment.Position,
-		&attachment.StorageKey, &attachment.ProcessingStatus, &attachment.SizeBytes, &attachment.MIMEType,
+		&storageKey, &attachment.Source, &attachment.RemoteURL, &attachment.ProcessingStatus, &attachment.SizeBytes, &attachment.MIMEType,
 		&width, &height, &duration, &attachment.ProviderToken, &providerExpires, &providerMeta, &attachment.ErrorCode,
 		&attachment.CreatedAt, &attachment.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return PostAttachment{}, ErrNotFound
 		}
 		return PostAttachment{}, fmt.Errorf("scan post attachment: %w", err)
+	}
+	if storageKey.Valid {
+		attachment.StorageKey = storageKey.String
 	}
 	if width.Valid {
 		value := int(width.Int64)
@@ -420,22 +438,35 @@ func scanPostAttachment(row scanner) (PostAttachment, error) {
 	}
 	attachment.ProviderExpires = parseNullableTime(providerExpires)
 	attachment.ProviderMeta = append(json.RawMessage(nil), providerMeta...)
-	attachment.URL = "/media/" + url.PathEscape(attachment.StorageKey)
+	if attachment.Source == PostAttachmentSourceMAXHistory {
+		attachment.URL = attachment.RemoteURL
+	} else {
+		attachment.URL = "/media/" + url.PathEscape(attachment.StorageKey)
+	}
 	attachment.CreatedAt = attachment.CreatedAt.UTC()
 	attachment.UpdatedAt = attachment.UpdatedAt.UTC()
 	return attachment, nil
 }
 
 type lockedPostAttachmentState struct {
-	status      string
-	linkButtons []byte
-	updatedAt   time.Time
+	status                   string
+	linkButtons              []byte
+	updatedAt                time.Time
+	origin                   string
+	maxHistoryComplete       bool
+	maxSenderIsBot           sql.NullBool
+	hasMAXHistoryAttachments bool
 }
 
 func lockPostAttachmentState(ctx context.Context, tx *sql.Tx, userID string, postID int64) (lockedPostAttachmentState, error) {
 	var state lockedPostAttachmentState
-	err := tx.QueryRowContext(ctx, bindSQL(`SELECT status, link_buttons, updated_at FROM posts
-WHERE owner_id=? AND id=? FOR UPDATE`), userID, postID).Scan(&state.status, &state.linkButtons, &state.updatedAt)
+	err := tx.QueryRowContext(ctx, bindSQL(`SELECT status,link_buttons,updated_at,origin,
+max_history_attachments_complete,max_sender_is_bot,
+EXISTS(SELECT 1 FROM max_history_post_attachments WHERE post_id=posts.id)
+FROM posts WHERE owner_id=? AND id=? FOR UPDATE`), userID, postID).Scan(
+		&state.status, &state.linkButtons, &state.updatedAt, &state.origin,
+		&state.maxHistoryComplete, &state.maxSenderIsBot, &state.hasMAXHistoryAttachments,
+	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return lockedPostAttachmentState{}, ErrNotFound
 	}
@@ -445,9 +476,16 @@ WHERE owner_id=? AND id=? FOR UPDATE`), userID, postID).Scan(&state.status, &sta
 	return state, nil
 }
 
-func validateAttachmentWriteState(status string) error {
-	if status == PostStatusPublishing {
+func validateAttachmentWriteState(state lockedPostAttachmentState) error {
+	if state.status == PostStatusPublishing {
 		return fmt.Errorf("%w: post is currently publishing", ErrConflict)
+	}
+	if state.status == PostStatusPublished && state.origin == PostOriginMAXHistory &&
+		(!state.maxHistoryComplete || !state.maxSenderIsBot.Valid || !state.maxSenderIsBot.Bool) {
+		return fmt.Errorf("%w: imported MAX publication cannot be edited safely; create an editable copy instead", ErrConflict)
+	}
+	if state.hasMAXHistoryAttachments {
+		return fmt.Errorf("%w: remote MAX history attachments are immutable; create an editable copy with uploaded media instead", ErrConflict)
 	}
 	return nil
 }
@@ -526,19 +564,24 @@ WHERE owner_id=? AND post_id=? AND id=?`), position, userID, postID, id)
 }
 
 func syncPostAttachmentProjectionTx(ctx context.Context, tx *sql.Tx, userID string, postID int64, now time.Time) error {
-	var key string
-	err := tx.QueryRowContext(ctx, bindSQL(`SELECT storage_key FROM post_attachments
+	var key, source, remoteURL string
+	err := tx.QueryRowContext(ctx, bindSQL(`SELECT COALESCE(storage_key,''),source,remote_url
+FROM (`+postAttachmentInventorySQL+`) post_attachment_inventory
 WHERE owner_id=? AND post_id=? AND type='image' AND processing_status='ready'
-ORDER BY position, id LIMIT 1`), userID, postID).Scan(&key)
+ORDER BY position, id LIMIT 1`), userID, postID).Scan(&key, &source, &remoteURL)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("read first image attachment: %w", err)
 	}
 	imageURL := ""
-	if key != "" {
+	imagePath := key
+	if source == PostAttachmentSourceMAXHistory {
+		imageURL = remoteURL
+		imagePath = ""
+	} else if key != "" {
 		imageURL = "/media/" + url.PathEscape(key)
 	}
 	if _, err := tx.ExecContext(ctx, bindSQL(`UPDATE posts SET image_url=?, image_path=?, updated_at=?
-WHERE owner_id=? AND id=?`), imageURL, key, now.UTC(), userID, postID); err != nil {
+WHERE owner_id=? AND id=?`), imageURL, imagePath, now.UTC(), userID, postID); err != nil {
 		return fmt.Errorf("sync legacy image projection: %w", err)
 	}
 	return nil

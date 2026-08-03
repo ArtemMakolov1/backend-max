@@ -209,6 +209,7 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/channels/{channel_id}/max-info", s.updateWorkspaceChannelMAXInfo)
 				r.Post("/channels/{channel_id}/description/suggest", s.suggestWorkspaceChannelDescription)
 				r.Post("/channels/{channel_id}/test", s.testWorkspaceChannel)
+				r.Post("/channels/{channel_id}/history/import", s.importWorkspaceChannelHistory)
 				r.Delete("/channels/{channel_id}", s.deleteWorkspaceChannel)
 				r.Get("/posts", s.listWorkspacePosts)
 				r.Post("/posts", s.createWorkspacePost)

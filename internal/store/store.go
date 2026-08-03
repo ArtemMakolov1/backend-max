@@ -53,7 +53,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "032_direct_external_campaigns.sql"
+const RequiredSchemaVersion = "033_max_history_import.sql"
 
 type schemaMigration struct {
 	version        string
@@ -1007,6 +1007,10 @@ func (s *Store) updatePostSnapshot(ctx context.Context, post Post, changes PostC
 		return Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
 	}
 	if post.Status == PostStatusPublished {
+		if post.Origin == PostOriginMAXHistory &&
+			(!post.MAXHistoryAttachmentsComplete || post.MAXSenderIsBot == nil || !*post.MAXSenderIsBot) {
+			return Post{}, fmt.Errorf("%w: imported MAX publication cannot be edited safely; create an editable copy instead", ErrConflict)
+		}
 		if changes.ChannelID != nil && !sameInt64Pointer(post.ChannelID, *changes.ChannelID) {
 			return Post{}, fmt.Errorf("%w: channel_id cannot change after publication", ErrConflict)
 		}
@@ -1147,9 +1151,13 @@ func (s *Store) DuplicatePost(ctx context.Context, id int64) (Post, error) {
 INSERT INTO posts(owner_id, workspace_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 	              notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views,
 	              max_stats_synced_at, max_is_pinned, last_error, published_at, created_at, updated_at)
-SELECT owner_id, workspace_id, trim(title || ' (копия)'), content, format, ?, channel_id, image_url, image_path, image_prompt, link_buttons,
+SELECT owner_id, workspace_id, trim(title || ' (копия)'), content, format, ?, channel_id,
+	   CASE WHEN origin=? THEN '' ELSE image_url END,
+	   CASE WHEN origin=? THEN '' ELSE image_path END,
+	   image_prompt, link_buttons,
 	   notify, disable_link_preview, NULL, '', '', NULL, NULL, FALSE, '', NULL, ?, ?
-FROM posts WHERE id = ? AND status != ? RETURNING id`), PostStatusDraft, now, now, id, PostStatusPublishing).Scan(&copyID)
+FROM posts WHERE id = ? AND status != ? RETURNING id`), PostStatusDraft,
+		PostOriginMAXHistory, PostOriginMAXHistory, now, now, id, PostStatusPublishing).Scan(&copyID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Post{}, s.postWriteMiss(ctx, id, "post is currently publishing")
 	}
@@ -1158,10 +1166,10 @@ FROM posts WHERE id = ? AND status != ? RETURNING id`), PostStatusDraft, now, no
 	}
 	if _, err := tx.ExecContext(ctx, bindSQL(`
 INSERT INTO post_attachments(owner_id, workspace_id, post_id, type, position, storage_key, processing_status, size_bytes, mime_type,
-                             width, height, duration_ms, provider_token, provider_token_expires_at, provider_meta,
-                             error_code, created_at, updated_at)
+	                         width, height, duration_ms, provider_token, provider_token_expires_at, provider_meta,
+	                         error_code, created_at, updated_at)
 SELECT owner_id, workspace_id, ?, type, position, storage_key, 'ready', size_bytes, mime_type,
-       width, height, duration_ms, '', NULL, '{}', '', ?, ?
+	   width, height, duration_ms, '', NULL, '{}', '', ?, ?
 FROM post_attachments
 WHERE post_id = ?
 ORDER BY position, id`), copyID, now, now, id); err != nil {
@@ -1433,7 +1441,8 @@ WHERE id = ? AND status IN (?, ?)`,
 
 const postColumns = `id, owner_id, workspace_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views, max_stats_synced_at,
-max_stats_attempted_at, max_is_pinned, last_error, created_at, updated_at, published_at, review_status, current_revision_id`
+max_stats_attempted_at, max_is_pinned, origin, max_history_attachments_complete, max_sender_is_bot,
+last_error, created_at, updated_at, published_at, review_status, current_revision_id`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -1470,11 +1479,13 @@ func scanPost(row scanner) (Post, error) {
 	var channelID sql.NullInt64
 	var scheduledAt, publishedAt, statsSyncedAt, statsAttemptedAt sql.NullTime
 	var maxViews sql.NullInt64
+	var maxSenderIsBot sql.NullBool
 	var currentRevisionID sql.NullInt64
 	var linkButtonsJSON []byte
 	if err := row.Scan(&post.ID, &post.UserID, &post.WorkspaceID, &post.Title, &post.Content, &post.Format, &post.Status, &channelID,
 		&post.ImageURL, &post.ImagePath, &post.ImagePrompt, &linkButtonsJSON, &post.Notify, &post.DisableLinkPreview,
 		&scheduledAt, &post.MAXMessageID, &post.MAXMessageURL, &maxViews, &statsSyncedAt, &statsAttemptedAt, &post.MAXIsPinned,
+		&post.Origin, &post.MAXHistoryAttachmentsComplete, &maxSenderIsBot,
 		&post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt, &post.ReviewStatus, &currentRevisionID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Post{}, ErrNotFound
@@ -1496,6 +1507,9 @@ func scanPost(row scanner) (Post, error) {
 	}
 	post.MAXStatsSyncedAt = parseNullableTime(statsSyncedAt)
 	post.MAXStatsAttemptedAt = parseNullableTime(statsAttemptedAt)
+	if maxSenderIsBot.Valid {
+		post.MAXSenderIsBot = &maxSenderIsBot.Bool
+	}
 	post.PublishedAt = parseNullableTime(publishedAt)
 	if currentRevisionID.Valid {
 		post.CurrentRevisionID = &currentRevisionID.Int64

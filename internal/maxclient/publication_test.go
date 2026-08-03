@@ -19,7 +19,7 @@ func TestPublicationMetadataAndPinContracts(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/messages/"+messageID:
-			_, _ = io.WriteString(w, `{"recipient":{"chat_id":-13549123},"body":{"mid":"`+messageID+`","text":"Привет"},"url":"https://max.ru/se13549123_biz/abc","stat":{"views":42}}`)
+			_, _ = io.WriteString(w, `{"recipient":{"chat_id":-13549123},"sender":{"user_id":42,"is_bot":true},"body":{"mid":"`+messageID+`","text":"Привет"},"url":"https://max.ru/se13549123_biz/abc","stat":{"views":42}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/chats/"+chatID+"/pin":
 			_, _ = io.WriteString(w, `{"message":{"recipient":{"chat_id":-13549123},"body":{"mid":"`+messageID+`"},"url":"https://max.ru/se13549123_biz/abc","stat":{"views":43}}}`)
 		case r.Method == http.MethodPut && r.URL.Path == "/chats/"+chatID+"/pin":
@@ -51,7 +51,7 @@ func TestPublicationMetadataAndPinContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if message.MessageID != messageID || message.ChatID != chatID || message.URL != "https://max.ru/se13549123_biz/abc" ||
-		message.Views == nil || *message.Views != 42 {
+		message.Views == nil || *message.Views != 42 || message.SenderUserID != "42" || !message.SenderIsBot {
 		t.Fatalf("message = %#v", message)
 	}
 	pinned, err := client.GetPinnedMessage(context.Background(), chatID)
@@ -139,6 +139,8 @@ func TestGetMessageRejectsMismatchedOrNegativeMetadata(t *testing.T) {
 		`{"recipient":{"chat_id":-1},"body":{"mid":"mid.other"},"stat":{"views":1}}`,
 		`{"recipient":{"chat_id":-1},"body":{"mid":"mid.requested"},"stat":{"views":-1}}`,
 		`{"recipient":{"chat_id":"not-numeric"},"body":{"mid":"mid.requested"},"stat":{"views":1}}`,
+		`{"recipient":{"chat_id":-1},"sender":{"user_id":"invalid","is_bot":true},"body":{"mid":"mid.requested"}}`,
+		`{"recipient":{"chat_id":-1},"sender":{"is_bot":true},"body":{"mid":"mid.requested"}}`,
 	}
 	for _, response := range tests {
 		response := response

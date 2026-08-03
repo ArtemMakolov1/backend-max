@@ -363,17 +363,31 @@ func lockSchedulePost(ctx context.Context, tx *sql.Tx, workspaceID string, postI
 	post.ID = postID
 	if err := tx.QueryRowContext(ctx, `SELECT p.status,p.updated_at,p.current_revision_id,p.channel_id,
 p.title,p.content,p.format,p.image_url,
-(SELECT count(*) FROM post_attachments pa
-    WHERE pa.workspace_id=p.workspace_id AND pa.post_id=p.id),
+(SELECT count(*) FROM (
+    SELECT processing_status,position FROM post_attachments
+    WHERE workspace_id=p.workspace_id AND post_id=p.id
+    UNION ALL
+    SELECT processing_status,position FROM max_history_post_attachments
+    WHERE workspace_id=p.workspace_id AND post_id=p.id
+) pa),
 NOT EXISTS(
-    SELECT 1 FROM post_attachments pa
-    WHERE pa.workspace_id=p.workspace_id AND pa.post_id=p.id
-      AND pa.processing_status<>'ready'
+    SELECT 1 FROM (
+        SELECT processing_status FROM post_attachments
+        WHERE workspace_id=p.workspace_id AND post_id=p.id
+        UNION ALL
+        SELECT processing_status FROM max_history_post_attachments
+        WHERE workspace_id=p.workspace_id AND post_id=p.id
+    ) pa WHERE pa.processing_status<>'ready'
 ),
 COALESCE((
     SELECT min(pa.position)=0 AND max(pa.position)=count(*)-1
-    FROM post_attachments pa
-    WHERE pa.workspace_id=p.workspace_id AND pa.post_id=p.id
+    FROM (
+        SELECT position FROM post_attachments
+        WHERE workspace_id=p.workspace_id AND post_id=p.id
+        UNION ALL
+        SELECT position FROM max_history_post_attachments
+        WHERE workspace_id=p.workspace_id AND post_id=p.id
+    ) pa
     HAVING count(*)>0
 ),TRUE),jsonb_array_length(p.link_buttons)
 FROM posts p WHERE p.workspace_id=$1 AND p.id=$2 FOR UPDATE OF p`, workspaceID, postID).Scan(

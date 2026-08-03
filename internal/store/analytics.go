@@ -132,6 +132,11 @@ post_published AS (
           AND posts.published_at IS NOT NULL
     )
 ),
+post_attachment_inventory AS (
+    SELECT id,owner_id,post_id,type,processing_status FROM post_attachments
+    UNION ALL
+    SELECT id,owner_id,post_id,type,processing_status FROM max_history_post_attachments
+),
 published_post_media AS (
     SELECT
         posts.id,
@@ -139,7 +144,7 @@ published_post_media AS (
         COUNT(post_attachments.id) FILTER (WHERE post_attachments.type = 'image') AS image_count,
         COUNT(post_attachments.id) FILTER (WHERE post_attachments.type = 'video') AS video_count
     FROM posts
-    LEFT JOIN post_attachments
+    LEFT JOIN post_attachment_inventory post_attachments
       ON post_attachments.owner_id = posts.owner_id
      AND post_attachments.post_id = posts.id
      AND post_attachments.processing_status = 'ready'

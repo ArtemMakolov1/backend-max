@@ -1643,6 +1643,26 @@ paths:
       responses:
         '200': {$ref: '#/components/responses/Channel'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/channels/{channel_id}/history/import:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/ChannelId'}
+    post:
+      tags: [Channels, Posts]
+      operationId: importWorkspaceChannelHistory
+      summary: Import one resumable page of existing MAX channel publications
+      description: >-
+        Imports at most one provider page and persists its cursor atomically.
+        Repeat while has_more is true. Retrying after an interrupted request is
+        idempotent and never creates a second post for the same MAX message.
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Durable import progress after this provider page
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ChannelHistoryImportResult'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/billing/checkout:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
     post:
@@ -4623,6 +4643,7 @@ components:
         - type
         - position
         - url
+        - source
         - processing_status
         - size_bytes
         - mime_type
@@ -4641,6 +4662,9 @@ components:
           maximum: 11
         url:
           type: string
+        source:
+          type: string
+          enum: [upload, max_history]
         processing_status:
           type: string
           enum: [uploading, processing, ready, failed]
@@ -4725,6 +4749,8 @@ components:
         - notify
         - disable_link_preview
         - max_is_pinned
+        - origin
+        - max_history_attachments_complete
         - created_at
         - updated_at
       properties:
@@ -4778,6 +4804,15 @@ components:
           format: date-time
         max_is_pinned:
           type: boolean
+        origin:
+          type: string
+          enum: [maxposty, max_history]
+        max_history_attachments_complete:
+          type: boolean
+          description: False when editing the normalized post could discard unsupported provider markup or attachments.
+        max_sender_is_bot:
+          type: [boolean, 'null']
+          description: Whether the publication was authored by the currently connected MaxPosty bot.
         last_error:
           type: [string, 'null']
         created_at:
@@ -4794,6 +4829,30 @@ components:
         current_revision_id:
           type: [integer, 'null']
           format: int64
+    ChannelHistoryImportResult:
+      type: object
+      required:
+        - channel_id
+        - status
+        - processed_count
+        - imported_count
+        - existing_count
+        - skipped_count
+        - expected_count
+        - has_more
+        - partial
+      properties:
+        channel_id: {type: integer, format: int64, minimum: 1}
+        status: {type: string, enum: [in_progress, complete]}
+        processed_count: {type: integer, format: int64, minimum: 0}
+        imported_count: {type: integer, format: int64, minimum: 0}
+        existing_count: {type: integer, format: int64, minimum: 0}
+        skipped_count: {type: integer, format: int64, minimum: 0}
+        expected_count: {type: integer, format: int64, minimum: 0}
+        has_more: {type: boolean}
+        partial:
+          type: boolean
+          description: True when MAX reports more channel messages than the history endpoint returned.
     GenerateImageInput:
       type: object
       required: [prompt]

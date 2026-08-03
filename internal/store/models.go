@@ -18,6 +18,12 @@ const (
 	PostAttachmentImage = "image"
 	PostAttachmentVideo = "video"
 
+	PostOriginMAXPosty   = "maxposty"
+	PostOriginMAXHistory = "max_history"
+
+	PostAttachmentSourceUpload     = "upload"
+	PostAttachmentSourceMAXHistory = "max_history"
+
 	AttachmentStatusUploading  = "uploading"
 	AttachmentStatusProcessing = "processing"
 	AttachmentStatusReady      = "ready"
@@ -47,6 +53,8 @@ type PostAttachment struct {
 	Position         int             `json:"position"`
 	URL              string          `json:"url"`
 	StorageKey       string          `json:"-"`
+	Source           string          `json:"source"`
+	RemoteURL        string          `json:"-"`
 	ProcessingStatus string          `json:"processing_status"`
 	SizeBytes        int64           `json:"size_bytes"`
 	MIMEType         string          `json:"mime_type"`
@@ -161,34 +169,37 @@ type DiscoverableChannelRefreshCandidates struct {
 }
 
 type Post struct {
-	ID                  int64            `json:"id"`
-	UserID              string           `json:"-"`
-	WorkspaceID         string           `json:"workspace_id,omitempty"`
-	Title               string           `json:"title"`
-	Content             string           `json:"content"`
-	Format              string           `json:"format"`
-	Status              string           `json:"status"`
-	ChannelID           *int64           `json:"channel_id,omitempty"`
-	ImageURL            string           `json:"image_url,omitempty"`
-	ImagePath           string           `json:"-"`
-	ImagePrompt         string           `json:"image_prompt,omitempty"`
-	Attachments         []PostAttachment `json:"attachments"`
-	LinkButtons         []LinkButton     `json:"link_buttons"`
-	Notify              bool             `json:"notify"`
-	DisableLinkPreview  bool             `json:"disable_link_preview"`
-	ScheduledAt         *time.Time       `json:"scheduled_at,omitempty"`
-	MAXMessageID        string           `json:"max_message_id,omitempty"`
-	MAXMessageURL       string           `json:"max_message_url"`
-	MAXViews            *int64           `json:"max_views"`
-	MAXStatsSyncedAt    *time.Time       `json:"max_stats_synced_at"`
-	MAXStatsAttemptedAt *time.Time       `json:"-"`
-	MAXIsPinned         bool             `json:"max_is_pinned"`
-	LastError           string           `json:"last_error,omitempty"`
-	CreatedAt           time.Time        `json:"created_at"`
-	UpdatedAt           time.Time        `json:"updated_at"`
-	PublishedAt         *time.Time       `json:"published_at,omitempty"`
-	ReviewStatus        string           `json:"review_status,omitempty"`
-	CurrentRevisionID   *int64           `json:"current_revision_id,omitempty"`
+	ID                            int64            `json:"id"`
+	UserID                        string           `json:"-"`
+	WorkspaceID                   string           `json:"workspace_id,omitempty"`
+	Title                         string           `json:"title"`
+	Content                       string           `json:"content"`
+	Format                        string           `json:"format"`
+	Status                        string           `json:"status"`
+	ChannelID                     *int64           `json:"channel_id,omitempty"`
+	ImageURL                      string           `json:"image_url,omitempty"`
+	ImagePath                     string           `json:"-"`
+	ImagePrompt                   string           `json:"image_prompt,omitempty"`
+	Attachments                   []PostAttachment `json:"attachments"`
+	LinkButtons                   []LinkButton     `json:"link_buttons"`
+	Notify                        bool             `json:"notify"`
+	DisableLinkPreview            bool             `json:"disable_link_preview"`
+	ScheduledAt                   *time.Time       `json:"scheduled_at,omitempty"`
+	MAXMessageID                  string           `json:"max_message_id,omitempty"`
+	MAXMessageURL                 string           `json:"max_message_url"`
+	MAXViews                      *int64           `json:"max_views"`
+	MAXStatsSyncedAt              *time.Time       `json:"max_stats_synced_at"`
+	MAXStatsAttemptedAt           *time.Time       `json:"-"`
+	MAXIsPinned                   bool             `json:"max_is_pinned"`
+	Origin                        string           `json:"origin"`
+	MAXHistoryAttachmentsComplete bool             `json:"max_history_attachments_complete"`
+	MAXSenderIsBot                *bool            `json:"max_sender_is_bot,omitempty"`
+	LastError                     string           `json:"last_error,omitempty"`
+	CreatedAt                     time.Time        `json:"created_at"`
+	UpdatedAt                     time.Time        `json:"updated_at"`
+	PublishedAt                   *time.Time       `json:"published_at,omitempty"`
+	ReviewStatus                  string           `json:"review_status,omitempty"`
+	CurrentRevisionID             *int64           `json:"current_revision_id,omitempty"`
 }
 
 const (

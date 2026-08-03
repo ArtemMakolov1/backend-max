@@ -33,6 +33,9 @@ func (a *App) DeletePublicationForWorkspace(ctx context.Context, actorUserID, wo
 	if a.max == nil {
 		return store.Post{}, ErrMAXNotConfigured
 	}
+	if err := requireMAXHistoryAuthoredByCurrentBot(post); err != nil {
+		return store.Post{}, err
+	}
 	if post.MAXMessageID == "" {
 		return store.Post{}, fmt.Errorf("%w: post has no MAX publication", ErrConflict)
 	}
@@ -55,6 +58,25 @@ func (a *App) DeletePublicationForWorkspace(ctx context.Context, actorUserID, wo
 	}
 	clear := func() (store.Post, error) {
 		return a.store.ClearPublicationForUser(ctx, post.UserID, post.ID, channel.ID, post.MAXMessageID)
+	}
+	if post.Origin == store.PostOriginMAXHistory {
+		message, getErr := a.max.GetMessage(ctx, post.MAXMessageID)
+		if getErr != nil {
+			if isMAXMessageNotFound(getErr) {
+				result, resultErr = clear()
+				if resultErr == nil {
+					a.recordWorkspacePublicationEvent(actorUserID, workspaceID, "post.publication_deleted", postID)
+				}
+				return result, resultErr
+			}
+			return store.Post{}, getErr
+		}
+		if err := validateMAXMessageOwnership(message, post.MAXMessageID, channel.MAXChatID); err != nil {
+			return store.Post{}, err
+		}
+		if err := requireMAXHistoryCurrentBotMessage(post, message, membership.UserID); err != nil {
+			return store.Post{}, err
+		}
 	}
 	if err := a.max.Delete(ctx, post.MAXMessageID); err != nil {
 		if isMAXMessageNotFound(err) {

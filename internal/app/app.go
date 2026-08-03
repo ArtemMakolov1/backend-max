@@ -1682,6 +1682,9 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result sto
 	if isStoredMAXPublicationMissing(post) {
 		return post, nil
 	}
+	if err := requireMAXHistoryEditable(post); err != nil {
+		return store.Post{}, err
+	}
 	if post.Status != store.PostStatusPublished || post.MAXMessageID == "" {
 		return store.Post{}, fmt.Errorf("%w: post has no active MAX publication", ErrConflict)
 	}
@@ -1710,6 +1713,9 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result sto
 	if err := validateMAXMessageOwnership(message, post.MAXMessageID, channel.MAXChatID); err != nil {
 		return store.Post{}, err
 	}
+	if err := requireMAXHistoryCurrentBotMessage(post, message, membership.UserID); err != nil {
+		return store.Post{}, err
+	}
 	mediaTokens, imageTokens, err := a.postMediaTokens(ctx, post)
 	if err != nil {
 		return store.Post{}, err
@@ -1729,8 +1735,15 @@ func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result sto
 		}
 		return store.Post{}, err
 	}
+	editFormat := maxclient.Format(claimed.Format)
+	if claimed.Origin == store.PostOriginMAXHistory {
+		// History messages with provider markup are read-only. The remaining
+		// imported text is sent without a format so Markdown metacharacters and
+		// edge whitespace keep their original literal representation.
+		editFormat = ""
+	}
 	err = a.max.Edit(ctx, maxclient.EditRequest{
-		MessageID: claimed.MAXMessageID, Text: claimed.Content, Format: maxclient.Format(claimed.Format),
+		MessageID: claimed.MAXMessageID, Text: claimed.Content, Format: editFormat,
 		MediaTokens: mediaTokens, ImageTokens: imageTokens, LinkButtons: maxLinkButtons(claimed.LinkButtons),
 	})
 	if err != nil {
@@ -1768,6 +1781,9 @@ func (a *App) DeletePublication(ctx context.Context, userID string, postID int64
 	if a.max == nil {
 		return store.Post{}, ErrMAXNotConfigured
 	}
+	if err := requireMAXHistoryAuthoredByCurrentBot(post); err != nil {
+		return store.Post{}, err
+	}
 	if post.MAXMessageID == "" {
 		return store.Post{}, fmt.Errorf("%w: post has no MAX publication", ErrConflict)
 	}
@@ -1789,24 +1805,42 @@ func (a *App) DeletePublication(ctx context.Context, userID string, postID int64
 	if !diagnostics.CanDelete {
 		return store.Post{}, &ChannelAccessError{Diagnostics: diagnostics, Message: "MAX delete permission is required"}
 	}
+	clear := func() (store.Post, error) {
+		return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)
+	}
+	if post.Origin == store.PostOriginMAXHistory {
+		message, getErr := a.max.GetMessage(ctx, post.MAXMessageID)
+		if getErr != nil {
+			if isMAXMessageNotFound(getErr) {
+				return clear()
+			}
+			return store.Post{}, getErr
+		}
+		if err := validateMAXMessageOwnership(message, post.MAXMessageID, channel.MAXChatID); err != nil {
+			return store.Post{}, err
+		}
+		if err := requireMAXHistoryCurrentBotMessage(post, message, membership.UserID); err != nil {
+			return store.Post{}, err
+		}
+	}
 	if err := a.max.Delete(ctx, post.MAXMessageID); err != nil {
 		// Deletion is idempotent from the user's perspective. If MAX reports
 		// that the message is already gone, clear the matching live metadata
 		// with the same CAS used after a successful explicit deletion.
 		if isMAXMessageNotFound(err) {
-			return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)
+			return clear()
 		}
 		// MAX delete operations can return HTTP 200 with success=false and no
 		// machine-readable reason. Re-read the message to distinguish an
 		// already completed deletion from a genuine delete failure.
 		if isMAXOperationFailed(err) {
 			if _, getErr := a.max.GetMessage(ctx, post.MAXMessageID); isMAXMessageNotFound(getErr) {
-				return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)
+				return clear()
 			}
 		}
 		return store.Post{}, err
 	}
-	return a.store.ClearPublicationForUser(ctx, userID, postID, channel.ID, post.MAXMessageID)
+	return clear()
 }
 
 // SyncMAXPublication refreshes the canonical MAX URL, latest view count and

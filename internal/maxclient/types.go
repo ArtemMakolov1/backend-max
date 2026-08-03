@@ -157,11 +157,13 @@ type MediaToken struct {
 
 // Message identifies a post created through Publish.
 type Message struct {
-	MessageID string
-	URL       string
-	Text      string
-	ChatID    string
-	Views     *int64
+	MessageID    string
+	URL          string
+	Text         string
+	ChatID       string
+	Views        *int64
+	SenderUserID string
+	SenderIsBot  bool
 }
 
 // PublishRequest describes a new channel post. MediaTokens preserve the given
@@ -252,6 +254,10 @@ type apiMessage struct {
 	Recipient *struct {
 		ChatID json.RawMessage `json:"chat_id,omitempty"`
 	} `json:"recipient,omitempty"`
+	Sender *struct {
+		UserID json.RawMessage `json:"user_id,omitempty"`
+		IsBot  bool            `json:"is_bot,omitempty"`
+	} `json:"sender,omitempty"`
 	Stat *struct {
 		Views *int64 `json:"views,omitempty"`
 	} `json:"stat,omitempty"`
@@ -267,7 +273,7 @@ func (m apiMessage) publicMessage() Message {
 		id = m.Mid
 	}
 
-	var text, chatID string
+	var text, chatID, senderUserID string
 	if m.Body != nil {
 		if id == "" {
 			id = m.Body.Mid
@@ -280,12 +286,20 @@ func (m apiMessage) publicMessage() Message {
 	if m.Recipient != nil && len(m.Recipient.ChatID) != 0 {
 		chatID = jsonCode(m.Recipient.ChatID)
 	}
+	var senderIsBot bool
+	if m.Sender != nil {
+		senderUserID = jsonCode(m.Sender.UserID)
+		senderIsBot = m.Sender.IsBot
+	}
 	var views *int64
 	if m.Stat != nil {
 		views = m.Stat.Views
 	}
 
-	return Message{MessageID: id, URL: m.URL, Text: text, ChatID: chatID, Views: views}
+	return Message{
+		MessageID: id, URL: m.URL, Text: text, ChatID: chatID, Views: views,
+		SenderUserID: senderUserID, SenderIsBot: senderIsBot,
+	}
 }
 
 func imageAttachments(tokens []string) (*[]attachment, error) {

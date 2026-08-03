@@ -54,11 +54,22 @@ func createPostRevisionTx(ctx context.Context, tx *sql.Tx, actorUserID, workspac
 'image_url',p.image_url,'image_path',p.image_path,'image_prompt',p.image_prompt,
 'link_buttons',p.link_buttons,'notify',p.notify,
 'disable_link_preview',p.disable_link_preview,
-'attachments',COALESCE((SELECT jsonb_agg(jsonb_build_object(
+'origin',p.origin,'max_history_attachments_complete',p.max_history_attachments_complete,
+'max_sender_is_bot',p.max_sender_is_bot,
+	'attachments',COALESCE((SELECT jsonb_agg(jsonb_build_object(
     'id',pa.id,'type',pa.type,'position',pa.position,'storage_key',pa.storage_key,
+    'source',pa.source,'remote_url',pa.remote_url,
     'processing_status',pa.processing_status,'size_bytes',pa.size_bytes,'mime_type',pa.mime_type,
     'width',pa.width,'height',pa.height,'duration_ms',pa.duration_ms
-) ORDER BY pa.position,pa.id) FROM post_attachments pa WHERE pa.post_id=p.id),'[]'::jsonb))
+) ORDER BY pa.position,pa.id) FROM (
+    SELECT id,type,position,storage_key,'upload'::text AS source,''::text AS remote_url,
+           processing_status,size_bytes,mime_type,width,height,duration_ms
+    FROM post_attachments WHERE post_id=p.id
+    UNION ALL
+    SELECT id,type,position,NULL::text AS storage_key,'max_history'::text AS source,remote_url,
+           processing_status,size_bytes,mime_type,width,height,duration_ms
+    FROM max_history_post_attachments WHERE post_id=p.id
+) pa),'[]'::jsonb))
 FROM posts p WHERE p.workspace_id=$1 AND p.id=$2 FOR UPDATE`, workspaceID, postID).Scan(&snapshot)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PostRevision{}, ErrNotFound

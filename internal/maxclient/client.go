@@ -336,6 +336,9 @@ func (c *Client) GetMessage(ctx context.Context, messageID string) (Message, err
 	if message.Views != nil && *message.Views < 0 {
 		return Message{}, errors.New("MAX message response contains a negative view count")
 	}
+	if err := validateMessageSender(message); err != nil {
+		return Message{}, err
+	}
 	return message, nil
 }
 
@@ -370,7 +373,23 @@ func (c *Client) GetPinnedMessage(ctx context.Context, chatID string) (*Message,
 	if message.Views != nil && *message.Views < 0 {
 		return nil, errors.New("MAX pinned message response contains a negative view count")
 	}
+	if err := validateMessageSender(message); err != nil {
+		return nil, err
+	}
 	return &message, nil
+}
+
+func validateMessageSender(message Message) error {
+	if message.SenderUserID != "" {
+		userID, err := strconv.ParseInt(message.SenderUserID, 10, 64)
+		if err != nil || userID <= 0 {
+			return errors.New("MAX message response contains an invalid sender user ID")
+		}
+	}
+	if message.SenderIsBot && message.SenderUserID == "" {
+		return errors.New("MAX message response identifies a bot sender without a user ID")
+	}
+	return nil
 }
 
 func decodePinnedMessage(response json.RawMessage) (*apiMessage, error) {
