@@ -43,8 +43,8 @@ SET LOCAL search_path=pg_catalog,public;
 -- Fail within the same transaction unless the reviewed schema is the latest.
 SELECT 'schema_verified=' || (1/COUNT(*)::int)
 FROM public.schema_migrations
-WHERE version='039' AND checksum_sha256=:'schema_checksum'
-  AND NOT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version>'039');
+WHERE version='039_account_complimentary_access.sql' AND checksum_sha256=:'schema_checksum'
+  AND NOT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version>'039_account_complimentary_access.sql');
 -- Keep the account identifier private. A separate statement lets STABLE
 -- entitlement helpers observe this transaction's completed grant/revoke.
 SELECT user_id,active::text AS active,owned_workspaces::text AS owned_workspaces,changed::text AS changed

@@ -50,7 +50,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE,SELECT,UPDATE ON SEQUENCES
 CREATE TABLE schema_migrations(version TEXT PRIMARY KEY,checksum_sha256 TEXT NOT NULL CHECK(checksum_sha256~'^[0-9a-f]{64}$'),applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP);
 SQL
 for migration in "$fixture"/migrations/[0-9][0-9][0-9]_*.sql; do
-  version=${migration##*/}; version=${version:0:3}
+  # Match store.loadEmbeddedMigrations: production persists the full filename.
+  version=${migration##*/}
   checksum=$(sha256sum "$migration" | cut -d' ' -f1)
   { printf 'BEGIN;\n'; cat "$migration"; printf '\nINSERT INTO schema_migrations(version,checksum_sha256) VALUES (:%s,:%s);\nCOMMIT;\n' "'version'" "'checksum'"; } |
     psql_owner "$test_database" -v version="$version" -v checksum="$checksum" >"$fixture/migrate.log" 2>&1 || { echo "Disposable fixture migration failed" >&2; exit 1; }
@@ -154,9 +155,9 @@ done
 
 bad_checksum=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 if call revoke fixture.owner@example.test "$bad_checksum" >"$fixture/result" 2>&1; then echo "Mismatched schema was accepted" >&2; exit 1; fi
-psql_owner "$test_database" -c "INSERT INTO schema_migrations(version,checksum_sha256) VALUES ('040',repeat('a',64));" >/dev/null
+psql_owner "$test_database" -c "INSERT INTO schema_migrations(version,checksum_sha256) VALUES ('040_fixture.sql',repeat('a',64));" >/dev/null
 if call revoke >"$fixture/result" 2>&1; then echo "Future schema was accepted" >&2; exit 1; fi
-psql_owner "$test_database" -c "DELETE FROM schema_migrations WHERE version='040';" >/dev/null
+psql_owner "$test_database" -c "DELETE FROM schema_migrations WHERE version='040_fixture.sql';" >/dev/null
 if call grant absent.fixture@example.test >"$fixture/result" 2>&1; then echo "Absent identity was accepted" >&2; exit 1; fi
 psql_owner "$test_database" <<'SQL' >/dev/null
 UPDATE users SET email='fixture.owner@example.test' WHERE id='fixture-other';
