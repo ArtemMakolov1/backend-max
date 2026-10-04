@@ -2623,6 +2623,24 @@ paths:
       responses:
         '200': {$ref: '#/components/responses/Post'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/attachments/{attachment_id}/video:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - {$ref: '#/components/parameters/AttachmentId'}
+    get:
+      tags: [Posts]
+      operationId: getWorkspaceMAXVideoPreview
+      summary: Read fresh MAX playback metadata for a published workspace video
+      description: Requires posts.read and a currently accessible administrator bot with read_all_messages. The server resolves the stored attachment token; arbitrary tokens and query parameters are rejected. This read-only call neither downloads media nor changes the post. Signed playback URLs should be requested again if they expire.
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Safe playback URLs and metadata, or available false with urls null
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MAXVideoPreview'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/posts/{post_id}/attachments/order:
     parameters:
       - {$ref: '#/components/parameters/WorkspaceId'}
@@ -5158,6 +5176,33 @@ components:
         updated_at:
           type: string
           format: date-time
+    MAXVideoURLs:
+      type: object
+      description: Actual MAX playback sources. Unsafe, null and absent provider fields are omitted. No URL is fetched by the backend.
+      properties:
+        mp4_1080: {type: string, format: uri, maxLength: 4096}
+        mp4_720: {type: string, format: uri, maxLength: 4096}
+        mp4_480: {type: string, format: uri, maxLength: 4096}
+        mp4_360: {type: string, format: uri, maxLength: 4096}
+        mp4_240: {type: string, format: uri, maxLength: 4096}
+        mp4_144: {type: string, format: uri, maxLength: 4096}
+        hls: {type: string, format: uri, maxLength: 4096}
+    MAXVideoPreview:
+      type: object
+      required: [attachment_id, available, urls]
+      properties:
+        attachment_id: {type: integer, format: int64, minimum: 1}
+        available:
+          type: boolean
+          description: At least one safe playback source was returned. This is not a processing-status field.
+        urls:
+          oneOf:
+            - {$ref: '#/components/schemas/MAXVideoURLs'}
+            - {type: 'null'}
+        thumbnail_url: {type: string, format: uri, maxLength: 4096}
+        width: {type: integer, minimum: 0}
+        height: {type: integer, minimum: 0}
+        duration_ms: {type: integer, format: int64, minimum: 0}
     PostAttachmentMutation:
       type: object
       required: [attachment, post]

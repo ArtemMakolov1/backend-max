@@ -103,15 +103,15 @@ func (s *Store) ClaimMAXHistoryImport(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if _, err := lockActiveWorkspaceForMAXHistoryWrite(ctx, tx, workspaceID); err != nil {
+		return MAXHistoryImport{}, err
+	}
 	access, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID)
 	if err != nil {
 		return MAXHistoryImport{}, err
 	}
 	if !access.Capabilities.EditContent {
 		return MAXHistoryImport{}, ErrNotFound
-	}
-	if _, err := lockActiveWorkspaceForMAXHistoryWrite(ctx, tx, workspaceID); err != nil {
-		return MAXHistoryImport{}, err
 	}
 	channel, err := scanChannel(tx.QueryRowContext(ctx, `SELECT `+channelColumns+`
 FROM channels
@@ -206,6 +206,7 @@ func (s *Store) ApplyMAXHistoryPage(
 	nextFrom *int64,
 	complete bool,
 	now time.Time,
+	deferOverlapCompletion ...bool,
 ) (MAXHistoryImport, error) {
 	if strings.TrimSpace(actorUserID) == "" || strings.TrimSpace(workspaceID) == "" || now.IsZero() {
 		return MAXHistoryImport{}, errors.New("MAX history page requires actor, workspace and now")
@@ -231,16 +232,16 @@ func (s *Store) ApplyMAXHistoryPage(
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	compatOwnerID, err := lockActiveWorkspaceForMAXHistoryWrite(ctx, tx, workspaceID)
+	if err != nil {
+		return MAXHistoryImport{}, err
+	}
 	access, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID)
 	if err != nil {
 		return MAXHistoryImport{}, err
 	}
 	if !access.Capabilities.EditContent {
 		return MAXHistoryImport{}, ErrNotFound
-	}
-	compatOwnerID, err := lockActiveWorkspaceForMAXHistoryWrite(ctx, tx, workspaceID)
-	if err != nil {
-		return MAXHistoryImport{}, err
 	}
 	channelID, err := maxHistoryChannelIDForGeneration(ctx, tx, workspaceID, generation)
 	if err != nil {
@@ -310,7 +311,8 @@ WHERE workspace_id=$1 AND channel_id=$2 AND status=$3
 	if processedCount > expectedCount {
 		expectedCount = processedCount
 	}
-	overlapComplete := !complete && progress.PreviousCompletedAt != nil && priorRunOverlap
+	overlapDeferred := len(deferOverlapCompletion) > 0 && deferOverlapCompletion[0]
+	overlapComplete := !complete && !overlapDeferred && progress.PreviousCompletedAt != nil && priorRunOverlap
 	effectiveComplete := complete || overlapComplete
 	if overlapComplete {
 		// An incremental run stops at the first message already seen by the
@@ -395,15 +397,15 @@ func (s *Store) ReleaseMAXHistoryImport(
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if _, err := lockActiveWorkspaceForMAXHistoryWrite(ctx, tx, workspaceID); err != nil {
+		return err
+	}
 	access, err := resolveWorkspaceAccess(ctx, tx, actorUserID, workspaceID)
 	if err != nil {
 		return err
 	}
 	if !access.Capabilities.EditContent {
 		return ErrNotFound
-	}
-	if _, err := lockActiveWorkspaceForMAXHistoryWrite(ctx, tx, workspaceID); err != nil {
-		return err
 	}
 	var channelID int64
 	err = tx.QueryRowContext(ctx, `SELECT channel_id FROM channel_history_imports
@@ -460,6 +462,11 @@ func applyMAXHistoryItemTx(
 	item MAXHistoryItem,
 	now time.Time,
 ) (maxHistoryItemClassification, error) {
+	// Lock the post before its mapping. Deleting a post cascades to that
+	// mapping in the same order; reversing it would permit a deadlock.
+	if err := enrichMAXHistoryPreviewsTx(ctx, tx, ownerID, workspaceID, channelID, item, now); err != nil {
+		return 0, err
+	}
 	var mappedPostID, mappedRunID int64
 	err := tx.QueryRowContext(ctx, `SELECT post_id,last_import_run_id
 FROM max_history_messages
