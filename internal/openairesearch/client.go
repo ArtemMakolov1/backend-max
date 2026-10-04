@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -34,6 +33,8 @@ const (
 )
 
 var opaqueCitationPattern = regexp.MustCompile(`cite[^]*`)
+var sourceDNSLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var sourceTLDSyntaxPattern = regexp.MustCompile(`^[a-z]{2,63}$`)
 
 type Client struct {
 	baseURL    string
@@ -276,8 +277,15 @@ type inputContentPart struct {
 }
 
 type webSearchTool struct {
-	Type              string `json:"type"`
-	SearchContextSize string `json:"search_context_size"`
+	Type               string            `json:"type"`
+	SearchContextSize  string            `json:"search_context_size"`
+	SearchContentTypes []string          `json:"search_content_types,omitempty"`
+	ImageSettings      *webImageSettings `json:"image_settings,omitempty"`
+}
+
+type webImageSettings struct {
+	MaxResults int  `json:"max_results"`
+	Caption    bool `json:"caption"`
 }
 
 type textOptions struct {
@@ -407,6 +415,25 @@ type outputItem struct {
 	Type    string        `json:"type"`
 	Status  string        `json:"status"`
 	Content []contentItem `json:"content"`
+	Action  *webAction    `json:"action,omitempty"`
+	Results []webResult   `json:"results,omitempty"`
+}
+
+type webAction struct {
+	Sources []webSource `json:"sources"`
+}
+
+type webSource struct {
+	Type  string `json:"type"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type webResult struct {
+	Type             string `json:"type"`
+	ImageURL         string `json:"image_url"`
+	SourceWebsiteURL string `json:"source_website_url"`
+	ThumbnailURL     string `json:"thumbnail_url"`
 }
 
 type contentItem struct {
@@ -653,12 +680,29 @@ func safeSource(title, rawURL string) (Source, bool) {
 
 func unsafeSourceHost(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+	if host == "" || len(host) > 253 {
 		return true
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast())
+	for _, suffix := range []string{"localhost", "local", "internal", "lan", "home", "home.arpa", "test", "invalid", "example", "onion"} {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	// Browsers accept IPv4 spellings that net.ParseIP does not: a single
+	// decimal integer, octal components, short addresses and 0x hexadecimal.
+	// Research sources need public domain names, so require DNS labels and a
+	// nonnumeric TLD instead of guessing every browser IP representation.
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return true
+	}
+	for _, label := range labels {
+		if !sourceDNSLabelPattern.MatchString(label) {
+			return true
+		}
+	}
+	tld := labels[len(labels)-1]
+	return !sourceTLDSyntaxPattern.MatchString(tld) && !strings.HasPrefix(tld, "xn--")
 }
 
 func deduplicateSources(sources []Source) []Source {

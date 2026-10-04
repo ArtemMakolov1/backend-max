@@ -594,6 +594,9 @@ WHERE workspace_id=$1 AND connection_id=$2
 SELECT 1 FROM direct_provider_operations
 WHERE workspace_id=$1 AND connection_id=$2
   AND completed_at IS NULL AND stage NOT IN ('completed','failed')
+) OR EXISTS(
+SELECT 1 FROM direct_external_edit_controls
+WHERE workspace_id=$1 AND connection_id=$2 AND edit_state<>'idle'
 )`, workspaceID, currentConnectionID).Scan(&launchInFlight); err != nil {
 		return DirectConnection{}, err
 	}
@@ -865,6 +868,9 @@ WHERE workspace_id=$1 AND connection_id=$2
 SELECT 1 FROM direct_provider_operations
 WHERE workspace_id=$1 AND connection_id=$2
   AND completed_at IS NULL AND stage NOT IN ('completed','failed')
+) OR EXISTS(
+SELECT 1 FROM direct_external_edit_controls
+WHERE workspace_id=$1 AND connection_id=$2 AND edit_state<>'idle'
 )`, workspaceID, connectionID).Scan(&launchInFlight); err != nil {
 		return err
 	}
