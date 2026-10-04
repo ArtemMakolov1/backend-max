@@ -42,7 +42,13 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return DiscoverContentResult{}, err
 		}
-		return DiscoverContentResult{}, &Error{Code: "content_search_failed", Message: "External source retrieval is unavailable"}
+		diagnostic := contentsearch.Diagnostics{}.Safe()
+		var sourceErr *contentsearch.Error
+		if errors.As(err, &sourceErr) {
+			diagnostic = sourceErr.SafeDiagnostics()
+		}
+		return DiscoverContentResult{}, &Error{Code: "content_search_failed", Message: "External source retrieval is unavailable",
+			SearchDiagnostics: diagnostic}
 	}
 	sources, previews, media, evidence := externalDiscoverySources(found.Sources)
 	if len(evidence) == 0 {

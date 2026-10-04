@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"maxpilot/backend/internal/contentsearch"
 )
 
 const (
@@ -77,10 +79,11 @@ type Result struct {
 }
 
 type Error struct {
-	StatusCode int
-	Code       string
-	Message    string
-	RequestID  string
+	StatusCode        int
+	Code              string
+	Message           string
+	RequestID         string
+	SearchDiagnostics contentsearch.Diagnostics `json:"-"`
 }
 
 func (e *Error) Error() string {

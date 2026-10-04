@@ -72,16 +72,18 @@ type Image struct {
 
 // Error deliberately excludes remote bodies, transport errors and credentials.
 type Error struct {
-	Provider string
-	Code     string
-	Status   int
+	Provider      string
+	Code          string
+	Status        int
+	TransportKind string
 }
 
 func (e *Error) Error() string {
-	if e.Status != 0 {
-		return fmt.Sprintf("content search %s: %s (HTTP %d)", e.Provider, e.Code, e.Status)
+	diagnostic := e.SafeDiagnostics()
+	if diagnostic.Status != 0 {
+		return fmt.Sprintf("content search %s: %s (HTTP %d)", diagnostic.Provider, diagnostic.Code, diagnostic.Status)
 	}
-	return "content search " + e.Provider + ": " + e.Code
+	return "content search " + diagnostic.Provider + ": " + diagnostic.Code
 }
 
 type Client struct {
@@ -266,7 +268,7 @@ func (c *Client) post(ctx context.Context, provider, endpoint string, payload, t
 	}
 	response, err := c.http.Do(req)
 	if err != nil {
-		return &Error{Provider: provider, Code: "request_failed"}
+		return &Error{Provider: provider, Code: "request_failed", TransportKind: safeTransportKind(err)}
 	}
 	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
@@ -281,7 +283,7 @@ func (c *Client) post(ctx context.Context, provider, endpoint string, payload, t
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
-		return &Error{Provider: provider, Code: "response_unreadable"}
+		return &Error{Provider: provider, Code: "response_unreadable", TransportKind: safeTransportKind(err)}
 	}
 	if len(data) > maxResponseBytes {
 		return &Error{Provider: provider, Code: "response_too_large"}
