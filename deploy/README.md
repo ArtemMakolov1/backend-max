@@ -157,6 +157,19 @@ health endpoint показывает `openai_configured=false` и
 ключа достаточно повторного deployment; хранить пустой secret в GitHub не
 требуется.
 
+Для внешнего поиска материалов можно добавить optional protected secrets
+`EXA_API_KEY` и/или `TAVILY_API_KEY` в Environment `production`. Они передаются
+через renderer в backend, не являются repository variables и не выводятся в логи.
+Для синтеза карточек обязательно нужен `OPENAI_API_KEY`; отдельный поисковый ключ
+без него отклоняется валидатором. Без обоих поисковых ключей сохраняется поиск
+через OpenAI. В `bootstrap` renderer всегда очищает эти значения, а runtime и
+env validator запрещают их включение. Старые env-файлы без новых optional полей
+остаются допустимыми. Провайдеры используют фиксированные HTTPS endpoints
+`api.exa.ai` и `api.tavily.com`; custom base URL не настраивается. В Compose нет
+общего ограничения исходящего трафика: backend использует сеть `edge`. Если на
+VPS настроен отдельный firewall, проверьте исходящий HTTPS к этим двум доменам;
+специальный host override для `api.openai.com` на них не распространяется.
+
 Добавьте repository variables:
 
 - `VPS_HOST=178.159.94.83` (это значение уже используется как безопасный

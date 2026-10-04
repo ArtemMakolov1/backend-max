@@ -4586,6 +4586,9 @@ components:
           type: boolean
         content_discovery_configured:
           type: boolean
+        content_search_configured:
+          type: boolean
+          description: Server-side Exa or Tavily retrieval is configured for content discovery. Credentials are never returned.
         content_formatting_configured:
           type: boolean
         observability_access:
@@ -5998,6 +6001,10 @@ components:
           maxItems: 3
           items: {$ref: '#/components/schemas/ContentDiscoveryCard'}
         context_analysis: {$ref: '#/components/schemas/ContentContextAnalysis'}
+        empty_reason:
+          type: string
+          enum: [no_sources, no_matching_materials]
+          description: Optional explanation for an empty successful selection; provider failures return a problem response instead.
     ContentContextAnalysis:
       type: object
       required: [status, images_analyzed, videos_analyzed, audio_analyzed, cached, warnings]

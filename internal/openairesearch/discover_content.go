@@ -76,6 +76,7 @@ type DiscoverContentResult struct {
 	ContentKind     string                  `json:"content_kind"`
 	Cards           []ContentCard           `json:"cards"`
 	ContextAnalysis *ContentContextAnalysis `json:"context_analysis,omitempty"`
+	EmptyReason     string                  `json:"empty_reason,omitempty"`
 }
 
 func NormalizeDiscoverContentRequest(request DiscoverContentRequest) DiscoverContentRequest {
@@ -150,6 +151,9 @@ func (c *Client) DiscoverContent(ctx context.Context, request DiscoverContentReq
 	request = NormalizeDiscoverContentRequest(request)
 	if err := ValidateDiscoverContentRequest(request); err != nil {
 		return DiscoverContentResult{}, err
+	}
+	if c.contentSearch != nil {
+		return c.discoverContentFromSearch(ctx, request)
 	}
 	envelope, err := c.call(ctx, discoveryPayload(c.model, request))
 	if err != nil {
@@ -343,6 +347,16 @@ func safeDiscoverySource(title, rawURL string) (Source, bool) {
 }
 
 func decodeDiscoveryCards(text string, envelope responseEnvelope, request DiscoverContentRequest) ([]ContentCard, error) {
+	sources, previews, searched := discoverySources(envelope)
+	if !searched {
+		return nil, errors.New("content discovery did not complete web search")
+	}
+	return decodeDiscoveryCardsFromSources(text, sources, previews, request)
+}
+
+// The authority map is selected by the retrieval layer. Model citations must
+// never add sources to an externally retrieved set.
+func decodeDiscoveryCardsFromSources(text string, sources map[string]Source, previews map[string]string, request DiscoverContentRequest) ([]ContentCard, error) {
 	var result struct {
 		Cards []struct {
 			ContentKind string `json:"content_kind"`
@@ -359,10 +373,6 @@ func decodeDiscoveryCards(text string, envelope responseEnvelope, request Discov
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || result.Cards == nil || len(result.Cards) > MaxDiscoveryCards {
 		return nil, errors.New("content discovery must contain one JSON object and at most three cards")
-	}
-	sources, previews, searched := discoverySources(envelope)
-	if !searched {
-		return nil, errors.New("content discovery did not complete web search")
 	}
 	cards := make([]ContentCard, 0, len(result.Cards))
 	seen := make(map[string]bool)

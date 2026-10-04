@@ -15,6 +15,7 @@ import (
 	"maxpilot/backend/internal/api"
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/config"
+	"maxpilot/backend/internal/contentsearch"
 	"maxpilot/backend/internal/email"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
@@ -107,6 +108,14 @@ func main() {
 		if err != nil {
 			logger.Error("could not initialize OpenAI research client", "error", err)
 			os.Exit(1)
+		}
+		searchClient, err := contentsearch.NewClient(contentsearch.Config{ExaAPIKey: cfg.ExaAPIKey, TavilyAPIKey: cfg.TavilyAPIKey})
+		if err != nil {
+			logger.Error("could not initialize content search", "error", err)
+			os.Exit(1)
+		}
+		if searchClient.Configured() {
+			researchClient = researchClient.WithContentSearch(searchClient)
 		}
 		research = researchClient
 	}

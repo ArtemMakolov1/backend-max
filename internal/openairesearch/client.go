@@ -37,10 +37,11 @@ var sourceDNSLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0
 var sourceTLDSyntaxPattern = regexp.MustCompile(`^[a-z]{2,63}$`)
 
 type Client struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	httpClient *http.Client
+	baseURL       string
+	apiKey        string
+	model         string
+	httpClient    *http.Client
+	contentSearch ContentSearcher
 }
 
 type Request struct {
