@@ -1,4 +1,4 @@
-name: Recover accepted production S3 configuration
+name: Recover production media storage
 
 on:
   workflow_dispatch:
@@ -13,6 +13,17 @@ on:
         required: true
         default: ghcr.io/artemmakolov1/backend-max@sha256:8140a76d1f755a4f5122bfb64bf6eace468b960135a00a548fe2ebc8967cbf20
         type: string
+      recovery_mode:
+        description: Inspect media, recover accepted S3, or roll forward to the protected R2 configuration
+        required: true
+        default: accepted_s3
+        type: choice
+        options: [accepted_s3, r2_inventory, r2]
+      allow_pending_media:
+        description: Explicitly permit R2 API restoration while existing media recovery remains pending
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -25,10 +36,12 @@ env:
   SOURCE_SHA: ${{ inputs.source_sha }}
   IMAGE: ${{ inputs.image }}
   DEPLOY_STAGE: production
+  RECOVERY_MODE: ${{ inputs.recovery_mode }}
+  ALLOW_PENDING_MEDIA: ${{ inputs.allow_pending_media }}
 
 jobs:
   recover:
-    name: Roll forward with accepted S3 settings
+    name: Recover media storage with the verified image
     if: github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -55,6 +68,8 @@ jobs:
           [[ "$IMAGE" == ghcr.io/artemmakolov1/backend-max@sha256:8140a76d1f755a4f5122bfb64bf6eace468b960135a00a548fe2ebc8967cbf20 ]] || { echo "Unapproved recovery image" >&2; exit 1; }
           [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ && "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ && "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid production target" >&2; exit 1; }
           (( VPS_PORT <= 65535 ))
+          case "$RECOVERY_MODE" in accepted_s3|r2_inventory|r2) ;; *) echo "Invalid recovery mode" >&2; exit 1;; esac
+          [[ "$ALLOW_PENDING_MEDIA" == false || "$ALLOW_PENDING_MEDIA" == true ]]
       - name: Require successful exact-source CI and security gates
         shell: bash
         env:
@@ -144,7 +159,7 @@ jobs:
           printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
           printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
-      - name: Restore accepted S3 settings, preflight and roll forward
+      - name: Inventory media or preflight storage and roll forward
         shell: bash
         env:
           GHCR_TOKEN: ${{ github.token }}
@@ -155,6 +170,7 @@ jobs:
           artifact="$RUNNER_TEMP/maxposty-backend-recovery.tgz"
           remote_artifact="/tmp/maxposty-backend-recovery-${SOURCE_SHA}.tgz"
           recovery_helper="/tmp/maxposty-s3-recovery-${SOURCE_SHA}.sh"
+          r2_helper="/tmp/maxposty-r2-recovery-${SOURCE_SHA}.sh"
           target="${VPS_USER}@${VPS_HOST}"
           ssh_options=(-i "$HOME/.ssh/id_deploy" -p "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
           scp_options=(-i "$HOME/.ssh/id_deploy" -P "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
@@ -164,8 +180,10 @@ jobs:
           ssh "${ssh_options[@]}" "$target" "set -eu; trap \"rm -f '$remote_artifact'\" 0; tar -xzf '$remote_artifact' --no-same-owner -C '$release_dir'; if [ -e '$release_dir/certs' ] && [ ! -L '$release_dir/certs' ]; then rmdir '$release_dir/certs'; fi; ln -sfn '$install_dir/certs' '$release_dir/certs'"
           scp "${scp_options[@]}" "$RUNNER_TEMP/maxposty-backend-recovery.env" "$target:$release_dir/.env.production.next"
           scp "${scp_options[@]}" deploy/recover-s3-env.sh "$target:$recovery_helper"
-          printf '%s\n' "$GHCR_TOKEN" | ssh "${ssh_options[@]}" "$target" "set -eu; trap \"rm -f '$recovery_helper' '$release_dir/.env.production.next' '$release_dir/.release.next'\" 0; chmod 600 '$release_dir/.env.production.next'; bash '$recovery_helper' '$release_dir'; '$release_dir/deploy/run-from-ci.sh' '$IMAGE' '$GITHUB_ACTOR' true '$GITHUB_REPOSITORY' '$SOURCE_SHA'"
+          scp "${scp_options[@]}" deploy/recover-r2-storage.sh "$target:$r2_helper"
+          printf '%s\n' "$GHCR_TOKEN" | ssh "${ssh_options[@]}" "$target" "set -eu; trap \"rm -f '$recovery_helper' '$r2_helper' '$release_dir/.env.production.next' '$release_dir/.release.next'\" 0; chmod 600 '$release_dir/.env.production.next'; if [ '$RECOVERY_MODE' = r2_inventory ]; then bash '$r2_helper' '$release_dir' inventory false '$IMAGE'; exit 0; elif [ '$RECOVERY_MODE' = r2 ]; then bash '$r2_helper' '$release_dir' rollout '$ALLOW_PENDING_MEDIA' '$IMAGE'; else bash '$recovery_helper' '$release_dir'; fi; '$release_dir/deploy/run-from-ci.sh' '$IMAGE' '$GITHUB_ACTOR' true '$GITHUB_REPOSITORY' '$SOURCE_SHA'"
       - name: Verify public production health
+        if: inputs.recovery_mode != 'r2_inventory'
         shell: bash
         run: |
           set -euo pipefail
