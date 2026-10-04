@@ -70,6 +70,61 @@ CONSTRAINTS = {
     "content_analysis_cache_result_json_check": "content_analysis_cache",
     "content_analysis_cache_workspace_id_channel_id_fkey": "content_analysis_cache",
 }
+TRANSPORT_KINDS = frozenset((
+    "dns", "tls_certificate_verification", "tls_handshake_timeout",
+    "tls_handshake_failure", "connection_refused", "connection_reset",
+    "connect_timeout", "connect_error", "no_route", "eof",
+    "deadline_exceeded", "request_canceled", "response_header_timeout",
+    "read_timeout", "write_timeout", "unknown",
+))
+
+
+def safe_transport_kind(error):
+    """Classify Go transport failures without returning any input fragments."""
+    # A net/url.Error embeds the requested URL in a quoted string. Remove only
+    # that structural wrapper first, so a private URL/query cannot determine
+    # the subtype. No URL, host, address or raw reason is ever returned.
+    wrapped = re.fullmatch(
+        r'(?:Get|Head|Post|Put|Patch|Delete|Connect|Options|Trace) "(?:[^"\\\r\n]|\\[^\r\n])*": ([^\r\n]+)', error
+    )
+    reason = wrapped.group(1) if wrapped else error
+    if "\r" in reason or "\n" in reason:
+        return "unknown"
+    if re.fullmatch(r'(?:dial (?:tcp|tcp4|tcp6): )?lookup [^\r\n]+: (?:no such host|server misbehaving|i/o timeout|temporary failure in name resolution)', reason):
+        return "dns"
+    if reason.startswith("tls: failed to verify certificate: x509: ") or reason.startswith("x509: "):
+        return "tls_certificate_verification"
+    if reason == "net/http: TLS handshake timeout":
+        return "tls_handshake_timeout"
+    if reason.startswith("remote error: tls: ") or reason == "tls: handshake failure":
+        return "tls_handshake_failure"
+    if re.fullmatch(r'(?:[^\r\n]+: )?connection refused', reason):
+        return "connection_refused"
+    if re.fullmatch(r'(?:[^\r\n]+: )?connection reset by peer', reason):
+        return "connection_reset"
+    if re.fullmatch(r'(?:[^\r\n]+: )?(?:no route to host|network is unreachable)', reason):
+        return "no_route"
+    if re.fullmatch(r'dial (?:tcp|tcp4|tcp6) [^\r\n]+: (?:i/o timeout|connect: connection timed out)', reason):
+        return "connect_timeout"
+    if re.fullmatch(r'dial (?:tcp|tcp4|tcp6) [^\r\n]+: connect: [^\r\n]+', reason):
+        return "connect_error"
+    if reason in ("EOF", "unexpected EOF"):
+        return "eof"
+    if reason in (
+        "context deadline exceeded",
+        "context deadline exceeded (Client.Timeout exceeded while awaiting headers)",
+        "net/http: request canceled (Client.Timeout exceeded while awaiting headers)",
+    ):
+        return "deadline_exceeded"
+    if reason in ("context canceled", "net/http: request canceled"):
+        return "request_canceled"
+    if reason == "net/http: timeout awaiting response headers":
+        return "response_header_timeout"
+    if re.fullmatch(r'read (?:tcp|tcp4|tcp6) [^\r\n]+: i/o timeout', reason):
+        return "read_timeout"
+    if re.fullmatch(r'write (?:tcp|tcp4|tcp6) [^\r\n]+: i/o timeout', reason):
+        return "write_timeout"
+    return "unknown"
 
 
 def safe_time(value):
@@ -100,6 +155,7 @@ def sanitize_record(record):
         chain.append(prefix)
         category = PREFIXES[prefix]
         remainder = remainder[len(prefix) + 2:]
+    transport_kind = safe_transport_kind(remainder) if category == "provider_transport" else None
     category = EXACT_ERRORS.get(remainder, category)
     sqlstate = table = constraint = None
     # Only recognize the actual pgx Error() shape, never SQL-like text in a
@@ -130,6 +186,7 @@ def sanitize_record(record):
         "time": safe_time(record.get("time")), "category": category,
         "sqlstate": sqlstate, "table": table, "constraint": constraint,
         "prefix_chain": chain,
+        "transport_kind": transport_kind,
     }
 
 
