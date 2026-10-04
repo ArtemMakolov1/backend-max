@@ -48,7 +48,9 @@ jobs:
       - name: Build and run migrations against PostgreSQL
         run: go run ./cmd/migrate
       - name: Enforce expand-contract migration safety
-        run: ./deploy/validate-expand-contract-migrations.sh internal/store/migrations
+        run: |
+          ./deploy/validate-expand-contract-migrations.sh internal/store/migrations
+          bash ./deploy/tests/expand-contract-migrations-policy.sh
       - name: Log in for immutable monitoring policy images
         shell: bash
         env:
