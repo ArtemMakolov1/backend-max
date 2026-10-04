@@ -107,7 +107,7 @@ func (s *Store) ObserveDirectExternalEdit(ctx context.Context, actor, workspace,
 	if _, err = externalEditContextTx(ctx, tx, actor, workspace, connection, campaign, false); err != nil {
 		return DirectExternalEditControl{}, err
 	}
-	revision := newStoreID("dxr")
+	revision := newStoreID("dxr_")
 	_, err = tx.ExecContext(ctx, `INSERT INTO direct_external_edit_controls (workspace_id,connection_id,provider_campaign_id,observed_hash,revision_id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING`, workspace, connection, campaign, hash, revision)
 	if err != nil {
 		return DirectExternalEditControl{}, err
@@ -166,7 +166,7 @@ func (s *Store) ClaimDirectExternalEdit(ctx context.Context, actor, workspace st
 	if control.Version != fence.Version || control.ObservedHash != fence.ObservedHash || control.RevisionID != fence.RevisionID {
 		return "", ErrConflict
 	}
-	operation := newStoreID("dxe")
+	operation := newStoreID("dxe_")
 	_, err = tx.ExecContext(ctx, `UPDATE direct_external_edit_controls SET edit_state='updating',operation_id=$4,desired_hash=$5,claimed_at=$6,version=version+1 WHERE workspace_id=$1 AND connection_id=$2 AND provider_campaign_id=$3`, workspace, fence.ConnectionID, campaign, operation, desired, now.UTC())
 	if err != nil {
 		return "", err

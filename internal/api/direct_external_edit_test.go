@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -90,6 +91,9 @@ func TestExternalCopyAPIChecksAuthRevisionAndUnknownSpendFieldsBeforePaidQuota(t
 	}
 	if envelope.Campaign.Ads[0].Title2 != nil || envelope.Campaign.ConnectionID != connection.ID || envelope.Campaign.EditableFields == nil || envelope.Campaign.Ads[0].EditableFields == nil {
 		t.Fatal("nullable or readonly detail contract missing")
+	}
+	if !regexp.MustCompile(`^dxr_[0-9a-f]{32}$`).MatchString(envelope.Campaign.RevisionID) {
+		t.Fatalf("revision incompatible with browser contract: %q", envelope.Campaign.RevisionID)
 	}
 	fence := store.DirectExternalEditFence{ConnectionID: connection.ID, Version: envelope.Campaign.Version, ObservedHash: envelope.Campaign.ObservedHash, RevisionID: envelope.Campaign.RevisionID}
 	request := map[string]any{"expected_connection_id": fence.ConnectionID, "expected_version": fence.Version, "expected_observed_hash": fence.ObservedHash, "expected_revision_id": fence.RevisionID, "brief": "Сделай текущее объявление яснее"}

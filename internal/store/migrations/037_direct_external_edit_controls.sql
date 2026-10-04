@@ -5,7 +5,7 @@ CREATE TABLE direct_external_edit_controls (
     provider_campaign_id BIGINT NOT NULL CHECK (provider_campaign_id > 0),
     version BIGINT NOT NULL DEFAULT 1 CHECK (version > 0),
     observed_hash TEXT NOT NULL CHECK (observed_hash ~ '^[0-9a-f]{64}$'),
-    revision_id TEXT NOT NULL,
+    revision_id TEXT NOT NULL CHECK (revision_id ~ '^dxr_[0-9a-f]{32}$'),
     bookmarked BOOLEAN NOT NULL DEFAULT FALSE,
     edit_state TEXT NOT NULL DEFAULT 'idle' CHECK (edit_state IN ('idle','updating','uncertain')),
     operation_id TEXT NOT NULL DEFAULT '',
