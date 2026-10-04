@@ -1,0 +1,53 @@
+--- a/dispatch/dispatch_test.go
++++ b/dispatch/dispatch_test.go
+@@ -777,8 +777,9 @@
+ 	}
+ 	timeout := func(d time.Duration) time.Duration { return d }
+ 	recorder := &recordStage{alerts: make(map[string]map[model.Fingerprint]*alert.Alert)}
++	casLimits := &maxpostyCASBarrierLimits{}
+ 	metrics := NewDispatcherMetrics(false, reg, featurecontrol.NoopFlags{})
+-	dispatcher := NewDispatcher(alerts, route, recorder, marker.NewGroupMarker(), timeout, testMaintenanceInterval, nil, logger, eventrecorder.NopRecorder(), metrics, nil)
++	dispatcher := NewDispatcher(alerts, route, recorder, marker.NewGroupMarker(), timeout, testMaintenanceInterval, casLimits, logger, eventrecorder.NopRecorder(), metrics, nil)
+ 	// Don't call Run — put the dispatcher manually in  the DispatcherStateWaitingToStart
+ 	// state so groupAlert's final switch falls through the default branch and the
+ 	// aggregation group's run goroutine is never started.
+@@ -793,6 +794,9 @@
+ 		require.True(t, destroyedAg.destroyed())
+ 		fp := destroyedAg.fingerprint()
+ 		dispatcher.routeGroupsSlice[0].groups.Store(fp, destroyedAg)
++
++		casLimits.ready.Add(alertsPerRound)
++		casLimits.release = make(chan struct{})
+ 
+ 		var ready, done sync.WaitGroup
+ 		ready.Add(alertsPerRound)
+@@ -812,6 +816,8 @@
+ 		}
+ 		ready.Wait()
+ 		close(start)
++		casLimits.ready.Wait()
++		close(casLimits.release)
+ 		done.Wait()
+ 
+ 		el, ok := dispatcher.routeGroupsSlice[0].groups.Load(fp)
+@@ -837,6 +843,20 @@
+ 	// branch (rather than every goroutine taking the early Load+insert path).
+ 	require.Positive(t, testutil.ToFloat64(metrics.aggrGroupCreationRetries), "contended CAS path was not exercised in %d rounds — scheduler is unusually serial", rounds)
+ }
++
++// maxpostyCASBarrierLimits holds contenders after the stale map Load and before
++// CompareAndSwap, preserving all upstream recovery and delivery assertions.
++type maxpostyCASBarrierLimits struct {
++	ready   sync.WaitGroup
++	release chan struct{}
++}
++
++func (l *maxpostyCASBarrierLimits) MaxNumberOfAggregationGroups() int {
++	l.ready.Done()
++	<-l.release
++	return 0
++}
++
+ 
+ // TestGroupAlert_DisplacedAggrGroupGoroutineExits is a regression test for a
+ // goroutine leak: when groupAlert CAS-replaces a destroyed aggrGroup in the

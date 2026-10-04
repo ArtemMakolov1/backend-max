@@ -96,7 +96,7 @@ jobs:
           build_image postgres-exporter v0.20.1-go1.26.8.3 docker/monitoring/postgres-exporter.Dockerfile
           build_image pgbouncer-exporter v0.12.1-go1.26.8.3 docker/monitoring/pgbouncer-exporter.Dockerfile
           build_image node-exporter v1.12.1-go1.26.8.1 docker/monitoring/node-exporter.Dockerfile
-          build_image alertmanager v0.34.1-go1.26.8.1 docker/monitoring/alertmanager.Dockerfile
+          build_image alertmanager v0.34.1-go1.26.8.2 docker/monitoring/alertmanager.Dockerfile
           build_image grafana nightly-20261004-prometheus.2 docker/monitoring/grafana.Dockerfile
       - name: Remove registry credentials
         if: ${{ always() }}
