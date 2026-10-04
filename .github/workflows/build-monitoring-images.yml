@@ -2,6 +2,19 @@ name: Build patched monitoring images
 
 on:
   workflow_dispatch:
+    inputs:
+      component:
+        description: Build every monitoring image or one changed component
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - postgres-exporter
+          - pgbouncer-exporter
+          - node-exporter
+          - alertmanager
+          - grafana
 
 permissions:
   contents: read
@@ -24,6 +37,7 @@ jobs:
       node_exporter: ${{ steps.build.outputs.node_exporter }}
       alertmanager: ${{ steps.build.outputs.alertmanager }}
       grafana: ${{ steps.build.outputs.grafana }}
+      components: ${{ steps.build.outputs.components }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -38,8 +52,17 @@ jobs:
       - name: Build and push both architectures with provenance and SBOM
         id: build
         shell: bash
+        env:
+          REQUESTED_COMPONENT: ${{ inputs.component || 'all' }}
         run: |
           set -euo pipefail
+          case "$REQUESTED_COMPONENT" in
+            all|postgres-exporter|pgbouncer-exporter|node-exporter|alertmanager|grafana) ;;
+            *) echo 'Unsupported monitoring component' >&2; exit 1 ;;
+          esac
+          components=$(jq -cn --arg component "$REQUESTED_COMPONENT" \
+            'if $component == "all" then ["postgres-exporter", "pgbouncer-exporter", "node-exporter", "alertmanager", "grafana"] else [$component] end')
+          printf 'components=%s\n' "$components" >>"$GITHUB_OUTPUT"
           owner=${GITHUB_REPOSITORY_OWNER,,}
           docker buildx create --name maxposty-monitoring-builder --driver docker-container --use
           docker buildx inspect --bootstrap
@@ -48,6 +71,9 @@ jobs:
             local component=$1
             local version=$2
             local dockerfile=$3
+            if [[ "$REQUESTED_COMPONENT" != all && "$REQUESTED_COMPONENT" != "$component" ]]; then
+              return
+            fi
             local repository="ghcr.io/${owner}/maxposty-${component}"
             local metadata="$RUNNER_TEMP/${component}.json"
             docker buildx build \
@@ -71,7 +97,7 @@ jobs:
           build_image pgbouncer-exporter v0.12.1-go1.26.8.3 docker/monitoring/pgbouncer-exporter.Dockerfile
           build_image node-exporter v1.12.1-go1.26.8.1 docker/monitoring/node-exporter.Dockerfile
           build_image alertmanager v0.34.1-go1.26.8.1 docker/monitoring/alertmanager.Dockerfile
-          build_image grafana nightly-20261004-prometheus.1 docker/monitoring/grafana.Dockerfile
+          build_image grafana nightly-20261004-prometheus.2 docker/monitoring/grafana.Dockerfile
       - name: Remove registry credentials
         if: ${{ always() }}
         shell: bash
@@ -88,7 +114,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [postgres-exporter, pgbouncer-exporter, node-exporter, alertmanager, grafana]
+        component: ${{ fromJSON(needs.build.outputs.components) }}
         platform: [linux/amd64, linux/arm64]
     env:
       TRIVY_PLATFORM: ${{ matrix.platform }}
