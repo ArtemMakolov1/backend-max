@@ -218,6 +218,7 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/posts/suggest-image-prompt", s.suggestWorkspaceImagePrompt)
 				r.Post("/research/generate", s.generateWorkspaceResearch)
 				r.Post("/research/discover", s.discoverWorkspaceContent)
+				r.Post("/research/content/drafts", s.createWorkspaceContentDiscoveryDraft)
 				r.Post("/images/generate", s.generateWorkspaceImage)
 				r.Post("/media", s.uploadWorkspaceMedia)
 				r.Get("/media/{filename}", s.serveWorkspaceMedia)

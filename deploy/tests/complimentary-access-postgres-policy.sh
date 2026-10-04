@@ -13,7 +13,10 @@ if [[ ${1:-} != --inside-local-fixture ]]; then
     container=$1
   fi
   repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
-  [[ $(docker inspect --format '{{.Config.Image}} {{.State.Running}}' "$container") == 'postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 true' ]] || { echo "Expected pinned disposable PostgreSQL image" >&2; exit 1; }
+  case $(docker inspect --format '{{.Config.Image}} {{.State.Running}}' "$container") in
+    'postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 true'|'postgres@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15 true') ;;
+    *) echo "Expected pinned disposable PostgreSQL image" >&2; exit 1;;
+  esac
   private_dir=$(docker exec "$container" mktemp -d /tmp/complimentary-policy.XXXXXX)
   [[ $private_dir =~ ^/tmp/complimentary-policy\.[A-Za-z0-9]+$ ]] || exit 1
   trap 'docker exec "$container" rm -rf "$private_dir" >/dev/null' EXIT
@@ -24,7 +27,9 @@ if [[ ${1:-} != --inside-local-fixture ]]; then
   exit
 fi
 
-[[ $# == 2 && -f /.dockerenv && $2 =~ ^/tmp/complimentary-policy\.[A-Za-z0-9]+$ && ( ${POSTGRES_USER:-}:${POSTGRES_DB:-} == postgres:maxposty_test || ${POSTGRES_USER:-}:${POSTGRES_DB:-} == maxstudio_test:maxstudio_test ) ]] || { echo "Disposable synthetic fixture guard failed" >&2; exit 2; }
+# The official image defaults to postgres when POSTGRES_USER is omitted.
+export POSTGRES_USER=${POSTGRES_USER:-postgres}
+[[ $# == 2 && -f /.dockerenv && $2 =~ ^/tmp/complimentary-policy\.[A-Za-z0-9]+$ && ( ${POSTGRES_USER}:${POSTGRES_DB:-} == postgres:maxposty_test || ${POSTGRES_USER}:${POSTGRES_DB:-} == maxstudio_test:maxstudio_test ) ]] || { echo "Disposable synthetic fixture guard failed" >&2; exit 2; }
 fixture=$2
 cluster_database=$POSTGRES_DB
 test_database=complimentary_ops_${RANDOM}_${RANDOM}
@@ -155,9 +160,9 @@ done
 
 bad_checksum=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 if call revoke fixture.owner@example.test "$bad_checksum" >"$fixture/result" 2>&1; then echo "Mismatched schema was accepted" >&2; exit 1; fi
-psql_owner "$test_database" -c "INSERT INTO schema_migrations(version,checksum_sha256) VALUES ('040_fixture.sql',repeat('a',64));" >/dev/null
+psql_owner "$test_database" -c "INSERT INTO schema_migrations(version,checksum_sha256) VALUES ('043_fixture.sql',repeat('a',64));" >/dev/null
 if call revoke >"$fixture/result" 2>&1; then echo "Future schema was accepted" >&2; exit 1; fi
-psql_owner "$test_database" -c "DELETE FROM schema_migrations WHERE version='040_fixture.sql';" >/dev/null
+psql_owner "$test_database" -c "DELETE FROM schema_migrations WHERE version='043_fixture.sql';" >/dev/null
 if call grant absent.fixture@example.test >"$fixture/result" 2>&1; then echo "Absent identity was accepted" >&2; exit 1; fi
 psql_owner "$test_database" <<'SQL' >/dev/null
 UPDATE users SET email='fixture.owner@example.test' WHERE id='fixture-other';

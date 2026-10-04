@@ -25,6 +25,7 @@ type DirectExternalDetail struct {
 	Connection store.DirectConnection
 	Control    store.DirectExternalEditControl
 	Provider   yandexdirect.ExternalCampaignDetail
+	Operations []store.DirectExternalOperation
 }
 
 func (a *App) DirectExternalDetailsConfigured() bool {
@@ -59,6 +60,19 @@ func (a *App) GetDirectExternalDetail(ctx context.Context, actor, workspace, exp
 	if detail.Campaign.ID != campaign {
 		return DirectExternalDetail{}, ErrDirectProvider
 	}
+	if controlsProvider, ok := a.direct.(DirectExternalControlsProvider); ok && (detail.Campaign.Type == "TEXT_CAMPAIGN" || detail.Campaign.Type == "UNIFIED_CAMPAIGN") {
+		controls, controlsErr := controlsProvider.GetExternalCampaignControls(ctx, token, connection.ClientLogin, campaign)
+		if controlsErr != nil {
+			return DirectExternalDetail{}, a.directGraphProviderError(ctx, connection, controlsErr)
+		}
+		if controls.CurrencyCode != connection.CurrencyCode || controls.CampaignType != detail.Campaign.Type || controls.LifecycleState != detail.Campaign.State {
+			return DirectExternalDetail{}, ErrDirectProvider
+		}
+		detail.Controls = &controls
+		if err = a.reconcileExternalControlReadback(ctx, actor, workspace, campaign, connection.ID, detail); err != nil {
+			return DirectExternalDetail{}, err
+		}
+	}
 	hash, err := detail.Fingerprint()
 	if err != nil {
 		return DirectExternalDetail{}, ErrDirectProvider
@@ -67,7 +81,14 @@ func (a *App) GetDirectExternalDetail(ctx context.Context, actor, workspace, exp
 	if err != nil {
 		return DirectExternalDetail{}, err
 	}
-	return DirectExternalDetail{Connection: connection, Control: control, Provider: detail}, nil
+	result := DirectExternalDetail{Connection: connection, Control: control, Provider: detail}
+	if detail.Controls != nil {
+		result.Operations, err = a.store.ListDirectExternalOperations(ctx, actor, workspace, connection.ID, campaign)
+		if err != nil {
+			return result, err
+		}
+	}
+	return result, nil
 }
 
 func externalDetailMatches(detail DirectExternalDetail, fence store.DirectExternalEditFence) error {

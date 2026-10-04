@@ -32,8 +32,9 @@ type ExternalAd struct {
 }
 
 type ExternalCampaignDetail struct {
-	Campaign CampaignSummary `json:"campaign"`
-	Ads      []ExternalAd    `json:"ads"`
+	Campaign CampaignSummary           `json:"campaign"`
+	Ads      []ExternalAd              `json:"ads"`
+	Controls *ExternalCampaignControls `json:"controls,omitempty"`
 }
 
 func (d ExternalCampaignDetail) Fingerprint() (string, error) {

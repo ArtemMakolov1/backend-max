@@ -19,7 +19,7 @@ func (a *App) ContentDiscoveryConfigured() bool {
 }
 
 // Finish all owned channel/context lookups before reserving a paid AI request.
-// The callback is the last step before the single upstream discovery call.
+// Reserve one bounded discovery operation before any paid media/model calls.
 func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 	ctx context.Context, actorUserID, workspaceID string, channelID *int64,
 	request openairesearch.DiscoverContentRequest, beforeGenerate func() error,
@@ -42,6 +42,7 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 	request.ChannelTitle, request.ChannelDescription = "", ""
 	request.RecentPosts, request.ForbiddenWords = nil, nil
 	request.Audience, request.Tone = "", ""
+	request.MediaContext = ""
 	if channelID != nil {
 		channel, err := a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, *channelID)
 		if err != nil {
@@ -111,7 +112,26 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 			return openairesearch.DiscoverContentResult{}, err
 		}
 	}
-	return discoverer.DiscoverContent(ctx, request)
+	analysis, err := a.analyzeChannelContent(ctx, actorUserID, workspaceID, channelID)
+	if err != nil {
+		return openairesearch.DiscoverContentResult{}, err
+	}
+	request.MediaContext = analysis.Summary
+	result, err := discoverer.DiscoverContent(ctx, request)
+	if err != nil {
+		return openairesearch.DiscoverContentResult{}, err
+	}
+	if channelID != nil {
+		if _, err := a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, *channelID); err != nil {
+			return openairesearch.DiscoverContentResult{}, err
+		}
+	}
+	result, err = a.SaveDiscoveryCandidatesForWorkspace(ctx, actorUserID, workspaceID, channelID, result)
+	if err != nil {
+		return openairesearch.DiscoverContentResult{}, err
+	}
+	result.ContextAnalysis = analysis
+	return result, nil
 }
 
 func boundDiscoveryText(value string, limit int) string {

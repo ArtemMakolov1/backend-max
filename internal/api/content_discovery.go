@@ -33,8 +33,8 @@ func (s *Server) discoverWorkspaceContent(w http.ResponseWriter, r *http.Request
 			release()
 		}
 	}()
-	// This short path uses one Responses call, bounded below the server deadline.
-	ctx, cancel := contextWithTimeout(r, 90*time.Second)
+	// Optional media analysis and discovery share one bounded request deadline.
+	ctx, cancel := contextWithTimeout(r, 3*time.Minute)
 	defer cancel()
 	result, err := s.app.DiscoverContentForWorkspaceWithBeforeGenerate(
 		ctx, access.UserID, access.WorkspaceID, request.ChannelID, request.DiscoverContentRequest,
