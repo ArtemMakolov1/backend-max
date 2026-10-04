@@ -74,17 +74,21 @@ func (s *Server) generateWorkspacePostImage(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, err)
 		return
 	}
-	release, err := s.aiLimiter.acquireForWorkspaceAmount(
-		r.Context(), access.UserID, workspace, store.AIOperationImage,
-		imageUsageCredits(request.Quality), s.now().UTC())
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	defer release()
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	updated, err := s.app.GeneratePostImageForWorkspace(ctx, access.UserID, access.WorkspaceID, postID, request)
+	updated, err := s.app.GeneratePostImageForWorkspaceWithBeforeGenerate(ctx, access.UserID, access.WorkspaceID, postID, request, func() error {
+		var err error
+		release, err = s.aiLimiter.acquireForWorkspaceAmount(
+			ctx, access.UserID, workspace, store.AIOperationImage,
+			imageUsageCredits(request.Quality), s.now().UTC())
+		return err
+	})
 	if err != nil {
 		s.writeError(w, err)
 		return

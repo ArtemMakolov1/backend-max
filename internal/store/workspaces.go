@@ -424,7 +424,7 @@ func (s *Store) AddWorkspaceMember(ctx context.Context, actorUserID string, memb
 		return WorkspaceMember{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := requireTeamWorkspaceOwner(ctx, tx, actorUserID, member.WorkspaceID); err != nil {
+	if err := lockTeamWorkspaceOwner(ctx, tx, actorUserID, member.WorkspaceID); err != nil {
 		return WorkspaceMember{}, err
 	}
 	now := member.JoinedAt
@@ -462,7 +462,7 @@ func (s *Store) UpdateWorkspaceMemberRole(ctx context.Context, actorUserID, work
 		return WorkspaceMember{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := requireTeamWorkspaceOwner(ctx, tx, actorUserID, workspaceID); err != nil {
+	if err := lockTeamWorkspaceOwner(ctx, tx, actorUserID, workspaceID); err != nil {
 		return WorkspaceMember{}, err
 	}
 	var currentRole string
@@ -485,6 +485,11 @@ RETURNING workspace_id,user_id,role,COALESCE(created_by,''),joined_at,updated_at
 	if err != nil {
 		return WorkspaceMember{}, err
 	}
+	if currentRole != role {
+		if err := revokePriorWorkspaceInvitationsForMemberTx(ctx, tx, actorUserID, workspaceID, userID, now); err != nil {
+			return WorkspaceMember{}, err
+		}
+	}
 	if err := appendAuditEventTx(ctx, tx, AuditEvent{
 		WorkspaceID: workspaceID, ActorUserID: actorUserID, Action: "member.role_updated",
 		EntityType: "user", EntityID: userID, Metadata: mustJSON(map[string]any{"role": role}), CreatedAt: now,
@@ -504,7 +509,7 @@ func (s *Store) RemoveWorkspaceMember(ctx context.Context, actorUserID, workspac
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := requireTeamWorkspaceOwner(ctx, tx, actorUserID, workspaceID); err != nil {
+	if err := lockTeamWorkspaceOwner(ctx, tx, actorUserID, workspaceID); err != nil {
 		return err
 	}
 	var role string
@@ -521,6 +526,9 @@ func (s *Store) RemoveWorkspaceMember(ctx context.Context, actorUserID, workspac
 		return err
 	}
 	now := time.Now().UTC()
+	if err := revokePriorWorkspaceInvitationsForMemberTx(ctx, tx, actorUserID, workspaceID, userID, now); err != nil {
+		return err
+	}
 	if err := appendAuditEventTx(ctx, tx, AuditEvent{
 		WorkspaceID: workspaceID, ActorUserID: actorUserID, Action: "member.removed",
 		EntityType: "user", EntityID: userID, Metadata: json.RawMessage(`{}`), CreatedAt: now,
@@ -691,7 +699,7 @@ func (s *Store) CreateWorkspaceInvitation(ctx context.Context, actorUserID strin
 		return WorkspaceInvitation{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := requireTeamWorkspaceOwner(ctx, tx, actorUserID, invitation.WorkspaceID); err != nil {
+	if err := lockTeamWorkspaceOwner(ctx, tx, actorUserID, invitation.WorkspaceID); err != nil {
 		return WorkspaceInvitation{}, err
 	}
 	invitation.Status, invitation.InvitedBy = InvitationStatusPending, actorUserID
@@ -760,7 +768,7 @@ func (s *Store) RevokeWorkspaceInvitation(ctx context.Context, actorUserID, work
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := requireTeamWorkspaceOwner(ctx, tx, actorUserID, workspaceID); err != nil {
+	if err := lockTeamWorkspaceOwner(ctx, tx, actorUserID, workspaceID); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE workspace_invitations SET status='revoked',revoked_at=$1
@@ -792,13 +800,26 @@ func (s *Store) AcceptWorkspaceInvitation(ctx context.Context, userID, tokenHash
 		return WorkspaceMember{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Take the same parent lock as role changes and removals before locking
+	// the invitation. A concurrent revocation must win atomically with either
+	// the membership insertion or the per-user invitation cutoff.
+	var workspaceID string
+	if err := tx.QueryRowContext(ctx, `SELECT workspace_id FROM workspace_invitations WHERE token_hash=$1`,
+		tokenHash).Scan(&workspaceID); errors.Is(err, sql.ErrNoRows) {
+		return WorkspaceMember{}, ErrNotFound
+	} else if err != nil {
+		return WorkspaceMember{}, err
+	}
+	if err := lockWorkspaceMembership(ctx, tx, workspaceID); err != nil {
+		return WorkspaceMember{}, err
+	}
 	var invitation WorkspaceInvitation
 	err = tx.QueryRowContext(ctx, `SELECT i.id,i.workspace_id,i.email,COALESCE(i.target_user_id,''),i.token_hash,
 i.role,i.status,i.invited_by,COALESCE(i.accepted_by,''),i.created_at,i.expires_at,i.accepted_at,i.revoked_at
 FROM workspace_invitations i
 JOIN workspaces w ON w.id=i.workspace_id
-WHERE i.token_hash=$1 AND w.archived_at IS NULL
-FOR UPDATE OF i,w`, tokenHash).Scan(
+WHERE i.token_hash=$1 AND i.workspace_id=$2 AND w.archived_at IS NULL
+FOR UPDATE OF i`, tokenHash, workspaceID).Scan(
 		&invitation.ID, &invitation.WorkspaceID, &invitation.Email, &invitation.TargetUserID, &invitation.TokenHash,
 		&invitation.Role, &invitation.Status, &invitation.InvitedBy, &invitation.AcceptedBy,
 		&invitation.CreatedAt, &invitation.ExpiresAt, &invitation.AcceptedAt, &invitation.RevokedAt)
@@ -827,16 +848,31 @@ FOR UPDATE OF i,w`, tokenHash).Scan(
 	if invitation.Email != "" && !strings.EqualFold(strings.TrimSpace(userEmail), invitation.Email) {
 		return WorkspaceMember{}, ErrNotFound
 	}
+	var revoked bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM workspace_member_invitation_cutoffs
+WHERE workspace_id=$1 AND user_id=$2 AND invalid_before>=$3)`,
+		workspaceID, userID, invitation.CreatedAt).Scan(&revoked); err != nil {
+		return WorkspaceMember{}, err
+	}
+	if revoked {
+		return WorkspaceMember{}, ErrNotFound
+	}
 	var member WorkspaceMember
 	err = tx.QueryRowContext(ctx, `INSERT INTO workspace_members(
 workspace_id,user_id,role,created_by,joined_at,updated_at)
 VALUES($1,$2,$3,$4,$5,$5)
-ON CONFLICT(workspace_id,user_id) DO UPDATE SET
-role=CASE WHEN workspace_members.role='owner' THEN workspace_members.role ELSE excluded.role END,
-updated_at=excluded.updated_at
+ON CONFLICT(workspace_id,user_id) DO NOTHING
 RETURNING workspace_id,user_id,role,COALESCE(created_by,''),joined_at,updated_at`,
 		invitation.WorkspaceID, userID, invitation.Role, invitation.InvitedBy, now.UTC()).Scan(
 		&member.WorkspaceID, &member.UserID, &member.Role, &member.CreatedBy, &member.JoinedAt, &member.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		// Invitations grant entry, never replace an owner's explicit role
+		// decision for an existing member.
+		err = tx.QueryRowContext(ctx, `SELECT workspace_id,user_id,role,COALESCE(created_by,''),joined_at,updated_at
+FROM workspace_members WHERE workspace_id=$1 AND user_id=$2`, workspaceID, userID).Scan(
+			&member.WorkspaceID, &member.UserID, &member.Role, &member.CreatedBy, &member.JoinedAt, &member.UpdatedAt)
+	}
 	if err != nil {
 		return WorkspaceMember{}, err
 	}

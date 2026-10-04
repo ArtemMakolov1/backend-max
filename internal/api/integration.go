@@ -169,6 +169,19 @@ func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch update.UpdateType {
+	case "bot_admin_permissions_changed":
+		eventAt, valid := maxEventTime(update.Timestamp, s.now().UTC())
+		if !valid {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		ctx, cancel := contextWithTimeout(r, 8*time.Second)
+		err = s.app.RefreshMAXChatPermissions(ctx, chatID, eventAt)
+		cancel()
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
 	case "bot_added":
 		eventAt, valid := maxEventTime(update.Timestamp, s.now().UTC())
 		if !valid {

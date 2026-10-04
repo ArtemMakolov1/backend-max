@@ -187,6 +187,9 @@ type Post struct {
 	ScheduledAt                   *time.Time       `json:"scheduled_at,omitempty"`
 	MAXMessageID                  string           `json:"max_message_id,omitempty"`
 	MAXMessageURL                 string           `json:"max_message_url"`
+	MAXPublishedFingerprint       string           `json:"-"`
+	PublicationHasChanges         bool             `json:"publication_has_changes"`
+	PublicationVersionKnown       bool             `json:"publication_version_known"`
 	MAXViews                      *int64           `json:"max_views"`
 	MAXStatsSyncedAt              *time.Time       `json:"max_stats_synced_at"`
 	MAXStatsAttemptedAt           *time.Time       `json:"-"`

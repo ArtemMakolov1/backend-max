@@ -474,21 +474,25 @@ func (s *Server) suggestDirectCampaign(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, app.ErrResearchNotConfigured)
 		return
 	}
-	release, err := s.aiLimiter.acquireForWorkspaceMetric(
-		r.Context(), access.UserID, workspace, store.AIOperationResearch,
-		store.UsageMetricAIResearchRequests, 1, s.now().UTC())
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	defer release()
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	result, err := s.app.SuggestDirectCampaign(ctx, access.UserID, access.WorkspaceID,
+	result, err := s.app.SuggestDirectCampaignWithBeforeGenerate(ctx, access.UserID, access.WorkspaceID,
 		openairesearch.SuggestDirectCampaignRequest{
 			Objective: request.Objective, Brief: request.Brief, LandingURL: request.LandingURL,
 			Audience: request.Audience, Regions: request.Regions,
 			WeeklyBudgetMinor: request.WeeklyBudgetMinor, CurrencyCode: request.CurrencyCode,
+		}, func() error {
+			var err error
+			release, err = s.aiLimiter.acquireForWorkspaceMetric(
+				ctx, access.UserID, workspace, store.AIOperationResearch,
+				store.UsageMetricAIResearchRequests, 1, s.now().UTC())
+			return err
 		})
 	if err != nil {
 		s.writeError(w, err)

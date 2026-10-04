@@ -1067,10 +1067,11 @@ func (a *App) TestChannelForWorkspace(
 }
 
 // ChannelMAXInfoUpdate carries channel metadata pushed to MAX itself. Icon is
-// streamed to the MAX upload endpoint first; Title changes both the MAX chat
-// and the cached channel record. The MAX Bot API cannot change descriptions.
+// streamed to the MAX upload endpoint first; title and description changes
+// are synced back into the cached channel record from the MAX response.
 type ChannelMAXInfoUpdate struct {
 	Title        *string
+	Description  *string
 	IconFilename string
 	Icon         io.Reader
 	Notify       bool
@@ -1082,8 +1083,11 @@ func (a *App) pushChannelMAXInfo(ctx context.Context, channel store.Channel, upd
 	if a.max == nil {
 		return maxclient.ChatInfo{}, ErrMAXNotConfigured
 	}
-	if update.Title == nil && update.Icon == nil {
-		return maxclient.ChatInfo{}, errors.New("channel title or icon is required")
+	if update.Title == nil && update.Icon == nil && update.Description == nil {
+		return maxclient.ChatInfo{}, errors.New("channel title, description or icon is required")
+	}
+	if update.Description != nil && utf8.RuneCountInString(*update.Description) > 16000 {
+		return maxclient.ChatInfo{}, errors.New("channel description must not exceed 16000 characters")
 	}
 	info, membership, err := a.inspectChannel(ctx, channel)
 	if err != nil {
@@ -1092,10 +1096,10 @@ func (a *App) pushChannelMAXInfo(ctx context.Context, channel store.Channel, upd
 	diagnostics := channelDiagnostics(info, membership)
 	if !channel.Active || !diagnostics.CanChangeInfo {
 		return maxclient.ChatInfo{}, &ChannelAccessError{Diagnostics: diagnostics,
-			Message: "The shared bot needs change_chat_info permission to change the channel title or photo"}
+			Message: "The shared bot needs change_chat_info permission to change the channel title, description or photo"}
 	}
 	notify := update.Notify
-	patch := maxclient.ChatPatch{Title: update.Title, Notify: &notify}
+	patch := maxclient.ChatPatch{Title: update.Title, Description: update.Description, Notify: &notify}
 	if update.Icon != nil {
 		upload, uploadErr := a.max.UploadImage(ctx, update.IconFilename, update.Icon)
 		if uploadErr != nil {
@@ -1492,54 +1496,11 @@ func (a *App) loadBrandKitImage(ctx context.Context, key string) (openairesearch
 }
 
 func (a *App) GeneratePostImage(ctx context.Context, userID string, postID int64, request openaiimg.GenerateRequest) (store.Post, error) {
-	post, err := a.store.GetPostForUser(ctx, userID, postID)
-	if err != nil {
-		return store.Post{}, err
-	}
-	if post.Status == store.PostStatusPublishing {
-		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
-	}
-	if strings.TrimSpace(request.Prompt) == "" {
-		request.Prompt = post.ImagePrompt
-	}
-	file, err := a.GenerateImageForUser(ctx, userID, request)
-	if err != nil {
-		return store.Post{}, err
-	}
-	prompt := request.Prompt
-	return a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(ctx, post, attachmentFromImage(file), prompt)
+	return a.GeneratePostImageWithBeforeGenerate(ctx, userID, postID, request, nil)
 }
 
 func (a *App) GeneratePostImageForWorkspace(ctx context.Context, actorUserID, workspaceID string, postID int64, request openaiimg.GenerateRequest) (store.Post, error) {
-	post, err := a.store.GetPostForWorkspace(ctx, actorUserID, workspaceID, postID)
-	if err != nil {
-		return store.Post{}, err
-	}
-	if post.Status == store.PostStatusPublishing {
-		return store.Post{}, fmt.Errorf("%w: post is currently publishing", ErrConflict)
-	}
-	if strings.TrimSpace(request.Prompt) == "" {
-		request.Prompt = post.ImagePrompt
-	}
-	file, err := a.GenerateImageForWorkspace(ctx, actorUserID, workspaceID, request)
-	if err != nil {
-		return store.Post{}, err
-	}
-	updated, err := a.store.ReplaceFirstImageAttachmentAndPromptIfUnchanged(
-		ctx, post, attachmentFromImage(file), request.Prompt)
-	if err != nil {
-		return store.Post{}, err
-	}
-	if updated.WorkspaceID != workspaceID {
-		return store.Post{}, store.ErrNotFound
-	}
-	_, err = a.store.CreateAuditEvent(ctx, actorUserID, store.AuditEvent{
-		WorkspaceID: workspaceID, Action: "post.image_generated", EntityType: "post", EntityID: fmt.Sprint(postID),
-	})
-	if err != nil {
-		return store.Post{}, err
-	}
-	return updated, nil
+	return a.GeneratePostImageForWorkspaceWithBeforeGenerate(ctx, actorUserID, workspaceID, postID, request, nil)
 }
 
 func (a *App) SavePostImage(ctx context.Context, postID int64, filename string, reader io.Reader) (store.Post, error) {
@@ -1634,7 +1595,7 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post, sendStart
 	if err != nil {
 		return a.fail(postID, err)
 	}
-	info, membership, err := a.inspectChannel(ctx, channel)
+	info, membership, err := a.inspectPublicationChannel(ctx, channel)
 	if err != nil {
 		return a.fail(postID, err)
 	}
@@ -1664,7 +1625,12 @@ func (a *App) publishClaimedPost(ctx context.Context, post store.Post, sendStart
 	if message.MessageID == "" {
 		return a.fail(postID, errors.New("MAX published the post but returned no message ID; check the channel before retrying"))
 	}
-	return a.store.MarkPublished(ctx, postID, message.MessageID, message.URL)
+	// Once MAX has confirmed the message, the result belongs to the durable
+	// publication rather than the HTTP request. A disconnected browser must not
+	// discard its known message ID and make a later retry send a duplicate.
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	return a.store.MarkPublished(persistCtx, postID, message.MessageID, message.URL)
 }
 
 func (a *App) UpdatePublishedPost(ctx context.Context, postID int64) (result store.Post, resultErr error) {
@@ -2317,6 +2283,10 @@ func (a *App) syncClaimedChannelParticipantStats(ctx context.Context, channel st
 	if err != nil {
 		return store.Channel{}, err
 	}
+	info, err = a.resolveMAXChatOwner(ctx, info, channel.VerifiedMAXOwnerID, false)
+	if err != nil {
+		return store.Channel{}, err
+	}
 	if err := validateChannelParticipantInfo(channel, info); err != nil {
 		return store.Channel{}, err
 	}
@@ -2666,13 +2636,22 @@ func (a *App) fail(postID int64, cause error) (store.Post, error) {
 	// scheduler worker forever.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.store.MarkPublishFailed(ctx, postID, publicationFailureMessage(cause)); err != nil {
+	failed, err := a.store.MarkPublishFailed(ctx, postID, publicationFailureMessage(cause))
+	if err != nil {
 		a.logger.Error("could not persist publication failure", "post_id", postID, "error", err)
+	} else if !errors.Is(cause, context.Canceled) {
+		if err := a.store.NotifyPublicationFailure(ctx, failed); err != nil {
+			a.logger.Error("could not notify publication failure", "post_id", postID, "error", err)
+		}
 	}
 	return store.Post{}, cause
 }
 
 func publicationFailureMessage(cause error) string {
+	var preflightErr *publicationPreflightExhaustedError
+	if errors.As(cause, &preflightErr) {
+		return "Не удалось проверить канал. Автоматические попытки остановлены. Пост не отправлен в MAX. Попробуйте опубликовать позже."
+	}
 	if errors.Is(cause, context.DeadlineExceeded) {
 		return "MAX не ответил вовремя. Проверьте канал и попробуйте опубликовать ещё раз."
 	}

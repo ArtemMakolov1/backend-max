@@ -914,6 +914,15 @@ func (a *App) SuggestDirectCampaign(
 	ctx context.Context, actorUserID, workspaceID string,
 	request openairesearch.SuggestDirectCampaignRequest,
 ) (openairesearch.SuggestDirectCampaignResult, error) {
+	return a.SuggestDirectCampaignWithBeforeGenerate(ctx, actorUserID, workspaceID, request, nil)
+}
+
+// SuggestDirectCampaignWithBeforeGenerate prepares and validates the complete
+// tenant-owned prompt before committing usage immediately before the AI call.
+func (a *App) SuggestDirectCampaignWithBeforeGenerate(
+	ctx context.Context, actorUserID, workspaceID string,
+	request openairesearch.SuggestDirectCampaignRequest, beforeGenerate func() error,
+) (openairesearch.SuggestDirectCampaignResult, error) {
 	suggester, ok := a.research.(DirectCampaignSuggester)
 	if !ok || a.research == nil {
 		return openairesearch.SuggestDirectCampaignResult{}, ErrResearchNotConfigured
@@ -948,6 +957,11 @@ func (a *App) SuggestDirectCampaign(
 	}
 	if err := openairesearch.ValidateSuggestDirectCampaignRequest(request); err != nil {
 		return openairesearch.SuggestDirectCampaignResult{}, err
+	}
+	if beforeGenerate != nil {
+		if err := beforeGenerate(); err != nil {
+			return openairesearch.SuggestDirectCampaignResult{}, err
+		}
 	}
 	return suggester.SuggestDirectCampaign(ctx, request)
 }

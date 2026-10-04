@@ -360,7 +360,8 @@ roll-forward и намеренно не делает автоматически�
 `DEPLOY_STAGE=production` и запустите workflow для `main`. Операторская команда
 сначала проверит публичный endpoint без redirect и только затем обновит
 существующую подписку общего бота штатным `POST /subscriptions` на события
-`bot_started`, `message_callback`, `message_created`, `bot_added`, `bot_removed`.
+`bot_started`, `message_callback`, `message_created`, `bot_added`, `bot_removed`,
+`bot_admin_permissions_changed`.
 Удалять подписку перед обновлением не нужно: так не возникает разрыва доставки.
 После обновления команда сверяет URL и обязательные события через
 `GET /subscriptions`.

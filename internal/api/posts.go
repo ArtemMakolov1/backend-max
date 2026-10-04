@@ -541,16 +541,20 @@ func (s *Server) generatePostImage(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	release, err := s.aiLimiter.acquireAmount(
-		r.Context(), userID, store.AIOperationImage, imageUsageCredits(request.Quality), s.now().UTC())
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	defer release()
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	post, err := s.app.GeneratePostImage(ctx, userID, id, request)
+	post, err := s.app.GeneratePostImageWithBeforeGenerate(ctx, userID, id, request, func() error {
+		var err error
+		release, err = s.aiLimiter.acquireAmount(
+			ctx, userID, store.AIOperationImage, imageUsageCredits(request.Quality), s.now().UTC())
+		return err
+	})
 	if err != nil {
 		s.writeError(w, err)
 		return

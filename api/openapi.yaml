@@ -359,11 +359,11 @@ paths:
     post:
       tags: [Channels]
       operationId: updateChannelMaxInfo
-      summary: Change the channel photo and title in MAX itself
+      summary: Change the channel photo, title and description in MAX itself
       description: >-
-        Pushes a new icon and/or title to the MAX channel through the Bot API
-        and refreshes the cached channel record. At least one of title or file
-        is required. The channel description cannot be changed by bots.
+        Pushes a new icon, title and/or description to the MAX channel and refreshes
+        the cached record. At least one changed field is required. An omitted
+        description is preserved; an empty string removes the description.
       security:
         - sessionCookie: []
       requestBody:
@@ -374,11 +374,12 @@ paths:
               type: object
               properties:
                 title: {type: string, minLength: 1, maxLength: 200}
+                description: {type: string, maxLength: 16000, description: "Omit to preserve; use an empty string to clear."}
                 file: {type: string, format: binary}
                 notify:
                   type: boolean
                   default: false
-                  description: Send a MAX system notification about the title or photo change.
+                  description: Send a MAX system notification about the profile change.
       responses:
         '200':
           description: Updated channel
@@ -1621,11 +1622,11 @@ paths:
     post:
       tags: [Channels]
       operationId: updateWorkspaceChannelMaxInfo
-      summary: Change the channel photo and title in MAX itself
+      summary: Change the channel photo, title and description in MAX itself
       description: >-
-        Pushes a new icon and/or title to the MAX channel through the Bot API
-        and refreshes the cached channel record. At least one of title or file
-        is required. The channel description cannot be changed by bots.
+        Pushes a new icon, title and/or description to the MAX channel and refreshes
+        the cached record. At least one changed field is required. An omitted
+        description is preserved; an empty string removes the description.
       security: [{sessionCookie: []}]
       requestBody:
         required: true
@@ -1635,11 +1636,12 @@ paths:
               type: object
               properties:
                 title: {type: string, minLength: 1, maxLength: 200}
+                description: {type: string, maxLength: 16000, description: "Omit to preserve; use an empty string to clear."}
                 file: {type: string, format: binary}
                 notify:
                   type: boolean
                   default: false
-                  description: Send a MAX system notification about the title or photo change.
+                  description: Send a MAX system notification about the profile change.
       responses:
         '200': {$ref: '#/components/responses/Channel'}
         default: {$ref: '#/components/responses/Problem'}
@@ -4802,6 +4804,12 @@ components:
         max_stats_synced_at:
           type: [string, 'null']
           format: date-time
+        publication_version_known:
+          type: boolean
+          description: False for historical publications until a successful delivery establishes the sent version.
+        publication_has_changes:
+          type: boolean
+          description: Whether the current content differs from the last successfully sent version, including attachment order.
         max_is_pinned:
           type: boolean
         origin:
@@ -5183,6 +5191,9 @@ components:
         views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
         views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
         score: {type: [number, 'null'], format: double, minimum: 0}
+        comparison_views: {type: [integer, 'null'], format: int64, minimum: 0}
+        comparison_captured_at: {type: [string, 'null'], format: date-time}
+        comparison_window_hours: {type: integer, const: 24}
         max_message_url: {type: string, format: uri}
         max_stats_synced_at: {type: [string, 'null'], format: date-time}
         publication_state: {type: string, enum: [published, removed]}
@@ -5207,6 +5218,8 @@ components:
         views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
         views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
         score: {type: number, format: double, minimum: 0}
+        total_sample_size: {type: integer, minimum: 10}
+        comparison_window_hours: {type: integer, const: 24}
         next_at: {type: string, format: date-time}
     WorkspaceContentAnalytics:
       type: object
@@ -5231,6 +5244,8 @@ components:
           oneOf:
             - {$ref: '#/components/schemas/AnalyticsBestTime'}
             - {type: 'null'}
+        comparison_window_hours: {type: integer, const: 24}
+        comparable_posts: {type: integer, minimum: 0}
         timezone_offset_minutes: {type: integer, minimum: -840, maximum: 840}
     WorkspaceContentAnalyticsEnvelope:
       type: object
