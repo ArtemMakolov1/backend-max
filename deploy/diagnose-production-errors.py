@@ -77,6 +77,24 @@ TRANSPORT_KINDS = frozenset((
     "deadline_exceeded", "request_canceled", "response_header_timeout",
     "read_timeout", "write_timeout", "unknown",
 ))
+# The API's exact research logger supplies status separately from the private
+# error message. Zero means a response-validation failure, not an HTTP status.
+PROVIDER_HTTP_STATUSES = frozenset((
+    400, 401, 403, 404, 408, 409, 413, 415, 422, 429, 500, 502, 503, 504,
+))
+# Only canonical known provider codes and source-owned Responses validation
+# codes may leave the server. Never infer a code from the private error text.
+PROVIDER_CODES = {
+    code: code for code in (
+        "model_not_found", "invalid_api_key", "insufficient_quota",
+        "unsupported_country_region_territory", "invalid_request_error",
+        "unsupported_parameter", "unsupported_value", "invalid_value",
+        "rate_limit_exceeded", "server_error",
+        "missing_citations", "invalid_structured_output", "response_not_completed",
+        "response_incomplete", "response_failed", "response_refused",
+        "missing_output_text", "content_changed",
+    )
+}
 
 
 def safe_transport_kind(error):
@@ -140,7 +158,28 @@ def safe_time(value):
 
 
 def sanitize_record(record):
-    if not isinstance(record, dict) or record.get("msg") != "request failed":
+    if not isinstance(record, dict):
+        return None
+    if record.get("msg") == "OpenAI research request failed":
+        status = record.get("status")
+        code = record.get("code")
+        error = record.get("error")
+        http_status = status if type(status) is int and status in PROVIDER_HTTP_STATUSES else None
+        # One complete canonical error only: prefixes, suffixes, URLs, keys and
+        # response-body fragments cannot produce a reason or cross the boundary.
+        reason = "unsupported_region" if (
+            http_status == 403 and isinstance(error, str)
+            and error.strip().casefold() == "country, region, or territory not supported"
+        ) else None
+        return {
+            "time": safe_time(record.get("time")),
+            "category": "provider_result" if type(status) is int and status == 0 else "provider_http",
+            "sqlstate": None, "table": None, "constraint": None,
+            "prefix_chain": [], "transport_kind": None,
+            "provider_status": http_status, "provider_reason": reason,
+            "provider_code": PROVIDER_CODES.get(code) if isinstance(code, str) else None,
+        }
+    if record.get("msg") != "request failed":
         return None
     error = record.get("error")
     if not isinstance(error, str):

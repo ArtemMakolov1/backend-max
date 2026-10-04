@@ -29,12 +29,23 @@ def record(error, **extra):
     return {"time": "2026-10-04T20:08:21.123456789Z", "msg": "request failed", "error": error, **extra}
 
 
+def provider_record(**extra):
+    return record("; ".join(SECRETS), msg="OpenAI research request failed", **extra)
+
+
 class SanitizerTests(unittest.TestCase):
     def assert_safe(self, value):
         rendered = json.dumps(value)
         for secret in SECRETS:
             self.assertNotIn(secret, rendered)
-        self.assertEqual(set(value), {"time", "category", "sqlstate", "table", "constraint", "prefix_chain", "transport_kind"})
+        keys = {"time", "category", "sqlstate", "table", "constraint", "prefix_chain", "transport_kind"}
+        if value["category"] in ("provider_http", "provider_result"):
+            keys |= {"provider_status", "provider_code", "provider_reason"}
+            self.assertTrue(value["provider_status"] is None or (
+                type(value["provider_status"]) is int and value["provider_status"] in diagnostic.PROVIDER_HTTP_STATUSES))
+            self.assertTrue(value["provider_code"] is None or value["provider_code"] in diagnostic.PROVIDER_CODES)
+            self.assertIn(value["provider_reason"], (None, "unsupported_region"))
+        self.assertEqual(set(value), keys)
         self.assertTrue(value["sqlstate"] is None or value["sqlstate"] in diagnostic.SQLSTATES)
         self.assertTrue(value["table"] is None or value["table"] in diagnostic.TABLES)
         self.assertTrue(value["constraint"] is None or value["constraint"] in diagnostic.CONSTRAINTS)
@@ -178,12 +189,90 @@ class SanitizerTests(unittest.TestCase):
         self.assert_safe(safe)
 
     def test_non_failure_messages_or_non_string_errors_are_not_exposed(self):
-        for item in (None, [], {"msg": "OpenAI research request failed", "error": SECRETS[0]},
+        for item in (None, [], {"msg": "OpenAI image request failed", "error": SECRETS[0]},
                      {"msg": "request validation failed", "error": SECRETS[0]}):
             self.assertIsNone(diagnostic.sanitize_record(item))
         safe = diagnostic.sanitize_record(record({"message": SECRETS}))
         self.assertEqual(safe["category"], "unknown")
         self.assert_safe(safe)
+
+    def test_exact_research_logger_reports_only_known_status_and_code(self):
+        for status in diagnostic.PROVIDER_HTTP_STATUSES:
+            for code in diagnostic.PROVIDER_CODES:
+                with self.subTest(status=status, code=code):
+                    safe = diagnostic.sanitize_record(provider_record(
+                        status=status, code=code, request_id=SECRETS[5], body=SECRETS,
+                        response=SECRETS, url=SECRETS[2], api_key=SECRETS[0]))
+                    self.assertEqual(safe["category"], "provider_http")
+                    self.assertEqual((safe["provider_status"], safe["provider_code"]), (status, code))
+                    self.assertEqual((safe["sqlstate"], safe["table"], safe["constraint"], safe["transport_kind"]),
+                                     (None, None, None, None))
+                    self.assertEqual(safe["prefix_chain"], [])
+                    self.assertIsNone(safe["provider_reason"])
+                    self.assert_safe(safe)
+
+    def test_provider_codes_are_exact_enums_and_private_values_are_discarded(self):
+        for code in (None, {}, [], 400, True, *SECRETS, "model_not_found " + SECRETS[0],
+                     "model_not_found\n" + SECRETS[0], "MODEL_NOT_FOUND", " model_not_found", "unrecognized_error"):
+            with self.subTest(code=code):
+                safe = diagnostic.sanitize_record(provider_record(status=400, code=code, request_id=SECRETS[5]))
+                self.assertEqual(safe["provider_status"], 400)
+                self.assertIsNone(safe["provider_code"])
+                self.assert_safe(safe)
+
+    def test_provider_http_status_requires_an_allowlisted_integer(self):
+        for status in (None, {}, [], True, False, 400.0, "400", SECRETS[0], 0, 200, 301, -1, 499, 999):
+            with self.subTest(status=status):
+                safe = diagnostic.sanitize_record(provider_record(status=status, code="missing_citations"))
+                self.assertIsNone(safe["provider_status"])
+                self.assertEqual(safe["provider_code"], "missing_citations")
+                self.assertEqual(safe["category"], "provider_result" if type(status) is int and status == 0 else "provider_http")
+                self.assert_safe(safe)
+
+    def test_provider_fields_are_ignored_for_every_other_logger_message(self):
+        for msg in ("OpenAI image request failed", "MAX request failed", "content source retrieval failed",
+                    "OpenAI research request failed ", "OpenAI research request failed\n" + SECRETS[0], SECRETS[0]):
+            self.assertIsNone(diagnostic.sanitize_record(record(SECRETS[0], msg=msg, status=400, code="model_not_found")))
+        safe = diagnostic.sanitize_record(record("context canceled", status=400, code="model_not_found"))
+        self.assertEqual(safe["category"], "request_canceled")
+        self.assertNotIn("provider_status", safe)
+        self.assertNotIn("provider_code", safe)
+        self.assert_safe(safe)
+
+    def test_current_logger_without_code_does_not_infer_it_from_private_error(self):
+        safe = diagnostic.sanitize_record(provider_record(status=403, request_id=SECRETS[5]))
+        self.assertEqual(safe["provider_status"], 403)
+        self.assertIsNone(safe["provider_code"])
+        self.assert_safe(safe)
+        for error in ("model_not_found", "missing_citations", "ERROR: permission denied for table content_analysis_cache (SQLSTATE 42501)"):
+            safe = diagnostic.sanitize_record(record(error, msg="OpenAI research request failed", status=0))
+            self.assertEqual(safe["category"], "provider_result")
+            self.assertIsNone(safe["provider_status"])
+            self.assertIsNone(safe["provider_code"])
+            self.assert_safe(safe)
+
+    def test_region_reason_requires_403_and_the_complete_canonical_message(self):
+        canonical = "Country, region, or territory not supported"
+        for error in (canonical, canonical.upper(), " \n" + canonical + "\t "):
+            safe = diagnostic.sanitize_record(record(error, msg="OpenAI research request failed", status=403,
+                                                     request_id=SECRETS[5], body=SECRETS, url=SECRETS[2]))
+            self.assertEqual(safe["provider_reason"], "unsupported_region")
+            self.assertEqual(safe["provider_status"], 403)
+            self.assertIsNone(safe["provider_code"])
+            self.assert_safe(safe)
+        for error in (*SECRETS, canonical + " " + SECRETS[0], SECRETS[0] + " " + canonical,
+                      canonical + "\n" + SECRETS[2], "unsupported_country_region_territory", canonical + ".",
+                      {"message": canonical}, [canonical], None):
+            with self.subTest(error=error):
+                safe = diagnostic.sanitize_record(record(error, msg="OpenAI research request failed", status=403,
+                                                         code=canonical + " " + SECRETS[0], request_id=SECRETS[5]))
+                self.assertIsNone(safe["provider_reason"])
+                self.assertIsNone(safe["provider_code"])
+                self.assert_safe(safe)
+        for status in (0, 400, 401, 404, 429, "403", 403.0, True, None):
+            safe = diagnostic.sanitize_record(record(canonical, msg="OpenAI research request failed", status=status))
+            self.assertIsNone(safe["provider_reason"])
+            self.assert_safe(safe)
 
     def test_timestamps_are_validated_and_reserialized(self):
         self.assertEqual(diagnostic.safe_time("2026-10-04T23:08:21+03:00"), "2026-10-04T20:08:21Z")
@@ -245,6 +334,8 @@ class InvocationTests(unittest.TestCase):
                             f" print({json.dumps(record('ERROR: permission denied for table content_discovery_candidates (SQLSTATE 42501)', body=SECRETS))!r})\n"
                             f" print({json.dumps(record('decode OpenAI Responses response: ' + SECRETS[0]))!r},file=sys.stderr)\n"
                             f" print({transport_record!r},file=sys.stderr)\n"
+                            f" print({json.dumps(provider_record(status=400, code='model_not_found', request_id=SECRETS[5], response=SECRETS))!r},file=sys.stderr)\n"
+                            f" print({json.dumps(record('Country, region, or territory not supported', msg='OpenAI research request failed', status=403, request_id=SECRETS[5], response=SECRETS))!r},file=sys.stderr)\n"
                             f" print({SECRETS[2]!r},file=sys.stderr)\n"
                             "else: sys.exit(91)\n")
             fake.chmod(0o700)
@@ -255,10 +346,16 @@ class InvocationTests(unittest.TestCase):
             for secret in SECRETS:
                 self.assertNotIn(secret, result.stdout)
             output = [json.loads(line) for line in result.stdout.splitlines()]
-            self.assertEqual(len(output), 4)
+            self.assertEqual(len(output), 6)
             transport = [item for item in output[:-1] if item["category"] == "provider_transport"]
             self.assertEqual(len(transport), 1)
             self.assertEqual(transport[0]["transport_kind"], "tls_handshake_timeout")
+            provider = [item for item in output[:-1] if item["category"] == "provider_http"]
+            self.assertEqual(len(provider), 2)
+            self.assertEqual((provider[0]["provider_status"], provider[0]["provider_code"]), (400, "model_not_found"))
+            self.assertEqual((provider[1]["provider_status"], provider[1]["provider_code"], provider[1]["provider_reason"]),
+                             (403, None, "unsupported_region"))
+            self.assertEqual(output[-1]["request_failures"], 5)
             self.assertEqual(output[-1]["read_status"], "complete")
             calls = [json.loads(line) for line in commands.read_text().splitlines()]
             self.assertEqual([call[0] for call in calls], ["inspect", "logs", "inspect"])
@@ -267,14 +364,16 @@ class InvocationTests(unittest.TestCase):
 
     def test_deploy_race_discards_every_sanitized_record_before_output(self):
         safe = diagnostic.sanitize_record(record('ERROR: permission denied for table content_analysis_cache (SQLSTATE 42501)'))
+        provider = diagnostic.sanitize_record(provider_record(status=403, code="unsupported_country_region_territory"))
         output = io.StringIO()
         with patch.object(sys, 'argv', ['diagnostic', '/opt/maxposty/backend']), \
                 patch.object(diagnostic, 'validate_target', side_effect=['a' * 64, 'b' * 64]), \
-                patch.object(diagnostic, 'read_diagnostics', return_value=([safe], {'read_status': 'complete'})), \
+                patch.object(diagnostic, 'read_diagnostics', return_value=([safe, provider], {'read_status': 'complete'})), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(diagnostic.main(), 1)
         self.assertEqual(json.loads(output.getvalue()), {'read_status': 'unavailable'})
         self.assertNotIn('content_analysis_cache', output.getvalue())
+        self.assertNotIn('provider_http', output.getvalue())
 
     def test_log_read_timeout_stops_only_the_log_client(self):
         process = subprocess.Popen([sys.executable, '-c', 'import time; print("private-provider-request", flush=True); time.sleep(10)'],
