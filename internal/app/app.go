@@ -1407,6 +1407,11 @@ func (a *App) suggestChannelDescription(
 	}
 	input.ChannelTitle = channel.Title
 	input.ChannelDescription = channel.Description
+	// MAX descriptions can be longer than the AI context budget. Bound only the
+	// context sent to the provider; keep the saved channel metadata intact.
+	if runes := []rune(input.ChannelDescription); len(runes) > openairesearch.MaxChannelDescriptionRunes {
+		input.ChannelDescription = string(runes[:openairesearch.MaxChannelDescriptionRunes])
+	}
 	input.Posts = make([]openairesearch.PostSample, 0, openairesearch.MaxSuggestChannelDescriptionPosts)
 	remaining := openairesearch.MaxSuggestChannelDescriptionTotalRunes
 	for _, post := range posts {

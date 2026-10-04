@@ -16,6 +16,9 @@ jobs:
     name: Test with PostgreSQL 18.4
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
     services:
       postgres:
         image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
@@ -40,12 +43,19 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.8"
           cache: true
       - name: Build and run migrations against PostgreSQL
         run: go run ./cmd/migrate
       - name: Enforce expand-contract migration safety
         run: ./deploy/validate-expand-contract-migrations.sh internal/store/migrations
+      - name: Log in for immutable monitoring policy images
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Verify release and deployment rollback policies
         run: |
           ./deploy/tests/release-gate-policy.sh
@@ -55,6 +65,10 @@ jobs:
           ./deploy/tests/operations-policy.sh
           ./deploy/tests/backup-release-policy.sh
           ./deploy/tests/rollback-policy.sh
+      - name: Remove registry credentials
+        if: ${{ always() }}
+        shell: bash
+        run: docker logout ghcr.io >/dev/null 2>&1 || true
       - name: Run all tests with the race detector
         run: go test -race ./...
       - run: go vet ./...
@@ -72,7 +86,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.8"
           cache: true
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:

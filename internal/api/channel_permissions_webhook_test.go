@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -101,7 +102,7 @@ func TestPermissionsWebhookRefreshesChannelAndNotifiesOncePerLoss(t *testing.T) 
 	if err != nil || channel.Active {
 		t.Fatalf("old permissions event resurrected removed channel: %#v, %v", channel, err)
 	}
-	if _, err := storage.GetActiveObservedBotChat(ctx, "", channel.MAXChatID); err != store.ErrNotFound {
+	if _, err := storage.GetActiveObservedBotChat(ctx, "", channel.MAXChatID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("removed lifecycle inventory was revived: %v", err)
 	}
 }

@@ -40,6 +40,7 @@ ORDER BY connected.id FOR UPDATE OF connected`, maxChatID, maxOwnerID)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = rows.Close() }()
 	type connectedChannel struct {
 		id                 int64
 		workspaceID, title string
@@ -48,7 +49,6 @@ ORDER BY connected.id FOR UPDATE OF connected`, maxChatID, maxOwnerID)
 	for rows.Next() {
 		var channel connectedChannel
 		if err := rows.Scan(&channel.id, &channel.workspaceID, &channel.title); err != nil {
-			_ = rows.Close()
 			return err
 		}
 		channels = append(channels, channel)

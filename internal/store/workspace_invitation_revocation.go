@@ -50,17 +50,16 @@ RETURNING id`, workspaceID, userID, now)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = rows.Close() }()
 	var invitationIDs []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
 			return err
 		}
 		invitationIDs = append(invitationIDs, id)
 	}
 	if err := rows.Err(); err != nil {
-		_ = rows.Close()
 		return err
 	}
 	if err := rows.Close(); err != nil {
