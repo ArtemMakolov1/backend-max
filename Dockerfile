@@ -12,7 +12,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/maxpilo
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 # The pinned base predates the OpenSSL QUIC security fix. Require patched
 # runtime libraries from this Alpine branch rather than retaining the base's versions.
-RUN apk add --no-cache ca-certificates 'libcrypto3>=3.5.8-r0' 'libssl3>=3.5.8-r0' \
+RUN apk add --no-cache ca-certificates ffmpeg 'libcrypto3>=3.5.8-r0' 'libssl3>=3.5.8-r0' \
     && addgroup -S maxpilot \
     && adduser -S -G maxpilot maxpilot \
     && mkdir -p /app/media \

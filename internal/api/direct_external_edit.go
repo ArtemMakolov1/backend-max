@@ -31,10 +31,12 @@ type directExternalAdResponse struct {
 type directExternalDetailResponse struct {
 	directExternalCampaignResponse
 	store.DirectExternalEditControl
-	ConnectionID   string                     `json:"connection_id"`
-	EditableFields []string                   `json:"editable_fields"`
-	ReadOnlyReason *string                    `json:"read_only_reason"`
-	Ads            []directExternalAdResponse `json:"ads"`
+	ConnectionID   string                                 `json:"connection_id"`
+	EditableFields []string                               `json:"editable_fields"`
+	ReadOnlyReason *string                                `json:"read_only_reason"`
+	Ads            []directExternalAdResponse             `json:"ads"`
+	Controls       *yandexdirect.ExternalCampaignControls `json:"controls,omitempty"`
+	LastOperations []store.DirectExternalOperation        `json:"last_operations,omitempty"`
 }
 type externalNamePatchRequest struct {
 	store.DirectExternalEditFence
@@ -72,6 +74,7 @@ type externalCopyRequest struct {
 
 // Called inside the authenticated /advertising/direct workspace group.
 func (s *Server) registerDirectExternalEditingRoutes(r chi.Router) {
+	s.registerDirectExternalControlsRoutes(r)
 	r.Get("/campaigns/external/{provider_campaign_id}", s.getDirectExternalDetail)
 	r.Patch("/campaigns/external/{provider_campaign_id}", s.patchDirectExternalName)
 	r.Patch("/campaigns/external/{provider_campaign_id}/ads/{provider_ad_id}", s.patchDirectExternalAd)
@@ -109,7 +112,7 @@ func (s *Server) getDirectExternalDetail(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, err)
 		return
 	}
-	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite))
+	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite), access.Can(app.CapabilityAdsBudgetManage))
 }
 func (s *Server) patchDirectExternalName(w http.ResponseWriter, r *http.Request) {
 	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityAdsWrite)
@@ -129,7 +132,7 @@ func (s *Server) patchDirectExternalName(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, err)
 		return
 	}
-	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite))
+	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite), access.Can(app.CapabilityAdsBudgetManage))
 }
 func (s *Server) patchDirectExternalAd(w http.ResponseWriter, r *http.Request) {
 	_, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityAdsWrite)
@@ -154,7 +157,7 @@ func (s *Server) patchDirectExternalAd(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite))
+	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite), access.Can(app.CapabilityAdsBudgetManage))
 }
 func (s *Server) bookmarkDirectExternal(w http.ResponseWriter, r *http.Request) {
 	s.setExternalBookmark(w, r, true)
@@ -186,7 +189,7 @@ func (s *Server) setExternalBookmark(w http.ResponseWriter, r *http.Request, boo
 		s.writeError(w, err)
 		return
 	}
-	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite))
+	s.writeExternalDetail(w, result, access.Can(app.CapabilityAdsWrite), access.Can(app.CapabilityAdsBudgetManage))
 }
 func (s *Server) suggestDirectExternalCopy(w http.ResponseWriter, r *http.Request) {
 	workspace, access, ok := s.requireWorkspaceCapability(w, r, app.CapabilityAdsWrite)
@@ -230,7 +233,7 @@ func (s *Server) suggestDirectExternalCopy(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{"suggestion": result})
 }
-func (s *Server) writeExternalDetail(w http.ResponseWriter, detail app.DirectExternalDetail, canWrite bool) {
+func (s *Server) writeExternalDetail(w http.ResponseWriter, detail app.DirectExternalDetail, canWrite bool, ownerAccess ...bool) {
 	campaign := detail.Provider.Campaign
 	result := directExternalDetailResponse{directExternalCampaignResponse: directExternalCampaignResponse{ProviderCampaignID: strconv.FormatInt(campaign.ID, 10), Name: campaign.Name, CampaignType: campaign.Type, ProviderStatus: campaign.Status, ProviderState: campaign.State, ProviderStatusPayment: campaign.StatusPayment, StartsAt: campaign.StartDate, EndsAt: campaign.EndDate, Timezone: campaign.TimeZone, SyncedAt: s.now().UTC()}, DirectExternalEditControl: detail.Control, ConnectionID: detail.Connection.ID, EditableFields: []string{}, Ads: []directExternalAdResponse{}}
 	var reason string
@@ -250,6 +253,57 @@ func (s *Server) writeExternalDetail(w http.ResponseWriter, detail app.DirectExt
 		result.EditableFields = []string{"name"}
 	} else {
 		result.ReadOnlyReason = &reason
+	}
+	if detail.Provider.Controls != nil {
+		encoded, _ := json.Marshal(detail.Provider.Controls)
+		var controls yandexdirect.ExternalCampaignControls
+		_ = json.Unmarshal(encoded, &controls)
+		owner := len(ownerAccess) > 0 && ownerAccess[0]
+		if reason != "" {
+			controls.CanCreateGroup = false
+			controls.CreateGroupReason = &reason
+			controls.StateActions.CanPause = false
+			controls.StateActions.CanResume = false
+			controls.StateActions.ReadOnlyReason = &reason
+		}
+		if !owner {
+			controls.StateActions.CanPause = false
+			controls.StateActions.CanResume = false
+			controls.StateActions.ReadOnlyReason = directControlReadOnlyReason("budget_permission_required")
+		}
+		for i := range controls.Budgets {
+			if reason != "" || !owner {
+				controls.Budgets[i].Editable = false
+				r := reason
+				if r == "" {
+					r = "budget_permission_required"
+				}
+				controls.Budgets[i].ReadOnlyReason = &r
+			}
+		}
+		for i := range controls.Groups {
+			if reason != "" {
+				controls.Groups[i].EditableFields = []string{}
+				controls.Groups[i].CanCreateKeyword = false
+				controls.Groups[i].ReadOnlyReason = &reason
+			}
+			for j := range controls.Groups[i].Keywords {
+				if reason != "" {
+					controls.Groups[i].Keywords[j].EditableFields = []string{}
+					controls.Groups[i].Keywords[j].ReadOnlyReason = &reason
+				} else if !owner {
+					fields := []string{}
+					for _, field := range controls.Groups[i].Keywords[j].EditableFields {
+						if field == "keyword" {
+							fields = append(fields, field)
+						}
+					}
+					controls.Groups[i].Keywords[j].EditableFields = fields
+				}
+			}
+		}
+		result.Controls = &controls
+		result.LastOperations = detail.Operations
 	}
 	for _, ad := range detail.Provider.Ads {
 		out := directExternalAdResponse{ProviderAdID: strconv.FormatInt(ad.ID, 10), ProviderAdGroupID: strconv.FormatInt(ad.AdGroupID, 10), AdType: ad.Type, ProviderStatus: ad.Status, ProviderState: ad.State, Title2: ad.Title2, Titles: ad.Titles, Texts: ad.Texts, Href: ad.Href, EditableFields: []string{}}
@@ -282,3 +336,5 @@ func (s *Server) writeExternalDetail(w http.ResponseWriter, detail app.DirectExt
 	w.Header().Set("Cache-Control", "no-store")
 	s.writeJSON(w, http.StatusOK, map[string]any{"campaign": result})
 }
+
+func directControlReadOnlyReason(value string) *string { return &value }

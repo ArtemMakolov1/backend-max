@@ -1140,6 +1140,155 @@ paths:
       responses:
         '200': {description: Verified provider detail, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/budget:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalBudget
+      summary: Update one existing strategy budget without changing bidding strategy
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBudgetPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/groups/{provider_group_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_group_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalGroup
+      summary: Update selected name, geography or negative phrases of an existing group
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalGroupPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/groups:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: createDirectExternalGroup
+      summary: Add one group with a durable request UUID and provider acknowledgment
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalGroupCreate'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/keywords/{provider_keyword_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_keyword_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalKeyword
+      summary: Edit a keyword and retain a provider-assigned replacement ID
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalKeywordPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/keywords/{provider_keyword_id}/bid:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_keyword_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalKeywordBid
+      summary: Set manual bids only when the existing strategy supports them
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBidPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/groups/{provider_group_id}/keywords:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_group_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: createDirectExternalKeyword
+      summary: Add one ordinary keyword without replaying an ambiguous provider write
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalKeywordPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/state:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: setDirectExternalCampaignState
+      summary: Pause or explicitly resume an existing provider campaign
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalStateInput'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/operations/{client_request_id}/reconcile:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: client_request_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [Advertising]
+      operationId: reconcileDirectExternalOperation
+      summary: Confirm a matching existing provider object without repeating the original write
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalOperationReconcile'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/ads/{provider_ad_id}:
     parameters:
       - {$ref: '#/components/parameters/WorkspaceId'}
@@ -1978,6 +2127,24 @@ paths:
             schema: {$ref: '#/components/schemas/ContentDiscoveryInput'}
       responses:
         '200': {description: Grounded content cards, content: {application/json: {schema: {$ref: '#/components/schemas/ContentDiscoveryResult'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/research/content/drafts:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: createWorkspaceContentDiscoveryDraft
+      summary: Create a draft and copy available grounded media with an idempotent request
+      description: Requires posts.write. Candidate belongs to this actor and workspace; arbitrary source URLs are never accepted. Reusing the same UUID returns the existing draft and transfer result, including after candidate expiry. This operation does not publish to MAX.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContentDiscoveryDraftInput'}
+      responses:
+        '200': {description: Saved draft with truthful complete or partial media transfer, content: {application/json: {schema: {$ref: '#/components/schemas/ContentDiscoveryDraftResult'}}}}
+        '409': {description: Same request is in progress or the UUID belongs to different parameters, content: {application/json: {schema: {$ref: '#/components/schemas/ProblemEnvelope'}}}}
+        '410': {description: Candidate expired before the first creation request, content: {application/json: {schema: {$ref: '#/components/schemas/ProblemEnvelope'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/brand-kit:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
@@ -3899,6 +4066,165 @@ components:
             editable_fields: {type: array, items: {$ref: '#/components/schemas/DirectExternalEditableField'}}
             read_only_reason: {type: [string, 'null'], enum: [writes_unavailable, account_read_only, member_read_only, edit_in_progress, campaign_archived, ad_archived, ad_fields_unavailable, unsupported_ad_type, null]}
             ads: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/DirectExternalAd'}}
+            controls: {$ref: '#/components/schemas/DirectExternalControls'}
+            last_operations: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/DirectExternalOperation'}}
+    DirectExternalMicros:
+      type: string
+      pattern: '^[1-9][0-9]{0,18}$'
+      description: Positive int64 micros in the provider currency, encoded as a decimal string without floating point conversion.
+    DirectExternalControlFence:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [client_request_id]
+          properties:
+            client_request_id: {type: string, format: uuid}
+    DirectExternalBudgetPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [budget_key, amount_micros, currency_code]
+          properties:
+            budget_key: {type: string, enum: [daily, search_weekly, network_weekly]}
+            amount_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+            currency_code: {type: string, pattern: '^[A-Z]{3}$'}
+    DirectExternalGroupFields:
+      type: object
+      description: Omitted fields remain unchanged. Empty negative_keywords clears the group list. New region IDs must come from the current provider dictionary; exact signed IDs already selected in the group may be preserved. Negative IDs exclude a region, and 0 means worldwide and cannot be combined with negative IDs. Negative phrases contain at most 7 words of at most 35 characters each; their aggregate length is at most 4096 Unicode characters, excluding whitespace, hyphens and keyword operators.
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        region_ids: {type: array, minItems: 1, maxItems: 1000, uniqueItems: true, items: {type: integer, format: int64, minimum: -9007199254740991, maximum: 9007199254740991}}
+        negative_keywords: {type: array, maxItems: 4096, items: {type: string, minLength: 1, maxLength: 4096}}
+    DirectExternalGroupPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - {$ref: '#/components/schemas/DirectExternalGroupFields'}
+    DirectExternalGroupCreate:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalGroupPatch'}
+        - type: object
+          required: [name, region_ids]
+    DirectExternalKeywordPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [keyword]
+          properties:
+            keyword: {type: string, minLength: 1, maxLength: 4096}
+    DirectExternalBidPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [currency_code]
+          description: At least one bid is required. Automatic strategy bids and autotargeting are read-only; the operation never changes the bidding strategy.
+          properties:
+            currency_code: {type: string, pattern: '^[A-Z]{3}$'}
+            search_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+            network_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+    DirectExternalStateInput:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [action]
+          properties:
+            action: {type: string, enum: [pause, resume]}
+            confirm_spend: {type: boolean, description: Explicit confirmation required for resume after reviewing the current provider budget and available spend data.}
+    DirectExternalOperationReconcile:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [provider_result_id]
+          properties:
+            provider_result_id: {type: string, pattern: '^[1-9][0-9]*$'}
+    DirectExternalOperation:
+      type: object
+      required: [client_request_id, operation_id, kind, state, created_at, updated_at]
+      properties:
+        client_request_id: {type: string, format: uuid}
+        operation_id: {type: string, pattern: '^dxe_[0-9a-f]{32}$'}
+        kind: {type: string, enum: [budget, group, keyword, bid, state, create_group, create_keyword]}
+        state: {type: string, enum: [updating, uncertain, succeeded, rejected]}
+        provider_result_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    DirectExternalRegion:
+      type: object
+      required: [id, name, parent_id]
+      properties:
+        id: {type: integer, format: int64, minimum: 0, maximum: 9007199254740991}
+        name: {type: string}
+        parent_id: {type: [integer, 'null'], format: int64}
+    DirectExternalBudget:
+      type: object
+      required: [budget_key, amount_micros, strategy_type, minimum_micros, maximum_micros, increment_micros, editable, read_only_reason, notice]
+      properties:
+        budget_key: {type: string, enum: [daily, search_weekly, network_weekly]}
+        amount_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        strategy_type: {type: string}
+        minimum_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        maximum_micros: {type: [string, 'null'], pattern: '^[1-9][0-9]{0,18}$'}
+        increment_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        editable: {type: boolean}
+        read_only_reason: {type: [string, 'null']}
+        notice: {type: [string, 'null']}
+    DirectExternalKeyword:
+      type: object
+      required: [provider_keyword_id, provider_group_id, keyword, provider_state, search_bid_micros, network_bid_micros, editable_fields, read_only_reason]
+      properties:
+        provider_keyword_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        provider_group_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        keyword: {type: string}
+        provider_state: {type: string}
+        search_bid_micros: {type: [string, 'null'], pattern: '^[0-9]{1,19}$'}
+        network_bid_micros: {type: [string, 'null'], pattern: '^[0-9]{1,19}$'}
+        editable_fields: {type: array, items: {type: string, enum: [keyword, search_bid_micros, network_bid_micros]}}
+        read_only_reason: {type: [string, 'null']}
+    DirectExternalGroup:
+      type: object
+      required: [provider_group_id, name, group_type, region_ids, negative_keywords, editable_fields, read_only_reason, can_create_keyword, keywords]
+      properties:
+        provider_group_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        name: {type: string}
+        group_type: {type: string}
+        region_ids: {type: array, items: {type: integer, format: int64, minimum: -9007199254740991, maximum: 9007199254740991}}
+        negative_keywords: {type: array, items: {type: string}}
+        editable_fields: {type: array, items: {type: string, enum: [name, region_ids, negative_keywords]}}
+        read_only_reason: {type: [string, 'null']}
+        can_create_keyword: {type: boolean}
+        keywords: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/DirectExternalKeyword'}}
+    DirectExternalControls:
+      type: object
+      required: [regions, currency_code, provider_state, search_strategy, network_strategy, budgets, groups, can_create_group, create_group_reason, state_actions, spend, minimum_bid_micros, maximum_bid_micros, bid_increment_micros]
+      properties:
+        regions: {type: array, maxItems: 20000, items: {$ref: '#/components/schemas/DirectExternalRegion'}}
+        currency_code: {type: string}
+        provider_state: {type: string}
+        search_strategy: {type: string}
+        network_strategy: {type: string}
+        budgets: {type: array, maxItems: 3, items: {$ref: '#/components/schemas/DirectExternalBudget'}}
+        groups: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/DirectExternalGroup'}}
+        can_create_group: {type: boolean}
+        create_group_reason: {type: [string, 'null']}
+        state_actions:
+          type: object
+          required: [can_pause, can_resume, read_only_reason]
+          properties:
+            can_pause: {type: boolean}
+            can_resume: {type: boolean}
+            read_only_reason: {type: [string, 'null']}
+        spend:
+          type: object
+          description: No spending total is fabricated when a dated provider report has not been requested.
+          required: [amount_micros, observed_at, from, to, reason]
+          properties:
+            amount_micros: {type: [string, 'null']}
+            observed_at: {type: [string, 'null'], format: date-time}
+            from: {type: [string, 'null'], format: date}
+            to: {type: [string, 'null'], format: date}
+            reason: {type: string}
+        minimum_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        maximum_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        bid_increment_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
     DirectExternalDetailEnvelope:
       type: object
       required: [campaign]
@@ -5649,6 +5975,7 @@ components:
       required: [id, content_kind, title, summary, source, draft]
       properties:
         id: {type: string, pattern: '^[0-9a-f]{16}$'}
+        candidate_id: {type: string, readOnly: true, description: Server-saved actor/workspace-scoped candidate authority for draft transfer.}
         content_kind: {type: string, enum: [idea, article, meme, video]}
         title: {type: string, minLength: 1, maxLength: 120}
         summary: {type: string, minLength: 1, maxLength: 350}
@@ -5659,7 +5986,7 @@ components:
             - type: object
               properties:
                 content: {type: string, minLength: 1, maxLength: 4000}
-        preview_image_url: {type: string, format: uri, description: Actual image search result associated with this source; never attached to a draft automatically.}
+        preview_image_url: {type: string, format: uri, description: Grounded image associated with this source. Draft transfer separately checks and copies actual available media.}
     ContentDiscoveryResult:
       type: object
       required: [topic, content_kind, cards]
@@ -5670,6 +5997,52 @@ components:
           type: array
           maxItems: 3
           items: {$ref: '#/components/schemas/ContentDiscoveryCard'}
+        context_analysis: {$ref: '#/components/schemas/ContentContextAnalysis'}
+    ContentContextAnalysis:
+      type: object
+      required: [status, images_analyzed, videos_analyzed, audio_analyzed, cached, warnings]
+      properties:
+        status: {type: string, enum: [text_only, ready, partial, unavailable]}
+        images_analyzed: {type: integer, minimum: 0, maximum: 3}
+        videos_analyzed: {type: integer, minimum: 0, maximum: 1}
+        audio_analyzed: {type: integer, minimum: 0, maximum: 1, description: Successfully analyzed audio fragments extracted from videos.}
+        cached: {type: boolean}
+        summary: {type: string, maxLength: 1200, description: Bounded semantic description of genuinely analyzed content. Untrusted editorial data.}
+        sample_limit_seconds: {type: integer, minimum: 1, maximum: 30, description: Video/audio sampling is limited to the first fragment; this does not represent complete analysis of a long clip.}
+        warnings: {type: array, items: {type: string}, maxItems: 6}
+    ContentDiscoveryDraftInput:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, client_request_id]
+      properties:
+        candidate_id: {type: string, minLength: 8, maxLength: 80}
+        client_request_id: {type: string, format: uuid}
+        channel_id: {type: integer, format: int64, minimum: 1}
+        include_media: {type: boolean, default: true}
+    ContentDiscoveryDraftResult:
+      type: object
+      required: [post, media_transfer]
+      properties:
+        post: {$ref: '#/components/schemas/Post'}
+        media_transfer: {$ref: '#/components/schemas/ContentDiscoveryMediaTransfer'}
+    ContentDiscoveryMediaTransfer:
+      type: object
+      required: [status, requested_count, copied_count, items, warnings]
+      properties:
+        status: {type: string, enum: [complete, partial, unavailable, skipped]}
+        requested_count: {type: integer, minimum: 0}
+        copied_count: {type: integer, minimum: 0}
+        warnings: {type: array, items: {type: string}}
+        items:
+          type: array
+          items:
+            type: object
+            required: [type, status]
+            properties:
+              type: {type: string, enum: [image, video]}
+              status: {type: string, enum: [copied, unavailable, skipped]}
+              reason: {type: string}
+              attachment_id: {type: integer, format: int64, minimum: 1, description: Present only for an attachment that has actually been copied into private storage and attached to the saved draft.}
     AnalyticsContentScope:
       type: object
       required: [kind, channels_count]

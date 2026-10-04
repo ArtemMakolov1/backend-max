@@ -29,7 +29,8 @@ for mode in inspect grant revoke; do
   grep -Fxq 'owned_workspaces=2' "$fixture/result"
   grep -Fq "public.manage_account_complimentary_access(:'target_email',:'operation',:'operator_name',:'operation_ref')" "$fixture/query.sql"
   grep -Fq "version='039_account_complimentary_access.sql' AND checksum_sha256=:'schema_checksum'" "$fixture/query.sql"
-  grep -Fq "version>'039_account_complimentary_access.sql'" "$fixture/query.sql"
+  grep -Fq "version='042_content_analysis_cache.sql'" "$fixture/query.sql"
+  grep -Fq "version>'042_content_analysis_cache.sql'" "$fixture/query.sql"
   grep -Fq "\\gset result_" "$fixture/query.sql"
   grep -Fq "w.owner_user_id=:'result_user_id' AND w.archived_at IS NULL" "$fixture/query.sql"
   for metric in channels seats storage_bytes; do
