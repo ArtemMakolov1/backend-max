@@ -276,8 +276,15 @@ type inputContentPart struct {
 }
 
 type webSearchTool struct {
-	Type              string `json:"type"`
-	SearchContextSize string `json:"search_context_size"`
+	Type               string            `json:"type"`
+	SearchContextSize  string            `json:"search_context_size"`
+	SearchContentTypes []string          `json:"search_content_types,omitempty"`
+	ImageSettings      *webImageSettings `json:"image_settings,omitempty"`
+}
+
+type webImageSettings struct {
+	MaxResults int  `json:"max_results"`
+	Caption    bool `json:"caption"`
 }
 
 type textOptions struct {
@@ -407,6 +414,25 @@ type outputItem struct {
 	Type    string        `json:"type"`
 	Status  string        `json:"status"`
 	Content []contentItem `json:"content"`
+	Action  *webAction    `json:"action,omitempty"`
+	Results []webResult   `json:"results,omitempty"`
+}
+
+type webAction struct {
+	Sources []webSource `json:"sources"`
+}
+
+type webSource struct {
+	Type  string `json:"type"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type webResult struct {
+	Type             string `json:"type"`
+	ImageURL         string `json:"image_url"`
+	SourceWebsiteURL string `json:"source_website_url"`
+	ThumbnailURL     string `json:"thumbnail_url"`
 }
 
 type contentItem struct {
