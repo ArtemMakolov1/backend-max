@@ -1,0 +1,282 @@
+"""Read-only, server-side allowlist for recent backend request failures.
+
+Never print input errors, provider responses, SQL detail/rows or arbitrary JSON
+fields. Unknown errors stay unknown. No log files or configuration are opened.
+"""
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import subprocess
+import sys
+import time
+
+CONTAINER = "maxposty-backend-backend-1"
+MAX_BYTES = 2 * 1024 * 1024
+MAX_LINES = 2000
+MAX_LINE_BYTES = 65536
+READ_TIMEOUT = 30
+
+# Exact source-owned strings only; the remainder of each wrapped error is
+# deliberately discarded, even when it looks safe or resembles a SQL row.
+PREFIXES = {
+    "list content discovery publications": "discovery_samples",
+    "lock workspace for MAX history write": "workspace_lock",
+    "encode OpenAI Responses request": "provider_request_encoding",
+    "create OpenAI Responses request": "provider_request_creation",
+    "call OpenAI Responses API": "provider_transport",
+    "read OpenAI Responses response": "provider_response_read",
+    "decode OpenAI Responses response": "provider_response_json_decode",
+    "decode structured post draft": "provider_structured_json_decode",
+}
+EXACT_ERRORS = {
+    "invalid saved content analysis": "content_analysis_cache_decode",
+    "invalid content analysis cache result": "content_analysis_cache_validation",
+    "invalid discovery candidate batch": "discovery_candidates_validation",
+    "invalid discovery candidate payload": "discovery_candidates_validation",
+    "saved discovery candidate is invalid": "discovery_candidates_decode",
+    "OpenAI Responses response is too large": "provider_response_size",
+    "context deadline exceeded": "deadline_exceeded",
+    "context canceled": "request_canceled",
+    "sql: database is closed": "database_unavailable",
+    "driver: bad connection": "database_unavailable",
+}
+SQLSTATES = {
+    "08001", "08003", "08006", "08P01", "22001", "22021", "22023", "22P02",
+    "23502", "23503", "23505", "23514", "25006", "25P02", "40001", "40P01",
+    "42501", "42703", "42P01", "53300", "53400", "55P03", "57014", "XX000",
+}
+TABLES = frozenset((
+    "content_discovery_candidates", "content_discovery_draft_operations",
+    "content_analysis_cache", "channels", "workspaces", "workspace_members",
+    "workspace_brand_kits", "workspace_templates", "posts", "post_attachments",
+    "media_assets", "workspace_usage_counters", "users",
+))
+CONSTRAINTS = {
+    "content_discovery_candidates_pkey": "content_discovery_candidates",
+    "content_discovery_candidates_workspace_id_fkey": "content_discovery_candidates",
+    "content_discovery_candidates_actor_user_id_fkey": "content_discovery_candidates",
+    "content_discovery_candidates_payload_check": "content_discovery_candidates",
+    "content_discovery_candidates_check": "content_discovery_candidates",
+    "content_discovery_candidates_workspace_id_actor_user_id_id_key": "content_discovery_candidates",
+    "content_discovery_candidates_workspace_id_channel_id_fkey": "content_discovery_candidates",
+    "content_discovery_draft_operations_pkey": "content_discovery_draft_operations",
+    "content_discovery_draft_opera_workspace_id_actor_user_id_c_fkey": "content_discovery_draft_operations",
+    "content_analysis_cache_pkey": "content_analysis_cache",
+    "content_analysis_cache_snapshot_key_check": "content_analysis_cache",
+    "content_analysis_cache_claim_id_check": "content_analysis_cache",
+    "content_analysis_cache_result_json_check": "content_analysis_cache",
+    "content_analysis_cache_workspace_id_channel_id_fkey": "content_analysis_cache",
+}
+
+
+def safe_time(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", value
+    ):
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    except (ValueError, OverflowError):
+        return None
+
+
+def sanitize_record(record):
+    if not isinstance(record, dict) or record.get("msg") != "request failed":
+        return None
+    error = record.get("error")
+    if not isinstance(error, str):
+        error = ""
+    remainder = error
+    chain = []
+    category = "unknown"
+    for _ in range(4):
+        prefix = next((value for value in PREFIXES if remainder.startswith(value + ": ")), None)
+        if prefix is None:
+            break
+        chain.append(prefix)
+        category = PREFIXES[prefix]
+        remainder = remainder[len(prefix) + 2:]
+    category = EXACT_ERRORS.get(remainder, category)
+    sqlstate = table = constraint = None
+    # Only recognize the actual pgx Error() shape, never SQL-like text in a
+    # transport error URL, response body, SQL DETAIL or unknown wrapper.
+    match = re.fullmatch(r"ERROR: ([^\r\n]*) \(SQLSTATE ([A-Z0-9]{5})\)", remainder)
+    if match and match.group(2) in SQLSTATES and category not in (
+        "provider_transport", "provider_response_read", "provider_response_json_decode",
+        "provider_request_creation", "provider_request_encoding", "provider_structured_json_decode",
+    ):
+        sqlstate = match.group(2)
+        message = match.group(1)
+        found_table = re.search(r'\b(?:table|relation) (?:"([a-z_]+)"|([a-z_]+)(?![a-z_0-9]))', message)
+        found_constraint = re.search(r'\bconstraint "([a-z_]+)"', message)
+        table_name = (found_table.group(1) or found_table.group(2)) if found_table else None
+        if table_name in TABLES:
+            table = table_name
+        if found_constraint and found_constraint.group(1) in CONSTRAINTS:
+            constraint = found_constraint.group(1)
+            table = table or CONSTRAINTS[constraint]
+        category = "database"
+        if table == "content_analysis_cache":
+            category = "content_analysis_cache_database"
+        elif table == "content_discovery_candidates":
+            category = "discovery_candidates_database"
+        elif table == "content_discovery_draft_operations":
+            category = "discovery_draft_database"
+    return {
+        "time": safe_time(record.get("time")), "category": category,
+        "sqlstate": sqlstate, "table": table, "constraint": constraint,
+        "prefix_chain": chain,
+    }
+
+
+class BoundedDiagnostics:
+    def __init__(self, emit):
+        self.emit = emit
+        self.bytes_read = self.lines_read = self.failures = 0
+        self.buffer = bytearray()
+        self.discard_line = False
+        self.truncated = False
+
+    def feed(self, data):
+        available = MAX_BYTES - self.bytes_read
+        if len(data) >= available:
+            self.truncated = True
+        data = data[:available]
+        self.bytes_read += len(data)
+        for byte in data:
+            if self.lines_read >= MAX_LINES:
+                self.truncated = True
+                break
+            if byte == 10:
+                self.lines_read += 1
+                if not self.discard_line:
+                    self._line(bytes(self.buffer))
+                self.buffer.clear()
+                self.discard_line = False
+            elif len(self.buffer) < MAX_LINE_BYTES and not self.discard_line:
+                self.buffer.append(byte)
+            else:
+                self.buffer.clear()
+                self.discard_line = True
+        return self.bytes_read < MAX_BYTES and self.lines_read < MAX_LINES
+
+    def finish(self):
+        if self.buffer and not self.discard_line and not self.truncated and self.lines_read < MAX_LINES:
+            self.lines_read += 1
+            self._line(bytes(self.buffer))
+        self.buffer.clear()
+        return {
+            "window_minutes": 60, "bytes_read": self.bytes_read,
+            "lines_read": self.lines_read, "request_failures": self.failures,
+            "truncated": self.truncated,
+        }
+
+    def _line(self, line):
+        try:
+            record = json.loads(line)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            return
+        safe = sanitize_record(record)
+        if safe is not None:
+            self.failures += 1
+            self.emit(safe)
+
+
+def emit(record):
+    print(json.dumps(record, ensure_ascii=True, separators=(",", ":")), flush=True)
+
+
+def validate_target(installation_dir):
+    if not re.fullmatch(r"(?:/[A-Za-z0-9_-]+)+", installation_dir):
+        raise ValueError("invalid_target")
+    installation = Path(installation_dir)
+    accepted = (installation / "current").resolve(strict=True)
+    releases = (installation / "releases").resolve(strict=True)
+    if not (installation / "current").is_symlink() or accepted.parent != releases:
+        raise ValueError("invalid_release")
+    if not re.fullmatch(r"[0-9a-f]{40}", accepted.name):
+        raise ValueError("invalid_release_revision")
+    if not (accepted / "deploy" / "compose.production.yaml").is_file():
+        raise ValueError("missing_compose")
+    result = subprocess.run(
+        ["docker", "inspect", "--format", '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{index .Config.Labels "org.opencontainers.image.revision"}}|{{.Id}}', CONTAINER],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False,
+    )
+    identity = result.stdout.strip().split(b"|")
+    if result.returncode != 0 or len(identity) != 4 or identity[:3] != [
+        b"maxposty-backend", b"backend", accepted.name.encode("ascii")
+    ] or not re.fullmatch(rb"[0-9a-f]{64}", identity[3]):
+        raise ValueError("invalid_container")
+    return identity[3].decode("ascii")
+
+
+def read_diagnostics(container_id):
+    records = []
+    diagnostics = BoundedDiagnostics(records.append)
+    process = subprocess.Popen(
+        ["docker", "logs", "--since=1h", "--tail=2000", container_id],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    timed_out = False
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + READ_TIMEOUT
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                events = selector.select(remaining)
+                if not events:
+                    timed_out = True
+                    break
+                data = os.read(process.stdout.fileno(), min(65536, MAX_BYTES - diagnostics.bytes_read))
+                if not data or not diagnostics.feed(data):
+                    break
+    finally:
+        if (timed_out or diagnostics.truncated) and process.poll() is None:
+            process.kill()  # Stop only the log-reading client, never the container.
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait(timeout=5)
+        process.stdout.close()
+    result = diagnostics.finish()
+    result["read_status"] = "timeout" if timed_out else (
+        "bounded" if diagnostics.truncated else "complete" if process.returncode == 0 else "failed"
+    )
+    return records, result
+
+
+def main():
+    try:
+        if len(sys.argv) != 2 or sys.version_info < (3, 9):
+            raise ValueError("unsupported_invocation")
+        container_id = validate_target(sys.argv[1])
+        records, result = read_diagnostics(container_id)
+        # Retain only bounded, already-sanitized records in memory. A container
+        # or accepted release change discards them before any remote output.
+        if validate_target(sys.argv[1]) != container_id:
+            raise ValueError("release_changed")
+        if result["read_status"] in ("complete", "bounded"):
+            for safe in records:
+                emit(safe)
+            emit(result)
+            return 0
+        emit({"read_status": result["read_status"]})
+        return 1
+    except Exception:
+        # Exception text and tracebacks can include command output or secrets.
+        emit({"read_status": "unavailable"})
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
