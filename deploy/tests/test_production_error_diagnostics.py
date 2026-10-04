@@ -21,6 +21,7 @@ SECRETS = (
     "https://provider.example/private?token=synthetic-signed-secret",
     "private-sql-row-content", "private-channel-post", "private-provider-request",
     "private-constraint-suffix", "private-column-name",
+    "private-provider-host.example", "10.20.30.40", "192.0.2.55",
 )
 
 
@@ -33,11 +34,12 @@ class SanitizerTests(unittest.TestCase):
         rendered = json.dumps(value)
         for secret in SECRETS:
             self.assertNotIn(secret, rendered)
-        self.assertEqual(set(value), {"time", "category", "sqlstate", "table", "constraint", "prefix_chain"})
+        self.assertEqual(set(value), {"time", "category", "sqlstate", "table", "constraint", "prefix_chain", "transport_kind"})
         self.assertTrue(value["sqlstate"] is None or value["sqlstate"] in diagnostic.SQLSTATES)
         self.assertTrue(value["table"] is None or value["table"] in diagnostic.TABLES)
         self.assertTrue(value["constraint"] is None or value["constraint"] in diagnostic.CONSTRAINTS)
         self.assertTrue(all(prefix in diagnostic.PREFIXES for prefix in value["prefix_chain"]))
+        self.assertTrue(value["transport_kind"] is None or value["transport_kind"] in diagnostic.TRANSPORT_KINDS)
 
     def test_candidate_permission_and_fk_errors_are_distinguished_from_cache(self):
         candidate = diagnostic.sanitize_record(record(
@@ -96,6 +98,74 @@ class SanitizerTests(unittest.TestCase):
             'decode OpenAI Responses response: ERROR: permission denied for table content_analysis_cache (SQLSTATE 42501)'))
         self.assertEqual(safe["category"], "provider_response_json_decode")
         self.assertEqual((safe["sqlstate"], safe["table"]), (None, None))
+
+    def test_transport_subtypes_discard_private_urls_hosts_addresses_and_certificate_details(self):
+        for reason, expected in (
+            ("dial tcp: lookup private-provider-host.example on 10.20.30.40:53: no such host", "dns"),
+            ("dial tcp: lookup private-provider-host.example on 10.20.30.40:53: server misbehaving", "dns"),
+            ("dial tcp: lookup private-provider-host.example: read udp 10.20.30.40:123->192.0.2.55:53: i/o timeout", "dns"),
+            ("tls: failed to verify certificate: x509: certificate is valid for private-provider-host.example, not private-channel-post", "tls_certificate_verification"),
+            ("x509: certificate signed by unknown authority private-provider-request", "tls_certificate_verification"),
+            ("net/http: TLS handshake timeout", "tls_handshake_timeout"),
+            ("remote error: tls: handshake failure", "tls_handshake_failure"),
+            ("dial tcp 192.0.2.55:443: connect: connection refused", "connection_refused"),
+            ("read tcp 10.20.30.40:123->192.0.2.55:443: read: connection reset by peer", "connection_reset"),
+            ("dial tcp 192.0.2.55:443: i/o timeout", "connect_timeout"),
+            ("dial tcp 192.0.2.55:443: connect: connection timed out", "connect_timeout"),
+            ("dial tcp 192.0.2.55:443: connect: cannot assign requested address", "connect_error"),
+            ("dial tcp 192.0.2.55:443: connect: no route to host", "no_route"),
+            ("dial tcp 192.0.2.55:443: connect: network is unreachable", "no_route"),
+            ("EOF", "eof"),
+            ("unexpected EOF", "eof"),
+            ("context deadline exceeded (Client.Timeout exceeded while awaiting headers)", "deadline_exceeded"),
+            ("net/http: request canceled (Client.Timeout exceeded while awaiting headers)", "deadline_exceeded"),
+            ("context canceled", "request_canceled"),
+            ("net/http: timeout awaiting response headers", "response_header_timeout"),
+            ("read tcp 10.20.30.40:123->192.0.2.55:443: read: i/o timeout", "read_timeout"),
+            ("write tcp 10.20.30.40:123->192.0.2.55:443: write: i/o timeout", "write_timeout"),
+            ("private-provider-request " + SECRETS[0], "unknown"),
+        ):
+            with self.subTest(expected=expected, reason=reason):
+                error = 'call OpenAI Responses API: Post "' + SECRETS[2] + '": ' + reason
+                safe = diagnostic.sanitize_record(record(error, url=SECRETS[2], response=SECRETS))
+                self.assertEqual(safe["transport_kind"], expected)
+                self.assertEqual(safe["category"], "provider_transport")
+                self.assertEqual((safe["sqlstate"], safe["table"], safe["constraint"]), (None, None, None))
+                self.assert_safe(safe)
+
+    def test_transport_subtype_ignores_reason_like_private_url_and_unknown_wrappers(self):
+        for quoted_url in (
+            'https://private-provider-host.example/net/http: TLS handshake timeout?token=' + SECRETS[0],
+            'https://private-provider-host.example/connection refused?token=' + SECRETS[0],
+            r'https://private-provider-host.example/escaped\"certificate\\path?token=' + SECRETS[0],
+        ):
+            safe = diagnostic.sanitize_record(record('call OpenAI Responses API: Post "' + quoted_url + '": EOF'))
+            self.assertEqual(safe["transport_kind"], "eof")
+            self.assert_safe(safe)
+        for suffix in (
+            "private-provider-request: net/http: TLS handshake timeout",
+            "private-provider-request: EOF",
+            "net/http: TLS handshake timeout\n" + SECRETS[0],
+            "dial tcp: lookup private-provider-host.example: unrecognized private-provider-request",
+        ):
+            safe = diagnostic.sanitize_record(record("call OpenAI Responses API: " + suffix))
+            self.assertEqual(safe["transport_kind"], "unknown")
+            self.assert_safe(safe)
+
+    def test_transport_classification_applies_only_to_source_owned_transport_prefix(self):
+        for error in (
+            "net/http: TLS handshake timeout",
+            "read OpenAI Responses response: EOF",
+            "decode OpenAI Responses response: context canceled",
+            "private-provider-request: call OpenAI Responses API: EOF",
+            'ERROR: permission denied for table content_analysis_cache (SQLSTATE 42501)',
+        ):
+            safe = diagnostic.sanitize_record(record(error))
+            self.assertIsNone(safe["transport_kind"])
+            self.assert_safe(safe)
+        safe = diagnostic.sanitize_record(record("call OpenAI Responses API: context deadline exceeded"))
+        self.assertEqual((safe["category"], safe["transport_kind"]), ("deadline_exceeded", "deadline_exceeded"))
+        self.assert_safe(safe)
 
     def test_static_wrapped_source_prefix_chain_is_bounded(self):
         safe = diagnostic.sanitize_record(record(
@@ -165,6 +235,8 @@ class InvocationTests(unittest.TestCase):
             (root / "current").symlink_to(release)
             commands = root / "docker-commands.jsonl"
             fake = root / "docker"
+            transport_record = json.dumps(record(
+                'call OpenAI Responses API: Post "' + SECRETS[2] + '": net/http: TLS handshake timeout', body=SECRETS))
             fake.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
                             "root=Path(__file__).parent\n"
                             "with (root/'docker-commands.jsonl').open('a') as log: log.write(json.dumps(sys.argv[1:])+'\\n')\n"
@@ -172,6 +244,7 @@ class InvocationTests(unittest.TestCase):
                             "elif sys.argv[1]=='logs':\n"
                             f" print({json.dumps(record('ERROR: permission denied for table content_discovery_candidates (SQLSTATE 42501)', body=SECRETS))!r})\n"
                             f" print({json.dumps(record('decode OpenAI Responses response: ' + SECRETS[0]))!r},file=sys.stderr)\n"
+                            f" print({transport_record!r},file=sys.stderr)\n"
                             f" print({SECRETS[2]!r},file=sys.stderr)\n"
                             "else: sys.exit(91)\n")
             fake.chmod(0o700)
@@ -182,7 +255,10 @@ class InvocationTests(unittest.TestCase):
             for secret in SECRETS:
                 self.assertNotIn(secret, result.stdout)
             output = [json.loads(line) for line in result.stdout.splitlines()]
-            self.assertEqual(len(output), 3)
+            self.assertEqual(len(output), 4)
+            transport = [item for item in output[:-1] if item["category"] == "provider_transport"]
+            self.assertEqual(len(transport), 1)
+            self.assertEqual(transport[0]["transport_kind"], "tls_handshake_timeout")
             self.assertEqual(output[-1]["read_status"], "complete")
             calls = [json.loads(line) for line in commands.read_text().splitlines()]
             self.assertEqual([call[0] for call in calls], ["inspect", "logs", "inspect"])
