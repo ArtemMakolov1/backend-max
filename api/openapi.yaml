@@ -20,6 +20,7 @@ tags:
   - name: Workspaces
   - name: Billing
   - name: Collaboration
+  - name: MAXComments
   - name: Notifications
   - name: Brand
   - name: Campaigns
@@ -2733,6 +2734,127 @@ paths:
       responses:
         '201': {$ref: '#/components/responses/PostReview'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    get:
+      tags: [MAXComments]
+      operationId: getWorkspacePostMAXComments
+      summary: Read observed public MAX comments for the current publication
+      description: Requires posts.read and the connected bot's administrator/read_all_messages permission. Reads the local inbox, bounded to its newest 100 rows, and checks current provider authority. This is separate from editorial team discussion. No provider total or complete history is claimed.
+      security: [{sessionCookie: []}]
+      parameters:
+        - name: expected_root_message_id
+          in: query
+          required: false
+          schema: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        - name: client_request_ids
+          in: query
+          required: false
+          description: Up to 20 comma-separated permanent request keys from the browser's pending journal. Matching finished operations from this current MAX publication are included even when older than the normal recent-operation window.
+          schema: {type: string, maxLength: 1619}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [MAXComments]
+      operationId: sendWorkspacePostMAXComment
+      summary: Send a public comment or reply once
+      description: |
+        Requires posts.write, bot administrator/read_all_messages/write authority and an active channel.
+        A permanent client_request_id and expected MAX publication MID fence the write. Never automatically retry an ambiguous request with a new key. A max_comment_uncertain or max_comment_busy response preserves the pending action; an explicit max_comment_not_written guarantees this action was not accepted by MAX. A successful duplicate key returns its durable result without another send. An uncertain send can only be linked explicitly to a matching received comment; ordinary sync never guesses that a send succeeded. Attachments and forwarding are unsupported.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MAXCommentSendInput'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments/sync:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [MAXComments]
+      operationId: syncWorkspacePostMAXComments
+      summary: Refresh the latest 100 public MAX comments
+      description: Requires posts.read and current bot administrator/read_all_messages authority. Performs read-only provider requests. Provider pagination has no documented total or marker, so even a short page remains incomplete. Missing rows and failed provider reads are never interpreted as deletion. A 15 second sync cooldown and per-publication claim prevent concurrent refreshes. Exact plain-text edit readback may reconcile an uncertain edit; SEND remains explicit and DELETE needs an actual removal event.
+      security: [{sessionCookie: []}]
+      parameters:
+        - name: expected_root_message_id
+          in: query
+          required: true
+          schema: {$ref: '#/components/schemas/MAXCommentMessageId'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments/{comment_mid}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - name: comment_mid
+        in: path
+        required: true
+        schema: {$ref: '#/components/schemas/MAXCommentMessageId'}
+    put:
+      tags: [MAXComments]
+      operationId: editWorkspacePostMAXComment
+      summary: Edit this connected bot's own plain comment
+      description: Requires posts.write and current read authority. Only the exact connected bot's plain-text comments younger than 26 hours are editable; own editing does not require provider write permission. The existing reply association is preserved. The current row version and MAX publication MID are rechecked before writing. Marked-up or other authors' comments remain read-only. No automatic provider retry; an accepted edit followed by failed readback remains uncertain.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MAXCommentEditInput'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [MAXComments]
+      operationId: deleteWorkspacePostMAXComment
+      summary: Delete a public MAX comment
+      description: Requires posts.delete and current bot administrator/read_all_messages/delete authority. The current row version and MAX publication MID are fenced before the single provider call. Reads, own edits and deletes of old comments remain available in archived provider channels when authority remains valid. A failed GET is never proof of deletion.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MAXCommentDeleteInput'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments/operations/{operation_id}/reconcile:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - name: operation_id
+        in: path
+        required: true
+        schema: {type: string, pattern: '^mco_[0-9a-f]{32}$'}
+    post:
+      tags: [MAXComments]
+      operationId: reconcileWorkspacePostMAXCommentSend
+      summary: Explicitly identify an already received reply for an uncertain send
+      description: Performs a scoped read-only MAX lookup and a local link, never a resend. Requires posts.write. Only a plain-text uncertain SEND by the exact current bot can be linked; root, author, text, reply and creation time must match the private durable attempt. An uncertain send blocks another SEND for this publication but does not block reading or editing/deleting other comments.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_root_message_id, message_id]
+              properties:
+                expected_root_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+                message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/posts/{post_id}/comments:
     parameters:
       - {$ref: '#/components/parameters/WorkspaceId'}
@@ -3143,6 +3265,11 @@ components:
     PostReviewList:
       description: Review decisions
       content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PostReview'}}}}
+    MAXComments:
+      description: Observed public MAX inbox, authority, coverage and durable operation states
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/MAXCommentsView'}
     PostComment:
       description: Post comment
       content: {application/json: {schema: {$ref: '#/components/schemas/PostComment'}}}
@@ -3159,6 +3286,121 @@ components:
       description: User notifications
       content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Notification'}}}}
   schemas:
+    MAXCommentMessageId:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$'
+    MAXCommentWriteFence:
+      type: object
+      required: [expected_root_message_id, client_request_id]
+      properties:
+        expected_root_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        client_request_id:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{16,80}$'
+          description: Permanent key for this single attempt. Reusing it with another payload or publication is rejected; an unknown result must not be resent using a new key.
+    MAXCommentSendInput:
+      allOf:
+        - {$ref: '#/components/schemas/MAXCommentWriteFence'}
+        - type: object
+          required: [text]
+          properties:
+            text: {type: string, minLength: 1, maxLength: 4000}
+            format: {type: string, enum: ['', markdown, html]}
+            reply_to_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+      unevaluatedProperties: false
+    MAXCommentEditInput:
+      allOf:
+        - {$ref: '#/components/schemas/MAXCommentWriteFence'}
+        - type: object
+          required: [text, expected_version]
+          properties:
+            text: {type: string, minLength: 1, maxLength: 4000}
+            format: {type: string, enum: ['', markdown, html]}
+            expected_version: {type: integer, format: int64, minimum: 1}
+      unevaluatedProperties: false
+    MAXCommentDeleteInput:
+      allOf:
+        - {$ref: '#/components/schemas/MAXCommentWriteFence'}
+        - type: object
+          required: [expected_version]
+          properties:
+            expected_version: {type: integer, format: int64, minimum: 1}
+      unevaluatedProperties: false
+    MAXCommentOperation:
+      type: object
+      required: [operation_id, client_request_id, kind, state]
+      properties:
+        operation_id: {type: string, pattern: '^mco_[0-9a-f]{32}$'}
+        client_request_id: {type: string, pattern: '^[A-Za-z0-9_-]{16,80}$'}
+        kind: {type: string, enum: [send, edit, delete]}
+        state: {type: string, enum: [sending, succeeded, rejected, uncertain]}
+        message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+    MAXCommentView:
+      type: object
+      required: [message_id, text, sender_name, sender_is_bot, created_at, updated_at, deleted_at, version, is_own, can_edit, can_delete]
+      properties:
+        message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        text: {type: string, maxLength: 4000}
+        sender_name: {type: string}
+        sender_is_bot: {type: boolean}
+        reply_to_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        deleted_at: {type: [string, 'null'], format: date-time}
+        version: {type: integer, format: int64, minimum: 1}
+        is_own:
+          type: boolean
+          description: True only for an explicit sender identity matching the current connected bot, never inferred from sender_is_bot alone.
+        can_edit: {type: boolean}
+        can_delete: {type: boolean}
+    MAXCommentsView:
+      type: object
+      required: [post_id, root_message_id, comments, operations, capabilities, coverage, metrics]
+      properties:
+        post_id: {type: integer, format: int64, minimum: 1}
+        root_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        comments:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/MAXCommentView'}
+        operations:
+          type: array
+          description: Every active sending/uncertain operation, the 10 most recent operations, and optionally requested finished keys; scoped to this current MAX publication.
+          items: {$ref: '#/components/schemas/MAXCommentOperation'}
+        operation: {$ref: '#/components/schemas/MAXCommentOperation'}
+        capabilities:
+          type: object
+          required: [can_read, can_reply, can_delete]
+          properties:
+            can_read: {type: boolean}
+            can_reply: {type: boolean}
+            can_delete: {type: boolean}
+            read_only_reason: {type: string, enum: [workspace_read_only]}
+            reply_unavailable_reason: {type: string, enum: [workspace_read_only, missing_write_permission, channel_not_active]}
+        coverage:
+          type: object
+          required: [kind, complete, page_limit, last_synced_at, truncated]
+          properties:
+            kind: {type: string, const: latest_100}
+            complete: {type: boolean, const: false}
+            page_limit: {type: integer, const: 100}
+            last_synced_at: {type: [string, 'null'], format: date-time}
+            truncated:
+              type: boolean
+              description: Latest provider page reached 100 entries. False does not imply complete history.
+        metrics:
+          type: object
+          description: Aggregates of all locally observed rows for this publication, separate from the 100-row response limit. Values remain null until a successful sync. Current active rows and known tombstones are observed coverage, never a provider total.
+          required: [observed_total, observed_inbound, observed_replies, observed_deleted, unique_authors, response_rate, median_response_seconds, total]
+          properties:
+            observed_total: {type: [integer, 'null'], format: int64, minimum: 0}
+            observed_inbound: {type: [integer, 'null'], format: int64, minimum: 0}
+            observed_replies: {type: [integer, 'null'], format: int64, minimum: 0}
+            observed_deleted: {type: [integer, 'null'], format: int64, minimum: 0}
+            unique_authors: {type: [integer, 'null'], format: int64, minimum: 0}
+            response_rate: {type: [number, 'null'], minimum: 0, maximum: 1}
+            median_response_seconds: {type: [number, 'null'], minimum: 0}
+            total: {type: 'null'}
     ProblemEnvelope:
       type: object
       required: [error]
@@ -3991,6 +4233,9 @@ components:
           const: ok
         max_configured:
           type: boolean
+        max_comments_configured:
+          type: boolean
+          description: The configured MAX client supports the provider comments API. Current workspace, publication and MAX rights still gate each endpoint.
         openai_configured:
           type: boolean
         research_configured:
@@ -5392,6 +5637,7 @@ components:
         participants_count: {type: integer, minimum: 0}
     AnalyticsContentSummary:
       type: object
+      description: Comment observations aggregate current MAX threads of publications selected by the report's publication period, not every comment created in that period. Unknown or unreconstructable as-of observations remain null.
       required:
         - posts_total
         - published_posts
@@ -5412,6 +5658,11 @@ components:
         views_change: {type: [integer, 'null'], format: int64}
         views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
         average_views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+        observed_comments: {type: [integer, 'null'], format: int64, minimum: 0}
+        observed_comment_authors: {type: [integer, 'null'], format: int64, minimum: 0}
+        comments_synced_posts: {type: integer, minimum: 0}
+        comments_last_synced_at: {type: [string, 'null'], format: date-time}
+        comments_coverage_complete: {type: boolean, const: false}
     AnalyticsContentPost:
       type: object
       required:
@@ -5446,6 +5697,14 @@ components:
         max_stats_synced_at: {type: [string, 'null'], format: date-time}
         publication_state: {type: string, enum: [published, removed]}
         removed_from_max: {type: boolean}
+        observed_comments:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: Active comments observed on this selected MAX publication, not a provider total. Null before successful sync or when the requested as-of snapshot cannot be reconstructed.
+        comments_last_synced_at: {type: [string, 'null'], format: date-time}
+        comments_coverage_complete: {type: boolean, const: false}
+        comments_truncated: {type: boolean}
     AnalyticsHeatmapCell:
       type: object
       required: [weekday, hour, posts, views_per_1k_audience, views_per_hour, score]
@@ -5524,6 +5783,7 @@ components:
         max_stats_synced_at: {type: [string, 'null'], format: date-time}
     WorkspacePostAnalyticsSummary:
       type: object
+      description: Comment fields apply only to the selected MAX publication/root and effective report cutoff. They describe observed coverage, not a provider total or complete history.
       required:
         - views
         - views_change
@@ -5566,6 +5826,10 @@ components:
         series_truncated:
           type: boolean
           description: True when older observations were omitted and summary window metrics use only the returned series.
+        observed_comments: {type: [integer, 'null'], format: int64, minimum: 0}
+        comments_last_synced_at: {type: [string, 'null'], format: date-time}
+        comments_coverage_complete: {type: boolean, const: false}
+        comments_truncated: {type: boolean}
     WorkspacePostAnalyticsSeriesPoint:
       type: object
       required: [captured_at, views, delta, interval_views_per_hour, correction]
