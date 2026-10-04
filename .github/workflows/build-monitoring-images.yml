@@ -5,7 +5,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: maxposty-monitoring-images
@@ -16,11 +15,15 @@ jobs:
     name: Build immutable monitoring images
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
     outputs:
       postgres_exporter: ${{ steps.build.outputs.postgres_exporter }}
       pgbouncer_exporter: ${{ steps.build.outputs.pgbouncer_exporter }}
       node_exporter: ${{ steps.build.outputs.node_exporter }}
       alertmanager: ${{ steps.build.outputs.alertmanager }}
+      grafana: ${{ steps.build.outputs.grafana }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -68,6 +71,7 @@ jobs:
           build_image pgbouncer-exporter v0.12.1-go1.26.8.3 docker/monitoring/pgbouncer-exporter.Dockerfile
           build_image node-exporter v1.12.1-go1.26.8.1 docker/monitoring/node-exporter.Dockerfile
           build_image alertmanager v0.34.1-go1.26.8.1 docker/monitoring/alertmanager.Dockerfile
+          build_image grafana nightly-20261004-prometheus.1 docker/monitoring/grafana.Dockerfile
       - name: Remove registry credentials
         if: ${{ always() }}
         shell: bash
@@ -78,10 +82,13 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
     strategy:
       fail-fast: false
       matrix:
-        component: [postgres-exporter, pgbouncer-exporter, node-exporter, alertmanager]
+        component: [postgres-exporter, pgbouncer-exporter, node-exporter, alertmanager, grafana]
         platform: [linux/amd64, linux/arm64]
     env:
       TRIVY_PLATFORM: ${{ matrix.platform }}
@@ -92,7 +99,9 @@ jobs:
             needs.build.outputs.pgbouncer_exporter ||
             matrix.component == 'node-exporter' &&
             needs.build.outputs.node_exporter ||
-            needs.build.outputs.alertmanager }}
+            matrix.component == 'alertmanager' &&
+            needs.build.outputs.alertmanager ||
+            needs.build.outputs.grafana }}
     steps:
       - name: Log in to GitHub Container Registry
         shell: bash
