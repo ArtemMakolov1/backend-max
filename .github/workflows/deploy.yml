@@ -257,6 +257,8 @@ jobs:
           BILLING_LIVE_ENABLED: ${{ vars.BILLING_LIVE_ENABLED || 'false' }}
           YOOKASSA_RECEIPTS_CONFIRMED: ${{ vars.YOOKASSA_RECEIPTS_CONFIRMED || 'false' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           OPENAI_RESEARCH_MODEL: ${{ vars.OPENAI_RESEARCH_MODEL || 'gpt-6-luna' }}
           OPENAI_IMAGE_MODEL: ${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}
           YOOKASSA_SHOP_ID: ${{ secrets.YOOKASSA_SHOP_ID }}

@@ -359,6 +359,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"status": "ok", "max_configured": s.app.MAXConfigured(), "openai_configured": s.app.OpenAIConfigured(),
 		"research_configured": s.app.ResearchConfigured(), "content_formatting_configured": s.app.ContentFormattingConfigured(),
 		"content_discovery_configured": s.app.ContentDiscoveryConfigured(),
+		"content_search_configured":    s.app.ContentSearchConfigured(),
 		"max_comments_configured":      s.app.MAXCommentsConfigured(),
 		"auth_required":                status.Required, "authenticated": status.Authenticated,
 		"auth_methods": status.Methods, "auth_method": status.Method, "user": status.User,
@@ -957,6 +958,12 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			return
 		}
 		if errors.As(err, &researchErr) {
+			if researchErr.Code == "content_search_failed" {
+				s.logger.Warn("content source retrieval failed")
+				s.problem(w, http.StatusBadGateway, "content_search_error",
+					"Не удалось получить материалы. Попробуйте ещё раз немного позже.", nil)
+				return
+			}
 			s.logger.Warn("OpenAI research request failed", "status", researchErr.StatusCode,
 				"request_id", researchErr.RequestID, "error", researchErr.Message)
 			s.problem(w, http.StatusBadGateway, "openai_research_error",

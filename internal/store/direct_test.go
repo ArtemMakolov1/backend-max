@@ -1384,6 +1384,16 @@ func createDirectTestCampaign(
 	if len(scheduledStart) > 0 {
 		startsAt = scheduledStart[0]
 	}
+	return createDirectTestCampaignStartingAt(t, ctx, storage, owner, workspaceID, now, startsAt)
+}
+
+// Keep the shared launch fixture due today; edit-only tests can explicitly
+// choose a later provider date without changing the campaign creation clock.
+func createDirectTestCampaignStartingAt(
+	t *testing.T, ctx context.Context, storage *Store, owner, workspaceID string,
+	now, startsAt time.Time,
+) DirectCampaign {
+	t.Helper()
 	campaign, err := storage.CreateDirectCampaign(ctx, owner, workspaceID, DirectCampaign{
 		Name: "Test campaign", Objective: "traffic", LandingURL: "https://maxposty.ru/",
 		Brief: "Promote the workspace channel", Regions: []string{"225"},

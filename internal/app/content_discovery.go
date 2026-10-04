@@ -18,6 +18,11 @@ func (a *App) ContentDiscoveryConfigured() bool {
 	return a.research != nil && ok
 }
 
+func (a *App) ContentSearchConfigured() bool {
+	client, ok := a.research.(interface{ ContentSearchConfigured() bool })
+	return ok && client.ContentSearchConfigured()
+}
+
 // Finish all owned channel/context lookups before reserving a paid AI request.
 // Reserve one bounded discovery operation before any paid media/model calls.
 func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
