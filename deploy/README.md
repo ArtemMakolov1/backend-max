@@ -41,6 +41,36 @@ read-only Docker-запрос — восемью секундами и 16 KiB. �
 Весь workflow ограничен пятью минутами. Диагностика ничего не деплоит и не
 сохраняет на сервере или в artifacts.
 
+### Однократная проверка авторизованного POST с хоста
+
+`validate-provider-host-post.yml` запускается вручную только для точного SHA
+`main` в защищённом Environment `production`. Получатель SSH закреплён как
+`maxposty-deploy@77.91.94.235:22` и проверяется по сохранённому host key.
+Runner передаёт только designated `EXA_API_KEY` и `TAVILY_API_KEY` через
+зашифрованный stdin SSH; ключи не попадают в аргументы команд, файлы или вывод.
+Серверный helper получает чистое окружение и не читает production-конфигурацию.
+
+Каждый запуск выполняет ровно один POST на `https://api.exa.ai/search`
+(`type: auto`, `numResults: 1`, `contents.highlights: true`) и один на
+`https://api.tavily.com/search` (`search_depth: basic`, `max_results: 1`).
+Запрос фиксирован: `public information about the solar system`.
+Форматы сверены с [Exa Search](https://exa.ai/docs/reference/search) и
+[Tavily Search](https://docs.tavily.com/documentation/api-reference/endpoint/search).
+Такие запросы могут использовать кредиты поиска. Повторов и fallback нет.
+
+Вывод содержит только `provider`, `scope: host`, безопасный `http_status` или
+enum `result`; response body, request ID, заголовки и причины ошибок не читаются
+и не выводятся. TLS проверяет сертификат и hostname, redirects и proxies отключены.
+Ввод ограничен 16 KiB и пятью секундами, каждый POST — socket timeout 15 секунд
+и deadline 20 секунд. ОС завершает весь серверный helper через 50 секунд,
+runner ограничен 70 секундами и 4 KiB вывода; на сервере нужен `/usr/bin/timeout`.
+Временная SSH identity на runner удаляется в `always()` cleanup.
+
+Успешный workflow означает завершение диагностики: например, `401` и `403`
+также штатно выводятся как результат. Пригодность ключа оценивается по HTTP-статусу.
+Хостовый `200` не подтверждает container TLS/POST, равенство runtime-ключа
+переданному GitHub secret, получение материалов, работу Luna или полный UX.
+
 Backend разворачивается из GitHub Actions в GHCR и затем на один VPS. Основной
 production-домен — `https://maxposty.ru`. Frontend-репозиторий владеет Caddy,
 портами `80/443` и внешней Docker-сетью `maxposty-edge`. Caddy направляет
