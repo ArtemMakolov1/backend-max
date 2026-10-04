@@ -6,7 +6,7 @@ info:
     Canonical HTTP contract shared by the MaxPosty backend and frontend.
     Browser sessions are carried by the secure `maxstudio_session` cookie.
 servers:
-  - url: https://api.maxposty.ru/api/v1
+  - url: https://maxposty.ru/api/v1
     description: Production
   - url: http://localhost:8080/api/v1
     description: Local development
@@ -1113,6 +1113,99 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/DirectExternalCampaignListEnvelope'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    get:
+      tags: [Advertising]
+      operationId: getDirectExternalCampaignDetail
+      summary: Inspect an existing provider campaign without importing or duplicating it
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Fresh provider fields and local edit revision, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalCampaignName
+      summary: Update only an existing campaign name after checking the observed revision
+      description: Local claims serialize MaxPosty writes; the provider API has no atomic revision check against changes made in its own console. Uncertain writes are reconciled by reading the provider, never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalNamePatch'}
+      responses:
+        '200': {description: Verified provider detail, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/ads/{provider_ad_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_ad_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalAd
+      summary: Update chosen copy or destination fields of one existing ad
+      description: Budget, bids, targeting and activation are outside this operation. Required ResponsiveAd peers are preserved from a fresh provider read.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalAdPatch'}
+      responses:
+        '200': {description: Verified provider detail, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/import:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: bookmarkDirectExternalCampaign
+      summary: Save a local reference without creating a duplicate provider campaign
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBookmarkInput'}
+      responses:
+        '200': {description: Provider campaign and saved local reference, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Advertising]
+      operationId: unbookmarkDirectExternalCampaign
+      summary: Remove only the local reference
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBookmarkInput'}
+      responses:
+        '200': {description: Provider campaign and cleared local reference, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/ads/{provider_ad_id}/suggest:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_ad_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising, AI]
+      operationId: suggestDirectExternalAdCopy
+      summary: Suggest copy for one existing ad without requiring new campaign dates or changing its budget
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalCopyInput'}
+      responses:
+        '200': {description: Proposal only; no provider writes, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalCopyEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/advertising/direct/campaigns/sync:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
     post:
@@ -1869,6 +1962,21 @@ paths:
             schema: {$ref: '#/components/schemas/WorkspaceResearchInput'}
       responses:
         '200': {description: Research result, content: {application/json: {schema: {$ref: '#/components/schemas/ResearchResult'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/research/discover:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: discoverWorkspaceContent
+      summary: Find up to three grounded ideas, articles, memes or videos for a channel
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContentDiscoveryInput'}
+      responses:
+        '200': {description: Grounded content cards, content: {application/json: {schema: {$ref: '#/components/schemas/ContentDiscoveryResult'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/brand-kit:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
@@ -3128,6 +3236,9 @@ components:
           type: boolean
           description: True when the separate Yandex Cloud Search API Wordstat credentials are configured.
         writes_enabled: {type: boolean}
+        external_details_available: {type: boolean, default: false}
+        external_edit_available: {type: boolean, default: false}
+        external_copy_ai_available: {type: boolean, default: false}
         auto_launch_enabled:
           type: boolean
           description: >
@@ -3493,6 +3604,108 @@ components:
         ends_at: {type: [string, 'null'], format: date}
         timezone: {type: string, minLength: 1, maxLength: 128}
         synced_at: {type: string, format: date-time}
+    DirectExternalEditableField:
+      type: string
+      enum: [name, title, title2, text, titles, texts, href]
+    DirectExternalAd:
+      type: object
+      required: [provider_ad_id, provider_ad_group_id, ad_type, provider_status, provider_state, title, title2, text, titles, texts, href, editable_fields, read_only_reason]
+      properties:
+        provider_ad_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        provider_ad_group_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        ad_type: {type: string}
+        provider_status: {type: string}
+        provider_state: {type: string}
+        title: {type: [string, 'null']}
+        title2: {type: [string, 'null']}
+        text: {type: [string, 'null']}
+        titles: {type: array, items: {type: string}}
+        texts: {type: array, items: {type: string}}
+        href: {type: [string, 'null']}
+        editable_fields: {type: array, items: {$ref: '#/components/schemas/DirectExternalEditableField'}}
+        read_only_reason: {type: [string, 'null'], enum: [writes_unavailable, account_read_only, member_read_only, edit_in_progress, campaign_archived, ad_archived, ad_fields_unavailable, unsupported_ad_type, null]}
+    DirectExternalDetail:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalCampaign'}
+        - type: object
+          required: [connection_id, version, observed_hash, revision_id, bookmarked, edit_state, editable_fields, read_only_reason, ads]
+          properties:
+            connection_id: {type: string}
+            version: {type: integer, format: int64, minimum: 1}
+            observed_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+            revision_id: {type: string, pattern: '^dxr_[0-9a-f]{32}$'}
+            bookmarked: {type: boolean}
+            edit_state: {type: string, enum: [idle, updating, uncertain]}
+            editable_fields: {type: array, items: {$ref: '#/components/schemas/DirectExternalEditableField'}}
+            read_only_reason: {type: [string, 'null'], enum: [writes_unavailable, account_read_only, member_read_only, edit_in_progress, campaign_archived, ad_archived, ad_fields_unavailable, unsupported_ad_type, null]}
+            ads: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/DirectExternalAd'}}
+    DirectExternalDetailEnvelope:
+      type: object
+      required: [campaign]
+      properties:
+        campaign: {$ref: '#/components/schemas/DirectExternalDetail'}
+    DirectExternalEditFence:
+      type: object
+      required: [expected_connection_id, expected_version, expected_observed_hash, expected_revision_id]
+      properties:
+        expected_connection_id: {type: string, minLength: 1}
+        expected_version: {type: integer, format: int64, minimum: 1}
+        expected_observed_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        expected_revision_id: {type: string, pattern: '^dxr_[0-9a-f]{32}$'}
+    DirectExternalNamePatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [name]
+          properties:
+            name: {type: string, minLength: 1, maxLength: 255}
+    DirectExternalCopyFields:
+      type: object
+      description: Only chosen editable copy fields are submitted; title2 null explicitly clears the second headline.
+      properties:
+        title: {type: string, minLength: 1, maxLength: 200}
+        title2: {type: [string, 'null'], maxLength: 200}
+        text: {type: string, minLength: 1, maxLength: 200}
+        titles: {type: array, minItems: 1, maxItems: 7, items: {type: string, minLength: 1, maxLength: 200}}
+        texts: {type: array, minItems: 1, maxItems: 3, items: {type: string, minLength: 1, maxLength: 200}}
+        href: {type: string, format: uri, maxLength: 1024}
+    DirectExternalAdPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - {$ref: '#/components/schemas/DirectExternalCopyFields'}
+    DirectExternalBookmarkInput:
+      type: object
+      required: [expected_connection_id]
+      properties:
+        expected_connection_id: {type: string, minLength: 1}
+    DirectExternalCopyInput:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [brief]
+          properties:
+            brief: {type: string, minLength: 10, maxLength: 4000}
+            current_draft: {$ref: '#/components/schemas/DirectExternalCopyFields'}
+    DirectExternalCopyEnvelope:
+      type: object
+      required: [suggestion]
+      properties:
+        suggestion:
+          type: object
+          required: [variants, rationale, risk_warnings]
+          properties:
+            variants:
+              type: array
+              minItems: 3
+              maxItems: 3
+              items:
+                type: object
+                required: [title, text]
+                properties:
+                  title: {type: string}
+                  text: {type: string}
+            rationale: {type: array, items: {type: string}}
+            risk_warnings: {type: array, items: {type: string}}
     DirectExternalCampaignListEnvelope:
       type: object
       required: [items, synced_at]
@@ -3781,6 +3994,8 @@ components:
         openai_configured:
           type: boolean
         research_configured:
+          type: boolean
+        content_discovery_configured:
           type: boolean
         content_formatting_configured:
           type: boolean
@@ -5126,6 +5341,39 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ResearchSource'
+    ContentDiscoveryInput:
+      type: object
+      properties:
+        topic: {type: string, maxLength: 500, description: Optional when an accessible channel is selected; otherwise at least two characters.}
+        content_kind: {type: string, enum: [auto, idea, article, meme, video], default: auto, description: Auto selects topics and formats from server-owned channel context and recent published text and media types.}
+        channel_id: {type: integer, format: int64, minimum: 1}
+        format: {$ref: '#/components/schemas/PostFormat'}
+    ContentDiscoveryCard:
+      type: object
+      required: [id, content_kind, title, summary, source, draft]
+      properties:
+        id: {type: string, pattern: '^[0-9a-f]{16}$'}
+        content_kind: {type: string, enum: [idea, article, meme, video]}
+        title: {type: string, minLength: 1, maxLength: 120}
+        summary: {type: string, minLength: 1, maxLength: 350}
+        source: {$ref: '#/components/schemas/ResearchSource'}
+        draft:
+          allOf:
+            - {$ref: '#/components/schemas/ResearchDraft'}
+            - type: object
+              properties:
+                content: {type: string, minLength: 1, maxLength: 4000}
+        preview_image_url: {type: string, format: uri, description: Actual image search result associated with this source; never attached to a draft automatically.}
+    ContentDiscoveryResult:
+      type: object
+      required: [topic, content_kind, cards]
+      properties:
+        topic: {type: string}
+        content_kind: {type: string, enum: [auto, idea, article, meme, video], description: Requested mode. Auto can return cards with different content kinds.}
+        cards:
+          type: array
+          maxItems: 3
+          items: {$ref: '#/components/schemas/ContentDiscoveryCard'}
     AnalyticsContentScope:
       type: object
       required: [kind, channels_count]

@@ -216,6 +216,7 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/posts/format-content", s.formatWorkspacePostContent)
 				r.Post("/posts/suggest-image-prompt", s.suggestWorkspaceImagePrompt)
 				r.Post("/research/generate", s.generateWorkspaceResearch)
+				r.Post("/research/discover", s.discoverWorkspaceContent)
 				r.Post("/images/generate", s.generateWorkspaceImage)
 				r.Post("/media", s.uploadWorkspaceMedia)
 				r.Get("/media/{filename}", s.serveWorkspaceMedia)
@@ -354,7 +355,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok", "max_configured": s.app.MAXConfigured(), "openai_configured": s.app.OpenAIConfigured(),
 		"research_configured": s.app.ResearchConfigured(), "content_formatting_configured": s.app.ContentFormattingConfigured(),
-		"auth_required": status.Required, "authenticated": status.Authenticated,
+		"content_discovery_configured": s.app.ContentDiscoveryConfigured(),
+		"auth_required":                status.Required, "authenticated": status.Authenticated,
 		"auth_methods": status.Methods, "auth_method": status.Method, "user": status.User,
 		"session_expires_at": status.SessionExpiresAt, "observability_access": status.ObservabilityAccess,
 	})
