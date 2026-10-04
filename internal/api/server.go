@@ -959,7 +959,9 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		}
 		if errors.As(err, &researchErr) {
 			if researchErr.Code == "content_search_failed" {
-				s.logger.Warn("content source retrieval failed")
+				diagnostic := researchErr.SearchDiagnostics.Safe()
+				s.logger.Warn("content source retrieval failed", "provider", diagnostic.Provider,
+					"code", diagnostic.Code, "status", diagnostic.Status, "transport_kind", diagnostic.TransportKind)
 				s.problem(w, http.StatusBadGateway, "content_search_error",
 					"Не удалось получить материалы. Попробуйте ещё раз немного позже.", nil)
 				return
