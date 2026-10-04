@@ -13,12 +13,14 @@ concurrency:
 
 jobs:
   build:
-    name: Build immutable exporter images
+    name: Build immutable monitoring images
     runs-on: ubuntu-latest
     timeout-minutes: 40
     outputs:
       postgres_exporter: ${{ steps.build.outputs.postgres_exporter }}
       pgbouncer_exporter: ${{ steps.build.outputs.pgbouncer_exporter }}
+      node_exporter: ${{ steps.build.outputs.node_exporter }}
+      alertmanager: ${{ steps.build.outputs.alertmanager }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -62,8 +64,10 @@ jobs:
             printf '%s=%s@%s\n' "${component//-/_}" "$repository" "$digest" >>"$GITHUB_OUTPUT"
           }
 
-          build_image postgres-exporter v0.20.1-go1.26.5.2 docker/monitoring/postgres-exporter.Dockerfile
-          build_image pgbouncer-exporter v0.12.1-go1.26.5.2 docker/monitoring/pgbouncer-exporter.Dockerfile
+          build_image postgres-exporter v0.20.1-go1.26.8.3 docker/monitoring/postgres-exporter.Dockerfile
+          build_image pgbouncer-exporter v0.12.1-go1.26.8.3 docker/monitoring/pgbouncer-exporter.Dockerfile
+          build_image node-exporter v1.12.1-go1.26.8.1 docker/monitoring/node-exporter.Dockerfile
+          build_image alertmanager v0.34.1-go1.26.8.1 docker/monitoring/alertmanager.Dockerfile
       - name: Remove registry credentials
         if: ${{ always() }}
         shell: bash
@@ -77,14 +81,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [postgres-exporter, pgbouncer-exporter]
+        component: [postgres-exporter, pgbouncer-exporter, node-exporter, alertmanager]
         platform: [linux/amd64, linux/arm64]
     env:
       TRIVY_PLATFORM: ${{ matrix.platform }}
       IMAGE_REF: >-
         ${{ matrix.component == 'postgres-exporter' &&
             needs.build.outputs.postgres_exporter ||
-            needs.build.outputs.pgbouncer_exporter }}
+            matrix.component == 'pgbouncer-exporter' &&
+            needs.build.outputs.pgbouncer_exporter ||
+            matrix.component == 'node-exporter' &&
+            needs.build.outputs.node_exporter ||
+            needs.build.outputs.alertmanager }}
     steps:
       - name: Log in to GitHub Container Registry
         shell: bash
