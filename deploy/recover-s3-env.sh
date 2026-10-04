@@ -50,11 +50,19 @@ awk '
 ' "$accepted_env" "$next_env" >"$temporary"
 chmod 600 "$temporary"
 "$release_dir/deploy/validate-production-env.sh" "$temporary"
+for key in S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION; do
+  same=false
+  [[ $(env_value "$accepted_env" "$key") != "$(env_value "$next_env" "$key")" ]] || same=true
+  echo "Accepted S3 versus fresh GitHub configuration: $key same=$same"
+done
 endpoint=$(env_value "$temporary" S3_HOST)
 endpoint=${endpoint%/}
 [[ "$endpoint" == https://* ]] || endpoint="https://$endpoint"
 region=$(env_value "$temporary" S3_REGION)
+region_explicit=false
+[[ -z "$region" ]] || region_explicit=true
 host=${endpoint#https://}; host=${host%%:*}
+host=${host,,}
 if [[ "$host" =~ ^[0-9.]+$ || "$host" != *.* ]]; then
   echo "Accepted S3 provider: private/custom endpoint"
 else
@@ -64,6 +72,7 @@ fi
 if [[ -z "$region" ]]; then
   if [[ "$host" =~ ^s3-([a-z0-9-]+)\.hostkey\.com$ ]]; then region=${BASH_REMATCH[1]}; else region=us-east-1; fi
 fi
+echo "S3 signing region (same resolver as verified SDK source): $region; explicit=$region_explicit"
 bucket=$(env_value "$temporary" S3_BUCKET)
 access_key=$(env_value "$temporary" S3_ACCESS_KEY)
 secret_key=$(env_value "$temporary" S3_SECRET_KEY)
@@ -75,6 +84,16 @@ config="$probe_dir/curl.conf"
   printf 'header = "x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"\n'
 } >"$config"
 unset access_key secret_key
+s3_error_code() {
+  local code
+  code=$(awk 'match($0, /<Code>[A-Za-z0-9]+<\/Code>/) { print substr($0,RSTART+6,RLENGTH-13); exit }' "$probe_dir/response")
+  # Never print provider-controlled response text, identifiers, or arbitrary Code values.
+  case "$code" in
+    InvalidAccessKeyId|SignatureDoesNotMatch|AccessDenied|AuthorizationHeaderMalformed|InvalidToken|ExpiredToken|RequestTimeTooSkewed|RequestExpired|NoSuchBucket|InvalidRequest|MalformedXML|PermanentRedirect|TemporaryRedirect|NotImplemented|InternalError|ServiceUnavailable|SlowDown|InvalidSecurity|AllAccessDisabled|AccountProblem)
+      printf '%s' "$code" ;;
+    *) printf 'unknown' ;;
+  esac
+}
 request() {
   local method=$1 target=$2 status
   printf 'url = "%s"\n' "$target" >"$probe_dir/url.conf"
@@ -83,7 +102,10 @@ request() {
   if ! status=$(curl "${args[@]}" 2>"$probe_dir/curl.error"); then
     echo "Accepted S3 settings failed the read-only connectivity check" >&2; return 1
   fi
-  [[ "$status" == 200 ]] || { echo "Accepted S3 settings failed read-only $method preflight (HTTP $status)" >&2; return 1; }
+  [[ "$status" == 200 ]] || {
+    echo "Accepted S3 settings failed read-only $method preflight (HTTP $status; S3 error code: $(s3_error_code))" >&2
+    return 1
+  }
 }
 if [[ -z "$bucket" ]]; then
   request GET "$endpoint/"
