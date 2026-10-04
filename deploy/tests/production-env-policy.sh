@@ -13,6 +13,8 @@ for billing_key in YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY; do
   grep -F "          $billing_key: \${{ secrets.$billing_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $billing_key: \${$billing_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
+grep -F "          OPENAI_RESEARCH_MODEL: \${{ vars.OPENAI_RESEARCH_MODEL || 'gpt-6-luna' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+grep -F "          OPENAI_IMAGE_MODEL: \${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
 for billing_flag in BILLING_LIVE_ENABLED YOOKASSA_RECEIPTS_CONFIRMED; do
   grep -F "          $billing_flag: \${{ vars.$billing_flag || 'false' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $billing_flag: \${$billing_flag}" "$repo_root/deploy/compose.production.yaml" >/dev/null
@@ -71,6 +73,8 @@ production_env="$sandbox/production.env"
 render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
 grep -Fx 'OPENAI_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'OPENAI_RESEARCH_MODEL=gpt-6-luna' "$production_env" >/dev/null
+grep -Fx 'OPENAI_IMAGE_MODEL=gpt-image-2' "$production_env" >/dev/null
 grep -Fx 'GRAFANA_ROOT_URL=https://maxposty.ru/monitoring/' "$production_env" >/dev/null
 grep -Fx 'ALERTMANAGER_WEBHOOK_URL=https://alerts.example.test/maxposty' "$production_env" >/dev/null
 grep -Fx 'PITR_RETENTION_DAYS=7' "$production_env" >/dev/null
@@ -108,6 +112,13 @@ grep -Fx 'SMTP_PASSWORD=' "$production_env" >/dev/null
 grep -Fx 'SMTP_FROM_EMAIL=' "$production_env" >/dev/null
 grep -Fx 'SMTP_FROM_NAME=MaxPosty' "$production_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$production_env"
+
+# Production overrides must survive workflow -> render -> compose so a model
+# rollback never silently falls back to a different provider default.
+configured_ai_env="$sandbox/configured-ai.env"
+render_production "$configured_ai_env" OPENAI_RESEARCH_MODEL=gpt-5.4-mini OPENAI_IMAGE_MODEL=gpt-image-2
+grep -Fx 'OPENAI_RESEARCH_MODEL=gpt-5.4-mini' "$configured_ai_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_ai_env"
 
 configured_smtp_env="$sandbox/configured-smtp.env"
 render_production "$configured_smtp_env" \

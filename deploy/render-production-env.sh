@@ -202,7 +202,7 @@ fi
   printf 'SMTP_FROM_EMAIL=%s\n' "$rendered_smtp_from_email"
   printf 'SMTP_FROM_NAME=%s\n' "$rendered_smtp_from_name"
   printf 'OPENAI_IMAGE_MODEL=%s\n' "${OPENAI_IMAGE_MODEL:-gpt-image-2}"
-  printf 'OPENAI_RESEARCH_MODEL=%s\n' "${OPENAI_RESEARCH_MODEL:-gpt-5.4-mini}"
+  printf 'OPENAI_RESEARCH_MODEL=%s\n' "${OPENAI_RESEARCH_MODEL:-gpt-6-luna}"
   printf 'AI_GLOBAL_MAX_CONCURRENT=%s\n' "${AI_GLOBAL_MAX_CONCURRENT:-4}"
   printf 'AI_USER_MAX_CONCURRENT=%s\n' "${AI_USER_MAX_CONCURRENT:-1}"
   printf 'AI_IMAGE_PER_MINUTE=%s\n' "${AI_IMAGE_PER_MINUTE:-2}"
