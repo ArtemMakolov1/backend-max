@@ -114,15 +114,18 @@ func externalDiscoverySources(found []contentsearch.Source) (map[string]Source, 
 			if !ok {
 				continue
 			}
-			entry.HasImage = true
-			if len(entry.Images) < 3 && strings.TrimSpace(image.Description) != "" {
-				entry.Images = append(entry.Images, truncateRunes(image.Description, 300))
-			}
 			candidate := DiscoveryMediaCandidate{Type: "image", URL: valid.URL, SourceURL: source.URL, PreviewOnly: image.PreviewOnly}
 			previous, exists := media[source.URL]
 			if !exists || (previous.PreviewOnly && !candidate.PreviewOnly) {
 				media[source.URL] = candidate
 				previews[source.URL] = valid.URL
+				entry.HasImage = true
+				// Describe only the image that will be previewed and transferred.
+				// A different image on the same page is not evidence for this one.
+				entry.Images = nil
+				if strings.TrimSpace(image.Description) != "" {
+					entry.Images = []string{truncateRunes(image.Description, 300)}
+				}
 			}
 		}
 		// An image page can have no extractable body. Keep its actual title and

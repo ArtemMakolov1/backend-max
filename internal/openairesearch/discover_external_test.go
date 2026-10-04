@@ -208,3 +208,66 @@ func TestExternalDiscoveryPreservesImageOnlyEvidenceWithoutInventingPageBody(t *
 		t.Fatalf("valid image-only retrieval was lost or its page text invented: %#v %#v", sources, evidence)
 	}
 }
+
+func TestExternalDiscoveryImageEvidenceMatchesTransferredCandidate(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		images      []contentsearch.Image
+		selectedURL string
+		description string
+		previewOnly bool
+	}{
+		{
+			name: "unrelated editor photo cannot describe the selected image",
+			images: []contentsearch.Image{
+				{URL: "https://cdn.example.com/meme.jpg"},
+				{URL: "https://cdn.example.com/editor.jpg", Description: "Фото редактора"},
+			},
+			selectedURL: "https://cdn.example.com/meme.jpg",
+		},
+		{
+			name: "selected original keeps only its own description",
+			images: []contentsearch.Image{
+				{URL: "https://cdn.example.com/cat.jpg", Description: "Кот с подписью"},
+				{URL: "https://cdn.example.com/dog.jpg", Description: "Собака"},
+			},
+			selectedURL: "https://cdn.example.com/cat.jpg", description: "Кот с подписью",
+		},
+		{
+			name: "original replaces thumbnail evidence",
+			images: []contentsearch.Image{
+				{URL: "https://cdn.example.com/thumb.jpg", Description: "Логотип сайта", PreviewOnly: true},
+				{URL: "https://cdn.example.com/cat.jpg", Description: "Кот с подписью"},
+			},
+			selectedURL: "https://cdn.example.com/cat.jpg", description: "Кот с подписью",
+		},
+		{
+			name: "original without a description cannot inherit thumbnail text",
+			images: []contentsearch.Image{
+				{URL: "https://cdn.example.com/thumb.jpg", Description: "Логотип сайта", PreviewOnly: true},
+				{URL: "https://cdn.example.com/cat.jpg"},
+			},
+			selectedURL: "https://cdn.example.com/cat.jpg",
+		},
+		{
+			name: "thumbnail remains attributable when there is no original",
+			images: []contentsearch.Image{
+				{URL: "https://cdn.example.com/thumb.jpg", Description: "Кот с подписью", PreviewOnly: true},
+			},
+			selectedURL: "https://cdn.example.com/thumb.jpg", description: "Кот с подписью", previewOnly: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, previews, media, evidence := externalDiscoverySources([]contentsearch.Source{{
+				Title: "Мемы", URL: "https://example.com/memes", Content: "Подборка мемов", Images: test.images,
+			}})
+			candidate := media["https://example.com/memes"]
+			if len(evidence) != 1 || !evidence[0].HasImage || previews["https://example.com/memes"] != test.selectedURL || candidate.URL != test.selectedURL || candidate.PreviewOnly != test.previewOnly {
+				t.Fatalf("preview and transfer selected different media: %#v %#v", previews, candidate)
+			}
+			if len(evidence[0].Images) > 1 || strings.Join(evidence[0].Images, "") != test.description {
+				t.Fatalf("synthesis received evidence for another image: %#v", evidence[0].Images)
+			}
+		})
+	}
+}
