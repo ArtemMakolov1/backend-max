@@ -268,6 +268,13 @@ func (s *Store) claimDirectCampaignGraphOperation(
 		return DirectGraphSubmissionMaterial{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if operationKind == "update" && changes.WeeklyBudgetMinor != nil {
+		// Serialize spend authority with membership/ownership changes before
+		// acquiring the campaign row; an unchanged form field stays permitted.
+		if err := lockActiveWorkspaceForDirectConnectionWrite(ctx, tx, workspaceID); err != nil {
+			return DirectGraphSubmissionMaterial{}, err
+		}
+	}
 	if err := requireWorkspaceRole(
 		ctx, tx, actorUserID, workspaceID, WorkspaceRoleOwner, WorkspaceRoleEditor,
 	); err != nil {
@@ -278,6 +285,15 @@ FROM direct_campaigns WHERE workspace_id=$1 AND id=$2 FOR UPDATE`,
 		workspaceID, campaignID))
 	if err != nil {
 		return DirectGraphSubmissionMaterial{}, err
+	}
+	if operationKind == "update" && changes.WeeklyBudgetMinor != nil &&
+		*changes.WeeklyBudgetMinor != campaign.WeeklyBudgetMinor {
+		// Provider budget changes require the same spend-management authority
+		// as bid changes. Editors may keep the current budget in full-form PATCHes.
+		if err := requireWorkspaceRole(ctx, tx, actorUserID, workspaceID,
+			WorkspaceRoleOwner, WorkspaceRoleApprover); err != nil {
+			return DirectGraphSubmissionMaterial{}, err
+		}
 	}
 	var providerSyncClaimedAt, providerSyncLeaseExpiresAt sql.NullTime
 	if err := tx.QueryRowContext(ctx, `SELECT provider_sync_claimed_at,provider_sync_lease_expires_at
