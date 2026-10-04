@@ -238,6 +238,7 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/posts/{post_id}/image", s.uploadWorkspacePostImage)
 				r.Post("/posts/{post_id}/generate-image", s.generateWorkspacePostImage)
 				r.Post("/posts/{post_id}/attachments", s.uploadWorkspacePostAttachment)
+				r.Get("/posts/{post_id}/attachments/{attachment_id}/video", s.getWorkspaceMAXVideoPreview)
 				r.Put("/posts/{post_id}/attachments/{attachment_id}", s.replaceWorkspacePostAttachment)
 				r.Patch("/posts/{post_id}/attachments/order", s.reorderWorkspacePostAttachments)
 				r.Delete("/posts/{post_id}/attachments/{attachment_id}", s.deleteWorkspacePostAttachment)

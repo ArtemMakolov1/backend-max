@@ -109,6 +109,10 @@ func (a *App) ImportMAXChannelHistoryPage(
 	if err != nil {
 		return fail(err)
 	}
+	messages, mediaLimited, err := prepareMAXHistoryVideoMedia(ctx, a.max, messages)
+	if err != nil {
+		return fail(err)
+	}
 	items := make([]store.MAXHistoryItem, 0, len(messages))
 	oldest := int64(0)
 	for _, message := range messages {
@@ -122,12 +126,17 @@ func (a *App) ImportMAXChannelHistoryPage(
 		}
 	}
 
-	complete, nextFrom, stalledBoundary, err := maxHistoryPageCursor(len(messages), oldest, before)
+	cursorCount := len(messages)
+	if mediaLimited {
+		// A bounded prefix is not the end of the provider's short page.
+		cursorCount = maxHistoryPageSize
+	}
+	complete, nextFrom, stalledBoundary, err := maxHistoryPageCursor(cursorCount, oldest, before)
 	if err != nil {
 		return fail(err)
 	}
 	progress, err := a.store.ApplyMAXHistoryPage(
-		ctx, actorUserID, workspaceID, claim.Generation, items, nextFrom, complete, a.now().UTC(),
+		ctx, actorUserID, workspaceID, claim.Generation, items, nextFrom, complete, a.now().UTC(), mediaLimited,
 	)
 	if err != nil {
 		return fail(err)
@@ -193,12 +202,14 @@ func maxHistoryItem(message maxclient.HistoryMessage, currentBotUserID int64) (s
 		}
 		switch attachment.Type {
 		case string(maxclient.MediaTypeImage), string(maxclient.MediaTypeVideo):
-			if strings.TrimSpace(attachment.Token) == "" || strings.TrimSpace(attachment.URL) == "" {
+			previewURL := maxclient.SafeAssetURL(attachment.URL)
+			if strings.TrimSpace(attachment.Token) == "" || previewURL == "" {
 				roundTrip = false
+				continue
 			}
 			attachments = append(attachments, store.MAXHistoryAttachment{
 				Type: attachment.Type, ProviderToken: strings.TrimSpace(attachment.Token),
-				RemoteURL: strings.TrimSpace(attachment.URL), Width: attachment.Width,
+				RemoteURL: previewURL, Width: attachment.Width,
 				Height: attachment.Height, DurationMS: attachment.DurationMS,
 				ProviderMeta: json.RawMessage(`{}`),
 			})
@@ -218,11 +229,14 @@ func maxHistoryItem(message maxclient.HistoryMessage, currentBotUserID int64) (s
 	if len(attachments) > mediaLimit {
 		roundTrip = false
 	}
-	// Never expose a normalized subset as directly editable: an edit would
-	// otherwise erase unsupported MAX attachments or keyboard controls.
+	// Safe previews can be displayed even when text/keyboard/other metadata
+	// cannot be round-tripped. The independent completeness flag keeps all
+	// writes blocked so unsupported provider content cannot be erased.
 	if !roundTrip {
-		attachments = nil
 		buttons = nil
+		if len(attachments) > store.MaxPostAttachments {
+			attachments = attachments[:store.MaxPostAttachments]
+		}
 		if strings.TrimSpace(content) == "" {
 			content = maxHistoryReferenceContent(strings.TrimSpace(message.URL))
 		}
