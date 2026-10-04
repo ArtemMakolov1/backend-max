@@ -1377,9 +1377,14 @@ func connectDirectTestAccount(
 
 func createDirectTestCampaign(
 	t *testing.T, ctx context.Context, storage *Store, owner, workspaceID string, now time.Time,
+	scheduledStart ...time.Time,
 ) DirectCampaign {
 	t.Helper()
-	return createDirectTestCampaignStartingAt(t, ctx, storage, owner, workspaceID, now, now)
+	startsAt := now
+	if len(scheduledStart) > 0 {
+		startsAt = scheduledStart[0]
+	}
+	return createDirectTestCampaignStartingAt(t, ctx, storage, owner, workspaceID, now, startsAt)
 }
 
 // Keep the shared launch fixture due today; edit-only tests can explicitly
