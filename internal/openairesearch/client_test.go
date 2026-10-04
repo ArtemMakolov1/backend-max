@@ -362,6 +362,14 @@ func TestSafeSourceRejectsUnsafeSchemesAndHosts(t *testing.T) {
 		"javascript:alert(1)", "http://example.com/source", "https://localhost/source",
 		"https://127.0.0.1/source", "https://10.0.0.1/source", "https://169.254.1.1/source",
 		"https://[::1]/source", "https://example.local/source", "//example.com/source",
+		"https://2130706433/source", "https://0177.0.0.1/source", "https://0x7f.0.0.1/source",
+		"https://0x7f000001/source", "https://127.1/source", "https://127.0.0.0x1/source",
+		"https://017700000001/source", "https://１２７.０.０.１/source", "https://127.0.0.1./source",
+		"https://8.8.8.8/source", "https://[2606:4700:4700::1111]/source",
+		"https://intranet/source", "https://metadata.google.internal/source", "https://server.lan/source",
+		"https://router.home.arpa/source", "https://source.invalid/source", "https://source.test/source",
+		"https://source.example/source", "https://private.onion/source", "https://user:secret@example.com/source",
+		"https://example..com/source", "https://-bad.example.com/source", "https://example.0x7f/source",
 	} {
 		if source, ok := safeSource("Unsafe", rawURL); ok {
 			t.Errorf("safeSource(%q) = %#v, true", rawURL, source)
@@ -369,6 +377,11 @@ func TestSafeSourceRejectsUnsafeSchemesAndHosts(t *testing.T) {
 	}
 	if source, ok := safeSource("", "https://example.com/source#fragment"); !ok || source.Title != "example.com" || source.URL != "https://example.com/source" {
 		t.Fatalf("safe HTTPS source = %#v, %v", source, ok)
+	}
+	for _, rawURL := range []string{"https://cdn.example.com/image.jpg", "https://example.com./source", "https://xn--e1afmkfd.xn--p1ai/source", "https://EXAMPLE.COM/source"} {
+		if _, ok := safeSource("Safe", rawURL); !ok {
+			t.Errorf("public DNS source rejected: %q", rawURL)
+		}
 	}
 }
 

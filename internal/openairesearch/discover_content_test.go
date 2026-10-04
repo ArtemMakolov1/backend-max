@@ -147,6 +147,40 @@ func TestDiscoverContentMemeRequiresMatchingRawImageResult(t *testing.T) {
 	}
 }
 
+func TestDiscoverContentAuthoritativeImageMetadataCannotExposeBrowserPrivateAddresses(t *testing.T) {
+	for _, imageURL := range []string{
+		"https://2130706433/preview.jpg", "https://0177.0.0.1/preview.jpg",
+		"https://0x7f.0.0.1/preview.jpg", "https://0x7f000001/preview.jpg",
+		"https://127.1/preview.jpg", "https://127.0.0.0x1/preview.jpg",
+		"https://017700000001/preview.jpg", "https://１２７.０.０.１/preview.jpg",
+		"https://server.internal/preview.jpg", "https://router.home.arpa/preview.jpg",
+	} {
+		t.Run(imageURL, func(t *testing.T) {
+			for _, kind := range []string{"idea", "meme"} {
+				envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://example.com/one", kind)})
+				// The unsafe URL came from the actual tool, not invented JSON.
+				envelope.Output[0].Results = []webResult{{Type: "image_result", SourceWebsiteURL: "https://example.com/one", ImageURL: imageURL, ThumbnailURL: imageURL}}
+				cards, err := decodeDiscoveryCards(envelope.Output[1].Content[0].Text, envelope, DiscoverContentRequest{ContentKind: "auto", Format: "markdown"})
+				if err != nil || cards == nil {
+					t.Fatalf("grounded result handling failed: kind=%s cards=%#v err=%v", kind, cards, err)
+				}
+				if kind == "meme" && len(cards) != 0 {
+					t.Fatalf("unsafe raw image metadata qualified as a meme: %#v", cards)
+				}
+				if kind == "idea" && (len(cards) != 1 || cards[0].PreviewImageURL != "") {
+					t.Fatalf("authoritative metadata exposed a browser-private preview: %#v", cards)
+				}
+			}
+		})
+	}
+	envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://2130706433/private-page", "meme")})
+	envelope.Output[0].Action.Sources[0].URL = "https://2130706433/private-page"
+	envelope.Output[0].Results = []webResult{{Type: "image_result", SourceWebsiteURL: "https://2130706433/private-page", ImageURL: "https://cdn.example.com/image.jpg"}}
+	if _, err := decodeDiscoveryCards(envelope.Output[1].Content[0].Text, envelope, DiscoverContentRequest{ContentKind: "auto", Format: "markdown"}); err == nil {
+		t.Fatal("a raw browser-private source page bypassed source grounding safety")
+	}
+}
+
 func TestDiscoverContentVideoRequiresIndividualGroundedWatchPage(t *testing.T) {
 	for _, test := range []struct {
 		name string

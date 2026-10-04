@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -34,6 +33,8 @@ const (
 )
 
 var opaqueCitationPattern = regexp.MustCompile(`cite[^]*`)
+var sourceDNSLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var sourceTLDSyntaxPattern = regexp.MustCompile(`^[a-z]{2,63}$`)
 
 type Client struct {
 	baseURL    string
@@ -679,12 +680,29 @@ func safeSource(title, rawURL string) (Source, bool) {
 
 func unsafeSourceHost(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+	if host == "" || len(host) > 253 {
 		return true
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast())
+	for _, suffix := range []string{"localhost", "local", "internal", "lan", "home", "home.arpa", "test", "invalid", "example", "onion"} {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	// Browsers accept IPv4 spellings that net.ParseIP does not: a single
+	// decimal integer, octal components, short addresses and 0x hexadecimal.
+	// Research sources need public domain names, so require DNS labels and a
+	// nonnumeric TLD instead of guessing every browser IP representation.
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return true
+	}
+	for _, label := range labels {
+		if !sourceDNSLabelPattern.MatchString(label) {
+			return true
+		}
+	}
+	tld := labels[len(labels)-1]
+	return !sourceTLDSyntaxPattern.MatchString(tld) && !strings.HasPrefix(tld, "xn--")
 }
 
 func deduplicateSources(sources []Source) []Source {
