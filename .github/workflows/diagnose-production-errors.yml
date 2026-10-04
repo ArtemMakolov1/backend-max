@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   diagnose:
-    name: Read recent sanitized backend errors
+    name: Read sanitized errors and fixed network diagnostics
     if: github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -54,7 +54,7 @@ jobs:
           printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
           printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
-      - name: Read one hour of errors through the server-side allowlist
+      - name: Read bounded errors, host HTTPS probes and container route booleans
         shell: bash
         run: |
           set -euo pipefail
@@ -70,8 +70,10 @@ jobs:
             -o ServerAliveInterval=10
             -o ServerAliveCountMax=2
           )
-          # The script runs from stdin: no production files, env reads, database
-          # commands, container exec, raw log transfer or retained artifacts.
+          # The script runs from stdin: no env reads, database commands,
+          # raw log transfer or retained artifacts. Fixed read-only container
+          # route queries emit booleans/counts only; verified HTTPS is host-only,
+          # without credentials, proxies, redirects or response-body reads.
           # Expand only the validated installation path on the runner.
           # shellcheck disable=SC2029
           if ! ssh "${ssh_options[@]}" "$target" "python3 - '$VPS_DEPLOY_DIR'" \

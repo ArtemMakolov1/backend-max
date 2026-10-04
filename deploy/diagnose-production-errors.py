@@ -4,6 +4,7 @@ Never print input errors, provider responses, SQL detail/rows or arbitrary JSON
 fields. Unknown errors stay unknown. No log files or configuration are opened.
 """
 import datetime
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,54 @@ MAX_BYTES = 2 * 1024 * 1024
 MAX_LINES = 2000
 MAX_LINE_BYTES = 65536
 READ_TIMEOUT = 30
+EDGE_NETWORK = "maxposty-edge"
+COMMAND_TIMEOUT = 8
+COMMAND_MAX_BYTES = 16384
+HOST_PROVIDERS = ("exa", "tavily", "openai")
+PROBE_RESULTS = frozenset(("dns", "tls", "timeout", "no_route", "unknown"))
+
+# This subprocess runs on the host, not inside the backend. It has no inherited
+# environment, credentials, redirects, proxy discovery or response-body reads.
+HOST_PROBE_CODE = r'''
+import errno, socket, ssl, sys, urllib.error, urllib.request
+URLS = {
+    "exa": "https://api.exa.ai/search",
+    "tavily": "https://api.tavily.com/search",
+    "openai": "https://api.openai.com/v1/models",
+}
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+def classify(error):
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, socket.gaierror): return "dns"
+    if isinstance(reason, ssl.SSLError): return "tls"
+    if isinstance(reason, TimeoutError): return "timeout"
+    if isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+        return "no_route"
+    return "unknown"
+def probe(provider):
+    if provider not in URLS: return "unknown"
+    try:
+        context = ssl.create_default_context()
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), NoRedirect(),
+            urllib.request.HTTPSHandler(context=context))
+        request = urllib.request.Request(URLS[provider], method="GET")
+        with opener.open(request, timeout=5) as response:
+            status = response.status
+            return str(status) if type(status) is int and 100 <= status <= 599 else "unknown"
+    except urllib.error.HTTPError as error:
+        status = error.code
+        error.close()
+        return str(status) if type(status) is int and 100 <= status <= 599 else "unknown"
+    except Exception as error:
+        return classify(error)
+if __name__ == "__main__":
+    print(probe(sys.argv[1]) if len(sys.argv) == 2 else "unknown")
+'''
 
 # Exact source-owned strings only; the remainder of each wrapped error is
 # deliberately discarded, even when it looks safe or resembles a SQL row.
@@ -236,6 +285,11 @@ class BoundedDiagnostics:
         self.buffer = bytearray()
         self.discard_line = False
         self.truncated = False
+        self.warning_counts = {
+            "content_source_retrieval_failed": 0,
+            "openai_research_request_failed": 0,
+            "openai_research_http_status_counts": {},
+        }
 
     def feed(self, data):
         available = MAX_BYTES - self.bytes_read
@@ -269,6 +323,7 @@ class BoundedDiagnostics:
             "window_minutes": 60, "bytes_read": self.bytes_read,
             "lines_read": self.lines_read, "request_failures": self.failures,
             "truncated": self.truncated,
+            "warning_counts": self.warning_counts,
         }
 
     def _line(self, line):
@@ -276,6 +331,16 @@ class BoundedDiagnostics:
             record = json.loads(line)
         except (ValueError, UnicodeDecodeError, RecursionError):
             return
+        if isinstance(record, dict) and record.get("level") == "WARN":
+            if record.get("msg") == "content source retrieval failed":
+                self.warning_counts["content_source_retrieval_failed"] += 1
+            elif record.get("msg") == "OpenAI research request failed":
+                self.warning_counts["openai_research_request_failed"] += 1
+                status = record.get("status")
+                if type(status) is int and 100 <= status <= 599:
+                    counts = self.warning_counts["openai_research_http_status_counts"]
+                    key = str(status)
+                    counts[key] = counts.get(key, 0) + 1
         safe = sanitize_record(record)
         if safe is not None:
             self.failures += 1
@@ -284,6 +349,148 @@ class BoundedDiagnostics:
 
 def emit(record):
     print(json.dumps(record, ensure_ascii=True, separators=(",", ":")), flush=True)
+
+
+def bounded_command(arguments, max_bytes=COMMAND_MAX_BYTES, timeout=COMMAND_TIMEOUT, clean_env=False):
+    """Return bounded stdout only; command errors and stderr never leave here."""
+    process = None
+    output = bytearray()
+    complete = False
+    read_status = "failed"
+    try:
+        process = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, env={} if clean_env else None)
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    read_status = "timeout"
+                    break
+                data = os.read(process.stdout.fileno(), min(4096, max_bytes + 1 - len(output)))
+                if not data:
+                    complete = True
+                    break
+                output.extend(data)
+                if len(output) > max_bytes:
+                    read_status = "bounded"
+                    break
+    except Exception:
+        complete = False
+    finally:
+        if process is not None:
+            if not complete and process.poll() is None:
+                process.kill()  # Only this read-only client, never the container.
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                complete = False
+                read_status = "timeout"
+                process.kill()
+                process.wait(timeout=5)
+            if process.stdout is not None:
+                process.stdout.close()
+    if complete and process is not None and process.returncode == 0:
+        return bytes(output), "complete"
+    return None, read_status
+
+
+def read_host_outbound_probes():
+    results = []
+    for provider in HOST_PROVIDERS:
+        data, read_status = bounded_command([sys.executable, "-c", HOST_PROBE_CODE, provider], max_bytes=64,
+                                            timeout=7, clean_env=True)
+        result = {"provider": provider, "scope": "host", "result": "unknown", "http_status": None}
+        if data is None:
+            result["result"] = "timeout" if read_status == "timeout" else "unknown"
+        elif re.fullmatch(rb"[1-5][0-9]{2}\n?", data):
+            result.update(result="http", http_status=int(data))
+        elif re.fullmatch(rb"(?:dns|tls|timeout|no_route|unknown)\n?", data):
+            result["result"] = data.rstrip(b"\n").decode("ascii")
+        results.append(result)
+    return results
+
+
+def ipv4(value):
+    try:
+        return ipaddress.IPv4Address(value) if isinstance(value, str) else None
+    except ipaddress.AddressValueError:
+        return None
+
+
+def route_gateways(data):
+    """Recognize only bounded BusyBox IPv4 defaults; never return route text."""
+    if data is None:
+        return None
+    try:
+        lines = data.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return None
+    if len(lines) > 32:
+        return None
+    gateways = []
+    for line in lines:
+        words = line.split()
+        if not words or words.pop(0) != "default":
+            return None
+        gateway = None
+        if words and words[0] == "via":
+            if len(words) < 2 or ipv4(words[1]) is None:
+                return None
+            gateway = ipv4(words[1])
+            words = words[2:]
+        if len(words) < 2 or words[0] != "dev" or not re.fullmatch(r"[A-Za-z0-9_.-]{1,16}", words[1]):
+            return None
+        words = words[2:]
+        while words:
+            if words[0] == "onlink":
+                words = words[1:]
+                continue
+            if len(words) < 2:
+                return None
+            name, value = words[:2]
+            if not ((name == "src" and ipv4(value) is not None)
+                    or (name == "metric" and re.fullmatch(r"[0-9]{1,10}", value))
+                    or (name == "proto" and value in ("kernel", "boot", "static", "dhcp"))
+                    or (name == "scope" and value in ("global", "link", "host"))):
+                return None
+            words = words[2:]
+        gateways.append(gateway)
+    return gateways
+
+
+def read_container_network(container_id):
+    result = {"edge_attached": None, "edge_internal": None,
+              "default_route_is_edge": None, "default_routes_count": None}
+    if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+        return result
+    network_data, _ = bounded_command(["docker", "inspect", "--format",
+                                       "{{json .NetworkSettings.Networks}}", container_id])
+    internal_data, _ = bounded_command(["docker", "network", "inspect", "--format",
+                                        "{{json .Internal}}", EDGE_NETWORK])
+    # BusyBox 1.37.0 in the pinned runtime base supports these IPv4 route flags.
+    route_data, _ = bounded_command(["docker", "exec", container_id, "/bin/busybox",
+                                     "ip", "-4", "route", "show", "default"])
+    if internal_data is not None and internal_data.strip() in (b"true", b"false"):
+        result["edge_internal"] = internal_data.strip() == b"true"
+    gateway = None
+    try:
+        networks = json.loads(network_data) if network_data is not None else None
+        if isinstance(networks, dict) and len(networks) <= 32:
+            result["edge_attached"] = EDGE_NETWORK in networks
+            edge = networks.get(EDGE_NETWORK)
+            gateway = ipv4(edge.get("Gateway")) if isinstance(edge, dict) else None
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        pass
+    routes = route_gateways(route_data)
+    if routes is not None:
+        result["default_routes_count"] = len(routes)
+        if not routes or result["edge_attached"] is False:
+            result["default_route_is_edge"] = False
+        elif len(routes) == 1 and gateway is not None:
+            result["default_route_is_edge"] = routes[0] == gateway
+    return result
 
 
 def validate_target(installation_dir):
@@ -357,6 +564,9 @@ def main():
             raise ValueError("unsupported_invocation")
         container_id = validate_target(sys.argv[1])
         records, result = read_diagnostics(container_id)
+        if result["read_status"] in ("complete", "bounded"):
+            result["container_network"] = read_container_network(container_id)
+            result["outbound_probes"] = read_host_outbound_probes()
         # Retain only bounded, already-sanitized records in memory. A container
         # or accepted release change discards them before any remote output.
         if validate_target(sys.argv[1]) != container_id:
