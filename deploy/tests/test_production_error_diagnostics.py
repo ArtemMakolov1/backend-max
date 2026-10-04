@@ -322,6 +322,50 @@ class SanitizerTests(unittest.TestCase):
 
 
 class NetworkDiagnosticsTests(unittest.TestCase):
+    def test_container_probes_use_only_fixed_hosts_immutable_id_and_hard_timeouts(self):
+        with patch.object(diagnostic, 'bounded_command', side_effect=[(b'1\n', 'complete'), (b'0\n', 'complete')] * 3) as command:
+            results = diagnostic.read_container_outbound_probes('a' * 64)
+        self.assertTrue(all(r['scope'] == 'container' and r['dns_resolved'] is True and r['tcp443_reachable'] is False for r in results))
+        self.assertEqual(len(command.call_args_list), 6)
+        for index, call in enumerate(command.call_args_list):
+            args = call.args[0]
+            host = diagnostic.CONTAINER_PROVIDER_HOSTS[index // 2][1]
+            self.assertEqual(args[:6], ['docker', 'exec', 'a' * 64, '/bin/busybox', 'sh', '-c'])
+            self.assertEqual(args[6], diagnostic.CONTAINER_PROBE_CODE)
+            self.assertIn('/bin/busybox timeout -s KILL 5 /bin/busybox', args[6])
+            self.assertIn('>/dev/null 2>&1', args[6])
+            self.assertEqual(args[7:], ['provider-probe', 'nslookup', host] if index % 2 == 0 else ['provider-probe', 'nc', '-z', '-w3', host, '443'])
+            self.assertEqual(call.kwargs, {'max_bytes': 4, 'timeout': 8})
+
+    def test_container_probe_malformed_or_timed_out_output_stays_unknown_without_leaks(self):
+        for data, status in ((b'u\n', 'complete'), (None, 'timeout'), (b'1\n', 'timeout'), (None, 'failed'),
+                             (SECRETS[0].encode(), 'complete'), (b'1\n192.0.2.55', 'complete'), (b'1', 'complete')):
+            with self.subTest(data=data), patch.object(diagnostic, 'bounded_command', return_value=(data, status)):
+                results = diagnostic.read_container_outbound_probes('a' * 64)
+            self.assertTrue(all(r['dns_resolved'] is None and r['tcp443_reachable'] is None for r in results))
+            for secret in SECRETS:
+                self.assertNotIn(secret, json.dumps(results))
+        for invalid in (SECRETS[0], 'a' * 63, 'A' * 64, None):
+            with patch.object(diagnostic, 'bounded_command') as command:
+                diagnostic.read_container_outbound_probes(invalid)
+                command.assert_not_called()
+
+    def test_structured_source_warning_allowlist_and_legacy_counter_only(self):
+        base = dict(level='WARN', msg='content source retrieval failed', provider='exa', code='request_failed',
+                    status=0, transport_kind='dns', error=SECRETS, request_id=SECRETS[0], body=SECRETS)
+        for status in (0, 100, 599, True, False, '403', 600, -1):
+            safe = diagnostic.sanitize_record({**base, 'status': status})
+            self.assertEqual(safe['category'], 'content_search_provider')
+            self.assertEqual(safe['provider_status'], status if type(status) is int and (status == 0 or 100 <= status <= 599) else None)
+            self.assertEqual(safe['transport_kind'], 'dns')
+            for secret in SECRETS:
+                self.assertNotIn(secret, json.dumps(safe))
+        malicious = diagnostic.sanitize_record({**base, 'provider': SECRETS[0], 'code': SECRETS[2], 'transport_kind': SECRETS[1]})
+        self.assertEqual((malicious['provider'], malicious['provider_code'], malicious['transport_kind']), ('unknown', 'unknown', None))
+        self.assertIsNone(diagnostic.sanitize_record({**base, 'level': 'INFO'}))
+        self.assertIsNone(diagnostic.sanitize_record({'level': 'WARN', 'msg': base['msg'], 'error': SECRETS}))
+        self.assertIsNone(diagnostic.sanitize_record({**base, 'code': 'provider_rejected'})['transport_kind'])
+
     def test_warning_counts_require_exact_warn_logger_and_integer_http_status(self):
         output = []
         reader = diagnostic.BoundedDiagnostics(output.append)
@@ -551,7 +595,7 @@ class InvocationTests(unittest.TestCase):
                 "edge_attached": True, "edge_internal": False,
                 "default_route_is_edge": True, "default_routes_count": 1})
             calls = [json.loads(line) for line in commands.read_text().splitlines()]
-            self.assertEqual([call[0] for call in calls], ["inspect", "logs", "inspect", "network", "exec", "inspect"])
+            self.assertEqual([call[0] for call in calls], ["inspect", "logs", "inspect", "network", "exec"] + ["exec"] * 6 + ["inspect"])
             self.assertEqual(calls[1], ["logs", "--since=1h", "--tail=2000", "b" * 64])
             self.assertEqual(calls[2], ["inspect", "--format", "{{json .NetworkSettings.Networks}}", "b" * 64])
             self.assertEqual(calls[3], ["network", "inspect", "--format", "{{json .Internal}}", "maxposty-edge"])
@@ -567,6 +611,7 @@ class InvocationTests(unittest.TestCase):
                 patch.object(diagnostic, 'read_diagnostics', return_value=([safe, provider], {'read_status': 'complete'})), \
                 patch.object(diagnostic, 'read_container_network', return_value={'edge_attached': True}), \
                 patch.object(diagnostic, 'read_host_outbound_probes', return_value=[{'scope': 'host', 'result': 'tls'}]), \
+                patch.object(diagnostic, 'read_container_outbound_probes', return_value=[{'scope': 'container', 'dns_resolved': True}]), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(diagnostic.main(), 1)
         self.assertEqual(json.loads(output.getvalue()), {'read_status': 'unavailable'})
@@ -574,6 +619,7 @@ class InvocationTests(unittest.TestCase):
         self.assertNotIn('provider_http', output.getvalue())
         self.assertNotIn('edge_attached', output.getvalue())
         self.assertNotIn('outbound_probes', output.getvalue())
+        self.assertNotIn('dns_resolved', output.getvalue())
 
     def test_log_read_timeout_stops_only_the_log_client(self):
         process = subprocess.Popen([sys.executable, '-c', 'import time; print("private-provider-request", flush=True); time.sleep(10)'],

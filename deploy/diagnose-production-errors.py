@@ -23,6 +23,16 @@ EDGE_NETWORK = "maxposty-edge"
 COMMAND_TIMEOUT = 8
 COMMAND_MAX_BYTES = 16384
 HOST_PROVIDERS = ("exa", "tavily", "openai")
+CONTAINER_PROVIDER_HOSTS = (("exa", "api.exa.ai"), ("tavily", "api.tavily.com"), ("openai", "api.openai.com"))
+CONTENT_SEARCH_CODES = frozenset(("invalid_endpoint", "invalid_request", "request_failed", "provider_rejected",
+                                  "invalid_response", "response_too_large", "response_unreadable", "unknown"))
+CONTENT_SEARCH_TRANSPORTS = frozenset(("dns", "tls", "timeout", "no_route", "connection_refused",
+                                       "connection_reset", "request_canceled", "unknown"))
+# timeout kills the actual applet, not just the Docker client or its shell.
+# Raw applet output is discarded inside the container; only a fixed marker exits.
+CONTAINER_PROBE_CODE = r'''/bin/busybox timeout -s KILL 5 /bin/busybox "$@" >/dev/null 2>&1
+status=$?
+case "$status" in 0) printf '1\n';; 1) printf '0\n';; *) printf 'u\n';; esac'''
 PROBE_RESULTS = frozenset(("dns", "tls", "timeout", "no_route", "unknown"))
 
 # This subprocess runs on the host, not inside the backend. It has no inherited
@@ -209,6 +219,20 @@ def safe_time(value):
 def sanitize_record(record):
     if not isinstance(record, dict):
         return None
+    if record.get("msg") == "content source retrieval failed":
+        if record.get("level") != "WARN" or not all(key in record for key in ("provider", "code", "status")):
+            return None  # Legacy warnings contribute only to the existing counter.
+        provider, code, status = record.get("provider"), record.get("code"), record.get("status")
+        code = code if isinstance(code, str) and code in CONTENT_SEARCH_CODES else "unknown"
+        kind = record.get("transport_kind")
+        return {
+            "time": safe_time(record.get("time")), "category": "content_search_provider",
+            "provider": provider if isinstance(provider, str) and provider in ("exa", "tavily", "unknown") else "unknown",
+            "provider_code": code,
+            "provider_status": status if type(status) is int and (status == 0 or 100 <= status <= 599) else None,
+            "transport_kind": (kind if isinstance(kind, str) and kind in CONTENT_SEARCH_TRANSPORTS else "unknown")
+                              if code in ("request_failed", "response_unreadable") else None,
+        }
     if record.get("msg") == "OpenAI research request failed":
         status = record.get("status")
         code = record.get("code")
@@ -412,6 +436,23 @@ def read_host_outbound_probes():
     return results
 
 
+def read_container_outbound_probes(container_id):
+    results = [{"provider": provider, "scope": "container", "dns_resolved": None,
+                "tcp443_reachable": None} for provider, _ in CONTAINER_PROVIDER_HOSTS]
+    if not isinstance(container_id, str) or not re.fullmatch(r"[0-9a-f]{64}", container_id):
+        return results
+    for result, (_, host) in zip(results, CONTAINER_PROVIDER_HOSTS):
+        for field, arguments in (("dns_resolved", ["nslookup", host]),
+                                 ("tcp443_reachable", ["nc", "-z", "-w3", host, "443"])):
+            # The pinned BusyBox nslookup has no timeout flags. Its own timeout
+            # applet supplies the hard limit; nc additionally has a 3s limit.
+            data, read_status = bounded_command(["docker", "exec", container_id, "/bin/busybox", "sh", "-c",
+                                        CONTAINER_PROBE_CODE, "provider-probe", *arguments], max_bytes=4, timeout=8)
+            if read_status == "complete":
+                result[field] = True if data == b"1\n" else False if data == b"0\n" else None
+    return results
+
+
 def ipv4(value):
     try:
         return ipaddress.IPv4Address(value) if isinstance(value, str) else None
@@ -567,6 +608,7 @@ def main():
         if result["read_status"] in ("complete", "bounded"):
             result["container_network"] = read_container_network(container_id)
             result["outbound_probes"] = read_host_outbound_probes()
+            result["container_outbound_probes"] = read_container_outbound_probes(container_id)
         # Retain only bounded, already-sanitized records in memory. A container
         # or accepted release change discards them before any remote output.
         if validate_target(sys.argv[1]) != container_id:
