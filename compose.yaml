@@ -225,7 +225,7 @@ services:
       - database
 
   postgres-exporter:
-    image: prometheuscommunity/postgres-exporter:v0.20.1@sha256:ac5ec343104fae0e2d84a27bb8d69b38430a11910c5382cad85d478d2bab713e
+    image: ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.8.3@sha256:dc577eda187be7c8c55c359def87643cd26dea62373a00b3e63fbcccc46a0f33
     restart: unless-stopped
     command:
       - --collector.long_running_transactions
@@ -265,7 +265,7 @@ services:
       - monitoring
 
   pgbouncer-exporter:
-    image: prometheuscommunity/pgbouncer-exporter:v0.12.1@sha256:30f31b6c2efdad3647f8182cc7c1a3a19e42bae5d17387694989f969371c230d
+    image: ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.8.3@sha256:57532238e7d5b182e44648dac084d4d5acf5176f3d7aabe644e0496b691136a5
     restart: unless-stopped
     environment:
       PGBOUNCER_EXPORTER_CONNECTION_STRING: postgresql://${POSTGRES_MONITOR_USER:-maxstudio_monitor}:${POSTGRES_MONITOR_PASSWORD:?Set POSTGRES_MONITOR_PASSWORD in .env}@pgbouncer:6432/pgbouncer?sslmode=disable
@@ -292,7 +292,7 @@ services:
       - monitoring
 
   node-exporter:
-    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    image: ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.8.1@sha256:77b0099bb6d4ac3268f90d01df13ca8f9266394ffbf1a9acb0a62fe49995fadf
     restart: unless-stopped
     command:
       - --path.procfs=/host/proc
@@ -323,7 +323,7 @@ services:
       - monitoring
 
   prometheus:
-    image: prom/prometheus:v3.13.2@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -363,7 +363,7 @@ services:
       - monitoring
 
   grafana:
-    image: grafana/grafana:nightly-slim@sha256:b07cf664959594536506b7a0f80e7c2d62e691b81c81345ced595670dd35d08c
+    image: ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261004-prometheus.2@sha256:d53ad9b2aafeb88b924b0b521224f549414a12248a54c13eb635d3954f6593c3
     restart: unless-stopped
     environment:
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000/}
@@ -390,6 +390,7 @@ services:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - max-studio-grafana:/var/lib/grafana
+    read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
     cap_drop:

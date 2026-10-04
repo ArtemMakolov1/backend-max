@@ -175,9 +175,17 @@ if grep -F 'webhook_configs:' "$without_alerts_config"; then
   exit 1
 fi
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  alertmanager_image=$(awk '
+    $0 == "  alertmanager:" { inside=1; next }
+    inside && /^    image:/ { print $2; exit }
+  ' "$repo_root/deploy/compose.production.yaml")
+  [[ "$alertmanager_image" =~ @sha256:[0-9a-f]{64}$ ]] || {
+    echo "Alertmanager configuration validation requires the deployed immutable image" >&2
+    exit 1
+  }
   docker run --rm --user "$(id -u):$(id -g)" --entrypoint=/bin/amtool \
     --volume "$sandbox:/config:ro" \
-    'prom/alertmanager:v0.33.1@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d' \
+    "$alertmanager_image" \
     check-config /config/alertmanager.yml >/dev/null
 fi
 
