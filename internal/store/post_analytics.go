@@ -44,6 +44,7 @@ type PostAnalyticsPost struct {
 }
 
 type PostAnalyticsSummary struct {
+	MAXCommentAnalyticsFields
 	Views                *int64     `json:"views"`
 	ViewsChange          *int64     `json:"views_change"`
 	Audience             *int       `json:"audience"`
@@ -215,6 +216,15 @@ func (s *Store) GetWorkspacePostAnalytics(
 	if selectedMessageID == "" {
 		return report, nil
 	}
+	commentEnd := toExclusive
+	if now := time.Now().UTC(); now.Before(commentEnd) {
+		commentEnd = now
+	}
+	commentFields, err := s.maxCommentAnalyticsForPost(ctx, workspaceID, post.ID, selectedMessageID, commentEnd)
+	if err != nil {
+		return PostAnalyticsReport{}, fmt.Errorf("get observed MAX comment analytics: %w", err)
+	}
+	report.Summary.MAXCommentAnalyticsFields = commentFields
 	observations, truncated, err := s.listPostAnalyticsObservations(
 		ctx, workspaceID, post.UserID, post.ID, selectedMessageID, fromDay, toExclusive,
 	)

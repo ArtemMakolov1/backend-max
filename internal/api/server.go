@@ -189,6 +189,7 @@ func (s *Server) Handler() http.Handler {
 				r.Delete("/", s.deleteWorkspace)
 				s.RegisterWorkspaceBrandRoutes(r)
 				s.RegisterAnalyticsContentRoutes(r)
+				s.registerMAXCommentRoutes(r)
 				s.registerCampaignRoutes(r)
 				s.registerDirectAdvertisingRoutes(r)
 				r.Post("/transfer-ownership", s.transferWorkspaceOwnership)
@@ -356,6 +357,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"status": "ok", "max_configured": s.app.MAXConfigured(), "openai_configured": s.app.OpenAIConfigured(),
 		"research_configured": s.app.ResearchConfigured(), "content_formatting_configured": s.app.ContentFormattingConfigured(),
 		"content_discovery_configured": s.app.ContentDiscoveryConfigured(),
+		"max_comments_configured":      s.app.MAXCommentsConfigured(),
 		"auth_required":                status.Required, "authenticated": status.Authenticated,
 		"auth_methods": status.Methods, "auth_method": status.Method, "user": status.User,
 		"session_expires_at": status.SessionExpiresAt, "observability_access": status.ObservabilityAccess,
@@ -544,6 +546,25 @@ func (s *Server) problem(w http.ResponseWriter, status int, code, message string
 
 func (s *Server) writeError(w http.ResponseWriter, err error) {
 	if err == nil {
+		return
+	}
+	var commentNotWritten *app.MAXCommentNotWrittenError
+	if errors.As(err, &commentNotWritten) {
+		status := http.StatusBadGateway
+		var channelAccess *app.ChannelAccessError
+		switch {
+		case errors.Is(err, store.ErrMAXCommentValidation):
+			status = http.StatusBadRequest
+		case errors.Is(err, store.ErrConflict):
+			status = http.StatusConflict
+		case errors.Is(err, store.ErrNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, store.ErrMAXCommentsUnavailable), errors.As(err, &channelAccess):
+			status = http.StatusUnprocessableEntity
+		case errors.Is(err, app.ErrMAXNotConfigured):
+			status = http.StatusServiceUnavailable
+		}
+		s.problem(w, status, "max_comment_not_written", "Действие не было отправлено в MAX. Обновите данные и проверьте права перед новой попыткой.", nil)
 		return
 	}
 	var upgradeErr *store.WorkspacePlanUpgradeRequiredError
@@ -871,6 +892,14 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			"Запуск уже выполняется или сверяется с Яндекс Директом.", nil)
 	case errors.Is(err, store.ErrNotFound):
 		s.problem(w, http.StatusNotFound, "not_found", "Запрошенные данные не найдены.", nil)
+	case errors.Is(err, store.ErrMAXCommentsUnavailable):
+		s.problem(w, http.StatusUnprocessableEntity, "max_comments_unavailable", "Комментарии MAX доступны для опубликованного поста канала.", nil)
+	case errors.Is(err, store.ErrMAXCommentValidation):
+		s.problem(w, http.StatusBadRequest, "validation_error", "Проверьте текст комментария и обновите его данные перед изменением.", nil)
+	case errors.Is(err, store.ErrMAXCommentBusy):
+		s.problem(w, http.StatusConflict, "max_comment_busy", "Операция с комментарием ещё выполняется. Обновите список через несколько секунд.", nil)
+	case errors.Is(err, store.ErrMAXCommentUncertain):
+		s.problem(w, http.StatusConflict, "max_comment_uncertain", "MAX мог принять действие, но его результат пока не подтверждён. Обновите список и сверьте ответ, прежде чем отправлять повторно.", nil)
 	case errors.Is(err, store.ErrConflict):
 		s.problem(w, http.StatusConflict, "state_conflict", storeConflictMessage(err), nil)
 	case errors.Is(err, app.ErrMAXNotConfigured):

@@ -41,18 +41,25 @@ type AnalyticsContentScope struct {
 }
 
 type AnalyticsContentSummary struct {
-	PostsTotal          int64    `json:"posts_total"`
-	PublishedPosts      int64    `json:"published_posts"`
-	KnownViewsPosts     int      `json:"known_views_posts"`
-	TotalViews          *int64   `json:"total_views"`
-	ParticipantsCurrent *int     `json:"participants_current"`
-	ParticipantsChange  *int     `json:"participants_change"`
-	ViewsChange         *int64   `json:"views_change"`
-	ViewsPer1KAudience  *float64 `json:"views_per_1k_audience"`
-	AverageViewsPerHour *float64 `json:"average_views_per_hour"`
+	ObservedComments         *int64     `json:"observed_comments"`
+	ObservedCommentAuthors   *int64     `json:"observed_comment_authors"`
+	CommentsSyncedPosts      int        `json:"comments_synced_posts"`
+	CommentsLastSyncedAt     *time.Time `json:"comments_last_synced_at"`
+	CommentsCoverageComplete bool       `json:"comments_coverage_complete"`
+	PostsTotal               int64      `json:"posts_total"`
+	PublishedPosts           int64      `json:"published_posts"`
+	KnownViewsPosts          int        `json:"known_views_posts"`
+	TotalViews               *int64     `json:"total_views"`
+	ParticipantsCurrent      *int       `json:"participants_current"`
+	ParticipantsChange       *int       `json:"participants_change"`
+	ViewsChange              *int64     `json:"views_change"`
+	ViewsPer1KAudience       *float64   `json:"views_per_1k_audience"`
+	AverageViewsPerHour      *float64   `json:"average_views_per_hour"`
 }
 
 type AnalyticsContentPost struct {
+	MAXCommentAnalyticsFields
+	RootMessageID         string     `json:"-"`
 	ID                    int64      `json:"id"`
 	Title                 string     `json:"title"`
 	ChannelID             int64      `json:"channel_id"`
@@ -190,7 +197,8 @@ SELECT post.id, post.title, post.channel_id, channel.title,
        COALESCE(latest.views, CASE WHEN post.max_stats_synced_at < ? THEN post.max_views END),
        post.max_message_url,
        COALESCE(latest.captured_at, CASE WHEN post.max_stats_synced_at < ? THEN post.max_stats_synced_at END),
-       CASE WHEN post.status = ? AND post.max_message_id <> '' THEN 'published' ELSE 'removed' END
+       CASE WHEN post.status = ? AND post.max_message_id <> '' THEN 'published' ELSE 'removed' END,
+       post.max_message_id
 FROM posts AS post
 JOIN channels AS channel ON channel.workspace_id=post.workspace_id AND channel.id=post.channel_id
 LEFT JOIN LATERAL (
@@ -237,7 +245,7 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 		var views sql.NullInt64
 		if err := rows.Scan(
 			&post.ID, &post.Title, &post.ChannelID, &post.ChannelTitle, &post.Audience,
-			&publishedAt, &views, &post.MAXMessageURL, &syncedAt, &post.PublicationState,
+			&publishedAt, &views, &post.MAXMessageURL, &syncedAt, &post.PublicationState, &post.RootMessageID,
 		); err != nil {
 			return AnalyticsContentReport{}, fmt.Errorf("scan workspace analytics post: %w", err)
 		}
@@ -323,6 +331,9 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 	report.Heatmap, report.BestTime = buildAnalyticsContentHeatmap(
 		comparisonPosts, asOf, tzOffsetMinutes,
 	)
+	if err := s.applyWorkspaceMAXCommentAnalytics(ctx, workspaceID, analysisEnd, &report); err != nil {
+		return AnalyticsContentReport{}, fmt.Errorf("get observed MAX comments analytics: %w", err)
+	}
 	return report, nil
 }
 

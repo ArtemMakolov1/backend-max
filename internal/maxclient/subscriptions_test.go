@@ -52,13 +52,13 @@ func TestConfigureStudioWebhookUsesRequiredEventsAndSecret(t *testing.T) {
 			if body.URL != "https://api.example.ru/api/v1/webhooks/max" || body.Secret != "safe_secret-123" {
 				t.Errorf("request body = %#v", body)
 			}
-			wantEvents := []string{"bot_added", "bot_removed", "bot_started", "message_created", "message_callback", "bot_admin_permissions_changed"}
+			wantEvents := []string{"bot_added", "bot_removed", "bot_started", "message_created", "message_callback", "bot_admin_permissions_changed", "comment_created", "comment_edited", "comment_removed"}
 			if !reflect.DeepEqual(body.UpdateTypes, wantEvents) {
 				t.Errorf("update_types = %#v, want %#v", body.UpdateTypes, wantEvents)
 			}
 			_, _ = io.WriteString(w, `{"success":true}`)
 		case http.MethodGet:
-			_, _ = io.WriteString(w, `{"subscriptions":[{"url":"https://api.example.ru/api/v1/webhooks/max","time":1,"update_types":["bot_added","bot_removed","bot_started","message_created","message_callback","bot_admin_permissions_changed"]}]}`)
+			_, _ = io.WriteString(w, `{"subscriptions":[{"url":"https://api.example.ru/api/v1/webhooks/max","time":1,"update_types":["bot_added","bot_removed","bot_started","message_created","message_callback","bot_admin_permissions_changed","comment_created","comment_edited","comment_removed"]}]}`)
 		default:
 			t.Errorf("unexpected request method: %s", r.Method)
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -95,6 +95,26 @@ func TestConfigureStudioWebhookRejectsUnverifiedEventSet(t *testing.T) {
 	err := client.ConfigureStudioWebhook(context.Background(), "https://api.example.ru/api/v1/webhooks/max", "safe_secret-123")
 	if err == nil || !strings.Contains(err.Error(), `required update type "message_created" is missing`) {
 		t.Fatalf("ConfigureStudioWebhook() error = %v", err)
+	}
+}
+
+func TestConfigureStudioWebhookRejectsMissingCommentEvent(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_, _ = io.WriteString(w, `{"success":true}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"subscriptions": []any{map[string]any{
+			"url":          "https://api.example.ru/api/v1/webhooks/max",
+			"update_types": []string{"bot_added", "bot_removed", "bot_started", "message_created", "message_callback", "bot_admin_permissions_changed", "comment_created", "comment_edited"},
+		}}})
+	}))
+	defer server.Close()
+	client := mustClient(t, server.URL, "bot-token", server.Client())
+	err := client.ConfigureStudioWebhook(context.Background(), "https://api.example.ru/api/v1/webhooks/max", "safe_secret-123")
+	if err == nil || !strings.Contains(err.Error(), `required update type "comment_removed" is missing`) {
+		t.Fatalf("unverified comment subscription accepted: %v", err)
 	}
 }
 
