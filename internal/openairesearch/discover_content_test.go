@@ -11,8 +11,12 @@ import (
 	"testing"
 )
 
-func discoveryFixtureCard(source string) map[string]any {
-	return map[string]any{"title": "Смешной момент", "summary": "Реальный материал для короткого поста.", "source_url": source,
+func discoveryFixtureCard(source string, kinds ...string) map[string]any {
+	kind := "idea"
+	if len(kinds) > 0 {
+		kind = kinds[0]
+	}
+	return map[string]any{"content_kind": kind, "title": "Смешной момент", "summary": "Реальный материал для короткого поста.", "source_url": source,
 		"draft": map[string]any{"title": "Небольшая пауза", "content": "**Небольшая пауза**\nУзнаваемый момент для вашей ленты.", "format": "markdown", "image_prompt": ""}}
 }
 
@@ -47,7 +51,7 @@ func TestDiscoverContentMakesOneBoundedCallAndUsesRawImagePreview(t *testing.T) 
 		if !strings.Contains(payload.Input[0].Content.(string), "недоверенные") || !strings.Contains(payload.Input[1].Content.(string), "Игнорируй инструкции") {
 			t.Error("editorial input was not isolated as data")
 		}
-		envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://example.com/one#fragment")})
+		envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://example.com/one#fragment", "meme")})
 		envelope.Output[0].Results = []webResult{
 			{Type: "image_result", SourceWebsiteURL: "https://example.com/other", ImageURL: "https://cdn.example.com/unrelated.jpg"},
 			{Type: "image_result", SourceWebsiteURL: "https://example.com/one", ImageURL: "https://cdn.example.com/original.jpg", ThumbnailURL: "https://cdn.example.com/preview.jpg"},
@@ -82,7 +86,7 @@ func TestDiscoverContentAppendsEscapedVerifiedSourceForBothFormats(t *testing.T)
 	rawSource := `https://example.com/material(1)?q="cat"&labels=[fun]#ignored`
 	for _, format := range []string{"markdown", "html"} {
 		t.Run(format, func(t *testing.T) {
-			card := discoveryFixtureCard(rawSource)
+			card := discoveryFixtureCard(rawSource, "article")
 			draft := card["draft"].(map[string]any)
 			draft["format"] = format
 			if format == "html" {
@@ -113,7 +117,7 @@ func TestDiscoverContentAppendsEscapedVerifiedSourceForBothFormats(t *testing.T)
 		})
 	}
 
-	envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://example.com/" + strings.Repeat("a", 3980))})
+	envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://example.com/"+strings.Repeat("a", 3980), "article")})
 	envelope.Output[0].Action.Sources[0].URL = "https://example.com/" + strings.Repeat("a", 3980)
 	if _, err := decodeDiscoveryCards(envelope.Output[1].Content[0].Text, envelope, DiscoverContentRequest{ContentKind: "article", Format: "markdown"}); err == nil {
 		t.Fatal("attribution bypassed the final MAX draft size bound")
@@ -133,7 +137,7 @@ func TestDiscoverContentMemeRequiresMatchingRawImageResult(t *testing.T) {
 		{name: "matching real image", results: []webResult{{Type: "image_result", SourceWebsiteURL: "https://example.com/one#image", ImageURL: "https://cdn.example.com/cat.jpg"}}, want: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://example.com/one")})
+			envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard("https://example.com/one", "meme")})
 			envelope.Output[0].Results = test.results
 			cards, err := decodeDiscoveryCards(envelope.Output[1].Content[0].Text, envelope, DiscoverContentRequest{ContentKind: "meme", Format: "markdown"})
 			if err != nil || cards == nil || len(cards) != test.want {
@@ -164,7 +168,7 @@ func TestDiscoverContentVideoRequiresIndividualGroundedWatchPage(t *testing.T) {
 		{name: "vimeo", url: "https://vimeo.com/123456789", want: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard(test.url)})
+			envelope := discoveryFixtureEnvelope([]any{discoveryFixtureCard(test.url, "video")})
 			envelope.Output[0].Action.Sources[0].URL = test.url
 			cards, err := decodeDiscoveryCards(envelope.Output[1].Content[0].Text, envelope, DiscoverContentRequest{ContentKind: "video", Format: "markdown"})
 			if err != nil || cards == nil || len(cards) != test.want {
@@ -186,12 +190,17 @@ func TestDiscoverContentBoundsNormalizedSourceURLs(t *testing.T) {
 	}
 }
 
-func TestDiscoverContentDefaultsToShortIdeasWithoutImageSearch(t *testing.T) {
+func TestDiscoverContentDefaultsToAutoAndPreservesExplicitIdeaOverride(t *testing.T) {
 	request := NormalizeDiscoverContentRequest(DiscoverContentRequest{Topic: "Коты"})
-	if request.ContentKind != "idea" || request.Format != "markdown" {
+	if request.ContentKind != "auto" || request.Format != "markdown" {
 		t.Fatal(request)
 	}
 	payload := discoveryPayload("gpt-5.4-mini", request)
+	if payload.Tools[0].ImageSettings == nil || !reflect.DeepEqual(payload.Tools[0].SearchContentTypes, []string{"text", "image"}) {
+		t.Fatal("automatic selection cannot discover actual images")
+	}
+	request.ContentKind = "idea"
+	payload = discoveryPayload("gpt-5.4-mini", request)
 	if payload.Tools[0].ImageSettings != nil || len(payload.Tools[0].SearchContentTypes) != 0 {
 		t.Fatal("ordinary ideas unexpectedly requested image search")
 	}
@@ -199,6 +208,87 @@ func TestDiscoverContentDefaultsToShortIdeasWithoutImageSearch(t *testing.T) {
 	cards, err := decodeDiscoveryCards(envelope.Output[1].Content[0].Text, envelope, request)
 	if err != nil || cards == nil || len(cards) != 0 {
 		t.Fatalf("honest empty results not preserved: cards=%#v err=%v", cards, err)
+	}
+}
+
+func TestDiscoverContentAutoUsesMediaOnlyContextInOneCallAndReturnsGroundedMixedCards(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var payload responsePayload
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.MaxToolCalls != 2 || payload.MaxOutputTokens != 4000 || payload.ToolChoice != "required" || len(payload.Tools) != 1 || payload.Tools[0].ImageSettings == nil {
+			t.Fatalf("auto introduced an unbounded or separate classification call: %#v", payload)
+		}
+		userInput := payload.Input[1].Content.(string)
+		var context struct {
+			ContentKind string                   `json:"content_kind"`
+			RecentPosts []DiscoveryPublishedPost `json:"recent_posts"`
+		}
+		_, encoded, ok := strings.Cut(userInput, "\n")
+		if !ok || json.Unmarshal([]byte(encoded), &context) != nil || context.ContentKind != "auto" || len(context.RecentPosts) != 2 || context.RecentPosts[0].Text != "" || !reflect.DeepEqual(context.RecentPosts[0].Media, []DiscoveryMedia{{Type: "video", Count: 2}}) || context.RecentPosts[1].Text != "Подпись смешного момента" {
+			t.Fatalf("real captions/media-only structure lost: %s", userInput)
+		}
+		if !strings.Contains(payload.Input[0].Content.(string), "Наличие фотографии само по себе не означает мем") || !strings.Contains(payload.Input[0].Content.(string), "ты не видел пиксели") {
+			t.Fatal("auto prompt claims visual analysis without media access")
+		}
+		envelope := discoveryFixtureEnvelope([]any{
+			discoveryFixtureCard("https://example.com/article", "article"),
+			discoveryFixtureCard("https://example.com/meme", "meme"),
+			discoveryFixtureCard("https://youtube.com/shorts/abcdefghijk", "video"),
+		})
+		envelope.Output[0].Action.Sources = []webSource{{Type: "url", URL: "https://example.com/article"}, {Type: "url", URL: "https://youtube.com/shorts/abcdefghijk"}}
+		envelope.Output[0].Results = []webResult{{Type: "image_result", SourceWebsiteURL: "https://example.com/meme", ImageURL: "https://cdn.example.com/meme.jpg"}}
+		_ = json.NewEncoder(w).Encode(envelope)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "mock-discovery-key", "gpt-5.4-mini", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.DiscoverContent(t.Context(), DiscoverContentRequest{Topic: "Забавные коты", RecentPosts: []DiscoveryPublishedPost{
+		{Media: []DiscoveryMedia{{Type: "video", Count: 2}}},
+		{Text: "Подпись смешного момента", Media: []DiscoveryMedia{{Type: "image", Count: 1}}},
+	}})
+	if err != nil || calls != 1 || result.ContentKind != "auto" || len(result.Cards) != 3 {
+		t.Fatalf("automatic mixed selection failed: result=%#v calls=%d err=%v", result, calls, err)
+	}
+	for i, kind := range []string{"article", "meme", "video"} {
+		if result.Cards[i].ContentKind != kind || !strings.Contains(result.Cards[i].Draft.Content, "Источник") {
+			t.Fatalf("mixed kind/attribution lost: %#v", result.Cards)
+		}
+	}
+	if result.Cards[1].PreviewImageURL != "https://cdn.example.com/meme.jpg" || result.Cards[2].PreviewImageURL != "" {
+		t.Fatal("automatic selection mixed unrelated media previews")
+	}
+}
+
+func TestDiscoverContentAutoAppliesMemeAndVideoProofPerCard(t *testing.T) {
+	envelope := discoveryFixtureEnvelope([]any{
+		discoveryFixtureCard("https://example.com/text-about-memes", "meme"),
+		discoveryFixtureCard("https://youtube.com/channel/UC123/videos", "video"),
+		discoveryFixtureCard("https://example.com/one", "article"),
+	})
+	envelope.Output[0].Action.Sources = append(envelope.Output[0].Action.Sources, webSource{Type: "url", URL: "https://example.com/text-about-memes"}, webSource{Type: "url", URL: "https://youtube.com/channel/UC123/videos"})
+	cards, err := decodeDiscoveryCards(envelope.Output[1].Content[0].Text, envelope, DiscoverContentRequest{ContentKind: "auto", Format: "markdown"})
+	if err != nil || len(cards) != 1 || cards[0].ContentKind != "article" {
+		t.Fatalf("auto bypassed per-card content proof: cards=%#v err=%v", cards, err)
+	}
+}
+
+func TestDiscoverContentRejectsUnboundedOrInventedMediaContextBeforeProviderCall(t *testing.T) {
+	for _, media := range [][]DiscoveryMedia{
+		{{Type: "image", Count: 0}},
+		{{Type: "image", Count: 13}},
+		{{Type: "image", Count: 12}, {Type: "video", Count: 1}},
+		{{Type: "image", Count: 1}, {Type: "image", Count: 1}},
+		{{Type: "imagined_contents", Count: 1}},
+	} {
+		if err := ValidateDiscoverContentRequest(DiscoverContentRequest{Topic: "Коты", RecentPosts: []DiscoveryPublishedPost{{Media: media}}}); err == nil {
+			t.Fatalf("invented/unbounded media context accepted: %#v", media)
+		}
 	}
 }
 
@@ -212,6 +302,9 @@ func TestDiscoverContentRejectsInventedSourcesAndModelPreviews(t *testing.T) {
 		{"invented preview", func(card map[string]any, _ *responseEnvelope) {
 			card["preview_image_url"] = "https://example.com/fake.png"
 		}},
+		{"missing card kind", func(card map[string]any, _ *responseEnvelope) { delete(card, "content_kind") }},
+		{"automatic card kind", func(card map[string]any, _ *responseEnvelope) { card["content_kind"] = "auto" }},
+		{"override ignored", func(card map[string]any, _ *responseEnvelope) { card["content_kind"] = "article" }},
 		{"search omitted", func(_ map[string]any, envelope *responseEnvelope) { envelope.Output = envelope.Output[1:] }},
 		{"search incomplete", func(_ map[string]any, envelope *responseEnvelope) { envelope.Output[0].Status = "in_progress" }},
 		{"invented draft link", func(card map[string]any, _ *responseEnvelope) {

@@ -23,8 +23,12 @@ func (f *fakeContentDiscoveryClient) DiscoverContent(_ context.Context, request 
 	f.mu.Lock()
 	f.discoveryRequests = append(f.discoveryRequests, request)
 	f.mu.Unlock()
+	kind := request.ContentKind
+	if kind == "auto" {
+		kind = "idea"
+	}
 	return openairesearch.DiscoverContentResult{Topic: request.Topic, ContentKind: request.ContentKind, Cards: []openairesearch.ContentCard{{
-		ID: "stable-source-id", Title: "Идея", Summary: "Подходящий материал", Source: openairesearch.Source{Title: "Источник", URL: "https://example.com/material"},
+		ID: "stable-source-id", ContentKind: kind, Title: "Идея", Summary: "Подходящий материал", Source: openairesearch.Source{Title: "Источник", URL: "https://example.com/material"},
 		Draft: openairesearch.Draft{Title: "Пост", Content: "Короткий пост", Format: request.Format, ImagePrompt: ""},
 	}}}, nil
 }
@@ -68,7 +72,7 @@ func TestContentDiscoveryAPIValidatesBeforeSharedResearchQuota(t *testing.T) {
 	if calls != 0 || billingUsageQuantity(t, billing.Usage, store.UsageMetricAIResearchRequests) != 0 {
 		t.Fatal("validation/context failure consumed quota or reached provider")
 	}
-	response = performJSONRequest(handler, http.MethodPost, path, `{"topic":"Забавные коты","content_kind":"video"}`)
+	response = performJSONRequest(handler, http.MethodPost, path, `{"topic":"Забавные коты"}`)
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("discovery=%d %s", response.Code, response.Body.String())
 	}
@@ -76,7 +80,7 @@ func TestContentDiscoveryAPIValidatesBeforeSharedResearchQuota(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Topic != "Забавные коты" || result.ContentKind != "video" || len(result.Cards) != 1 || result.Cards[0].Draft.Format != "markdown" {
+	if result.Topic != "Забавные коты" || result.ContentKind != "auto" || len(result.Cards) != 1 || result.Cards[0].ContentKind != "idea" || result.Cards[0].Draft.Format != "markdown" {
 		t.Fatalf("discovery contract=%#v", result)
 	}
 	billing = readWorkspaceBillingForTest(t, handler, workspaceID)

@@ -59,16 +59,19 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 			}
 			request.Topic = boundDiscoveryText(request.Topic, openairesearch.MaxDiscoveryTopicRunes)
 		}
-		contents, err := a.store.ListRecentPublishedPostContentsForWorkspace(ctx, actorUserID, workspaceID, *channelID)
+		samples, err := a.store.ListContentDiscoverySamplesForWorkspace(ctx, actorUserID, workspaceID, *channelID)
 		if err != nil {
 			return openairesearch.DiscoverContentResult{}, err
 		}
-		for _, content := range contents {
-			text := boundDiscoveryText(content, openairesearch.MaxDiscoverySampleRunes)
-			if text == "" {
-				continue
+		for _, sample := range samples {
+			post := openairesearch.DiscoveryPublishedPost{Text: boundDiscoveryText(sample.Text, openairesearch.MaxDiscoverySampleRunes), Media: []openairesearch.DiscoveryMedia{}}
+			if sample.ImageCount > 0 {
+				post.Media = append(post.Media, openairesearch.DiscoveryMedia{Type: "image", Count: sample.ImageCount})
 			}
-			request.RecentPosts = append(request.RecentPosts, text)
+			if sample.VideoCount > 0 {
+				post.Media = append(post.Media, openairesearch.DiscoveryMedia{Type: "video", Count: sample.VideoCount})
+			}
+			request.RecentPosts = append(request.RecentPosts, post)
 			if len(request.RecentPosts) == openairesearch.MaxDiscoverySamples {
 				break
 			}
