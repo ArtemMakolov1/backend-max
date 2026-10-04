@@ -251,15 +251,20 @@ func normalizeEditorialList(values []string) []string {
 }
 
 type responsePayload struct {
-	Model           string          `json:"model"`
-	Input           []inputMessage  `json:"input"`
-	Tools           []webSearchTool `json:"tools,omitempty"`
-	ToolChoice      string          `json:"tool_choice,omitempty"`
-	MaxToolCalls    int             `json:"max_tool_calls,omitempty"`
-	Include         []string        `json:"include,omitempty"`
-	Text            *textOptions    `json:"text,omitempty"`
-	MaxOutputTokens int             `json:"max_output_tokens"`
-	Store           bool            `json:"store"`
+	Model           string            `json:"model"`
+	Reasoning       *reasoningOptions `json:"reasoning,omitempty"`
+	Input           []inputMessage    `json:"input"`
+	Tools           []webSearchTool   `json:"tools,omitempty"`
+	ToolChoice      string            `json:"tool_choice,omitempty"`
+	MaxToolCalls    int               `json:"max_tool_calls,omitempty"`
+	Include         []string          `json:"include,omitempty"`
+	Text            *textOptions      `json:"text,omitempty"`
+	MaxOutputTokens int               `json:"max_output_tokens"`
+	Store           bool              `json:"store"`
+}
+
+type reasoningOptions struct {
+	Effort string `json:"effort"`
 }
 
 // inputMessage carries either a plain string or a []inputContentPart in
@@ -458,6 +463,11 @@ type annotation struct {
 }
 
 func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnvelope, error) {
+	// Luna defaults to medium. Keep the previous Mini workload's effective
+	// none effort across every text feature, including both research steps.
+	if c.model == "gpt-6-luna" || strings.HasPrefix(c.model, "gpt-6-luna-") {
+		payload.Reasoning = &reasoningOptions{Effort: "none"}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return responseEnvelope{}, fmt.Errorf("encode OpenAI Responses request: %w", err)

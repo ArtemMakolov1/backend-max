@@ -36,7 +36,7 @@ const (
 	directOAuthCallbackRedirectURI   = "https://maxposty.ru/api/v1/advertising/direct/oauth/callback"
 	directOAuthVerificationCodeURI   = "https://oauth.yandex.ru/verification_code"
 	defaultOpenAIImageModel          = "gpt-image-2"
-	defaultOpenAIResearchModel       = "gpt-5.4-mini"
+	defaultOpenAIResearchModel       = "gpt-6-luna"
 	defaultSchedulerInterval         = 15 * time.Second
 	defaultAuthSessionTTL            = 12 * time.Hour
 	defaultMaxOwnedTeamWorkspaces    = 5
