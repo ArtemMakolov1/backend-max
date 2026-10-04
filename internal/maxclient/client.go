@@ -215,7 +215,7 @@ func (c *Client) getChat(ctx context.Context, identifier string) (ChatInfo, erro
 	return chat, nil
 }
 
-// EditChat updates the chat photo and title through PATCH /chats/{chatId}.
+// EditChat updates the chat photo, title and description through PATCH /chats/{chatId}.
 // The MAX Bot API applies the change for every subscriber, so callers must
 // verify the bot still administers the verified channel before invoking it.
 func (c *Client) EditChat(ctx context.Context, chatID string, patch ChatPatch) (ChatInfo, error) {
@@ -223,13 +223,14 @@ func (c *Client) EditChat(ctx context.Context, chatID string, patch ChatPatch) (
 		return ChatInfo{}, errors.New("edit MAX chat: chat ID must be numeric")
 	}
 	iconToken := strings.TrimSpace(patch.IconToken)
-	if iconToken == "" && patch.Title == nil {
-		return ChatInfo{}, errors.New("edit MAX chat: an icon or a title is required")
+	if iconToken == "" && patch.Title == nil && patch.Description == nil {
+		return ChatInfo{}, errors.New("edit MAX chat: an icon, title or description is required")
 	}
 	body := struct {
-		Icon   *attachmentPayload `json:"icon,omitempty"`
-		Title  *string            `json:"title,omitempty"`
-		Notify *bool              `json:"notify,omitempty"`
+		Icon        *attachmentPayload `json:"icon,omitempty"`
+		Title       *string            `json:"title,omitempty"`
+		Description *string            `json:"description,omitempty"`
+		Notify      *bool              `json:"notify,omitempty"`
 	}{}
 	if iconToken != "" {
 		body.Icon = &attachmentPayload{Token: iconToken}
@@ -240,6 +241,12 @@ func (c *Client) EditChat(ctx context.Context, chatID string, patch ChatPatch) (
 			return ChatInfo{}, errors.New("edit MAX chat: title must contain 1 to 200 characters")
 		}
 		body.Title = &title
+	}
+	if patch.Description != nil {
+		if utf8.RuneCountInString(*patch.Description) > 16000 {
+			return ChatInfo{}, errors.New("edit MAX chat: description must not exceed 16000 characters")
+		}
+		body.Description = patch.Description
 	}
 	body.Notify = patch.Notify
 	var response chatInfoResponse

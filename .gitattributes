@@ -1,0 +1,2 @@
+# Preserve the official certificate bytes, including its CRLF line endings.
+internal/maxclient/certs/russian_trusted_root_ca.pem -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

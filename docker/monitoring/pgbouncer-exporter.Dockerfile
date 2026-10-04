@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine3.23@sha256:622e56dbc11a8cfe87cafa2331e9a201877271cbff918af53d3be315f3da88cc AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.23@sha256:a8fa79c5bd40d880b52bd3b6d7669ecdcfd00e85facdd427d279efb5ddd79cb1 AS build
 
 ARG TARGETARCH
 ARG TARGETOS
@@ -12,22 +12,22 @@ RUN wget -q "https://github.com/prometheus-community/pgbouncer_exporter/archive/
     && echo "${SOURCE_SHA256}  /tmp/source.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/source.tar.gz --strip-components=1 \
     && rm /tmp/source.tar.gz
-# The upstream release predates coordinated x/crypto and x/text security
-# updates. Keep the source tag fixed and override only those dependencies.
-RUN go get golang.org/x/crypto@v0.52.0 golang.org/x/text@v0.39.0 \
+# Keep the release source immutable while rebuilding the vulnerable standard
+# library and applying the coordinated x/crypto, x/net and x/text fixes.
+RUN go get golang.org/x/crypto@v0.55.0 golang.org/x/net@v0.57.0 golang.org/x/text@v0.41.0 \
     && go mod tidy \
     && go mod download \
     && go mod verify \
     && go test ./...
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath \
-      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.12.1-maxposty.2 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.12.1" \
+      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.12.1-maxposty.3 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.12.1" \
       -o /out/pgbouncer_exporter .
 
 FROM busybox:1.37.0-uclibc@sha256:39e0df8c4d65953b55c344f017e1ff2e0031a7454b3c24e6b76d402f207e315a
 
 LABEL org.opencontainers.image.source="https://github.com/prometheus-community/pgbouncer_exporter" \
-      org.opencontainers.image.version="0.12.1-maxposty.2" \
+      org.opencontainers.image.version="0.12.1-maxposty.3" \
       org.opencontainers.image.revision="2a70ffdb35b6fbd3413ac5abf07c4ddf6dde3067"
 
 COPY --from=build /out/pgbouncer_exporter /bin/pgbouncer_exporter

@@ -541,6 +541,14 @@ func (s *Server) decodeChannelMAXInfoForm(w http.ResponseWriter, r *http.Request
 		}
 		update.Title = &title
 	}
+	if descriptions := r.MultipartForm.Value["description"]; len(descriptions) > 0 {
+		description := descriptions[0]
+		if utf8.RuneCountInString(description) > 16000 {
+			s.problem(w, http.StatusBadRequest, "validation_error", "description must not exceed 16000 characters", nil)
+			return fail()
+		}
+		update.Description = &description
+	}
 	if header, err := firstFile(r, "file", "icon", "image"); err == nil {
 		upload, openErr := header.Open()
 		if openErr != nil {
@@ -551,8 +559,8 @@ func (s *Server) decodeChannelMAXInfoForm(w http.ResponseWriter, r *http.Request
 		update.Icon = upload
 		update.IconFilename = header.Filename
 	}
-	if update.Title == nil && update.Icon == nil {
-		s.problem(w, http.StatusBadRequest, "validation_error", "channel title or icon file is required", nil)
+	if update.Title == nil && update.Icon == nil && update.Description == nil {
+		s.problem(w, http.StatusBadRequest, "validation_error", "channel title, description or icon file is required", nil)
 		return fail()
 	}
 	return update, cleanup, true

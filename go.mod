@@ -1,6 +1,6 @@
 module maxpilot/backend
 
-go 1.25.12
+go 1.26.8
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.42.1
@@ -36,7 +36,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/sync v0.22.0
-	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.39.0 // indirect
+	golang.org/x/sys v0.44.0 // indirect
+	golang.org/x/text v0.39.0
 	google.golang.org/protobuf v1.36.8 // indirect
 )

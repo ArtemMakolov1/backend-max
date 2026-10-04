@@ -314,7 +314,7 @@ services:
       - database
 
   postgres-exporter:
-    image: ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.5.2@sha256:84020b3c33fe7803164b5aa44145908afd5a15a6b506bee0096492044cab7561
+    image: ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.8.3@sha256:dc577eda187be7c8c55c359def87643cd26dea62373a00b3e63fbcccc46a0f33
     restart: unless-stopped
     command:
       - --collector.long_running_transactions
@@ -356,7 +356,7 @@ services:
       - monitoring
 
   pgbouncer-exporter:
-    image: ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.5.2@sha256:95eeb763dc29db1e911918f1fe7b1aeef677e36941c3acf4d35dc4ef37cf24ef
+    image: ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.8.3@sha256:57532238e7d5b182e44648dac084d4d5acf5176f3d7aabe644e0496b691136a5
     restart: unless-stopped
     environment:
       PGBOUNCER_EXPORTER_CONNECTION_STRING: postgresql://${POSTGRES_MONITOR_USER}:${POSTGRES_MONITOR_PASSWORD}@pgbouncer:6432/pgbouncer?sslmode=disable
@@ -385,7 +385,7 @@ services:
       - monitoring
 
   node-exporter:
-    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    image: ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.8.1@sha256:77b0099bb6d4ac3268f90d01df13ca8f9266394ffbf1a9acb0a62fe49995fadf
     restart: unless-stopped
     command:
       - --path.procfs=/host/proc
@@ -420,7 +420,7 @@ services:
       - monitoring
 
   alertmanager:
-    image: prom/alertmanager:v0.33.1@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d
+    image: ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.8.2@sha256:fae6b44fad35877bf49ad2bac4cd9b9688bef7b0ecaa84959b7936e32f5a623a
     restart: unless-stopped
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
@@ -454,7 +454,7 @@ services:
       - monitoring
 
   prometheus:
-    image: prom/prometheus:v3.13.2@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -502,10 +502,9 @@ services:
       - monitoring
 
   grafana:
-    # The stable 13.1.0 image was blocked by the release CVE gate. This clean
-    # official build is pinned by digest, so the mutable nightly tag can never
-    # change what production pulls.
-    image: grafana/grafana:nightly-slim@sha256:b07cf664959594536506b7a0f80e7c2d62e691b81c81345ced595670dd35d08c
+    # The required Prometheus datasource is baked into this immutable image.
+    # Runtime plugin downloads and automatic updates are disabled.
+    image: ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261004-prometheus.2@sha256:d53ad9b2aafeb88b924b0b521224f549414a12248a54c13eb635d3954f6593c3
     restart: unless-stopped
     environment:
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}
@@ -538,6 +537,7 @@ services:
       - ../monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana-data:/var/lib/grafana
+    read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
     pids_limit: 256

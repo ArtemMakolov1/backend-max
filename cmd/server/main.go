@@ -2,10 +2,7 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -294,28 +291,5 @@ func main() {
 }
 
 func newMAXHTTPClient(caCertFile string) (*http.Client, error) {
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, errors.New("default HTTP transport has an unexpected type")
-	}
-	clone := transport.Clone()
-	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if caCertFile != "" {
-		roots, err := x509.SystemCertPool()
-		if err != nil {
-			return nil, fmt.Errorf("load system CA pool: %w", err)
-		}
-		pemBytes, err := os.ReadFile(caCertFile)
-		if err != nil {
-			return nil, fmt.Errorf("read MAX_CA_CERT_FILE: %w", err)
-		}
-		if ok := roots.AppendCertsFromPEM(pemBytes); !ok {
-			return nil, errors.New("MAX_CA_CERT_FILE does not contain a valid PEM certificate")
-		}
-		tlsConfig.RootCAs = roots
-	}
-	// TLS verification remains enabled. MAX_CA_CERT_FILE only extends the
-	// system trust store for the platform-api2.max.ru certificate chain.
-	clone.TLSClientConfig = tlsConfig
-	return &http.Client{Transport: clone, Timeout: 75 * time.Second}, nil
+	return maxclient.NewHTTPClient(caCertFile, 75*time.Second)
 }

@@ -364,6 +364,7 @@ func (s *Store) hydratePostAttachments(ctx context.Context, posts []Post) error 
 		if list := byPost[posts[index].ID]; list != nil {
 			posts[index].Attachments = list
 		}
+		hydratePublicationState(&posts[index])
 	}
 	return nil
 }

@@ -52,13 +52,13 @@ func TestConfigureStudioWebhookUsesRequiredEventsAndSecret(t *testing.T) {
 			if body.URL != "https://api.example.ru/api/v1/webhooks/max" || body.Secret != "safe_secret-123" {
 				t.Errorf("request body = %#v", body)
 			}
-			wantEvents := []string{"bot_added", "bot_removed", "bot_started", "message_created", "message_callback"}
+			wantEvents := []string{"bot_added", "bot_removed", "bot_started", "message_created", "message_callback", "bot_admin_permissions_changed"}
 			if !reflect.DeepEqual(body.UpdateTypes, wantEvents) {
 				t.Errorf("update_types = %#v, want %#v", body.UpdateTypes, wantEvents)
 			}
 			_, _ = io.WriteString(w, `{"success":true}`)
 		case http.MethodGet:
-			_, _ = io.WriteString(w, `{"subscriptions":[{"url":"https://api.example.ru/api/v1/webhooks/max","time":1,"update_types":["bot_added","bot_removed","bot_started","message_created","message_callback"]}]}`)
+			_, _ = io.WriteString(w, `{"subscriptions":[{"url":"https://api.example.ru/api/v1/webhooks/max","time":1,"update_types":["bot_added","bot_removed","bot_started","message_created","message_callback","bot_admin_permissions_changed"]}]}`)
 		default:
 			t.Errorf("unexpected request method: %s", r.Method)
 			w.WriteHeader(http.StatusMethodNotAllowed)

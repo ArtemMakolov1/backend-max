@@ -18,12 +18,28 @@
   `X-WEBAUTH-*` и самостоятельно устанавливать `X-WEBAUTH-USER` и
 `X-WEBAUTH-ROLE`.
 
-Production exporter images are rebuilt from the exact upstream release
-commits with the patched Go toolchain and dependencies in
-`docker/monitoring/`. The resulting multi-architecture GHCR manifests are
-pinned by digest, carry SBOM/provenance attestations and pass the same Trivy
-gate as the application image. Grafana is also pinned to the exact clean
-official image digest selected by that gate.
+Образы экспортёров и Alertmanager собираются из фиксированных коммитов
+официальных релизов с исправленными Go и зависимостями в `docker/monitoring/`.
+Multi-architecture образы GHCR закреплены по digest, содержат SBOM и provenance
+и проходят тот же Trivy-контроль, что образ приложения. Это относится и к
+Node Exporter.
+
+В тесте гонки CAS у Alertmanager явный барьер через существующий интерфейс
+`Limits` устраняет зависимость от планировщика CI. Production-код и проверки
+доставки не изменены; перед патчем проверяется SHA256 исходного теста, а при
+сборке выполняется полный набор upstream-тестов.
+
+В Grafana заранее встроен настроенный источник данных Prometheus из совместимого
+официального образа с фиксированным digest. Установка плагинов и автоматические
+обновления отключены. Файлы плагина принадлежат root, а корневая файловая система
+доступна только для чтения. Внешние плагины ищутся в пустом неизменяемом каталоге:
+старые плагины в постоянном томе данных не загружаются. Prometheus использует
+официальный образ с фиксированным digest, прошедший проверку безопасности.
+
+Security workflow проверяет все шесть образов мониторинга на обеих архитектурах,
+включая Alertmanager, без исключений для уязвимостей. Monitoring policy проверяет,
+что digest каждого развёрнутого образа совпадает с образом в соответствующей
+проверке безопасности.
 
 `OBSERVABILITY_ADMIN_USERS` — comma-separated allowlist идентификаторов
 операторов. Backend endpoint `/api/v1/observability/auth` разрешает доступ
