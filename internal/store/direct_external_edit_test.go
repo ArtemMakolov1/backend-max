@@ -98,6 +98,9 @@ func TestExternalExpiredPrewriteClaimCannotSendAndManagedCampaignCannotBypassGra
 	s, owner, workspace := newDirectStoreFixture(t, ctx)
 	connection := connectDirectTestAccount(t, ctx, s, owner, workspace.ID)
 	now := time.Now().UTC()
+	// Provider dates use Moscow's calendar; keep tomorrow independent of UTC midnight.
+	providerDay := now.In(directMoscowLocation)
+	startsAt := time.Date(providerDay.Year(), providerDay.Month(), providerDay.Day()+1, 0, 0, 0, 0, time.UTC)
 	seedExternalEditTestSnapshot(t, s, owner, workspace.ID, connection.ID, now)
 	hash := strings.Repeat("a", 64)
 	control, err := s.ObserveDirectExternalEdit(ctx, owner, workspace.ID, connection.ID, 77, hash, now)
@@ -116,7 +119,7 @@ func TestExternalExpiredPrewriteClaimCannotSendAndManagedCampaignCannotBypassGra
 	if err = s.BeginDirectExternalWrite(ctx, owner, workspace.ID, connection.ID, 77, operation, now.Add(3*time.Minute)); !errors.Is(err, ErrConflict) {
 		t.Fatalf("expired worker could write: %v", err)
 	}
-	campaign := createDirectTestCampaign(t, ctx, s, owner, workspace.ID, now)
+	campaign := createDirectTestCampaign(t, ctx, s, owner, workspace.ID, now, startsAt)
 	campaign = acceptDirectTestCampaign(t, ctx, s, owner, workspace.ID, campaign, now)
 	if _, err = s.db.ExecContext(ctx, `UPDATE direct_external_campaigns SET provider_campaign_id=$1 WHERE workspace_id=$2 AND provider_campaign_id=77`, *campaign.ProviderCampaignID, workspace.ID); err != nil {
 		t.Fatal(err)
@@ -135,6 +138,9 @@ func TestProviderBudgetPatchRequiresSpendRoleOnlyForActualChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
+	// Provider dates use Moscow's calendar; keep tomorrow independent of UTC midnight.
+	providerDay := now.In(directMoscowLocation)
+	startsAt := time.Date(providerDay.Year(), providerDay.Month(), providerDay.Day()+1, 0, 0, 0, 0, time.UTC)
 	seedBillingContract(t, s, team.ID, "pro", now.Add(-time.Hour), now.AddDate(0, 1, 0), "test-method")
 	for _, role := range []string{WorkspaceRoleEditor, WorkspaceRoleApprover, WorkspaceRoleViewer} {
 		user := "member-" + role
@@ -146,7 +152,7 @@ func TestProviderBudgetPatchRequiresSpendRoleOnlyForActualChange(t *testing.T) {
 		}
 	}
 	connectDirectTestAccount(t, ctx, s, owner, team.ID)
-	campaign := createDirectTestCampaign(t, ctx, s, owner, team.ID, now)
+	campaign := createDirectTestCampaign(t, ctx, s, owner, team.ID, now, startsAt)
 	campaign = acceptDirectTestCampaign(t, ctx, s, owner, team.ID, campaign, now)
 	changed := campaign.WeeklyBudgetMinor + 1000
 	for _, role := range []string{WorkspaceRoleEditor, WorkspaceRoleApprover, WorkspaceRoleViewer} {
@@ -160,12 +166,12 @@ func TestProviderBudgetPatchRequiresSpendRoleOnlyForActualChange(t *testing.T) {
 	if _, err = s.ClaimDirectCampaignProviderEdit(ctx, "member-editor", team.ID, campaign.ID, DirectCampaignChanges{WeeklyBudgetMinor: &unchanged, Texts: &texts, ExpectedVersion: campaign.Version}, campaign.ProviderGraphHash, campaign.ProviderRevisionID, "provider-editor-copy", now.Add(time.Minute)); err != nil {
 		t.Fatalf("editor unchanged full-form budget rejected: %v", err)
 	}
-	second := createDirectTestCampaign(t, ctx, s, owner, team.ID, now)
+	second := createDirectTestCampaign(t, ctx, s, owner, team.ID, now, startsAt)
 	second = acceptDirectTestCampaign(t, ctx, s, owner, team.ID, second, now)
 	if _, err = s.ClaimDirectCampaignProviderEdit(ctx, owner, team.ID, second.ID, DirectCampaignChanges{WeeklyBudgetMinor: &changed, ExpectedVersion: second.Version}, second.ProviderGraphHash, second.ProviderRevisionID, "provider-owner-budget", now.Add(time.Minute)); err != nil {
 		t.Fatalf("owner changed budget rejected: %v", err)
 	}
-	draft := createDirectTestCampaign(t, ctx, s, owner, team.ID, now)
+	draft := createDirectTestCampaign(t, ctx, s, owner, team.ID, now, startsAt)
 	if _, err = s.UpdateDirectCampaignDraft(ctx, "member-editor", team.ID, draft.ID, DirectCampaignChanges{WeeklyBudgetMinor: &changed, ExpectedVersion: draft.Version}); err != nil {
 		t.Fatalf("draft-only workflow changed: %v", err)
 	}
