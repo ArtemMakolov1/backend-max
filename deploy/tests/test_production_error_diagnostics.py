@@ -1,14 +1,21 @@
 """Offline regression tests: raw logs never cross the diagnostic boundary."""
 import contextlib
+import errno
+import http.server
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
+import socket
+import ssl
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).parents[1] / "diagnose-production-errors.py"
@@ -314,6 +321,176 @@ class SanitizerTests(unittest.TestCase):
         self.assert_safe(output[0])
 
 
+class NetworkDiagnosticsTests(unittest.TestCase):
+    def test_warning_counts_require_exact_warn_logger_and_integer_http_status(self):
+        output = []
+        reader = diagnostic.BoundedDiagnostics(output.append)
+        records = [record(SECRETS[0], level='WARN', msg='content source retrieval failed', body=SECRETS)]
+        for status in (100, 599, 403, True, 403.0, '403', 99, 600, SECRETS[0], None):
+            records.append(provider_record(level='WARN', status=status, code=SECRETS[0]))
+        records.extend([
+            record(SECRETS[0], level='INFO', msg='content source retrieval failed'),
+            record(SECRETS[0], level='WARN', msg='content source retrieval failed '),
+            record(SECRETS[0], level='WARN', msg=SECRETS[0]),
+        ])
+        reader.feed(b''.join(json.dumps(item).encode() + b'\n' for item in records))
+        summary = reader.finish()
+        self.assertEqual(summary['warning_counts'], {
+            'content_source_retrieval_failed': 1, 'openai_research_request_failed': 10,
+            'openai_research_http_status_counts': {'100': 1, '599': 1, '403': 1}})
+        for secret in SECRETS:
+            self.assertNotIn(secret, json.dumps([summary, output]))
+
+    def test_network_summary_distinguishes_edge_and_private_gateway_without_addresses(self):
+        for edge_internal, route, expected in (
+            (False, b'default via 10.20.30.40 dev eth0\n', True),
+            (False, b'default via 192.0.2.55 dev eth1 proto dhcp src 192.0.2.10 metric 10\n', False),
+            (True, b'default via 10.20.30.40 dev eth0\n', True),
+            (False, b'', False),
+            (False, b'default via 10.20.30.40 dev eth0\ndefault via 192.0.2.55 dev eth1\n', None),
+        ):
+            with self.subTest(route=route):
+                responses = [(json.dumps({'maxposty-edge': {'Gateway': '10.20.30.40', 'IPAddress': SECRETS[10]}}).encode(), 'complete'),
+                             (json.dumps(edge_internal).encode(), 'complete'), (route, 'complete')]
+                with patch.object(diagnostic, 'bounded_command', side_effect=responses) as commands:
+                    result = diagnostic.read_container_network('a' * 64)
+                self.assertEqual(result['edge_attached'], True)
+                self.assertEqual(result['edge_internal'], edge_internal)
+                self.assertEqual(result['default_route_is_edge'], expected)
+                self.assertEqual(result['default_routes_count'], len(route.splitlines()))
+                self.assertEqual(set(result), {'edge_attached', 'edge_internal', 'default_route_is_edge', 'default_routes_count'})
+                self.assertEqual(commands.call_args_list[0].args[0][-1], 'a' * 64)
+                self.assertEqual(commands.call_args_list[2].args[0][2], 'a' * 64)
+                for secret in SECRETS:
+                    self.assertNotIn(secret, json.dumps(result))
+
+    def test_unrecognized_network_or_route_output_is_not_promoted_or_printed(self):
+        for route in (SECRETS[0].encode(), b'default via 10.20.30.40 dev eth0 private-provider-request',
+                      b'default via 999.1.2.3 dev eth0', b'\xff', b'default via 10.20.30.40 dev eth0\n' * 33):
+            with self.subTest(route=route), patch.object(diagnostic, 'bounded_command', side_effect=[
+                    (json.dumps(SECRETS).encode(), 'complete'), (b'true private-provider-request', 'complete'), (route, 'complete')]):
+                result = diagnostic.read_container_network('a' * 64)
+                self.assertEqual(result, {'edge_attached': None, 'edge_internal': None,
+                                          'default_route_is_edge': None, 'default_routes_count': None})
+                self.assertNotIn(SECRETS[0], json.dumps(result))
+        with patch.object(diagnostic, 'bounded_command') as command:
+            diagnostic.read_container_network(SECRETS[0])
+            command.assert_not_called()
+
+    def test_host_probe_subprocess_is_fixed_clean_env_and_accepts_only_status_or_enum(self):
+        for raw, status, expected, http_status in (
+            (b'401\n', 'complete', 'http', 401), (b'302\n', 'complete', 'http', 302),
+            (b'599', 'complete', 'http', 599), (b'dns\n', 'complete', 'dns', None),
+            (b'tls\n', 'complete', 'tls', None), (None, 'timeout', 'timeout', None),
+            (None, 'failed', 'unknown', None), (b'600\n', 'complete', 'unknown', None),
+            (b'dns\n\n', 'complete', 'unknown', None), (SECRETS[0].encode(), 'complete', 'unknown', None),
+            (b'HTTP/1.1 401 private-provider-request', 'complete', 'unknown', None),
+        ):
+            with self.subTest(raw=raw), patch.object(diagnostic, 'bounded_command', return_value=(raw, status)) as command:
+                results = diagnostic.read_host_outbound_probes()
+                self.assertEqual([r['provider'] for r in results], ['exa', 'tavily', 'openai'])
+                self.assertTrue(all(r['scope'] == 'host' and r['result'] == expected and r['http_status'] == http_status for r in results))
+                self.assertTrue(all(c.kwargs == {'max_bytes': 64, 'timeout': 7, 'clean_env': True} for c in command.call_args_list))
+                self.assertEqual([c.args[0][-1] for c in command.call_args_list], list(diagnostic.HOST_PROVIDERS))
+                for secret in SECRETS:
+                    self.assertNotIn(secret, json.dumps(results))
+
+    def test_command_timeout_and_output_limit_kill_only_reader_without_printing_output(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            bounded = diagnostic.bounded_command([sys.executable, '-c', 'print("private-provider-request"*1000)'], max_bytes=16)
+            timeout = diagnostic.bounded_command([sys.executable, '-c', 'import time; time.sleep(10)'], timeout=0.05)
+        self.assertEqual(bounded, (None, 'bounded'))
+        self.assertEqual(timeout, (None, 'timeout'))
+        self.assertEqual(output.getvalue(), '')
+
+
+class HostHTTPSProbeTests(unittest.TestCase):
+    def namespace(self):
+        namespace = {'__name__': 'offline_probe_test'}
+        exec(compile(diagnostic.HOST_PROBE_CODE, '<fixed-host-probe>', 'exec'), namespace)
+        return namespace
+
+    def test_tls_proxy_redirect_and_body_boundaries_for_fixed_requests(self):
+        namespace = self.namespace()
+        self.assertEqual(namespace['URLS'], {'exa': 'https://api.exa.ai/search', 'tavily': 'https://api.tavily.com/search',
+                                            'openai': 'https://api.openai.com/v1/models'})
+        class Response:
+            status = 204
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, *args): raise AssertionError('response body must not be read')
+        class Opener:
+            def open(self, request, timeout):
+                self.request, self.timeout = request, timeout
+                return Response()
+        opener = Opener()
+        with patch('urllib.request.build_opener', return_value=opener) as build:
+            self.assertEqual(namespace['probe']('exa'), '204')
+        handlers = build.call_args.args
+        self.assertEqual(handlers[0].proxies, {})
+        self.assertIsNone(handlers[1].redirect_request(None, None, 302, SECRETS[0], {}, SECRETS[2]))
+        self.assertEqual(handlers[2]._context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(handlers[2]._context.check_hostname)
+        self.assertEqual(opener.request.full_url, namespace['URLS']['exa'])
+        self.assertEqual(opener.request.get_method(), 'GET')
+        self.assertEqual(opener.request.header_items(), [])
+        self.assertIsNone(opener.request.data)
+        self.assertEqual(opener.timeout, 5)
+        with patch('urllib.request.build_opener') as build:
+            self.assertEqual(namespace['probe'](SECRETS[2]), 'unknown')
+            build.assert_not_called()
+
+    def test_http_errors_expose_only_status_and_close_without_reading_private_body(self):
+        namespace = self.namespace()
+        class NoRead(io.BytesIO):
+            def read(self, *args): raise AssertionError('private response body read')
+        for status in (100, 302, 401, 403, 599):
+            body = NoRead(SECRETS[0].encode())
+            error = urllib.error.HTTPError(SECRETS[2], status, SECRETS[0], {'Location': SECRETS[2]}, body)
+            with patch('urllib.request.build_opener') as build:
+                build.return_value.open.side_effect = error
+                self.assertEqual(namespace['probe']('tavily'), str(status))
+                self.assertEqual(build.return_value.open.call_count, 1)
+            self.assertTrue(body.closed)
+
+    def test_exception_types_produce_only_known_enums_never_error_fragments(self):
+        classify = self.namespace()['classify']
+        for error, expected in (
+            (socket.gaierror(-2, SECRETS[0]), 'dns'), (ssl.SSLCertVerificationError(SECRETS[0]), 'tls'),
+            (TimeoutError(SECRETS[0]), 'timeout'), (OSError(errno.ENETUNREACH, SECRETS[0]), 'no_route'),
+            (OSError(errno.EHOSTUNREACH, SECRETS[0]), 'no_route'), (Exception(SECRETS[0]), 'unknown'),
+            (SECRETS[0], 'unknown'),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(classify(urllib.error.URLError(error)), expected)
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL is needed only to generate a local untrusted TLS fixture')
+    def test_actual_tls_client_rejects_untrusted_certificate_before_http_request(self):
+        namespace = self.namespace()
+        with tempfile.TemporaryDirectory(prefix='diagnostic-tls-negative-') as directory:
+            root = Path(directory)
+            subprocess.run([shutil.which('openssl'), 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                            '-keyout', str(root / 'key.pem'), '-out', str(root / 'cert.pem'), '-days', '1',
+                            '-subj', '/CN=localhost'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            requests = []
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self): requests.append(self.path); self.send_response(200); self.end_headers()
+                def log_message(self, *args): pass
+            server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(root / 'cert.pem', root / 'key.pem')
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            namespace['URLS']['exa'] = f'https://127.0.0.1:{server.server_port}/'
+            try:
+                self.assertEqual(namespace['probe']('exa'), 'tls')
+                self.assertEqual(requests, [])
+            finally:
+                server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
 class InvocationTests(unittest.TestCase):
     def test_actual_remote_entrypoint_reads_only_inspect_labels_and_bounded_logs(self):
         with tempfile.TemporaryDirectory(prefix="diagnostic-") as directory:
@@ -329,17 +506,27 @@ class InvocationTests(unittest.TestCase):
             fake.write_text("#!/usr/bin/env python3\nimport json,sys\nfrom pathlib import Path\n"
                             "root=Path(__file__).parent\n"
                             "with (root/'docker-commands.jsonl').open('a') as log: log.write(json.dumps(sys.argv[1:])+'\\n')\n"
-                            "if sys.argv[1]=='inspect': print('maxposty-backend|backend|'+'a'*40+'|'+'b'*64)\n"
+                            "if sys.argv[1]=='inspect':\n"
+                            " if '.NetworkSettings.Networks' in sys.argv[3]: print(json.dumps({'maxposty-edge':{'Gateway':'10.20.30.40','IPAddress':'192.0.2.55'}}))\n"
+                            " else: print('maxposty-backend|backend|'+'a'*40+'|'+'b'*64)\n"
+                            "elif sys.argv[1]=='network': print('false')\n"
+                            "elif sys.argv[1]=='exec': print('default via 10.20.30.40 dev eth0')\n"
                             "elif sys.argv[1]=='logs':\n"
                             f" print({json.dumps(record('ERROR: permission denied for table content_discovery_candidates (SQLSTATE 42501)', body=SECRETS))!r})\n"
                             f" print({json.dumps(record('decode OpenAI Responses response: ' + SECRETS[0]))!r},file=sys.stderr)\n"
                             f" print({transport_record!r},file=sys.stderr)\n"
-                            f" print({json.dumps(provider_record(status=400, code='model_not_found', request_id=SECRETS[5], response=SECRETS))!r},file=sys.stderr)\n"
-                            f" print({json.dumps(record('Country, region, or territory not supported', msg='OpenAI research request failed', status=403, request_id=SECRETS[5], response=SECRETS))!r},file=sys.stderr)\n"
+                            f" print({json.dumps(provider_record(level='WARN', status=400, code='model_not_found', request_id=SECRETS[5], response=SECRETS))!r},file=sys.stderr)\n"
+                            f" print({json.dumps(record('Country, region, or territory not supported', level='WARN', msg='OpenAI research request failed', status=403, request_id=SECRETS[5], response=SECRETS))!r},file=sys.stderr)\n"
+                            f" print({json.dumps(record(SECRETS[0], level='WARN', msg='content source retrieval failed', body=SECRETS))!r},file=sys.stderr)\n"
                             f" print({SECRETS[2]!r},file=sys.stderr)\n"
                             "else: sys.exit(91)\n")
             fake.chmod(0o700)
-            result = subprocess.run([sys.executable, str(SCRIPT), directory], capture_output=True, text=True,
+            # Execute the real remote entrypoint/CLI with only host HTTP probes
+            # stubbed. This integration fixture must never contact the internet.
+            wrapper = ("import importlib.util,sys; spec=importlib.util.spec_from_file_location('diag',sys.argv[1]); "
+                       "m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); "
+                       "m.read_host_outbound_probes=lambda: []; sys.argv=['diagnostic',sys.argv[2]]; sys.exit(m.main())")
+            result = subprocess.run([sys.executable, '-c', wrapper, str(SCRIPT), directory], capture_output=True, text=True,
                                     env={**os.environ, "PATH": str(root) + os.pathsep + os.environ.get("PATH", "")}, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "")
@@ -357,9 +544,18 @@ class InvocationTests(unittest.TestCase):
                              (403, None, "unsupported_region"))
             self.assertEqual(output[-1]["request_failures"], 5)
             self.assertEqual(output[-1]["read_status"], "complete")
+            self.assertEqual(output[-1]["warning_counts"], {
+                "content_source_retrieval_failed": 1, "openai_research_request_failed": 2,
+                "openai_research_http_status_counts": {"400": 1, "403": 1}})
+            self.assertEqual(output[-1]["container_network"], {
+                "edge_attached": True, "edge_internal": False,
+                "default_route_is_edge": True, "default_routes_count": 1})
             calls = [json.loads(line) for line in commands.read_text().splitlines()]
-            self.assertEqual([call[0] for call in calls], ["inspect", "logs", "inspect"])
+            self.assertEqual([call[0] for call in calls], ["inspect", "logs", "inspect", "network", "exec", "inspect"])
             self.assertEqual(calls[1], ["logs", "--since=1h", "--tail=2000", "b" * 64])
+            self.assertEqual(calls[2], ["inspect", "--format", "{{json .NetworkSettings.Networks}}", "b" * 64])
+            self.assertEqual(calls[3], ["network", "inspect", "--format", "{{json .Internal}}", "maxposty-edge"])
+            self.assertEqual(calls[4], ["exec", "b" * 64, "/bin/busybox", "ip", "-4", "route", "show", "default"])
             self.assertNotIn(".Config.Env", json.dumps(calls))
 
     def test_deploy_race_discards_every_sanitized_record_before_output(self):
@@ -369,11 +565,15 @@ class InvocationTests(unittest.TestCase):
         with patch.object(sys, 'argv', ['diagnostic', '/opt/maxposty/backend']), \
                 patch.object(diagnostic, 'validate_target', side_effect=['a' * 64, 'b' * 64]), \
                 patch.object(diagnostic, 'read_diagnostics', return_value=([safe, provider], {'read_status': 'complete'})), \
+                patch.object(diagnostic, 'read_container_network', return_value={'edge_attached': True}), \
+                patch.object(diagnostic, 'read_host_outbound_probes', return_value=[{'scope': 'host', 'result': 'tls'}]), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(diagnostic.main(), 1)
         self.assertEqual(json.loads(output.getvalue()), {'read_status': 'unavailable'})
         self.assertNotIn('content_analysis_cache', output.getvalue())
         self.assertNotIn('provider_http', output.getvalue())
+        self.assertNotIn('edge_attached', output.getvalue())
+        self.assertNotIn('outbound_probes', output.getvalue())
 
     def test_log_read_timeout_stops_only_the_log_client(self):
         process = subprocess.Popen([sys.executable, '-c', 'import time; print("private-provider-request", flush=True); time.sleep(10)'],
