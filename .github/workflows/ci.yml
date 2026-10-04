@@ -59,6 +59,7 @@ jobs:
       - name: Verify release and deployment rollback policies
         run: |
           ./deploy/tests/release-gate-policy.sh
+          bash ./deploy/tests/complimentary-access-policy.sh
           ./deploy/tests/pgbouncer-healthcheck-policy.sh
           ./deploy/tests/monitoring-policy.sh
           bash ./deploy/tests/production-env-policy.sh
@@ -69,6 +70,10 @@ jobs:
         if: ${{ always() }}
         shell: bash
         run: docker logout ghcr.io >/dev/null 2>&1 || true
+      - name: Verify complimentary access owner operation and runtime privileges
+        env:
+          COMPLIMENTARY_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+        run: bash ./deploy/tests/complimentary-access-postgres-policy.sh --ci-service "$COMPLIMENTARY_TEST_PG_CONTAINER"
       - name: Run all tests with the race detector
         run: go test -race ./...
       - run: go vet ./...

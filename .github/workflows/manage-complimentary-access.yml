@@ -1,0 +1,120 @@
+name: Manage approved account complimentary access
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Inspect, grant or revoke full feature access for the approved production account
+        required: true
+        default: inspect
+        type: choice
+        options: [inspect, grant, revoke]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxposty-backend-production
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: ${{ github.sha }}
+  ACCESS_OPERATION: ${{ inputs.operation }}
+
+jobs:
+  manage:
+    name: Inspect or update the approved account grant
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    environment:
+      name: production
+      url: https://maxposty.ru
+    env:
+      DEPLOY_STAGE: ${{ vars.DEPLOY_STAGE }}
+      VPS_HOST: ${{ vars.VPS_HOST }}
+      VPS_PORT: ${{ vars.VPS_PORT || '22' }}
+      VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
+      TARGET_EMAIL: ${{ secrets.COMPLIMENTARY_ACCESS_ACCOUNT_EMAIL }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Validate the approved production operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          [[ "$DEPLOY_STAGE" == production ]] || { echo "A protected production target is required" >&2; exit 1; }
+          case "$ACCESS_OPERATION" in inspect|grant|revoke) ;; *) echo "Invalid complimentary access operation" >&2; exit 1;; esac
+          target_email=${TARGET_EMAIL,,}
+          [[ ${#target_email} -le 254 && "$target_email" =~ ^[a-z0-9][a-z0-9._+-]{0,63}@[a-z0-9][a-z0-9.-]*\.[a-z]{2,63}$ ]] || { echo "The protected approved account secret is required" >&2; exit 1; }
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ && "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ && "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid pinned production target" >&2; exit 1; }
+          (( VPS_PORT <= 65535 ))
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$GITHUB_ACTOR" =~ ^[A-Za-z0-9_-]{1,39}$ && "$GITHUB_RUN_ID" =~ ^[0-9]{1,20}$ && "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,5}$ ]]
+          [[ -f deploy/manage-complimentary-access.sh && ! -L deploy/manage-complimentary-access.sh && -f internal/store/migrations/039_account_complimentary_access.sql && ! -L internal/store/migrations/039_account_complimentary_access.sql ]]
+      - name: Verify owner-operation policy without production access
+        shell: bash
+        run: bash ./deploy/tests/complimentary-access-policy.sh
+      - name: Require successful gates for this exact main source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./deploy/verify-release-gates.sh "$GITHUB_REPOSITORY" "$SOURCE_SHA" 1 0
+      - name: Configure pinned SSH identity
+        shell: bash
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          set +x
+          [[ -n "$VPS_SSH_PRIVATE_KEY" && -n "$VPS_SSH_KNOWN_HOSTS" ]] || { echo "Pinned deployment SSH credentials are required" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
+      - name: Transfer and run the reviewed owner-only operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          target="${VPS_USER}@${VPS_HOST}"
+          remote_dir="/opt/maxposty/backend/backups/complimentary-access-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          script_sha=$(sha256sum deploy/manage-complimentary-access.sh | cut -d ' ' -f 1)
+          schema_sha=$(sha256sum internal/store/migrations/039_account_complimentary_access.sql | cut -d ' ' -f 1)
+          target_email=${TARGET_EMAIL,,}
+          ssh_options=(-i "$HOME/.ssh/id_deploy" -p "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          scp_options=(-i "$HOME/.ssh/id_deploy" -P "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          ssh "${ssh_options[@]}" "$target" "set -eu; umask 077; test ! -e '$remote_dir'; mkdir -m 700 '$remote_dir'"
+          scp "${scp_options[@]}" deploy/manage-complimentary-access.sh "$target:$remote_dir/manage-complimentary-access.sh"
+          ssh "${ssh_options[@]}" "$target" "bash -s -- '$remote_dir' '$ACCESS_OPERATION' '$SOURCE_SHA' '$target_email' '$GITHUB_ACTOR' '${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}' '$script_sha' '$schema_sha'" <<'REMOTE'
+          set -euo pipefail
+          set +x
+          private_dir=$1
+          operation=$2
+          source_sha=$3
+          target_email=$4
+          actor=$5
+          run_reference=$6
+          script_sha=$7
+          schema_sha=$8
+          trap 'rm -f "$private_dir/manage-complimentary-access.sh"; rmdir "$private_dir" 2>/dev/null || true' EXIT
+          [[ -f "$private_dir/manage-complimentary-access.sh" && ! -L "$private_dir/manage-complimentary-access.sh" && $(sha256sum "$private_dir/manage-complimentary-access.sh" | cut -d ' ' -f 1) == "$script_sha" ]] || { echo "Transferred operation does not match the reviewed source" >&2; exit 1; }
+          chmod 600 "$private_dir/manage-complimentary-access.sh"
+          bash "$private_dir/manage-complimentary-access.sh" "$operation" "$source_sha" "$target_email" "$actor" "$run_reference" /opt/maxposty/backend "$schema_sha"
+          REMOTE
+      - name: Verify public API stayed healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30 https://maxposty.ru/api/v1/health | jq -e '.status == "ok" and .auth_required == true' >/dev/null
+          echo "Production API remains healthy and authenticated"
+      - name: Remove runner deployment credentials
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
