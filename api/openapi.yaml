@@ -4409,7 +4409,7 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: limit multiplied by unit_scale; authoritative for hard enforcement.
+          description: limit multiplied by unit_scale; authoritative for hard enforcement only when unlimited is false.
         unit:
           type: string
           description: User-facing unit such as channel, seat, byte, request or medium_equivalent_image.
@@ -4421,6 +4421,9 @@ components:
           description: |
             Ledger base units in one displayed unit. ai_images_monthly uses 9:
             low=1 credit, medium/default=9 and high=36.
+        unlimited:
+          type: boolean
+          description: Absent means false. True means the workspace has no tariff cap for this metric. Numeric limits remain the immutable base-plan allowance and are not enforced when unlimited is true.
         hard_limit: {type: boolean}
     BillingCatalogEntry:
       type: object
@@ -4609,6 +4612,9 @@ components:
         - image_credit_costs
       properties:
         workspace_id: {type: string}
+        complimentary_access:
+          type: boolean
+          description: Absent means false. Operator-granted access inherited only from this workspace owner; independent of paid plans, payment contracts and member roles. Tariff caps and AI paid-feature gates do not apply, while technical safety limits remain.
         subscription: {$ref: '#/components/schemas/WorkspaceSubscription'}
         entitlements:
           type: array

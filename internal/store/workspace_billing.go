@@ -53,6 +53,7 @@ type BillingEntitlement struct {
 	Period         string `json:"period"`
 	UnitScale      int64  `json:"unit_scale"`
 	HardLimit      bool   `json:"hard_limit"`
+	Unlimited      bool   `json:"unlimited"`
 }
 
 type BillingCatalogEntry struct {
@@ -88,13 +89,14 @@ type WorkspaceUsageMetric struct {
 }
 
 type WorkspaceBillingState struct {
-	WorkspaceID  string                     `json:"workspace_id"`
-	Subscription WorkspaceSubscriptionState `json:"subscription"`
-	Entitlements []BillingEntitlement       `json:"entitlements"`
-	Usage        []WorkspaceUsageMetric     `json:"usage"`
-	Features     BillingFeatures            `json:"features"`
-	Contract     *BillingContract           `json:"contract"`
-	Actions      BillingActions             `json:"billing_actions"`
+	WorkspaceID         string                     `json:"workspace_id"`
+	ComplimentaryAccess bool                       `json:"complimentary_access"`
+	Subscription        WorkspaceSubscriptionState `json:"subscription"`
+	Entitlements        []BillingEntitlement       `json:"entitlements"`
+	Usage               []WorkspaceUsageMetric     `json:"usage"`
+	Features            BillingFeatures            `json:"features"`
+	Contract            *BillingContract           `json:"contract"`
+	Actions             BillingActions             `json:"billing_actions"`
 }
 
 type BillingFeatures struct {
@@ -343,11 +345,26 @@ WHERE s.workspace_id=$1`, workspaceID).Scan(
 		return WorkspaceBillingState{}, err
 	}
 	state.Features = billingFeatures(state.Subscription.Plan.Code, state.Entitlements)
+	state.ComplimentaryAccess, err = workspaceComplimentaryAccess(ctx, tx, workspaceID)
+	if err != nil {
+		return WorkspaceBillingState{}, err
+	}
+	if state.ComplimentaryAccess {
+		for index := range state.Entitlements {
+			state.Entitlements[index].Unlimited = true
+			state.Entitlements[index].HardLimit = false
+		}
+		state.Features = BillingFeatures{AIImages: true, AIResearch: true, AIFormat: true, AIChannelDescription: true, AIBrandKit: true}
+	}
 	state.Contract, err = readBillingContract(ctx, tx, workspaceID)
 	if err != nil {
 		return WorkspaceBillingState{}, err
 	}
 	state.Actions = billingActions(state.Subscription.Plan.Code, state.Contract)
+	if state.ComplimentaryAccess {
+		state.Actions.CanCheckout = false
+		state.Actions.CanResume = false
+	}
 	state.Usage, err = readWorkspaceUsage(ctx, tx, workspaceID, state.Entitlements, now.UTC())
 	if err != nil {
 		return WorkspaceBillingState{}, err
@@ -396,6 +413,13 @@ func chargeWorkspaceMonthlyUsageTx(
 		return WorkspaceMonthlyUsage{}, errors.New("monthly usage time is required")
 	}
 	now = now.UTC()
+	complimentary, err := lockWorkspaceComplimentaryAccess(ctx, tx, workspaceID)
+	if err != nil {
+		return WorkspaceMonthlyUsage{}, err
+	}
+	if complimentary {
+		enforce = false
+	}
 	if err := requireActiveWorkspaceSubscription(ctx, tx, workspaceID); err != nil {
 		return WorkspaceMonthlyUsage{}, err
 	}
@@ -483,6 +507,10 @@ type workspaceUsageWindow struct {
 func resolveWorkspaceUsageWindow(
 	ctx context.Context, tx *sql.Tx, workspaceID string, now time.Time,
 ) (workspaceUsageWindow, error) {
+	complimentary, err := workspaceComplimentaryAccess(ctx, tx, workspaceID)
+	if err != nil {
+		return workspaceUsageWindow{}, err
+	}
 	var planCode string
 	if err := tx.QueryRowContext(ctx, `SELECT plan_code FROM workspace_subscriptions
 WHERE workspace_id=$1`, workspaceID).Scan(&planCode); errors.Is(err, sql.ErrNoRows) {
@@ -499,7 +527,13 @@ WHERE workspace_id=$1`, workspaceID).Scan(&planCode); errors.Is(err, sql.ErrNoRo
 	if err := tx.QueryRowContext(ctx, `SELECT p.id,p.period_start,p.period_end
 FROM billing_subscription_contracts c
 JOIN billing_subscription_periods p ON p.id=c.current_period_id
-WHERE c.workspace_id=$1 AND p.workspace_id=$1`, workspaceID).Scan(&periodID, &start, &end); errors.Is(err, sql.ErrNoRows) {
+WHERE c.workspace_id=$1 AND p.workspace_id=$1
+  AND (NOT $2 OR (c.status IN ('active','past_due') AND p.status='active'
+       AND (p.period_end>$3 OR (c.status='past_due' AND c.grace_until>$3))))`, workspaceID, complimentary, now).Scan(&periodID, &start, &end); errors.Is(err, sql.ErrNoRows) {
+		if complimentary {
+			start, end := workspaceMonthlyUsagePeriod(now)
+			return workspaceUsageWindow{PeriodStart: start, PeriodEnd: end, LockSuffix: start.Format("2006-01-02")}, nil
+		}
 		return workspaceUsageWindow{}, fmt.Errorf("%w: paid subscription period", ErrWorkspaceEntitlementUnavailable)
 	} else if err != nil {
 		return workspaceUsageWindow{}, fmt.Errorf("read paid workspace usage period: %w", err)
@@ -525,6 +559,11 @@ func aiFeatureForUsageMetric(metric string) string {
 }
 
 func requireWorkspaceAIFeature(ctx context.Context, tx *sql.Tx, workspaceID, metric, feature string) error {
+	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
+		return err
+	} else if active {
+		return nil
+	}
 	var limit, scale int64
 	err := tx.QueryRowContext(ctx, `SELECT e.limit_value,e.unit_scale
 FROM workspace_subscriptions s
@@ -629,6 +668,11 @@ func nullTimePointer(value sql.NullTime) *time.Time {
 }
 
 func requireActiveWorkspaceSubscription(ctx context.Context, tx *sql.Tx, workspaceID string) error {
+	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
+		return err
+	} else if active {
+		return nil
+	}
 	var status string
 	var entitled bool
 	err := tx.QueryRowContext(ctx, `SELECT s.status,

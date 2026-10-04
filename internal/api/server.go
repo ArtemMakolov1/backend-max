@@ -797,6 +797,8 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrBillingIntentInvalid):
 		s.problem(w, http.StatusUnprocessableEntity, "billing_intent_invalid",
 			"Подтверждение отмены истекло или уже использовано.", nil)
+	case errors.Is(err, store.ErrBillingComplimentaryAccess):
+		s.problem(w, http.StatusConflict, "complimentary_access_active", "В рабочем пространстве уже включён бесплатный доступ без тарифных ограничений.", nil)
 	case errors.Is(err, store.ErrBillingConflict):
 		s.problem(w, http.StatusConflict, "billing_conflict",
 			"Состояние подписки изменилось. Обновите страницу и повторите действие.", nil)

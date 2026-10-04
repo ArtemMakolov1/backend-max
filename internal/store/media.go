@@ -102,6 +102,14 @@ WHERE owner_id=? AND filename=?`), now.UTC(), userID, filename); err != nil {
 		return MediaReservation{}, fmt.Errorf("lookup media reservation: %w", lookupErr)
 	}
 
+	var workspaceIDForQuota string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM workspaces WHERE owner_user_id=$1 AND is_personal=TRUE AND archived_at IS NULL`, userID).Scan(&workspaceIDForQuota); err != nil {
+		return MediaReservation{}, fmt.Errorf("resolve personal workspace for media quota: %w", err)
+	}
+	complimentary, err := lockWorkspaceComplimentaryAccess(ctx, tx, workspaceIDForQuota)
+	if err != nil {
+		return MediaReservation{}, err
+	}
 	if _, err := tx.ExecContext(ctx, bindSQL(`INSERT INTO media_usage(owner_id, asset_count, total_bytes, updated_at)
 VALUES (?,0,0,?) ON CONFLICT(owner_id) DO NOTHING`), userID, now.UTC()); err != nil {
 		return MediaReservation{}, fmt.Errorf("initialize media usage: %w", err)
@@ -111,7 +119,7 @@ VALUES (?,0,0,?) ON CONFLICT(owner_id) DO NOTHING`), userID, now.UTC()); err != 
 WHERE owner_id=? FOR UPDATE`), userID).Scan(&usedFiles, &usedBytes); err != nil {
 		return MediaReservation{}, fmt.Errorf("lock media usage: %w", err)
 	}
-	if usedFiles >= limits.MaxFiles || size > limits.MaxBytes || usedBytes > limits.MaxBytes-size {
+	if !complimentary && (usedFiles >= limits.MaxFiles || size > limits.MaxBytes || usedBytes > limits.MaxBytes-size) {
 		return MediaReservation{}, ErrMediaQuotaExceeded
 	}
 	token, err := newMediaReservationToken()

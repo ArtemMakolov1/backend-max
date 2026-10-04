@@ -666,6 +666,11 @@ func requireOwnedTeamWorkspaceCapacity(
 		`SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
 		return fmt.Errorf("lock owned team workspace quota: %w", err)
 	}
+	if active, err := accountComplimentaryAccess(ctx, tx, ownerUserID); err != nil {
+		return err
+	} else if active {
+		return nil
+	}
 	var owned int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM workspaces
 WHERE owner_user_id=$1 AND is_personal=FALSE`, ownerUserID).Scan(&owned); err != nil {

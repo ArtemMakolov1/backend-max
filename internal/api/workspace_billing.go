@@ -253,7 +253,7 @@ func (s *Server) writeWorkspaceBilling(
 	s.writeJSON(w, status, workspaceBillingResponse{
 		WorkspaceBillingState:     state,
 		MonthlyEnforcementEnabled: s.aiLimiter.options.MonthlyPlanEnforcement,
-		CheckoutEnabled:           s.app.BillingLiveEnabled(),
+		CheckoutEnabled:           s.app.BillingLiveEnabled() && !state.ComplimentaryAccess,
 		ImageCreditCosts:          currentImageCreditCosts(),
 	})
 }

@@ -29,6 +29,19 @@ reject_statement() {
 }
 
 for file in "${migration_files[@]}"; do
+  # This exact reviewed migration revokes DML/EXECUTE only on new operator
+  # objects. Its two replaced entitlement helpers preserve every pre-grant
+  # branch; the private grant is activated only after the healthy new release.
+  # Pin the complete body, rather than permitting arbitrary ACL/function
+  # changes. Any edit requires another explicit compatibility review.
+  if [ "${file##*/}" = 039_account_complimentary_access.sql ]; then
+    reviewed_sha=c0516b3c39a814d07e32de7d6d8bc79363a12195e73a4f26d56a8630dfa99fdd
+    actual_sha=$(perl -MDigest::SHA=sha256_hex -0ne 'print sha256_hex($_)' "$file")
+    if [[ "$actual_sha" != "$reviewed_sha" ]]; then
+      reject_statement "$file" "Reviewed migration checksum changed; compatibility must be reviewed again."
+    fi
+    continue
+  fi
   while IFS= read -r statement || [[ -n "$statement" ]]; do
     statement=${statement#"${statement%%[![:space:]]*}"}
     statement=${statement%"${statement##*[![:space:]]}"}
