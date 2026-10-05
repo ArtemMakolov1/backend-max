@@ -57,7 +57,7 @@ jobs:
       VPS_PORT: ${{ vars.VPS_PORT || '22' }}
       VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Restrict recovery to the reviewed source and image
@@ -86,7 +86,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/37202833994/jobs?per_page=100" >"$RUNNER_TEMP/recovery-image-jobs.json"
           jq -e '[.jobs[] | select(.name == "Build immutable production image" or .name == "Scan exact pushed digest (linux/amd64)" or .name == "Scan exact pushed digest (linux/arm64)")] | length == 3 and all(.[]; .conclusion == "success")' "$RUNNER_TEMP/recovery-image-jobs.json" >/dev/null
           echo "Reviewed immutable image build and both architecture scans verified"
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.SOURCE_SHA }}
           path: verified-source
