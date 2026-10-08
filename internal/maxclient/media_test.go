@@ -472,3 +472,69 @@ func TestPublishRejectsCombinedLegacyAndTypedMedia(t *testing.T) {
 		t.Fatalf("Publish() error = %v", err)
 	}
 }
+
+func TestUploadVideoNotBoundedByBaseClientTotalTimeout(t *testing.T) {
+	t.Parallel()
+
+	uploadServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Slower than the base client's total deadline below: a video upload
+		// that crosses the configured Timeout must still succeed.
+		time.Sleep(250 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"retval":1}`)
+	}))
+	defer uploadServer.Close()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"url":   uploadServer.URL + "/signed-video",
+			"token": "video-reservation-token",
+		})
+	}))
+	defer apiServer.Close()
+
+	baseClient := uploadServer.Client()
+	baseClient.Timeout = 50 * time.Millisecond
+	client := mustClient(t, apiServer.URL, "bot-token", baseClient)
+
+	media, err := client.UploadMedia(context.Background(), MediaTypeVideo, "clip.mp4",
+		strings.NewReader("video-payload"))
+	if err != nil {
+		t.Fatalf("UploadMedia() error = %v, want the upload copy to drop the base client total timeout", err)
+	}
+	if media != (MediaToken{Type: MediaTypeVideo, Token: "video-reservation-token"}) {
+		t.Fatalf("UploadMedia() = %#v", media)
+	}
+}
+
+func TestUploadTransportFailureIsStructuredUpstreamError(t *testing.T) {
+	t.Parallel()
+
+	// The reservation points at a TLS endpoint the client cannot talk to
+	// (closed server), producing a transport-level upload failure.
+	uploadServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"retval":1}`)
+	}))
+	uploadServer.Close()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"url":   uploadServer.URL + "/signed-video",
+			"token": "video-reservation-token",
+		})
+	}))
+	defer apiServer.Close()
+
+	client := mustClient(t, apiServer.URL, "bot-token", uploadServer.Client())
+	_, err := client.UploadMedia(context.Background(), MediaTypeVideo, "clip.mp4",
+		strings.NewReader("video-payload"))
+	var maxErr *Error
+	if !errors.As(err, &maxErr) {
+		t.Fatalf("UploadMedia() error = %v, want a structured MAX upstream error", err)
+	}
+	if maxErr.Code != "upload_transport_failed" || maxErr.StatusCode != http.StatusBadGateway {
+		t.Fatalf("UploadMedia() error = %#v, want a 502 upload_transport_failed", maxErr)
+	}
+}

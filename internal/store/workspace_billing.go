@@ -420,7 +420,7 @@ func chargeWorkspaceMonthlyUsageTx(
 	if complimentary {
 		enforce = false
 	}
-	if err := requireActiveWorkspaceSubscription(ctx, tx, workspaceID); err != nil {
+	if err := requireActiveWorkspaceSubscription(ctx, tx, workspaceID, now); err != nil {
 		return WorkspaceMonthlyUsage{}, err
 	}
 	window, err := resolveWorkspaceUsageWindow(ctx, tx, workspaceID, now)
@@ -429,7 +429,7 @@ func chargeWorkspaceMonthlyUsageTx(
 	}
 	periodStart, periodEnd := window.PeriodStart, window.PeriodEnd
 	if feature := aiFeatureForUsageMetric(metric); feature != "" {
-		if err := requireWorkspaceAIFeature(ctx, tx, workspaceID, metric, feature); err != nil {
+		if err := requireWorkspaceAIFeature(ctx, tx, workspaceID, metric, feature, now); err != nil {
 			return WorkspaceMonthlyUsage{}, err
 		}
 	}
@@ -452,7 +452,7 @@ WHERE workspace_id=$1 AND period_start=$2 AND metric=$3`, workspaceID, periodSta
 		return WorkspaceMonthlyUsage{}, fmt.Errorf("read monthly workspace usage: %w", err)
 	}
 	if enforce {
-		limit, limitErr := readWorkspaceMonthlyEntitlementLimit(ctx, tx, workspaceID, metric)
+		limit, limitErr := readWorkspaceMonthlyEntitlementLimit(ctx, tx, workspaceID, metric, now)
 		if limitErr != nil {
 			return WorkspaceMonthlyUsage{}, limitErr
 		}
@@ -558,7 +558,7 @@ func aiFeatureForUsageMetric(metric string) string {
 	}
 }
 
-func requireWorkspaceAIFeature(ctx context.Context, tx *sql.Tx, workspaceID, metric, feature string) error {
+func requireWorkspaceAIFeature(ctx context.Context, tx *sql.Tx, workspaceID, metric, feature string, now time.Time) error {
 	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
 		return err
 	} else if active {
@@ -576,10 +576,10 @@ WHERE s.workspace_id=$1 AND s.status IN ('active','trialing')
 	      SELECT 1 FROM billing_subscription_contracts c
 	      JOIN billing_subscription_periods p ON p.id=c.current_period_id AND p.workspace_id=c.workspace_id
 	      WHERE c.workspace_id=s.workspace_id AND c.status IN ('active','past_due') AND p.status='active'
-	        AND (p.period_end>CURRENT_TIMESTAMP OR (c.status='past_due' AND c.grace_until>CURRENT_TIMESTAMP))
+	        AND (p.period_end>$3 OR (c.status='past_due' AND c.grace_until>$3))
 	    )
 	  )
-	  AND e.usage_metric=$2 AND e.period='month'`, workspaceID, metric).Scan(&limit, &scale)
+	  AND e.usage_metric=$2 AND e.period='month'`, workspaceID, metric, now.UTC()).Scan(&limit, &scale)
 	if errors.Is(err, sql.ErrNoRows) {
 		return &WorkspacePlanUpgradeRequiredError{Feature: feature}
 	}
@@ -667,7 +667,7 @@ func nullTimePointer(value sql.NullTime) *time.Time {
 	return &result
 }
 
-func requireActiveWorkspaceSubscription(ctx context.Context, tx *sql.Tx, workspaceID string) error {
+func requireActiveWorkspaceSubscription(ctx context.Context, tx *sql.Tx, workspaceID string, now time.Time) error {
 	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
 		return err
 	} else if active {
@@ -680,9 +680,9 @@ s.plan_code='free' OR EXISTS(
   SELECT 1 FROM billing_subscription_contracts c
   JOIN billing_subscription_periods p ON p.id=c.current_period_id AND p.workspace_id=c.workspace_id
   WHERE c.workspace_id=s.workspace_id AND c.status IN ('active','past_due') AND p.status='active'
-    AND (p.period_end>CURRENT_TIMESTAMP OR (c.status='past_due' AND c.grace_until>CURRENT_TIMESTAMP))
+    AND (p.period_end>$2 OR (c.status='past_due' AND c.grace_until>$2))
 )
-FROM workspace_subscriptions s WHERE s.workspace_id=$1 FOR SHARE OF s`, workspaceID).Scan(&status, &entitled)
+FROM workspace_subscriptions s WHERE s.workspace_id=$1 FOR SHARE OF s`, workspaceID, now.UTC()).Scan(&status, &entitled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: subscription", ErrWorkspaceEntitlementUnavailable)
 	}
@@ -699,7 +699,7 @@ FROM workspace_subscriptions s WHERE s.workspace_id=$1 FOR SHARE OF s`, workspac
 }
 
 func readWorkspaceMonthlyEntitlementLimit(
-	ctx context.Context, tx *sql.Tx, workspaceID, metric string,
+	ctx context.Context, tx *sql.Tx, workspaceID, metric string, now time.Time,
 ) (int64, error) {
 	var limit, scale int64
 	err := tx.QueryRowContext(ctx, `SELECT e.limit_value,e.unit_scale
@@ -713,12 +713,12 @@ WHERE s.workspace_id=$1
       SELECT 1 FROM billing_subscription_contracts c
       JOIN billing_subscription_periods p ON p.id=c.current_period_id AND p.workspace_id=c.workspace_id
       WHERE c.workspace_id=s.workspace_id AND c.status IN ('active','past_due') AND p.status='active'
-        AND (p.period_end>CURRENT_TIMESTAMP OR (c.status='past_due' AND c.grace_until>CURRENT_TIMESTAMP))
+        AND (p.period_end>$3 OR (c.status='past_due' AND c.grace_until>$3))
     )
   )
   AND e.usage_metric=$2
   AND e.period='month'
-  AND e.hard_limit=TRUE`, workspaceID, metric).Scan(&limit, &scale)
+  AND e.hard_limit=TRUE`, workspaceID, metric, now.UTC()).Scan(&limit, &scale)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, fmt.Errorf("%w: %s", ErrWorkspaceEntitlementUnavailable, metric)
 	}
