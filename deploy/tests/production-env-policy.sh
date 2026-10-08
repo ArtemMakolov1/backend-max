@@ -9,10 +9,17 @@ for smtp_key in SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL 
   grep -F "          $smtp_key: \${{ secrets.$smtp_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $smtp_key: \${$smtp_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
+for search_key in EXA_API_KEY TAVILY_API_KEY; do
+  grep -F "          $search_key: \${{ secrets.$search_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+  grep -F "          $search_key: \${{ secrets.$search_key }}" "$repo_root/.github/workflows/recover-s3-production.yml" >/dev/null
+  grep -F "      $search_key: \${$search_key:-}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
 for billing_key in YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY; do
   grep -F "          $billing_key: \${{ secrets.$billing_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $billing_key: \${$billing_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
+grep -F "          OPENAI_RESEARCH_MODEL: \${{ vars.OPENAI_RESEARCH_MODEL || 'gpt-6-luna' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
+grep -F "          OPENAI_IMAGE_MODEL: \${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
 for billing_flag in BILLING_LIVE_ENABLED YOOKASSA_RECEIPTS_CONFIRMED; do
   grep -F "          $billing_flag: \${{ vars.$billing_flag || 'false' }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $billing_flag: \${$billing_flag}" "$repo_root/deploy/compose.production.yaml" >/dev/null
@@ -63,6 +70,8 @@ render_production() {
     BILLING_LIVE_ENABLED=false \
     YOOKASSA_RECEIPTS_CONFIRMED=false \
     OPENAI_API_KEY= \
+    EXA_API_KEY= \
+    TAVILY_API_KEY= \
     "$@" \
     "$repo_root/deploy/render-production-env.sh" "$output"
 }
@@ -71,6 +80,10 @@ production_env="$sandbox/production.env"
 render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
 grep -Fx 'OPENAI_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'EXA_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'TAVILY_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'OPENAI_RESEARCH_MODEL=gpt-6-luna' "$production_env" >/dev/null
+grep -Fx 'OPENAI_IMAGE_MODEL=gpt-image-2' "$production_env" >/dev/null
 grep -Fx 'GRAFANA_ROOT_URL=https://maxposty.ru/monitoring/' "$production_env" >/dev/null
 grep -Fx 'ALERTMANAGER_WEBHOOK_URL=https://alerts.example.test/maxposty' "$production_env" >/dev/null
 grep -Fx 'PITR_RETENTION_DAYS=7' "$production_env" >/dev/null
@@ -108,6 +121,55 @@ grep -Fx 'SMTP_PASSWORD=' "$production_env" >/dev/null
 grep -Fx 'SMTP_FROM_EMAIL=' "$production_env" >/dev/null
 grep -Fx 'SMTP_FROM_NAME=MaxPosty' "$production_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$production_env"
+
+# Production overrides must survive workflow -> render -> compose so a model
+# rollback never silently falls back to a different provider default.
+configured_ai_env="$sandbox/configured-ai.env"
+render_production "$configured_ai_env" OPENAI_RESEARCH_MODEL=gpt-5.4-mini OPENAI_IMAGE_MODEL=gpt-image-2
+grep -Fx 'OPENAI_RESEARCH_MODEL=gpt-5.4-mini' "$configured_ai_env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$configured_ai_env"
+
+# Optional search credentials survive production rendering independently, but
+# cannot run without the model that synthesizes their retrieved sources.
+for search_mode in exa tavily both; do
+  exa_key=''
+  tavily_key=''
+  [[ "$search_mode" == tavily ]] || exa_key=synthetic-exa-secret
+  [[ "$search_mode" == exa ]] || tavily_key=synthetic-tavily-secret
+  configured_search_env="$sandbox/search-$search_mode.env"
+  render_production "$configured_search_env" OPENAI_API_KEY=synthetic-openai-secret \
+    EXA_API_KEY="$exa_key" TAVILY_API_KEY="$tavily_key"
+  grep -Fx "EXA_API_KEY=$exa_key" "$configured_search_env" >/dev/null
+  grep -Fx "TAVILY_API_KEY=$tavily_key" "$configured_search_env" >/dev/null
+  "$repo_root/deploy/validate-production-env.sh" "$configured_search_env"
+done
+
+# Old env files remain valid when optional provider keys are entirely absent.
+awk -F= '$1 != "EXA_API_KEY" && $1 != "TAVILY_API_KEY" { print }' \
+  "$production_env" >"$sandbox/legacy-search.env"
+"$repo_root/deploy/validate-production-env.sh" "$sandbox/legacy-search.env"
+for search_key in EXA_API_KEY TAVILY_API_KEY; do
+  if render_production "$sandbox/search-without-model.env" \
+    "$search_key=synthetic-search-secret" >"$sandbox/search-error.log" 2>&1; then
+    echo "Production render accepted search without synthesis credentials" >&2
+    exit 1
+  fi
+  if grep -F 'synthetic-search-secret' "$sandbox/search-error.log" >/dev/null; then
+    echo "Search validation disclosed credentials" >&2
+    exit 1
+  fi
+  for unsafe_key in $'synthetic-search-secret\ninjection' $'synthetic-search-secret\r' $'\nsynthetic-search-secret'; do
+    if render_production "$sandbox/search-newline.env" OPENAI_API_KEY=synthetic-openai-secret \
+      "$search_key=$unsafe_key" >"$sandbox/search-error.log" 2>&1; then
+      echo "Production render accepted a newline in search credentials" >&2
+      exit 1
+    fi
+    if grep -F 'synthetic-search-secret' "$sandbox/search-error.log" >/dev/null; then
+      echo "Search validation disclosed malformed credentials" >&2
+      exit 1
+    fi
+  done
+done
 
 configured_smtp_env="$sandbox/configured-smtp.env"
 render_production "$configured_smtp_env" \
@@ -384,13 +446,15 @@ env \
   S3_BUCKET=must-not-leak \
   S3_REGION=must-not-leak \
   OPENAI_API_KEY=must-not-leak \
+  EXA_API_KEY=must-not-leak \
+  TAVILY_API_KEY=must-not-leak \
   SMTP_HOST=must-not-leak \
   SMTP_USERNAME=must-not-leak \
   SMTP_PASSWORD=must-not-leak \
   SMTP_FROM_EMAIL=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY EXA_API_KEY TAVILY_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

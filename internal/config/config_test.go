@@ -783,7 +783,7 @@ func clearAuthEnv(t *testing.T) {
 		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
-		"OPENAI_API_KEY", "OPENAI_API_BASE_URL",
+		"OPENAI_API_KEY", "OPENAI_API_BASE_URL", "EXA_API_KEY", "TAVILY_API_KEY",
 		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
 		"MEDIA_USER_MAX_FILES", "MEDIA_USER_MAX_BYTES", "MEDIA_ORPHAN_GRACE_PERIOD", "MEDIA_CLEANUP_INTERVAL", "MEDIA_CLEANUP_BATCH_SIZE",
 		"BILLING_ENFORCEMENT_ENABLED", "BILLING_LIVE_ENABLED", "YOOKASSA_RECEIPTS_CONFIRMED",
@@ -798,4 +798,77 @@ func setValidLocalYandexAuth(t *testing.T) {
 	t.Setenv("YANDEX_CLIENT_ID", "client-id")
 	t.Setenv("YANDEX_CLIENT_SECRET", "client-secret")
 	t.Setenv("YANDEX_REDIRECT_URI", "http://localhost:8080/api/v1/auth/yandex/callback")
+}
+
+func TestLoadSearchProvidersAreOptionalAndTrimmed(t *testing.T) {
+	for _, test := range []struct {
+		name, exa, tavily string
+	}{
+		{name: "absent"},
+		{name: "exa only", exa: "synthetic-exa-key"},
+		{name: "tavily only", tavily: "synthetic-tavily-key"},
+		{name: "both", exa: "synthetic-exa-key", tavily: "synthetic-tavily-key"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			if test.exa != "" || test.tavily != "" {
+				t.Setenv("OPENAI_API_KEY", "synthetic-openai-key")
+			}
+			t.Setenv("EXA_API_KEY", "  "+test.exa+"  ")
+			t.Setenv("TAVILY_API_KEY", "  "+test.tavily+"  ")
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ExaAPIKey != test.exa || cfg.TavilyAPIKey != test.tavily {
+				t.Fatal("optional search credentials were not normalized")
+			}
+		})
+	}
+}
+
+func TestLoadSearchProvidersRequireOpenAIWithoutLeakingKeys(t *testing.T) {
+	for _, name := range []string{"EXA_API_KEY", "TAVILY_API_KEY"} {
+		t.Run(name, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv(name, "synthetic-secret-must-not-appear")
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "requires OPENAI_API_KEY") || strings.Contains(err.Error(), "synthetic-secret") {
+				t.Fatal("missing synthesis credentials were not rejected safely")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsSearchCredentialsInBootstrap(t *testing.T) {
+	for _, name := range []string{"EXA_API_KEY", "TAVILY_API_KEY"} {
+		t.Run(name, func(t *testing.T) {
+			clearAuthEnv(t)
+			t.Setenv("PUBLIC_BASE_URL", "http://178.159.94.83")
+			t.Setenv("FRONTEND_ORIGIN", "http://178.159.94.83")
+			t.Setenv("AUTH_BOOTSTRAP_MODE", "true")
+			t.Setenv(name, "synthetic-secret-must-not-appear")
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "AUTH_BOOTSTRAP_MODE") || strings.Contains(err.Error(), "synthetic-secret") {
+				t.Fatal("bootstrap search credentials were not rejected safely")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnsafeSearchCredentialsWithoutLeakingValues(t *testing.T) {
+	for _, name := range []string{"EXA_API_KEY", "TAVILY_API_KEY"} {
+		for _, value := range []string{"synthetic-secret\ninjection", "synthetic-secret\r", "\nsynthetic-secret", "synthetic-secret with space", "synthetic-secret$unsafe", strings.Repeat("s", 1025)} {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv("OPENAI_API_KEY", "synthetic-openai-key")
+			t.Setenv(name, value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), name) || strings.Contains(err.Error(), "synthetic-secret") {
+				t.Fatal("unsafe search credentials were not rejected safely")
+			}
+		}
+	}
 }

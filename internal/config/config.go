@@ -15,6 +15,7 @@ import (
 var (
 	maxWebhookSecretPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{5,256}$`)
 	observabilityAdminPattern = regexp.MustCompile(`^[a-z0-9._+-]{1,128}$`)
+	searchAPIKeyPattern       = regexp.MustCompile(`^[A-Za-z0-9._~:/+@,=-]+$`)
 )
 
 const (
@@ -36,7 +37,7 @@ const (
 	directOAuthCallbackRedirectURI   = "https://maxposty.ru/api/v1/advertising/direct/oauth/callback"
 	directOAuthVerificationCodeURI   = "https://oauth.yandex.ru/verification_code"
 	defaultOpenAIImageModel          = "gpt-image-2"
-	defaultOpenAIResearchModel       = "gpt-5.4-mini"
+	defaultOpenAIResearchModel       = "gpt-6-luna"
 	defaultSchedulerInterval         = 15 * time.Second
 	defaultAuthSessionTTL            = 12 * time.Hour
 	defaultMaxOwnedTeamWorkspaces    = 5
@@ -100,6 +101,8 @@ type Config struct {
 	AuthSessionTTL            time.Duration
 	MaxOwnedTeamWorkspaces    int
 	OpenAIAPIKey              string
+	ExaAPIKey                 string
+	TavilyAPIKey              string
 	OpenAIAPIBaseURL          string
 	OpenAIImageModel          string
 	OpenAIResearchModel       string
@@ -292,6 +295,8 @@ func Load() (Config, error) {
 		AuthSessionTTL:            sessionTTL,
 		MaxOwnedTeamWorkspaces:    maxOwnedTeamWorkspaces,
 		OpenAIAPIKey:              strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		ExaAPIKey:                 strings.TrimSpace(os.Getenv("EXA_API_KEY")),
+		TavilyAPIKey:              strings.TrimSpace(os.Getenv("TAVILY_API_KEY")),
 		OpenAIAPIBaseURL:          env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL),
 		OpenAIImageModel:          env("OPENAI_IMAGE_MODEL", defaultOpenAIImageModel),
 		OpenAIResearchModel:       env("OPENAI_RESEARCH_MODEL", defaultOpenAIResearchModel),
@@ -369,6 +374,16 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.OpenAIAPIBaseURL = strings.TrimSuffix(cfg.OpenAIAPIBaseURL, "/")
+	for _, name := range []string{"EXA_API_KEY", "TAVILY_API_KEY"} {
+		raw := os.Getenv(name)
+		key := strings.TrimSpace(raw)
+		if strings.ContainsAny(raw, "\r\n") || len(key) > 1024 || (key != "" && !searchAPIKeyPattern.MatchString(key)) {
+			return Config{}, fmt.Errorf("%s contains unsupported characters or exceeds its size bound", name)
+		}
+	}
+	if !cfg.AuthBootstrapMode && (cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "") && cfg.OpenAIAPIKey == "" {
+		return Config{}, fmt.Errorf("EXA_API_KEY or TAVILY_API_KEY requires OPENAI_API_KEY for grounded synthesis")
+	}
 	if cfg.MAXBotToken != "" && !maxWebhookSecretPattern.MatchString(cfg.MAXWebhookSecret) {
 		return Config{}, fmt.Errorf("MAX_WEBHOOK_SECRET is required with MAX_BOT_TOKEN and must contain 5-256 letters, digits, underscores or hyphens")
 	}
@@ -424,8 +439,8 @@ func Load() (Config, error) {
 			len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
 		}
-		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.YooKassaConfigured() {
-			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX and OpenAI integrations to be disabled")
+		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "" || cfg.YooKassaConfigured() {
+			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX, OpenAI and search integrations to be disabled")
 		}
 		if s3Parts != 0 || cfg.S3Bucket != "" || cfg.S3Region != "" {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires S3 storage to be disabled")

@@ -26,7 +26,7 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 	}
 	if _, err := fixture.storage.SyncChannelParticipantStatsForUser(
 		t.Context(), fixture.workspace.CompatOwnerUserID, primary.ID, primary.MAXChatID,
-		"", 800, time.Date(2026, time.July, 12, 20, 0, 0, 0, time.UTC),
+		"", 800, time.Date(2026, time.July, 5, 20, 0, 0, 0, time.UTC),
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +48,7 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 
 	// Sunday 23:30 UTC is Monday 02:30 at UTC+03:00. The heatmap must use
 	// the requested local offset and report it back to the client.
-	primaryPublishedAt := time.Date(2026, time.July, 12, 23, 30, 0, 0, time.UTC)
+	primaryPublishedAt := time.Date(2026, time.July, 5, 23, 30, 0, 0, time.UTC)
 	primaryViews := int64(100)
 	primaryPost, err := fixture.storage.CreatePostForWorkspace(
 		t.Context(), "ws-owner", fixture.workspace.ID, store.Post{
@@ -64,15 +64,29 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 	}
 	secondaryPublishedAt := time.Date(2026, time.July, 11, 8, 0, 0, 0, time.UTC)
 	secondaryViews := int64(40)
-	if _, err := fixture.storage.CreatePostForWorkspace(
+	secondaryPost, err := fixture.storage.CreatePostForWorkspace(
 		t.Context(), "ws-owner", fixture.workspace.ID, store.Post{
 			Title: "Secondary post", Content: "Other body", Format: store.FormatMarkdown,
 			Status: store.PostStatusPublished, ChannelID: &secondary.ID,
 			MAXMessageID: "secondary-message", MAXViews: &secondaryViews,
 			MAXStatsSyncedAt: &now, PublishedAt: &secondaryPublishedAt, Notify: true,
 		},
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatal(err)
+	}
+	// Ranking compares actual first-day observations, so this fixture includes
+	// mature posts and real snapshots at the same 24-hour comparison age.
+	for _, sample := range []struct {
+		post    store.Post
+		channel store.Channel
+		views   int64
+	}{{primaryPost, primary, primaryViews}, {secondaryPost, secondary, secondaryViews}} {
+		if _, err := fixture.storage.SyncPublicationMetadataForUser(t.Context(), fixture.workspace.CompatOwnerUserID,
+			sample.post.ID, sample.channel.ID, sample.post.MAXMessageID, sample.post.MAXMessageURL,
+			&sample.views, sample.post.PublishedAt.Add(24*time.Hour), false); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	server := New(fixture.app, fixture.logger, "http://localhost:4321", "", AuthOptions{YandexClient: &fakeYandexOAuth{}})
@@ -106,11 +120,19 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 		t.Fatal(err)
 	}
 	report := payload.Analytics
+	var primaryMetrics *store.AnalyticsContentPost
+	for index := range report.Posts {
+		if report.Posts[index].ID == primaryPost.ID {
+			primaryMetrics = &report.Posts[index]
+			break
+		}
+	}
 	if report.Scope.Kind != "workspace" || report.Summary.PublishedPosts != 2 ||
 		report.Summary.ViewsPer1KAudience == nil || report.Summary.AverageViewsPerHour == nil ||
 		report.TimezoneOffsetMinutes != 180 || len(report.Heatmap) != 7*24 ||
-		len(report.Posts) != 2 || report.Posts[0].Audience != 800 ||
-		report.Posts[0].Score == nil || *report.Posts[0].Score != 31.62 {
+		len(report.Posts) != 2 || primaryMetrics == nil || primaryMetrics.Audience != 800 ||
+		report.ComparablePosts != 2 || primaryMetrics.ComparisonViews == nil || *primaryMetrics.ComparisonViews != 100 ||
+		primaryMetrics.Score == nil || *primaryMetrics.Score != 22.83 {
 		t.Fatalf("analytics report = %#v", report)
 	}
 	var rolloverCell *store.AnalyticsHeatmapCell
@@ -125,9 +147,8 @@ func TestWorkspaceAnalyticsContentIsScopedNormalizedTimezoneAwareAndSafe(t *test
 		*rolloverCell.ViewsPer1KAudience != 125 || rolloverCell.Score == nil {
 		t.Fatalf("UTC-to-local rollover cell = %#v", rolloverCell)
 	}
-	if report.BestTime == nil || report.BestTime.Weekday != 0 || report.BestTime.Hour != 2 ||
-		report.BestTime.NextAt.Before(now) {
-		t.Fatalf("best time = %#v", report.BestTime)
+	if report.BestTime != nil {
+		t.Fatalf("two posts must not produce an unsupported best-time recommendation: %#v", report.BestTime)
 	}
 
 	current := performJSONRequest(viewer, http.MethodGet,

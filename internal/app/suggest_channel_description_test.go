@@ -7,8 +7,10 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
@@ -181,5 +183,52 @@ func TestSuggestChannelDescriptionRejectsForeignTenantBeforeAI(t *testing.T) {
 	defer fake.mu.Unlock()
 	if len(fake.requests) != 0 {
 		t.Fatalf("foreign request reached AI: %#v", fake.requests)
+	}
+}
+
+func TestSuggestChannelDescriptionBoundsLongMAXDescriptionWithoutChangingSavedChannel(t *testing.T) {
+	fake := &fakeChannelDescriptionSuggester{result: openairesearch.SuggestChannelDescriptionResult{
+		Suggestions: []openairesearch.ChannelDescriptionSuggestion{
+			{Style: "concise", Label: "Кратко", Text: "Описание."},
+		},
+	}}
+	application, storage, workspace := newChannelDescriptionFixture(t, fake)
+	activatePaidWorkspaceForTest(t, storage, "description-owner", workspace.ID)
+	// MAX accepts 16,000 characters; AI context has its own smaller rune budget.
+	maxDescription := strings.Repeat("я", 16000)
+	channel, err := storage.CreateChannel(context.Background(), store.Channel{
+		UserID: "description-owner", WorkspaceID: workspace.ID, VerifiedMAXOwnerID: "100",
+		MAXChatID: "-300", Title: "Канал", Description: maxDescription,
+		IsChannel: true, Active: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.SuggestChannelDescriptionForWorkspace(
+		context.Background(), "description-owner", workspace.ID, channel.ID,
+		openairesearch.SuggestChannelDescriptionRequest{CurrentDescription: "Черновик пользователя"},
+	); err != nil {
+		t.Fatalf("valid MAX description prevented AI suggestion: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.requests) != 1 {
+		t.Fatalf("requests = %#v", fake.requests)
+	}
+	request := fake.requests[0]
+	fake.mu.Unlock()
+	if !utf8.ValidString(request.ChannelDescription) ||
+		utf8.RuneCountInString(request.ChannelDescription) != openairesearch.MaxChannelDescriptionRunes ||
+		request.ChannelDescription != strings.Repeat("я", openairesearch.MaxChannelDescriptionRunes) {
+		t.Fatalf("AI context was not bounded at a character boundary: %q", request.ChannelDescription)
+	}
+	if request.CurrentDescription != "Черновик пользователя" {
+		t.Fatalf("user draft changed: %q", request.CurrentDescription)
+	}
+	saved, err := storage.GetChannelForUser(context.Background(), "description-owner", channel.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Description != maxDescription {
+		t.Fatal("AI context limit changed the saved MAX description")
 	}
 }

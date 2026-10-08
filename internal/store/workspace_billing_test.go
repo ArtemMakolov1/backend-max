@@ -181,11 +181,13 @@ func TestMonthlyUsageObserveAndEnforceAreAtomicAndQuantityBased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
+	// Entitlement checks use the database clock. Keep the fixture active on
+	// every run, with a paid period that spans the next calendar boundary.
+	periodEnd := addBillingMonth(now)
 	periodID := seedBillingContract(
 		t, storage, workspace.ID, "solo",
-		time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC),
-		time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC), "sealed-usage-method",
+		now, periodEnd, "sealed-usage-method",
 	)
 
 	// Observe mode records usage even after the paid allowance is exhausted.
@@ -224,7 +226,8 @@ WHERE subscription_period_id=$1 AND workspace_id=$2 AND metric=$3`,
 		t.Fatalf("format charge = %#v, %v", format, err)
 	}
 	_, err = storage.ChargeWorkspaceMonthlyUsage(
-		ctx, workspace.ID, UsageMetricAIImageCredits, 1, true, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+		ctx, workspace.ID, UsageMetricAIImageCredits, 1, true,
+		time.Date(now.Year(), now.Month()+1, 1, 0, 0, 0, 0, time.UTC))
 	if !errors.As(err, &limitErr) {
 		t.Fatalf("calendar rollover reset a paid-period quota: %v", err)
 	}
@@ -244,7 +247,7 @@ func TestInactiveWorkspaceSubscriptionRejectsUsageWithoutCharging(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	seedBillingContract(t, storage, workspace.ID, "solo", now.AddDate(0, -1, 0), now.AddDate(0, 1, 0), "sealed-inactive-method")
 
 	for _, status := range []string{"paused", "canceled"} {

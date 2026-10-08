@@ -189,6 +189,7 @@ func (s *Server) Handler() http.Handler {
 				r.Delete("/", s.deleteWorkspace)
 				s.RegisterWorkspaceBrandRoutes(r)
 				s.RegisterAnalyticsContentRoutes(r)
+				s.registerMAXCommentRoutes(r)
 				s.registerCampaignRoutes(r)
 				s.registerDirectAdvertisingRoutes(r)
 				r.Post("/transfer-ownership", s.transferWorkspaceOwnership)
@@ -216,6 +217,8 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/posts/format-content", s.formatWorkspacePostContent)
 				r.Post("/posts/suggest-image-prompt", s.suggestWorkspaceImagePrompt)
 				r.Post("/research/generate", s.generateWorkspaceResearch)
+				r.Post("/research/discover", s.discoverWorkspaceContent)
+				r.Post("/research/content/drafts", s.createWorkspaceContentDiscoveryDraft)
 				r.Post("/images/generate", s.generateWorkspaceImage)
 				r.Post("/media", s.uploadWorkspaceMedia)
 				r.Get("/media/{filename}", s.serveWorkspaceMedia)
@@ -236,6 +239,7 @@ func (s *Server) Handler() http.Handler {
 				r.Post("/posts/{post_id}/image", s.uploadWorkspacePostImage)
 				r.Post("/posts/{post_id}/generate-image", s.generateWorkspacePostImage)
 				r.Post("/posts/{post_id}/attachments", s.uploadWorkspacePostAttachment)
+				r.Get("/posts/{post_id}/attachments/{attachment_id}/video", s.getWorkspaceMAXVideoPreview)
 				r.Put("/posts/{post_id}/attachments/{attachment_id}", s.replaceWorkspacePostAttachment)
 				r.Patch("/posts/{post_id}/attachments/order", s.reorderWorkspacePostAttachments)
 				r.Delete("/posts/{post_id}/attachments/{attachment_id}", s.deleteWorkspacePostAttachment)
@@ -354,7 +358,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok", "max_configured": s.app.MAXConfigured(), "openai_configured": s.app.OpenAIConfigured(),
 		"research_configured": s.app.ResearchConfigured(), "content_formatting_configured": s.app.ContentFormattingConfigured(),
-		"auth_required": status.Required, "authenticated": status.Authenticated,
+		"content_discovery_configured": s.app.ContentDiscoveryConfigured(),
+		"content_search_configured":    s.app.ContentSearchConfigured(),
+		"max_comments_configured":      s.app.MAXCommentsConfigured(),
+		"auth_required":                status.Required, "authenticated": status.Authenticated,
 		"auth_methods": status.Methods, "auth_method": status.Method, "user": status.User,
 		"session_expires_at": status.SessionExpiresAt, "observability_access": status.ObservabilityAccess,
 	})
@@ -542,6 +549,25 @@ func (s *Server) problem(w http.ResponseWriter, status int, code, message string
 
 func (s *Server) writeError(w http.ResponseWriter, err error) {
 	if err == nil {
+		return
+	}
+	var commentNotWritten *app.MAXCommentNotWrittenError
+	if errors.As(err, &commentNotWritten) {
+		status := http.StatusBadGateway
+		var channelAccess *app.ChannelAccessError
+		switch {
+		case errors.Is(err, store.ErrMAXCommentValidation):
+			status = http.StatusBadRequest
+		case errors.Is(err, store.ErrConflict):
+			status = http.StatusConflict
+		case errors.Is(err, store.ErrNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, store.ErrMAXCommentsUnavailable), errors.As(err, &channelAccess):
+			status = http.StatusUnprocessableEntity
+		case errors.Is(err, app.ErrMAXNotConfigured):
+			status = http.StatusServiceUnavailable
+		}
+		s.problem(w, status, "max_comment_not_written", "Действие не было отправлено в MAX. Обновите данные и проверьте права перед новой попыткой.", nil)
 		return
 	}
 	var upgradeErr *store.WorkspacePlanUpgradeRequiredError
@@ -774,6 +800,8 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrBillingIntentInvalid):
 		s.problem(w, http.StatusUnprocessableEntity, "billing_intent_invalid",
 			"Подтверждение отмены истекло или уже использовано.", nil)
+	case errors.Is(err, store.ErrBillingComplimentaryAccess):
+		s.problem(w, http.StatusConflict, "complimentary_access_active", "В рабочем пространстве уже включён бесплатный доступ без тарифных ограничений.", nil)
 	case errors.Is(err, store.ErrBillingConflict):
 		s.problem(w, http.StatusConflict, "billing_conflict",
 			"Состояние подписки изменилось. Обновите страницу и повторите действие.", nil)
@@ -869,6 +897,14 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			"Запуск уже выполняется или сверяется с Яндекс Директом.", nil)
 	case errors.Is(err, store.ErrNotFound):
 		s.problem(w, http.StatusNotFound, "not_found", "Запрошенные данные не найдены.", nil)
+	case errors.Is(err, store.ErrMAXCommentsUnavailable):
+		s.problem(w, http.StatusUnprocessableEntity, "max_comments_unavailable", "Комментарии MAX доступны для опубликованного поста канала.", nil)
+	case errors.Is(err, store.ErrMAXCommentValidation):
+		s.problem(w, http.StatusBadRequest, "validation_error", "Проверьте текст комментария и обновите его данные перед изменением.", nil)
+	case errors.Is(err, store.ErrMAXCommentBusy):
+		s.problem(w, http.StatusConflict, "max_comment_busy", "Операция с комментарием ещё выполняется. Обновите список через несколько секунд.", nil)
+	case errors.Is(err, store.ErrMAXCommentUncertain):
+		s.problem(w, http.StatusConflict, "max_comment_uncertain", "MAX мог принять действие, но его результат пока не подтверждён. Обновите список и сверьте ответ, прежде чем отправлять повторно.", nil)
 	case errors.Is(err, store.ErrConflict):
 		s.problem(w, http.StatusConflict, "state_conflict", storeConflictMessage(err), nil)
 	case errors.Is(err, app.ErrMAXNotConfigured):
@@ -922,6 +958,14 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			return
 		}
 		if errors.As(err, &researchErr) {
+			if researchErr.Code == "content_search_failed" {
+				diagnostic := researchErr.SearchDiagnostics.Safe()
+				s.logger.Warn("content source retrieval failed", "provider", diagnostic.Provider,
+					"code", diagnostic.Code, "status", diagnostic.Status, "transport_kind", diagnostic.TransportKind)
+				s.problem(w, http.StatusBadGateway, "content_search_error",
+					"Не удалось получить материалы. Попробуйте ещё раз немного позже.", nil)
+				return
+			}
 			s.logger.Warn("OpenAI research request failed", "status", researchErr.StatusCode,
 				"request_id", researchErr.RequestID, "error", researchErr.Message)
 			s.problem(w, http.StatusBadGateway, "openai_research_error",

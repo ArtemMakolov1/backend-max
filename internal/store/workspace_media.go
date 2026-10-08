@@ -69,6 +69,10 @@ WHERE workspace_id=$2 AND filename=$3`, now.UTC(), workspaceID, filename); err !
 	if !errors.Is(lookupErr, sql.ErrNoRows) {
 		return MediaReservation{}, lookupErr
 	}
+	complimentary, err := lockWorkspaceComplimentaryAccess(ctx, tx, workspaceID)
+	if err != nil {
+		return MediaReservation{}, err
+	}
 	// Personal workspaces alias the legacy personal API, where media_usage is
 	// the per-user ledger. Release and GC drain both ledgers for personal
 	// workspaces, so charge both here as well. media_usage goes first to keep
@@ -91,7 +95,7 @@ VALUES($1,0,0,$2) ON CONFLICT(workspace_id) DO NOTHING`, workspaceID, now.UTC())
 WHERE workspace_id=$1 FOR UPDATE`, workspaceID).Scan(&usedFiles, &usedBytes); err != nil {
 		return MediaReservation{}, err
 	}
-	if usedFiles >= limits.MaxFiles || size > limits.MaxBytes || usedBytes > limits.MaxBytes-size {
+	if !complimentary && (usedFiles >= limits.MaxFiles || size > limits.MaxBytes || usedBytes > limits.MaxBytes-size) {
 		return MediaReservation{}, ErrMediaQuotaExceeded
 	}
 	token, err := newMediaReservationToken()

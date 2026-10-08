@@ -1,5 +1,76 @@
 # Production deployment: maxposty.ru
 
+## Read-only диагностика ошибок и сети
+
+Ручной workflow `diagnose-production-errors.yml` запускается только из `main`
+и защищённого Environment `production`. Он проверяет принятый релиз и точный
+backend-контейнер до и после сбора данных; при смене релиза результаты отбрасываются.
+Production-секреты и env-файлы диагностический Python не читает, сырые логи,
+тексты ответов, заголовки, IP-адреса и маршруты не передаёт.
+
+Вывод включает ограниченную историю ошибок, счётчики двух точных WARN-сообщений
+о получении материалов и OpenAI research, а также только безопасные HTTP-статусы
+и ранее проверенные enum-коды. Для контейнера выводятся `edge_attached`,
+`edge_internal`, `default_route_is_edge` и `default_routes_count`; `null` означает,
+что значение не удалось надёжно определить. Несколько default routes считаются
+неоднозначными, поэтому `default_route_is_edge` в этом случае остаётся `null`.
+
+Три фиксированных GET-пробы `https://api.exa.ai/search`,
+`https://api.tavily.com/search` и `https://api.openai.com/v1/models` выполняются
+**на хосте**, что явно отражено в `scope: host`. Они не используют ключи,
+не выполняют платный поиск, не читают response body, не следуют redirects,
+отключают proxy и проверяют сертификат и hostname. Например, `401` или `405`
+подтверждают получение HTTP-ответа из хостовой сети, но не доказывают доступ
+из backend-контейнера или корректность ключа. Ошибки представлены только enum
+`dns`, `tls`, `timeout`, `no_route`, `unknown`.
+
+`container_outbound_probes` проверяет только DNS и TCP-порт 443 фиксированных
+хостов `api.exa.ai`, `api.tavily.com`, `api.openai.com` из точного backend-контейнера.
+Записи содержат `provider`, `scope: container`, `dns_resolved` и `tcp443_reachable`
+(`true`, `false` или `null` для неопределённого результата). BusyBox
+`timeout -s KILL 5` ограничивает сам applet внутри контейнера; `nc -z -w3`
+не отправляет HTTP-запрос. Ответы DNS и stderr отбрасываются внутри контейнера.
+Успех TCP не подтверждает TLS, доступность поиска или правильность ключа.
+Структурированные WARN поиска возвращают только разрешённые provider/code/status
+и транспортный enum; старые WARN без этих полей учитываются только счётчиком.
+
+Каждая хостовая проба ограничена семью секундами и 64 байтами stdout; каждый
+read-only Docker-запрос — восемью секундами и 16 KiB. Контейнерный exec выполняет
+проверенную команду BusyBox `ip -4 route show default` и фиксированные DNS/TCP-пробы,
+без изменения сети и чтения секретов.
+Весь workflow ограничен пятью минутами. Диагностика ничего не деплоит и не
+сохраняет на сервере или в artifacts.
+
+### Однократная проверка авторизованного POST с хоста
+
+`validate-provider-host-post.yml` запускается вручную только для точного SHA
+`main` в защищённом Environment `production`. Получатель SSH закреплён как
+`maxposty-deploy@77.91.94.235:22` и проверяется по сохранённому host key.
+Runner передаёт только designated `EXA_API_KEY` и `TAVILY_API_KEY` через
+зашифрованный stdin SSH; ключи не попадают в аргументы команд, файлы или вывод.
+Серверный helper получает чистое окружение и не читает production-конфигурацию.
+
+Каждый запуск выполняет ровно один POST на `https://api.exa.ai/search`
+(`type: auto`, `numResults: 1`, `contents.highlights: true`) и один на
+`https://api.tavily.com/search` (`search_depth: basic`, `max_results: 1`).
+Запрос фиксирован: `public information about the solar system`.
+Форматы сверены с [Exa Search](https://exa.ai/docs/reference/search) и
+[Tavily Search](https://docs.tavily.com/documentation/api-reference/endpoint/search).
+Такие запросы могут использовать кредиты поиска. Повторов и fallback нет.
+
+Вывод содержит только `provider`, `scope: host`, безопасный `http_status` или
+enum `result`; response body, request ID, заголовки и причины ошибок не читаются
+и не выводятся. TLS проверяет сертификат и hostname, redirects и proxies отключены.
+Ввод ограничен 16 KiB и пятью секундами, каждый POST — socket timeout 15 секунд
+и deadline 20 секунд. ОС завершает весь серверный helper через 50 секунд,
+runner ограничен 70 секундами и 4 KiB вывода; на сервере нужен `/usr/bin/timeout`.
+Временная SSH identity на runner удаляется в `always()` cleanup.
+
+Успешный workflow означает завершение диагностики: например, `401` и `403`
+также штатно выводятся как результат. Пригодность ключа оценивается по HTTP-статусу.
+Хостовый `200` не подтверждает container TLS/POST, равенство runtime-ключа
+переданному GitHub secret, получение материалов, работу Luna или полный UX.
+
 Backend разворачивается из GitHub Actions в GHCR и затем на один VPS. Основной
 production-домен — `https://maxposty.ru`. Frontend-репозиторий владеет Caddy,
 портами `80/443` и внешней Docker-сетью `maxposty-edge`. Caddy направляет
@@ -157,6 +228,20 @@ health endpoint показывает `openai_configured=false` и
 ключа достаточно повторного deployment; хранить пустой secret в GitHub не
 требуется.
 
+Для внешнего поиска материалов можно добавить optional protected secrets
+`EXA_API_KEY` и/или `TAVILY_API_KEY` в Environment `production`. Они передаются
+через renderer в backend, не являются repository variables и не выводятся в логи.
+Для синтеза карточек обязательно нужен `OPENAI_API_KEY`; отдельный поисковый ключ
+без него отклоняется валидатором. Без обоих поисковых ключей сохраняется поиск
+через OpenAI. В `bootstrap` renderer всегда очищает эти значения, а runtime и
+env validator запрещают их включение. Старые env-файлы без новых optional полей
+остаются допустимыми. Провайдеры используют фиксированные HTTPS endpoints
+`api.exa.ai` и `api.tavily.com`; custom base URL не настраивается. В Compose нет
+общего ограничения исходящего трафика: backend использует сеть `edge`. Если на
+VPS настроен отдельный firewall, проверьте исходящий HTTPS к этим двум доменам
+и `api.openai.com`. Все три адреса используют обычное DNS-разрешение и HTTPS
+с проверкой сертификатов; статическая запись для OpenAI на внутренний IP не нужна.
+
 Добавьте repository variables:
 
 - `VPS_HOST=178.159.94.83` (это значение уже используется как безопасный
@@ -177,7 +262,9 @@ health endpoint показывает `openai_configured=false` и
 интеграционные secrets исключительно шагу рендера production-конфига; bootstrap
 job их не получает.
 
-`MAX_CA_CERT_FILE`, если нужен, должен указывать только внутрь `/app/certs`,
+Официальный корневой сертификат для MAX уже встроен в клиент сервера и команду
+настройки webhook; настройка не меняет глобальное хранилище доверия контейнера.
+`MAX_CA_CERT_FILE` для дополнительной операторской цепочки должен указывать только внутрь `/app/certs`,
 например `/app/certs/max-official-chain.pem`. Сам проверенный PEM размещается на
 VPS вручную в `/opt/maxposty/backend/certs`; сертификаты и ключи не передаются
 через репозиторий.
@@ -360,7 +447,8 @@ roll-forward и намеренно не делает автоматически�
 `DEPLOY_STAGE=production` и запустите workflow для `main`. Операторская команда
 сначала проверит публичный endpoint без redirect и только затем обновит
 существующую подписку общего бота штатным `POST /subscriptions` на события
-`bot_started`, `message_callback`, `message_created`, `bot_added`, `bot_removed`.
+`bot_started`, `message_callback`, `message_created`, `bot_added`, `bot_removed`,
+`bot_admin_permissions_changed`.
 Удалять подписку перед обновлением не нужно: так не возникает разрыва доставки.
 После обновления команда сверяет URL и обязательные события через
 `GET /subscriptions`.

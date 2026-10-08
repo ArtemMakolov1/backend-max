@@ -1,0 +1,162 @@
+name: Recover exact production media from MAX
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_mode:
+        description: Inspect MAX candidates, or upload only files matching the original size and SHA-256
+        required: true
+        default: inventory
+        type: choice
+        options: [inventory, upload_exact]
+      inventory_run:
+        description: Successful inventory run and attempt, such as 123456789-1; required only for exact uploads
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxposty-backend-production
+  cancel-in-progress: false
+
+env:
+  VERIFIED_SOURCE: 2bf45ab973d7f2ac514772dbc878efab3bf4451d
+  VERIFIED_IMAGE: ghcr.io/artemmakolov1/backend-max@sha256:8140a76d1f755a4f5122bfb64bf6eace468b960135a00a548fe2ebc8967cbf20
+  MAX_CA_SHA256: 936a43fea6e8e525bcc0f81acd9c3d21b4fc4b9b68acea7906d698005afc6504
+  RECOVERY_MODE: ${{ inputs.recovery_mode }}
+  INVENTORY_RUN: ${{ inputs.inventory_run }}
+
+jobs:
+  recover:
+    name: Inspect or recover byte-identical media
+    if: github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    environment:
+      name: production
+      url: https://maxposty.ru
+    env:
+      VPS_HOST: ${{ vars.VPS_HOST || '178.159.94.83' }}
+      VPS_PORT: ${{ vars.VPS_PORT || '22' }}
+      VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restrict the operation and production target
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RECOVERY_MODE" in inventory|upload_exact) ;; *) echo "Invalid media recovery mode" >&2; exit 1;; esac
+          if [[ "$RECOVERY_MODE" == inventory ]]; then
+            [[ -z "$INVENTORY_RUN" ]] || { echo "A new inventory must not use a previous run" >&2; exit 1; }
+          else
+            [[ "$INVENTORY_RUN" =~ ^[0-9]+-[1-9][0-9]*$ ]] || { echo "Exact uploads require a successful private inventory run and attempt" >&2; exit 1; }
+          fi
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ && "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ && "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          (( VPS_PORT <= 65535 ))
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          [[ -f deploy/recover-max-media.py && ! -L deploy/recover-max-media.py ]] || { echo "Reviewed media recovery tool is missing" >&2; exit 1; }
+      - name: Require an unchanged successful inventory workflow before uploads
+        if: inputs.recovery_mode == 'upload_exact'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          inventory_id=${INVENTORY_RUN%-*}
+          inventory_attempt=${INVENTORY_RUN##*-}
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$inventory_id/attempts/$inventory_attempt" >"$RUNNER_TEMP/max-media-inventory-run.json"
+          jq -e --arg sha "$GITHUB_SHA" '.head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .path == ".github/workflows/recover-max-media.yml" and .conclusion == "success"' "$RUNNER_TEMP/max-media-inventory-run.json" >/dev/null
+          echo "Successful inventory used the unchanged reviewed workflow and tool"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.VERIFIED_SOURCE }}
+          path: verified-source
+          persist-credentials: false
+      - name: Verify the MAX-only additional trust root
+        shell: bash
+        run: |
+          set -euo pipefail
+          cert=verified-source/internal/maxclient/certs/russian_trusted_root_ca.pem
+          [[ $(sha256sum "$cert" | cut -d ' ' -f 1) == "$MAX_CA_SHA256" ]] || { echo "Verified MAX trust root does not match" >&2; exit 1; }
+          openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null
+      - name: Configure pinned SSH host identity
+        shell: bash
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VPS_SSH_PRIVATE_KEY" && -n "$VPS_SSH_KNOWN_HOSTS" ]] || { echo "Pinned deployment SSH credentials are required" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
+      - name: Check server Python and transfer the reviewed private tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${VPS_USER}@${VPS_HOST}"
+          remote_dir="/opt/maxposty/backend/backups/max-media-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ssh_options=(-i "$HOME/.ssh/id_deploy" -p "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          scp_options=(-i "$HOME/.ssh/id_deploy" -P "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          ssh "${ssh_options[@]}" "$target" "set -eu; command -v python3 >/dev/null || { echo 'Server Python3 is required' >&2; exit 1; }; python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' || { echo 'Server Python3 version is unsupported' >&2; exit 1; }; umask 077; test ! -e '$remote_dir'; mkdir '$remote_dir'; chmod 700 '$remote_dir'"
+          scp "${scp_options[@]}" deploy/recover-max-media.py "$target:$remote_dir/recover-max-media.py"
+          scp "${scp_options[@]}" verified-source/internal/maxclient/certs/russian_trusted_root_ca.pem "$target:$remote_dir/max-ca.pem"
+      - name: Run a private inventory or exact-file recovery without deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${VPS_USER}@${VPS_HOST}"
+          remote_dir="/opt/maxposty/backend/backups/max-media-recovery-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tool_sha=$(sha256sum deploy/recover-max-media.py | cut -d ' ' -f 1)
+          state_run=${INVENTORY_RUN:-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"}
+          state_dir="/opt/maxposty/backend/backups/max-media-recovery-${state_run}/state"
+          ssh_options=(-i "$HOME/.ssh/id_deploy" -p "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          ssh "${ssh_options[@]}" "$target" "bash -s -- '$remote_dir' '$RECOVERY_MODE' '$VERIFIED_SOURCE' '$VERIFIED_IMAGE' '$MAX_CA_SHA256' '$tool_sha' '$state_dir'" <<'REMOTE'
+          set -euo pipefail
+          set +x
+          umask 077
+          private_dir=$1
+          mode=$2
+          source_sha=$3
+          image=$4
+          ca_sha=$5
+          tool_sha=$6
+          state_dir=$7
+          installation_dir=/opt/maxposty/backend
+          cleanup() { rm -f "$private_dir/recover-max-media.py" "$private_dir/max-ca.pem"; }
+          trap cleanup EXIT
+          exec 9>"$installation_dir/.deploy.lock"
+          flock -n 9 || { echo "Another backend production operation is running" >&2; exit 1; }
+          [[ -L "$installation_dir/current" ]] || { echo "Accepted production release is missing" >&2; exit 1; }
+          accepted_dir=$(readlink -f "$installation_dir/current")
+          [[ "$accepted_dir" == "$installation_dir/releases/$source_sha" ]] || { echo "Accepted application source changed; review this operation again" >&2; exit 1; }
+          accepted_env="$accepted_dir/.env.production"
+          [[ -f "$accepted_env" && ! -L "$accepted_env" && -f "$accepted_dir/.release" && ! -L "$accepted_dir/.release" ]] || { echo "Accepted production configuration is missing" >&2; exit 1; }
+          [[ $(awk -F= '$1=="BACKEND_IMAGE" {sub(/^[^=]*=/,""); print; exit}' "$accepted_dir/.release") == "$image" ]] || { echo "Accepted immutable image changed; review this operation again" >&2; exit 1; }
+          [[ $(docker inspect --format '{{.Config.Image}}' maxposty-backend-backend-1) == "$image" ]] || { echo "Running backend image differs from the reviewed image" >&2; exit 1; }
+          [[ $(sha256sum "$private_dir/recover-max-media.py" | cut -d ' ' -f 1) == "$tool_sha" && $(sha256sum "$private_dir/max-ca.pem" | cut -d ' ' -f 1) == "$ca_sha" ]] || { echo "Transferred recovery files do not match" >&2; exit 1; }
+          chmod 600 "$private_dir/recover-max-media.py" "$private_dir/max-ca.pem"
+          tool_mode=inventory
+          [[ "$mode" != upload_exact ]] || tool_mode=apply
+          python3 "$private_dir/recover-max-media.py" "$tool_mode" --env-file "$accepted_env" --ca-file "$private_dir/max-ca.pem" --state-dir "$state_dir"
+          echo "Private media recovery evidence retained on the server; production configuration and database unchanged"
+          REMOTE
+      - name: Verify production stayed healthy
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30 https://maxposty.ru/api/v1/health | jq -e '.status == "ok"' >/dev/null
+          echo "Production API health verified"
+      - name: Remove runner deployment credentials
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"

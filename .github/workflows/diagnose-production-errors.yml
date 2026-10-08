@@ -1,0 +1,87 @@
+name: Diagnose production request failures
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxposty-backend-production-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    name: Read sanitized errors and fixed network diagnostics
+    if: github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    environment:
+      name: production
+      url: https://maxposty.ru
+    env:
+      VPS_HOST: ${{ vars.VPS_HOST || '178.159.94.83' }}
+      VPS_PORT: ${{ vars.VPS_PORT || '22' }}
+      VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
+      VPS_DEPLOY_DIR: ${{ vars.VPS_DEPLOY_DIR || '/opt/maxposty/backend' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate the fixed read-only diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          [[ "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          (( VPS_PORT <= 65535 )) || { echo "Invalid production target" >&2; exit 1; }
+          [[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          [[ "$VPS_DEPLOY_DIR" =~ ^(/[A-Za-z0-9_-]+)+$ ]] || { echo "Invalid deployment directory" >&2; exit 1; }
+          [[ -f deploy/diagnose-production-errors.py && ! -L deploy/diagnose-production-errors.py ]] || { echo "Reviewed diagnostic is missing" >&2; exit 1; }
+          python3 -m unittest discover -s deploy/tests -p 'test_production_error_diagnostics.py'
+      - name: Configure pinned SSH host identity
+        shell: bash
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VPS_SSH_PRIVATE_KEY" && -n "$VPS_SSH_KNOWN_HOSTS" ]] || { echo "Pinned deployment SSH credentials are required" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
+      - name: Read bounded errors, host HTTPS probes and container route booleans
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${VPS_USER}@${VPS_HOST}"
+          ssh_options=(
+            -i "$HOME/.ssh/id_deploy"
+            -p "$VPS_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=10
+            -o ServerAliveInterval=10
+            -o ServerAliveCountMax=2
+          )
+          # The script runs from stdin: no env reads, database commands,
+          # raw log transfer or retained artifacts. Fixed read-only container
+          # route queries emit booleans/counts only; verified HTTPS is host-only,
+          # without credentials, proxies, redirects or response-body reads.
+          # Expand only the validated installation path on the runner.
+          # shellcheck disable=SC2029
+          if ! ssh "${ssh_options[@]}" "$target" "python3 - '$VPS_DEPLOY_DIR'" \
+              <deploy/diagnose-production-errors.py 2>/dev/null; then
+            echo "Read-only production diagnostic could not complete" >&2
+            exit 1
+          fi
+      - name: Remove runner SSH credentials
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"

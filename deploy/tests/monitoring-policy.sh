@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 production_compose="$repo_root/deploy/compose.production.yaml"
 local_compose="$repo_root/compose.yaml"
-prometheus_image='prom/prometheus:v3.13.2@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69'
+prometheus_image='prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e'
 security_workflow="$repo_root/.github/workflows/security.yml"
 monitoring_trivy_ignore="$repo_root/.github/trivy/monitoring-images.yaml"
 
@@ -15,16 +15,32 @@ if [[ $(grep -c '^    ports:$' "$production_compose") -ne 1 ]] ||
 fi
 
 for image in \
-  'prom/prometheus:v3.13.2@sha256:' \
-  'prom/alertmanager:v0.33.1@sha256:' \
-  'grafana/grafana:nightly-slim@sha256:' \
-  'ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.5.2@sha256:' \
-  'ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.5.2@sha256:' \
-  'prom/node-exporter:v1.12.1@sha256:'; do
+  'prom/prometheus:v3.15.0@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.8.2@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261004-prometheus.2@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.8.3@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.8.3@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.8.1@sha256:'; do
   grep -F "$image" "$production_compose" >/dev/null || {
     echo "Monitoring image is not pinned by digest: $image" >&2
     exit 1
   }
+done
+
+for component in postgres-exporter pgbouncer-exporter node-exporter alertmanager prometheus grafana; do
+  deployed_image=$(awk -v component="$component" '
+    $0 == "  " component ":" { inside=1; next }
+    inside && /^    image:/ { print $2; exit }
+  ' "$production_compose")
+  scanned_image=$(awk -v component="$component" '
+    $0 == "          - component: " component { inside=1; next }
+    inside && /^            image:/ { gsub(/"/, "", $2); print $2; exit }
+    inside && /^          - component:/ { exit }
+  ' "$security_workflow")
+  if [[ -z "$deployed_image" || "$deployed_image" != "$scanned_image" ]]; then
+    echo "Security scan must cover the deployed immutable image for $component" >&2
+    exit 1
+  fi
 done
 
 if ! grep -Fx 'vulnerabilities: []' "$monitoring_trivy_ignore" >/dev/null ||
@@ -32,7 +48,7 @@ if ! grep -Fx 'vulnerabilities: []' "$monitoring_trivy_ignore" >/dev/null ||
   echo "Fixed monitoring images must not retain vulnerability exceptions" >&2
   exit 1
 fi
-if [[ $(grep -Fc 'trivyignores: ""' "$security_workflow") -ne 5 ]] ||
+if [[ $(grep -Fc 'trivyignores: ""' "$security_workflow") -ne 6 ]] ||
   [[ $(grep -Fc 'trivyignores: ${{ matrix.trivyignores }}' "$security_workflow") -ne 1 ]]; then
   echo "Every monitoring image scan must run without a vulnerability exception" >&2
   exit 1
@@ -125,6 +141,17 @@ if grep -q '^      edge:' <<<"$grafana_block"; then
   echo "Grafana must not join the shared application edge network" >&2
   exit 1
 fi
+for compose_file in "$production_compose" "$local_compose"; do
+  grafana_block=$(awk '
+    $0 == "  grafana:" { inside=1; next }
+    inside && $0 ~ /^  [a-zA-Z0-9_-]+:$/ { exit }
+    inside { print }
+  ' "$compose_file")
+  if ! grep -Fx '    read_only: true' <<<"$grafana_block" >/dev/null; then
+    echo "Grafana's prebuilt plugin must remain on a read-only root filesystem" >&2
+    exit 1
+  fi
+done
 
 for dashboard in "$repo_root"/monitoring/grafana/dashboards/*.json; do
   jq -e '(.uid | length > 0) and (.panels | length > 0)' "$dashboard" >/dev/null

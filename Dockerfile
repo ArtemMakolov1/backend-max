@@ -1,4 +1,4 @@
-FROM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
+FROM golang:1.26.8-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -10,7 +10,9 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/maxpilo
     && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/setup-max-webhook ./cmd/setup-max-webhook
 
 FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
-RUN apk add --no-cache ca-certificates \
+# The pinned base predates the OpenSSL QUIC security fix. Require patched
+# runtime libraries from this Alpine branch rather than retaining the base's versions.
+RUN apk add --no-cache ca-certificates ffmpeg 'libcrypto3>=3.5.8-r0' 'libssl3>=3.5.8-r0' \
     && addgroup -S maxpilot \
     && adduser -S -G maxpilot maxpilot \
     && mkdir -p /app/media \

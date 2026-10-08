@@ -53,7 +53,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "033_max_history_import.sql"
+const RequiredSchemaVersion = "042_content_analysis_cache.sql"
 
 type schemaMigration struct {
 	version        string
@@ -1299,9 +1299,10 @@ WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
 func (s *Store) ReleasePublishedUpdate(ctx context.Context, claimed Post, lastError string) (Post, error) {
 	now := time.Now().UTC()
 	result, err := s.db.ExecContext(ctx, bindSQL(`UPDATE posts
-SET status=?, last_error=?, updated_at=?
+SET status=?, last_error=?, updated_at=?,
+    max_published_fingerprint=CASE WHEN ? THEN ? ELSE max_published_fingerprint END
 WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
-		PostStatusPublished, truncate(lastError, 2000), now, claimed.UserID, claimed.ID,
+		PostStatusPublished, truncate(lastError, 2000), now, lastError == "", publicationFingerprint(claimed), claimed.UserID, claimed.ID,
 		PostStatusPublishing, claimed.MAXMessageID, claimed.UpdatedAt.UTC())
 	if err != nil {
 		return Post{}, fmt.Errorf("release published post update: %w", err)
@@ -1387,13 +1388,17 @@ WHERE owner_id <> '' AND status = ? AND updated_at < ?`,
 }
 
 func (s *Store) MarkPublished(ctx context.Context, id int64, messageID, messageURL string) (Post, error) {
+	claimed, err := s.GetPost(ctx, id)
+	if err != nil {
+		return Post{}, err
+	}
 	now := nowText()
 	result, err := s.db.ExecContext(ctx, `
 UPDATE posts SET status = ?, max_message_id = ?, max_message_url = ?, max_views = NULL,
                  max_stats_synced_at = NULL, max_stats_attempted_at = NULL, max_is_pinned = FALSE,
-                 last_error = '', scheduled_at = NULL,
+                 last_error = '', scheduled_at = NULL, max_published_fingerprint = ?,
                  published_at = ?, updated_at = ? WHERE id = ? AND status = ?`,
-		PostStatusPublished, messageID, messageURL, now, now, id, PostStatusPublishing)
+		PostStatusPublished, messageID, messageURL, publicationFingerprint(claimed), now, now, id, PostStatusPublishing)
 	if err != nil {
 		return Post{}, fmt.Errorf("mark published: %w", err)
 	}
@@ -1442,7 +1447,7 @@ WHERE id = ? AND status IN (?, ?)`,
 const postColumns = `id, owner_id, workspace_id, title, content, format, status, channel_id, image_url, image_path, image_prompt, link_buttons,
 notify, disable_link_preview, scheduled_at, max_message_id, max_message_url, max_views, max_stats_synced_at,
 max_stats_attempted_at, max_is_pinned, origin, max_history_attachments_complete, max_sender_is_bot,
-last_error, created_at, updated_at, published_at, review_status, current_revision_id`
+last_error, created_at, updated_at, published_at, review_status, current_revision_id, max_published_fingerprint`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -1486,7 +1491,7 @@ func scanPost(row scanner) (Post, error) {
 		&post.ImageURL, &post.ImagePath, &post.ImagePrompt, &linkButtonsJSON, &post.Notify, &post.DisableLinkPreview,
 		&scheduledAt, &post.MAXMessageID, &post.MAXMessageURL, &maxViews, &statsSyncedAt, &statsAttemptedAt, &post.MAXIsPinned,
 		&post.Origin, &post.MAXHistoryAttachmentsComplete, &maxSenderIsBot,
-		&post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt, &post.ReviewStatus, &currentRevisionID); err != nil {
+		&post.LastError, &post.CreatedAt, &post.UpdatedAt, &publishedAt, &post.ReviewStatus, &currentRevisionID, &post.MAXPublishedFingerprint); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Post{}, ErrNotFound
 		}

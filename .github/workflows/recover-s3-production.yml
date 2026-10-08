@@ -1,0 +1,198 @@
+name: Recover production media storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Previously verified application source commit
+        required: true
+        default: 2bf45ab973d7f2ac514772dbc878efab3bf4451d
+        type: string
+      image:
+        description: Previously built and scanned immutable production image
+        required: true
+        default: ghcr.io/artemmakolov1/backend-max@sha256:8140a76d1f755a4f5122bfb64bf6eace468b960135a00a548fe2ebc8967cbf20
+        type: string
+      recovery_mode:
+        description: Inspect media, recover accepted S3, or roll forward to the protected R2 configuration
+        required: true
+        default: accepted_s3
+        type: choice
+        options: [accepted_s3, r2_inventory, r2]
+      allow_pending_media:
+        description: Explicitly permit R2 API restoration while existing media recovery remains pending
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxposty-backend-production
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  IMAGE: ${{ inputs.image }}
+  DEPLOY_STAGE: production
+  RECOVERY_MODE: ${{ inputs.recovery_mode }}
+  ALLOW_PENDING_MEDIA: ${{ inputs.allow_pending_media }}
+
+jobs:
+  recover:
+    name: Recover media storage with the verified image
+    if: github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    environment:
+      name: production
+      url: https://maxposty.ru
+    env:
+      VPS_HOST: ${{ vars.VPS_HOST || '178.159.94.83' }}
+      VPS_PORT: ${{ vars.VPS_PORT || '22' }}
+      VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restrict recovery to the reviewed source and image
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" == 2bf45ab973d7f2ac514772dbc878efab3bf4451d ]] || { echo "Unapproved recovery source" >&2; exit 1; }
+          [[ "$IMAGE" == ghcr.io/artemmakolov1/backend-max@sha256:8140a76d1f755a4f5122bfb64bf6eace468b960135a00a548fe2ebc8967cbf20 ]] || { echo "Unapproved recovery image" >&2; exit 1; }
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ && "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ && "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          (( VPS_PORT <= 65535 ))
+          case "$RECOVERY_MODE" in accepted_s3|r2_inventory|r2) ;; *) echo "Invalid recovery mode" >&2; exit 1;; esac
+          [[ "$ALLOW_PENDING_MEDIA" == false || "$ALLOW_PENDING_MEDIA" == true ]]
+      - name: Require successful exact-source CI and security gates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./deploy/verify-release-gates.sh "$GITHUB_REPOSITORY" "$SOURCE_SHA" 1 0
+      - name: Require both successful scans of the approved immutable image
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37202833994" >"$RUNNER_TEMP/recovery-image-run.json"
+          jq -e --arg sha "$SOURCE_SHA" '.head_sha == $sha and .head_branch == "main" and .event == "push" and .path == ".github/workflows/deploy.yml"' "$RUNNER_TEMP/recovery-image-run.json" >/dev/null
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/37202833994/jobs?per_page=100" >"$RUNNER_TEMP/recovery-image-jobs.json"
+          jq -e '[.jobs[] | select(.name == "Build immutable production image" or .name == "Scan exact pushed digest (linux/amd64)" or .name == "Scan exact pushed digest (linux/arm64)")] | length == 3 and all(.[]; .conclusion == "success")' "$RUNNER_TEMP/recovery-image-jobs.json" >/dev/null
+          echo "Reviewed immutable image build and both architecture scans verified"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          path: verified-source
+          persist-credentials: false
+      - name: Render fresh protected production configuration
+        shell: bash
+        env:
+          POSTGRES_OWNER_PASSWORD: ${{ secrets.POSTGRES_OWNER_PASSWORD }}
+          POSTGRES_APP_PASSWORD: ${{ secrets.POSTGRES_APP_PASSWORD }}
+          POSTGRES_MONITOR_PASSWORD: ${{ secrets.POSTGRES_MONITOR_PASSWORD }}
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          GRAFANA_SECRET_KEY: ${{ secrets.GRAFANA_SECRET_KEY }}
+          ALERTMANAGER_WEBHOOK_URL: ${{ secrets.ALERTMANAGER_WEBHOOK_URL }}
+          YANDEX_CLIENT_ID: ${{ secrets.YANDEX_CLIENT_ID }}
+          YANDEX_CLIENT_SECRET: ${{ secrets.YANDEX_CLIENT_SECRET }}
+          YANDEX_ALLOWED_USERS: ${{ vars.YANDEX_ALLOWED_USERS }}
+          OBSERVABILITY_ADMIN_USERS: ${{ vars.OBSERVABILITY_ADMIN_USERS }}
+          DIRECT_OAUTH_CLIENT_ID: ${{ secrets.DIRECT_OAUTH_CLIENT_ID }}
+          DIRECT_OAUTH_CLIENT_SECRET: ${{ secrets.DIRECT_OAUTH_CLIENT_SECRET }}
+          DIRECT_OAUTH_REDIRECT_URI: ${{ vars.DIRECT_OAUTH_REDIRECT_URI }}
+          DIRECT_TOKEN_DATA_KEY: ${{ secrets.DIRECT_TOKEN_DATA_KEY }}
+          DIRECT_API_BASE_URL: ${{ vars.DIRECT_API_BASE_URL }}
+          DIRECT_WRITES_ENABLED: ${{ vars.DIRECT_WRITES_ENABLED || 'false' }}
+          DIRECT_AUTO_LAUNCH_ENABLED: ${{ vars.DIRECT_AUTO_LAUNCH_ENABLED || 'false' }}
+          DIRECT_SANDBOX: ${{ vars.DIRECT_SANDBOX || 'true' }}
+          YANDEX_WORDSTAT_API_KEY: ${{ secrets.YANDEX_WORDSTAT_API_KEY }}
+          YANDEX_WORDSTAT_FOLDER_ID: ${{ vars.YANDEX_WORDSTAT_FOLDER_ID }}
+          MAX_BOT_TOKEN: ${{ secrets.MAX_BOT_TOKEN }}
+          MAX_WEBHOOK_SECRET: ${{ secrets.MAX_WEBHOOK_SECRET }}
+          MAX_CA_CERT_FILE: ${{ vars.MAX_CA_CERT_FILE }}
+          S3_HOST: ${{ secrets.S3_HOST }}
+          S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+          S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_REGION: ${{ vars.S3_REGION }}
+          MEDIA_USER_MAX_FILES: ${{ vars.MEDIA_USER_MAX_FILES || '500' }}
+          MEDIA_USER_MAX_BYTES: ${{ vars.MEDIA_USER_MAX_BYTES || '10737418240' }}
+          MEDIA_ORPHAN_GRACE_PERIOD: ${{ vars.MEDIA_ORPHAN_GRACE_PERIOD || '24h' }}
+          MEDIA_CLEANUP_INTERVAL: ${{ vars.MEDIA_CLEANUP_INTERVAL || '15m' }}
+          MEDIA_CLEANUP_BATCH_SIZE: ${{ vars.MEDIA_CLEANUP_BATCH_SIZE || '50' }}
+          WORKSPACE_MAX_OWNED_TEAM_WORKSPACES: ${{ vars.WORKSPACE_MAX_OWNED_TEAM_WORKSPACES || '5' }}
+          BILLING_ENFORCEMENT_ENABLED: ${{ vars.BILLING_ENFORCEMENT_ENABLED || 'false' }}
+          BILLING_LIVE_ENABLED: ${{ vars.BILLING_LIVE_ENABLED || 'false' }}
+          YOOKASSA_RECEIPTS_CONFIRMED: ${{ vars.YOOKASSA_RECEIPTS_CONFIRMED || 'false' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          YOOKASSA_SHOP_ID: ${{ secrets.YOOKASSA_SHOP_ID }}
+          YOOKASSA_SECRET_KEY: ${{ secrets.YOOKASSA_SECRET_KEY }}
+          YOOKASSA_DATA_KEY: ${{ secrets.YOOKASSA_DATA_KEY }}
+          # Welcome-email SMTP (optional; unset leaves emails disabled).
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM_EMAIL: ${{ secrets.SMTP_FROM_EMAIL }}
+          SMTP_FROM_NAME: ${{ secrets.SMTP_FROM_NAME }}
+          BACKUP_RETENTION_DAYS: ${{ vars.BACKUP_RETENTION_DAYS || '14' }}
+          PITR_RETENTION_DAYS: ${{ vars.PITR_RETENTION_DAYS || '7' }}
+        run: |
+          set -euo pipefail
+          ./verified-source/deploy/render-production-env.sh "$RUNNER_TEMP/maxposty-backend-recovery.env"
+      - name: Configure pinned SSH host identity
+        shell: bash
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VPS_SSH_PRIVATE_KEY" && -n "$VPS_SSH_KNOWN_HOSTS" ]] || { echo "Pinned deployment SSH credentials are required" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
+      - name: Inventory media or preflight storage and roll forward
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install_dir=/opt/maxposty/backend
+          release_dir="$install_dir/releases/$SOURCE_SHA"
+          artifact="$RUNNER_TEMP/maxposty-backend-recovery.tgz"
+          remote_artifact="/tmp/maxposty-backend-recovery-${SOURCE_SHA}.tgz"
+          recovery_helper="/tmp/maxposty-s3-recovery-${SOURCE_SHA}.sh"
+          r2_helper="/tmp/maxposty-r2-recovery-${SOURCE_SHA}.sh"
+          target="${VPS_USER}@${VPS_HOST}"
+          ssh_options=(-i "$HOME/.ssh/id_deploy" -p "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          scp_options=(-i "$HOME/.ssh/id_deploy" -P "$VPS_PORT" -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$HOME/.ssh/known_hosts")
+          tar -czf "$artifact" -C verified-source deploy docker monitoring
+          ssh "${ssh_options[@]}" "$target" "install -d -m 750 '$install_dir/releases' '$release_dir' '$install_dir/backups'; install -d -m 755 '$install_dir/certs' '$install_dir/hooks'"
+          scp "${scp_options[@]}" "$artifact" "$target:$remote_artifact"
+          ssh "${ssh_options[@]}" "$target" "set -eu; trap \"rm -f '$remote_artifact'\" 0; tar -xzf '$remote_artifact' --no-same-owner -C '$release_dir'; if [ -e '$release_dir/certs' ] && [ ! -L '$release_dir/certs' ]; then rmdir '$release_dir/certs'; fi; ln -sfn '$install_dir/certs' '$release_dir/certs'"
+          scp "${scp_options[@]}" "$RUNNER_TEMP/maxposty-backend-recovery.env" "$target:$release_dir/.env.production.next"
+          scp "${scp_options[@]}" deploy/recover-s3-env.sh "$target:$recovery_helper"
+          scp "${scp_options[@]}" deploy/recover-r2-storage.sh "$target:$r2_helper"
+          printf '%s\n' "$GHCR_TOKEN" | ssh "${ssh_options[@]}" "$target" "set -eu; trap \"rm -f '$recovery_helper' '$r2_helper' '$release_dir/.env.production.next' '$release_dir/.release.next'\" 0; chmod 600 '$release_dir/.env.production.next'; if [ '$RECOVERY_MODE' = r2_inventory ]; then bash '$r2_helper' '$release_dir' inventory false '$IMAGE'; exit 0; elif [ '$RECOVERY_MODE' = r2 ]; then bash '$r2_helper' '$release_dir' rollout '$ALLOW_PENDING_MEDIA' '$IMAGE'; else bash '$recovery_helper' '$release_dir'; fi; '$release_dir/deploy/run-from-ci.sh' '$IMAGE' '$GITHUB_ACTOR' true '$GITHUB_REPOSITORY' '$SOURCE_SHA'"
+      - name: Verify public production health
+        if: inputs.recovery_mode != 'r2_inventory'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30 https://maxposty.ru/api/v1/health | jq -e '.status == "ok"' >/dev/null
+          echo "Production health and MAX webhook recovery completed"
+      - name: Remove runner deployment credentials
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          rm -f "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts" "$RUNNER_TEMP/maxposty-backend-recovery.env" "$RUNNER_TEMP/maxposty-backend-recovery.tgz"

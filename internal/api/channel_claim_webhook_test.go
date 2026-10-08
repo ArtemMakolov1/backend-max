@@ -65,6 +65,9 @@ func (f *claimWebhookMAX) EditChat(_ context.Context, chatID string, patch maxcl
 	if patch.Title != nil {
 		chat.Title = *patch.Title
 	}
+	if patch.Description != nil {
+		chat.Description = *patch.Description
+	}
 	if patch.IconToken != "" {
 		chat.Icon = maxclient.ChatIcon{URL: "https://cdn.max.ru/icons/" + patch.IconToken + ".png"}
 	}

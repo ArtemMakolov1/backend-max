@@ -79,6 +79,8 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_s3_bucket=''
   rendered_s3_region=''
   rendered_openai_key=''
+  rendered_exa_key=''
+  rendered_tavily_key=''
   rendered_alertmanager_webhook_url=''
   rendered_smtp_host=''
   rendered_smtp_port=587
@@ -122,6 +124,15 @@ else
   rendered_s3_bucket=${S3_BUCKET:-}
   rendered_s3_region=${S3_REGION:-}
   rendered_openai_key=${OPENAI_API_KEY:-}
+  rendered_exa_key=${EXA_API_KEY:-}
+  rendered_tavily_key=${TAVILY_API_KEY:-}
+  for name in EXA_API_KEY TAVILY_API_KEY; do
+    value=${!name:-}
+    if [[ -n "$value" && ( ${#value} -gt 1024 || ! "$value" =~ ^[A-Za-z0-9._~:/+@,=-]+$ ) ]]; then
+      echo "Deployment secret contains unsupported characters: $name" >&2
+      exit 1
+    fi
+  done
   rendered_alertmanager_webhook_url=${ALERTMANAGER_WEBHOOK_URL:-}
   rendered_smtp_host=${SMTP_HOST:-}
   rendered_smtp_port=${SMTP_PORT:-587}
@@ -193,6 +204,8 @@ fi
   printf 'MEDIA_CLEANUP_INTERVAL=%s\n' "${MEDIA_CLEANUP_INTERVAL:-15m}"
   printf 'MEDIA_CLEANUP_BATCH_SIZE=%s\n' "${MEDIA_CLEANUP_BATCH_SIZE:-50}"
   printf 'OPENAI_API_KEY=%s\n' "$rendered_openai_key"
+  printf 'EXA_API_KEY=%s\n' "$rendered_exa_key"
+  printf 'TAVILY_API_KEY=%s\n' "$rendered_tavily_key"
   printf 'OPENAI_API_BASE_URL=https://api.openai.com\n'
   # Welcome-email SMTP is optional: empty values disable it (NoopSender).
   printf 'SMTP_HOST=%s\n' "$rendered_smtp_host"
@@ -202,7 +215,7 @@ fi
   printf 'SMTP_FROM_EMAIL=%s\n' "$rendered_smtp_from_email"
   printf 'SMTP_FROM_NAME=%s\n' "$rendered_smtp_from_name"
   printf 'OPENAI_IMAGE_MODEL=%s\n' "${OPENAI_IMAGE_MODEL:-gpt-image-2}"
-  printf 'OPENAI_RESEARCH_MODEL=%s\n' "${OPENAI_RESEARCH_MODEL:-gpt-5.4-mini}"
+  printf 'OPENAI_RESEARCH_MODEL=%s\n' "${OPENAI_RESEARCH_MODEL:-gpt-6-luna}"
   printf 'AI_GLOBAL_MAX_CONCURRENT=%s\n' "${AI_GLOBAL_MAX_CONCURRENT:-4}"
   printf 'AI_USER_MAX_CONCURRENT=%s\n' "${AI_USER_MAX_CONCURRENT:-1}"
   printf 'AI_IMAGE_PER_MINUTE=%s\n' "${AI_IMAGE_PER_MINUTE:-2}"

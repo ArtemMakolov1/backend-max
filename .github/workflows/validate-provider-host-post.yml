@@ -1,0 +1,57 @@
+name: Validate fixed provider POST from production host
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxposty-backend-production-provider-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment:
+      name: production
+      url: https://maxposty.ru
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify the reviewed fixed provider validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in deploy/validate-provider-host-post.py deploy/run-provider-host-post.py; do
+            [[ -f "$script" && ! -L "$script" ]] || { echo "Reviewed validation is missing" >&2; exit 1; }
+          done
+          python3 -m unittest discover -s deploy/tests -p 'test_provider_host_post.py'
+      - name: Configure pinned SSH host identity
+        shell: bash
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VPS_SSH_PRIVATE_KEY" && -n "$VPS_SSH_KNOWN_HOSTS" ]] || { echo "Pinned SSH identity is required" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
+      - name: Make one fixed authenticated search POST per source from host
+        shell: bash
+        env:
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 deploy/run-provider-host-post.py
+      - name: Remove runner SSH credentials
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"

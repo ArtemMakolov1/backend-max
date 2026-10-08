@@ -18,6 +18,10 @@ var studioWebhookUpdateTypes = []string{
 	"bot_started",
 	"message_created",
 	"message_callback",
+	"bot_admin_permissions_changed",
+	"comment_created",
+	"comment_edited",
+	"comment_removed",
 }
 
 // ConfigureStudioWebhook creates or updates the product webhook for the shared

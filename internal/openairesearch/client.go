@@ -7,12 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"maxpilot/backend/internal/contentsearch"
 )
 
 const (
@@ -34,12 +35,15 @@ const (
 )
 
 var opaqueCitationPattern = regexp.MustCompile(`cite[^]*`)
+var sourceDNSLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var sourceTLDSyntaxPattern = regexp.MustCompile(`^[a-z]{2,63}$`)
 
 type Client struct {
-	baseURL    string
-	apiKey     string
-	model      string
-	httpClient *http.Client
+	baseURL       string
+	apiKey        string
+	model         string
+	httpClient    *http.Client
+	contentSearch ContentSearcher
 }
 
 type Request struct {
@@ -75,10 +79,11 @@ type Result struct {
 }
 
 type Error struct {
-	StatusCode int
-	Code       string
-	Message    string
-	RequestID  string
+	StatusCode        int
+	Code              string
+	Message           string
+	RequestID         string
+	SearchDiagnostics contentsearch.Diagnostics `json:"-"`
 }
 
 func (e *Error) Error() string {
@@ -250,15 +255,20 @@ func normalizeEditorialList(values []string) []string {
 }
 
 type responsePayload struct {
-	Model           string          `json:"model"`
-	Input           []inputMessage  `json:"input"`
-	Tools           []webSearchTool `json:"tools,omitempty"`
-	ToolChoice      string          `json:"tool_choice,omitempty"`
-	MaxToolCalls    int             `json:"max_tool_calls,omitempty"`
-	Include         []string        `json:"include,omitempty"`
-	Text            *textOptions    `json:"text,omitempty"`
-	MaxOutputTokens int             `json:"max_output_tokens"`
-	Store           bool            `json:"store"`
+	Model           string            `json:"model"`
+	Reasoning       *reasoningOptions `json:"reasoning,omitempty"`
+	Input           []inputMessage    `json:"input"`
+	Tools           []webSearchTool   `json:"tools,omitempty"`
+	ToolChoice      string            `json:"tool_choice,omitempty"`
+	MaxToolCalls    int               `json:"max_tool_calls,omitempty"`
+	Include         []string          `json:"include,omitempty"`
+	Text            *textOptions      `json:"text,omitempty"`
+	MaxOutputTokens int               `json:"max_output_tokens"`
+	Store           bool              `json:"store"`
+}
+
+type reasoningOptions struct {
+	Effort string `json:"effort"`
 }
 
 // inputMessage carries either a plain string or a []inputContentPart in
@@ -276,8 +286,15 @@ type inputContentPart struct {
 }
 
 type webSearchTool struct {
-	Type              string `json:"type"`
-	SearchContextSize string `json:"search_context_size"`
+	Type               string            `json:"type"`
+	SearchContextSize  string            `json:"search_context_size"`
+	SearchContentTypes []string          `json:"search_content_types,omitempty"`
+	ImageSettings      *webImageSettings `json:"image_settings,omitempty"`
+}
+
+type webImageSettings struct {
+	MaxResults int  `json:"max_results"`
+	Caption    bool `json:"caption"`
 }
 
 type textOptions struct {
@@ -407,6 +424,25 @@ type outputItem struct {
 	Type    string        `json:"type"`
 	Status  string        `json:"status"`
 	Content []contentItem `json:"content"`
+	Action  *webAction    `json:"action,omitempty"`
+	Results []webResult   `json:"results,omitempty"`
+}
+
+type webAction struct {
+	Sources []webSource `json:"sources"`
+}
+
+type webSource struct {
+	Type  string `json:"type"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type webResult struct {
+	Type             string `json:"type"`
+	ImageURL         string `json:"image_url"`
+	SourceWebsiteURL string `json:"source_website_url"`
+	ThumbnailURL     string `json:"thumbnail_url"`
 }
 
 type contentItem struct {
@@ -431,6 +467,11 @@ type annotation struct {
 }
 
 func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnvelope, error) {
+	// Luna defaults to medium. Keep the previous Mini workload's effective
+	// none effort across every text feature, including both research steps.
+	if c.model == "gpt-6-luna" || strings.HasPrefix(c.model, "gpt-6-luna-") {
+		payload.Reasoning = &reasoningOptions{Effort: "none"}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return responseEnvelope{}, fmt.Errorf("encode OpenAI Responses request: %w", err)
@@ -653,12 +694,29 @@ func safeSource(title, rawURL string) (Source, bool) {
 
 func unsafeSourceHost(host string) bool {
 	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
-	if host == "" || host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
+	if host == "" || len(host) > 253 {
 		return true
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast())
+	for _, suffix := range []string{"localhost", "local", "internal", "lan", "home", "home.arpa", "test", "invalid", "example", "onion"} {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	// Browsers accept IPv4 spellings that net.ParseIP does not: a single
+	// decimal integer, octal components, short addresses and 0x hexadecimal.
+	// Research sources need public domain names, so require DNS labels and a
+	// nonnumeric TLD instead of guessing every browser IP representation.
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return true
+	}
+	for _, label := range labels {
+		if !sourceDNSLabelPattern.MatchString(label) {
+			return true
+		}
+	}
+	tld := labels[len(labels)-1]
+	return !sourceTLDSyntaxPattern.MatchString(tld) && !strings.HasPrefix(tld, "xn--")
 }
 
 func deduplicateSources(sources []Source) []Source {

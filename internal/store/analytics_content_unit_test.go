@@ -12,7 +12,7 @@ func TestAnalyticsContentHeatmapUsesExplicitTimezoneAcrossDayRollover(t *testing
 	viewsPer1K := 125.0
 	viewsPerHour := 8.5
 	heatmap, best := buildAnalyticsContentHeatmap([]AnalyticsContentPost{{
-		ID: 1, PublishedAt: &publishedAt,
+		ID: 1, PublishedAt: &publishedAt, Score: float64PointerForAnalytics(32.6),
 		ViewsPer1KAudience: &viewsPer1K, ViewsPerHour: &viewsPerHour,
 	}}, time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC), 180)
 
@@ -25,14 +25,14 @@ func TestAnalyticsContentHeatmapUsesExplicitTimezoneAcrossDayRollover(t *testing
 		cell.Score == nil || *cell.Score != 32.6 {
 		t.Fatalf("rollover cell = %#v", cell)
 	}
-	if best == nil || best.Weekday != 0 || best.Hour != 2 || best.SampleSize != 1 || best.Score != 32.6 {
-		t.Fatalf("best time = %#v", best)
+	if best != nil {
+		t.Fatalf("one post must not produce a recommendation: %#v", best)
 	}
-	// 02:00 at UTC+03:00 is 23:00 UTC on the previous calendar day.
 	wantNext := time.Date(2026, time.July, 19, 23, 0, 0, 0, time.UTC)
-	if !best.NextAt.Equal(wantNext) {
-		t.Fatalf("next recommendation = %s, want %s", best.NextAt, wantNext)
+	if next := nextAnalyticsContentSlot(time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC), 180, 0, 2); !next.Equal(wantNext) {
+		t.Fatalf("next = %s", next)
 	}
+
 }
 
 func TestAnalyticsContentBestTimeRequiresBothNormalizedSignals(t *testing.T) {
@@ -43,7 +43,7 @@ func TestAnalyticsContentBestTimeRequiresBothNormalizedSignals(t *testing.T) {
 	}}, time.Date(2026, time.July, 13, 8, 0, 0, 0, time.UTC), 0)
 
 	cell := heatmap[6*24+10]
-	if cell.ViewsPer1KAudience == nil || cell.ViewsPerHour != nil || cell.Score != nil {
+	if cell.Posts != 0 || cell.ViewsPerHour != nil || cell.Score != nil {
 		t.Fatalf("partial-metric heatmap cell = %#v", cell)
 	}
 	if best != nil {
@@ -108,3 +108,5 @@ WHERE workspace_id=$1 AND action='post.duplicated'`, workspace.ID).Scan(&duplica
 			postsBefore, postsAfter, campaignsBefore, campaignsAfter, duplicateAudits)
 	}
 }
+
+func float64PointerForAnalytics(value float64) *float64 { return &value }

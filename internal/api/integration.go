@@ -96,6 +96,9 @@ type maxUpdate struct {
 	UpdateType string          `json:"update_type"`
 	Timestamp  int64           `json:"timestamp"`
 	ChatID     json.RawMessage `json:"chat_id"`
+	PostID     string          `json:"post_id,omitempty"`
+	MessageID  string          `json:"message_id,omitempty"`
+	MessageRaw json.RawMessage `json:"-"`
 	IsChannel  bool            `json:"is_channel"`
 	Title      string          `json:"title,omitempty"`
 	Chat       *struct {
@@ -136,13 +139,30 @@ func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	decoder := json.NewDecoder(r.Body)
 	decoder.UseNumber()
-	var update maxUpdate
-	if err := decoder.Decode(&update); err != nil {
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
 		if errors.Is(err, io.EOF) {
 			s.problem(w, http.StatusBadRequest, "invalid_webhook", "Webhook body is empty", nil)
 		} else {
 			s.problem(w, http.StatusBadRequest, "invalid_webhook", "Webhook body is invalid", nil)
 		}
+		return
+	}
+	var update maxUpdate
+	if err := json.Unmarshal(raw, &update); err != nil {
+		s.problem(w, http.StatusBadRequest, "invalid_webhook", "Webhook body is invalid", nil)
+		return
+	}
+	var messageEnvelope struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &messageEnvelope); err != nil {
+		s.problem(w, http.StatusBadRequest, "invalid_webhook", "Webhook body is invalid", nil)
+		return
+	}
+	update.MessageRaw = messageEnvelope.Message
+	if update.UpdateType == "comment_created" || update.UpdateType == "comment_edited" || update.UpdateType == "comment_removed" {
+		s.handleMAXCommentEvent(w, r, update)
 		return
 	}
 	if update.UpdateType == "bot_started" {
@@ -169,6 +189,19 @@ func (s *Server) maxWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch update.UpdateType {
+	case "bot_admin_permissions_changed":
+		eventAt, valid := maxEventTime(update.Timestamp, s.now().UTC())
+		if !valid {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ignored": true})
+			return
+		}
+		ctx, cancel := contextWithTimeout(r, 8*time.Second)
+		err = s.app.RefreshMAXChatPermissions(ctx, chatID, eventAt)
+		cancel()
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
 	case "bot_added":
 		eventAt, valid := maxEventTime(update.Timestamp, s.now().UTC())
 		if !valid {

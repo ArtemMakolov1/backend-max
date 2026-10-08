@@ -12,6 +12,10 @@ import (
 
 const MaxAnalyticsTimezoneOffsetMinutes = 14 * 60
 
+// These are conservative product thresholds, not statistical significance.
+const analyticsRecommendationMinPosts = 10
+const analyticsRecommendationMinSlotPosts = 3
+
 // AnalyticsContentReport is the workspace-scoped analytics-to-content view.
 // It keeps missing upstream counters nullable and makes the timezone used for
 // weekday/hour buckets explicit.
@@ -25,6 +29,8 @@ type AnalyticsContentReport struct {
 	Heatmap               []AnalyticsHeatmapCell  `json:"heatmap"`
 	BestTime              *AnalyticsBestTime      `json:"best_time"`
 	TimezoneOffsetMinutes int                     `json:"timezone_offset_minutes"`
+	ComparisonWindowHours int                     `json:"comparison_window_hours"`
+	ComparablePosts       int                     `json:"comparable_posts"`
 }
 
 type AnalyticsContentScope struct {
@@ -35,32 +41,42 @@ type AnalyticsContentScope struct {
 }
 
 type AnalyticsContentSummary struct {
-	PostsTotal          int64    `json:"posts_total"`
-	PublishedPosts      int64    `json:"published_posts"`
-	KnownViewsPosts     int      `json:"known_views_posts"`
-	TotalViews          *int64   `json:"total_views"`
-	ParticipantsCurrent *int     `json:"participants_current"`
-	ParticipantsChange  *int     `json:"participants_change"`
-	ViewsChange         *int64   `json:"views_change"`
-	ViewsPer1KAudience  *float64 `json:"views_per_1k_audience"`
-	AverageViewsPerHour *float64 `json:"average_views_per_hour"`
+	ObservedComments         *int64     `json:"observed_comments"`
+	ObservedCommentAuthors   *int64     `json:"observed_comment_authors"`
+	CommentsSyncedPosts      int        `json:"comments_synced_posts"`
+	CommentsLastSyncedAt     *time.Time `json:"comments_last_synced_at"`
+	CommentsCoverageComplete bool       `json:"comments_coverage_complete"`
+	PostsTotal               int64      `json:"posts_total"`
+	PublishedPosts           int64      `json:"published_posts"`
+	KnownViewsPosts          int        `json:"known_views_posts"`
+	TotalViews               *int64     `json:"total_views"`
+	ParticipantsCurrent      *int       `json:"participants_current"`
+	ParticipantsChange       *int       `json:"participants_change"`
+	ViewsChange              *int64     `json:"views_change"`
+	ViewsPer1KAudience       *float64   `json:"views_per_1k_audience"`
+	AverageViewsPerHour      *float64   `json:"average_views_per_hour"`
 }
 
 type AnalyticsContentPost struct {
-	ID                 int64      `json:"id"`
-	Title              string     `json:"title"`
-	ChannelID          int64      `json:"channel_id"`
-	ChannelTitle       string     `json:"channel_title"`
-	Audience           int        `json:"audience"`
-	PublishedAt        *time.Time `json:"published_at"`
-	Views              *int64     `json:"views"`
-	ViewsPer1KAudience *float64   `json:"views_per_1k_audience"`
-	ViewsPerHour       *float64   `json:"views_per_hour"`
-	Score              *float64   `json:"score"`
-	MAXMessageURL      string     `json:"max_message_url,omitempty"`
-	MAXStatsSyncedAt   *time.Time `json:"max_stats_synced_at"`
-	PublicationState   string     `json:"publication_state"`
-	RemovedFromMAX     bool       `json:"removed_from_max"`
+	MAXCommentAnalyticsFields
+	RootMessageID         string     `json:"-"`
+	ID                    int64      `json:"id"`
+	Title                 string     `json:"title"`
+	ChannelID             int64      `json:"channel_id"`
+	ChannelTitle          string     `json:"channel_title"`
+	Audience              int        `json:"audience"`
+	PublishedAt           *time.Time `json:"published_at"`
+	Views                 *int64     `json:"views"`
+	ViewsPer1KAudience    *float64   `json:"views_per_1k_audience"`
+	ViewsPerHour          *float64   `json:"views_per_hour"`
+	Score                 *float64   `json:"score"`
+	ComparisonViews       *int64     `json:"comparison_views"`
+	ComparisonCapturedAt  *time.Time `json:"comparison_captured_at"`
+	ComparisonWindowHours int        `json:"comparison_window_hours"`
+	MAXMessageURL         string     `json:"max_message_url,omitempty"`
+	MAXStatsSyncedAt      *time.Time `json:"max_stats_synced_at"`
+	PublicationState      string     `json:"publication_state"`
+	RemovedFromMAX        bool       `json:"removed_from_max"`
 }
 
 type AnalyticsHeatmapCell struct {
@@ -73,13 +89,15 @@ type AnalyticsHeatmapCell struct {
 }
 
 type AnalyticsBestTime struct {
-	Weekday            int       `json:"weekday"`
-	Hour               int       `json:"hour"`
-	SampleSize         int       `json:"sample_size"`
-	ViewsPer1KAudience *float64  `json:"views_per_1k_audience"`
-	ViewsPerHour       *float64  `json:"views_per_hour"`
-	Score              float64   `json:"score"`
-	NextAt             time.Time `json:"next_at"`
+	Weekday               int       `json:"weekday"`
+	Hour                  int       `json:"hour"`
+	SampleSize            int       `json:"sample_size"`
+	ViewsPer1KAudience    *float64  `json:"views_per_1k_audience"`
+	ViewsPerHour          *float64  `json:"views_per_hour"`
+	Score                 float64   `json:"score"`
+	NextAt                time.Time `json:"next_at"`
+	TotalSampleSize       int       `json:"total_sample_size"`
+	ComparisonWindowHours int       `json:"comparison_window_hours"`
 }
 
 // GetWorkspaceAnalyticsContent returns current-channel or all-channel
@@ -156,6 +174,7 @@ func (s *Store) GetWorkspaceAnalyticsContent(
 		Posts:                 make([]AnalyticsContentPost, 0),
 		Heatmap:               make([]AnalyticsHeatmapCell, 0, 7*24),
 		TimezoneOffsetMinutes: tzOffsetMinutes,
+		ComparisonWindowHours: 24,
 	}
 	currentAudience := audienceTotal
 	report.Summary.ParticipantsCurrent = &currentAudience
@@ -178,7 +197,8 @@ SELECT post.id, post.title, post.channel_id, channel.title,
        COALESCE(latest.views, CASE WHEN post.max_stats_synced_at < ? THEN post.max_views END),
        post.max_message_url,
        COALESCE(latest.captured_at, CASE WHEN post.max_stats_synced_at < ? THEN post.max_stats_synced_at END),
-       CASE WHEN post.status = ? AND post.max_message_id <> '' THEN 'published' ELSE 'removed' END
+       CASE WHEN post.status = ? AND post.max_message_id <> '' THEN 'published' ELSE 'removed' END,
+       post.max_message_id
 FROM posts AS post
 JOIN channels AS channel ON channel.workspace_id=post.workspace_id AND channel.id=post.channel_id
 LEFT JOIN LATERAL (
@@ -225,7 +245,7 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 		var views sql.NullInt64
 		if err := rows.Scan(
 			&post.ID, &post.Title, &post.ChannelID, &post.ChannelTitle, &post.Audience,
-			&publishedAt, &views, &post.MAXMessageURL, &syncedAt, &post.PublicationState,
+			&publishedAt, &views, &post.MAXMessageURL, &syncedAt, &post.PublicationState, &post.RootMessageID,
 		); err != nil {
 			return AnalyticsContentReport{}, fmt.Errorf("scan workspace analytics post: %w", err)
 		}
@@ -247,7 +267,11 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 				audienceExposure += int64(post.Audience)
 			}
 			if post.PublishedAt != nil {
-				ageHours := analysisEnd.Sub(post.PublishedAt.UTC()).Hours()
+				measuredAt := analysisEnd
+				if post.MAXStatsSyncedAt != nil && post.MAXStatsSyncedAt.Before(measuredAt) {
+					measuredAt = *post.MAXStatsSyncedAt
+				}
+				ageHours := measuredAt.Sub(post.PublishedAt.UTC()).Hours()
 				if ageHours < 1 {
 					ageHours = 1
 				}
@@ -256,10 +280,7 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 				viewsPerHourTotal += rate
 				viewsPerHourCount++
 			}
-			if score, ok := analyticsContentScore(post.ViewsPer1KAudience, post.ViewsPerHour); ok {
-				rounded := roundAnalyticsMetric(score)
-				post.Score = &rounded
-			}
+
 		}
 		report.Posts = append(report.Posts, post)
 	}
@@ -301,9 +322,18 @@ WHERE post.workspace_id=? AND post.published_at>=? AND post.published_at<?`
 		}
 	}
 
+	comparisonPosts := applyAnalyticsComparisonWindow(report.Posts, observations, analysisEnd)
+	for _, post := range comparisonPosts {
+		if post.Score != nil {
+			report.ComparablePosts++
+		}
+	}
 	report.Heatmap, report.BestTime = buildAnalyticsContentHeatmap(
-		report.Posts, asOf, tzOffsetMinutes,
+		comparisonPosts, asOf, tzOffsetMinutes,
 	)
+	if err := s.applyWorkspaceMAXCommentAnalytics(ctx, workspaceID, analysisEnd, &report); err != nil {
+		return AnalyticsContentReport{}, fmt.Errorf("get observed MAX comments analytics: %w", err)
+	}
 	return report, nil
 }
 
@@ -396,10 +426,12 @@ func buildAnalyticsContentHeatmap(
 ) ([]AnalyticsHeatmapCell, *AnalyticsBestTime) {
 	accumulators := make([]analyticsHeatmapAccumulator, 7*24)
 	offset := time.Duration(tzOffsetMinutes) * time.Minute
+	comparablePosts := 0
 	for _, post := range posts {
-		if post.PublishedAt == nil {
+		if post.PublishedAt == nil || post.Score == nil || post.RemovedFromMAX {
 			continue
 		}
+		comparablePosts++
 		local := post.PublishedAt.UTC().Add(offset)
 		weekday := (int(local.Weekday()) + 6) % 7 // Monday=0.
 		index := weekday*24 + local.Hour()
@@ -418,6 +450,7 @@ func buildAnalyticsContentHeatmap(
 	cells := make([]AnalyticsHeatmapCell, 0, 7*24)
 	bestIndex := -1
 	bestScore := -1.0
+	eligibleSlots := 0
 	for weekday := 0; weekday < 7; weekday++ {
 		for hour := 0; hour < 24; hour++ {
 			index := weekday*24 + hour
@@ -441,23 +474,28 @@ func buildAnalyticsContentHeatmap(
 			if cell.Score != nil {
 				score = *cell.Score
 			}
-			if score > bestScore || (score == bestScore && bestIndex >= 0 && cell.Posts > cells[bestIndex].Posts) {
+			if cell.Posts >= analyticsRecommendationMinSlotPosts && cell.Score != nil {
+				eligibleSlots++
+			}
+			if cell.Posts >= analyticsRecommendationMinSlotPosts && (score > bestScore || (score == bestScore && bestIndex >= 0 && cell.Posts > cells[bestIndex].Posts)) {
 				bestIndex, bestScore = len(cells)-1, score
 			}
 		}
 	}
-	if bestIndex < 0 || bestScore < 0 {
+	if bestIndex < 0 || bestScore < 0 || comparablePosts < analyticsRecommendationMinPosts || eligibleSlots < 2 {
 		return cells, nil
 	}
 	bestCell := cells[bestIndex]
 	best := &AnalyticsBestTime{
-		Weekday:            bestCell.Weekday,
-		Hour:               bestCell.Hour,
-		SampleSize:         bestCell.Posts,
-		ViewsPer1KAudience: bestCell.ViewsPer1KAudience,
-		ViewsPerHour:       bestCell.ViewsPerHour,
-		Score:              bestScore,
-		NextAt:             nextAnalyticsContentSlot(asOf.UTC(), tzOffsetMinutes, bestCell.Weekday, bestCell.Hour),
+		Weekday:               bestCell.Weekday,
+		Hour:                  bestCell.Hour,
+		SampleSize:            bestCell.Posts,
+		ViewsPer1KAudience:    bestCell.ViewsPer1KAudience,
+		ViewsPerHour:          bestCell.ViewsPerHour,
+		Score:                 bestScore,
+		NextAt:                nextAnalyticsContentSlot(asOf.UTC(), tzOffsetMinutes, bestCell.Weekday, bestCell.Hour),
+		TotalSampleSize:       comparablePosts,
+		ComparisonWindowHours: 24,
 	}
 	return cells, best
 }

@@ -6,7 +6,7 @@ info:
     Canonical HTTP contract shared by the MaxPosty backend and frontend.
     Browser sessions are carried by the secure `maxstudio_session` cookie.
 servers:
-  - url: https://api.maxposty.ru/api/v1
+  - url: https://maxposty.ru/api/v1
     description: Production
   - url: http://localhost:8080/api/v1
     description: Local development
@@ -20,6 +20,7 @@ tags:
   - name: Workspaces
   - name: Billing
   - name: Collaboration
+  - name: MAXComments
   - name: Notifications
   - name: Brand
   - name: Campaigns
@@ -359,11 +360,11 @@ paths:
     post:
       tags: [Channels]
       operationId: updateChannelMaxInfo
-      summary: Change the channel photo and title in MAX itself
+      summary: Change the channel photo, title and description in MAX itself
       description: >-
-        Pushes a new icon and/or title to the MAX channel through the Bot API
-        and refreshes the cached channel record. At least one of title or file
-        is required. The channel description cannot be changed by bots.
+        Pushes a new icon, title and/or description to the MAX channel and refreshes
+        the cached record. At least one changed field is required. An omitted
+        description is preserved; an empty string removes the description.
       security:
         - sessionCookie: []
       requestBody:
@@ -374,11 +375,12 @@ paths:
               type: object
               properties:
                 title: {type: string, minLength: 1, maxLength: 200}
+                description: {type: string, maxLength: 16000, description: "Omit to preserve; use an empty string to clear."}
                 file: {type: string, format: binary}
                 notify:
                   type: boolean
                   default: false
-                  description: Send a MAX system notification about the title or photo change.
+                  description: Send a MAX system notification about the profile change.
       responses:
         '200':
           description: Updated channel
@@ -1112,6 +1114,248 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/DirectExternalCampaignListEnvelope'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    get:
+      tags: [Advertising]
+      operationId: getDirectExternalCampaignDetail
+      summary: Inspect an existing provider campaign without importing or duplicating it
+      security: [{sessionCookie: []}]
+      responses:
+        '200': {description: Fresh provider fields and local edit revision, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalCampaignName
+      summary: Update only an existing campaign name after checking the observed revision
+      description: Local claims serialize MaxPosty writes; the provider API has no atomic revision check against changes made in its own console. Uncertain writes are reconciled by reading the provider, never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalNamePatch'}
+      responses:
+        '200': {description: Verified provider detail, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/budget:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalBudget
+      summary: Update one existing strategy budget without changing bidding strategy
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBudgetPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/groups/{provider_group_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_group_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalGroup
+      summary: Update selected name, geography or negative phrases of an existing group
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalGroupPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/groups:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: createDirectExternalGroup
+      summary: Add one group with a durable request UUID and provider acknowledgment
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalGroupCreate'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/keywords/{provider_keyword_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_keyword_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalKeyword
+      summary: Edit a keyword and retain a provider-assigned replacement ID
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalKeywordPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/keywords/{provider_keyword_id}/bid:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_keyword_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalKeywordBid
+      summary: Set manual bids only when the existing strategy supports them
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBidPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/groups/{provider_group_id}/keywords:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_group_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: createDirectExternalKeyword
+      summary: Add one ordinary keyword without replaying an ambiguous provider write
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalKeywordPatch'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/state:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: setDirectExternalCampaignState
+      summary: Pause or explicitly resume an existing provider campaign
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalStateInput'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/operations/{client_request_id}/reconcile:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: client_request_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      tags: [Advertising]
+      operationId: reconcileDirectExternalOperation
+      summary: Confirm a matching existing provider object without repeating the original write
+      description: A current connection, version, observed hash and revision are required. Writes are serialized locally; Yandex Direct has no atomic revision check against its own console. Budget, bid and activation changes require workspace ownership. Unknown provider outcomes stay locked until an authoritative read or an explicit scoped reconciliation; they are never automatically replayed.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalOperationReconcile'}
+      responses:
+        '200': {description: Authoritative provider detail and durable operation status, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/ads/{provider_ad_id}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_ad_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    patch:
+      tags: [Advertising]
+      operationId: updateDirectExternalAd
+      summary: Update chosen copy or destination fields of one existing ad
+      description: Budget, bids, targeting and activation are outside this operation. Required ResponsiveAd peers are preserved from a fresh provider read.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalAdPatch'}
+      responses:
+        '200': {description: Verified provider detail, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/import:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising]
+      operationId: bookmarkDirectExternalCampaign
+      summary: Save a local reference without creating a duplicate provider campaign
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBookmarkInput'}
+      responses:
+        '200': {description: Provider campaign and saved local reference, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [Advertising]
+      operationId: unbookmarkDirectExternalCampaign
+      summary: Remove only the local reference
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalBookmarkInput'}
+      responses:
+        '200': {description: Provider campaign and cleared local reference, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalDetailEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/advertising/direct/campaigns/external/{provider_campaign_id}/ads/{provider_ad_id}/suggest:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {name: provider_campaign_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+      - {name: provider_ad_id, in: path, required: true, schema: {type: string, pattern: '^[1-9][0-9]*$'}}
+    post:
+      tags: [Advertising, AI]
+      operationId: suggestDirectExternalAdCopy
+      summary: Suggest copy for one existing ad without requiring new campaign dates or changing its budget
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DirectExternalCopyInput'}
+      responses:
+        '200': {description: Proposal only; no provider writes, content: {application/json: {schema: {$ref: '#/components/schemas/DirectExternalCopyEnvelope'}}}}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/advertising/direct/campaigns/sync:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
     post:
@@ -1621,11 +1865,11 @@ paths:
     post:
       tags: [Channels]
       operationId: updateWorkspaceChannelMaxInfo
-      summary: Change the channel photo and title in MAX itself
+      summary: Change the channel photo, title and description in MAX itself
       description: >-
-        Pushes a new icon and/or title to the MAX channel through the Bot API
-        and refreshes the cached channel record. At least one of title or file
-        is required. The channel description cannot be changed by bots.
+        Pushes a new icon, title and/or description to the MAX channel and refreshes
+        the cached record. At least one changed field is required. An omitted
+        description is preserved; an empty string removes the description.
       security: [{sessionCookie: []}]
       requestBody:
         required: true
@@ -1635,11 +1879,12 @@ paths:
               type: object
               properties:
                 title: {type: string, minLength: 1, maxLength: 200}
+                description: {type: string, maxLength: 16000, description: "Omit to preserve; use an empty string to clear."}
                 file: {type: string, format: binary}
                 notify:
                   type: boolean
                   default: false
-                  description: Send a MAX system notification about the title or photo change.
+                  description: Send a MAX system notification about the profile change.
       responses:
         '200': {$ref: '#/components/responses/Channel'}
         default: {$ref: '#/components/responses/Problem'}
@@ -1867,6 +2112,39 @@ paths:
             schema: {$ref: '#/components/schemas/WorkspaceResearchInput'}
       responses:
         '200': {description: Research result, content: {application/json: {schema: {$ref: '#/components/schemas/ResearchResult'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/research/discover:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: discoverWorkspaceContent
+      summary: Find up to three grounded ideas, articles, memes or videos for a channel
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContentDiscoveryInput'}
+      responses:
+        '200': {description: Grounded content cards, content: {application/json: {schema: {$ref: '#/components/schemas/ContentDiscoveryResult'}}}}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/research/content/drafts:
+    parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
+    post:
+      tags: [AI]
+      operationId: createWorkspaceContentDiscoveryDraft
+      summary: Create a draft and copy available grounded media with an idempotent request
+      description: Requires posts.write. Candidate belongs to this actor and workspace; arbitrary source URLs are never accepted. Reusing the same UUID returns the existing draft and transfer result, including after candidate expiry. This operation does not publish to MAX.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContentDiscoveryDraftInput'}
+      responses:
+        '200': {description: Saved draft with truthful complete or partial media transfer, content: {application/json: {schema: {$ref: '#/components/schemas/ContentDiscoveryDraftResult'}}}}
+        '409': {description: Same request is in progress or the UUID belongs to different parameters, content: {application/json: {schema: {$ref: '#/components/schemas/ProblemEnvelope'}}}}
+        '410': {description: Candidate expired before the first creation request, content: {application/json: {schema: {$ref: '#/components/schemas/ProblemEnvelope'}}}}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/brand-kit:
     parameters: [{$ref: '#/components/parameters/WorkspaceId'}]
@@ -2512,6 +2790,24 @@ paths:
       responses:
         '200': {$ref: '#/components/responses/Post'}
         default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/attachments/{attachment_id}/video:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - {$ref: '#/components/parameters/AttachmentId'}
+    get:
+      tags: [Posts]
+      operationId: getWorkspaceMAXVideoPreview
+      summary: Read fresh MAX playback metadata for a published workspace video
+      description: Requires posts.read and a currently accessible administrator bot with read_all_messages. The server resolves the stored attachment token; arbitrary tokens and query parameters are rejected. This read-only call neither downloads media nor changes the post. Signed playback URLs should be requested again if they expire.
+      security: [{sessionCookie: []}]
+      responses:
+        '200':
+          description: Safe playback URLs and metadata, or available false with urls null
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MAXVideoPreview'}
+        default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/posts/{post_id}/attachments/order:
     parameters:
       - {$ref: '#/components/parameters/WorkspaceId'}
@@ -2622,6 +2918,127 @@ paths:
             schema: {$ref: '#/components/schemas/PostReviewDecisionInput'}
       responses:
         '201': {$ref: '#/components/responses/PostReview'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    get:
+      tags: [MAXComments]
+      operationId: getWorkspacePostMAXComments
+      summary: Read observed public MAX comments for the current publication
+      description: Requires posts.read and the connected bot's administrator/read_all_messages permission. Reads the local inbox, bounded to its newest 100 rows, and checks current provider authority. This is separate from editorial team discussion. No provider total or complete history is claimed.
+      security: [{sessionCookie: []}]
+      parameters:
+        - name: expected_root_message_id
+          in: query
+          required: false
+          schema: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        - name: client_request_ids
+          in: query
+          required: false
+          description: Up to 20 comma-separated permanent request keys from the browser's pending journal. Matching finished operations from this current MAX publication are included even when older than the normal recent-operation window.
+          schema: {type: string, maxLength: 1619}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+    post:
+      tags: [MAXComments]
+      operationId: sendWorkspacePostMAXComment
+      summary: Send a public comment or reply once
+      description: |
+        Requires posts.write, bot administrator/read_all_messages/write authority and an active channel.
+        A permanent client_request_id and expected MAX publication MID fence the write. Never automatically retry an ambiguous request with a new key. A max_comment_uncertain or max_comment_busy response preserves the pending action; an explicit max_comment_not_written guarantees this action was not accepted by MAX. A successful duplicate key returns its durable result without another send. An uncertain send can only be linked explicitly to a matching received comment; ordinary sync never guesses that a send succeeded. Attachments and forwarding are unsupported.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MAXCommentSendInput'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments/sync:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+    post:
+      tags: [MAXComments]
+      operationId: syncWorkspacePostMAXComments
+      summary: Refresh the latest 100 public MAX comments
+      description: Requires posts.read and current bot administrator/read_all_messages authority. Performs read-only provider requests. Provider pagination has no documented total or marker, so even a short page remains incomplete. Missing rows and failed provider reads are never interpreted as deletion. A 15 second sync cooldown and per-publication claim prevent concurrent refreshes. Exact plain-text edit readback may reconcile an uncertain edit; SEND remains explicit and DELETE needs an actual removal event.
+      security: [{sessionCookie: []}]
+      parameters:
+        - name: expected_root_message_id
+          in: query
+          required: true
+          schema: {$ref: '#/components/schemas/MAXCommentMessageId'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments/{comment_mid}:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - name: comment_mid
+        in: path
+        required: true
+        schema: {$ref: '#/components/schemas/MAXCommentMessageId'}
+    put:
+      tags: [MAXComments]
+      operationId: editWorkspacePostMAXComment
+      summary: Edit this connected bot's own plain comment
+      description: Requires posts.write and current read authority. Only the exact connected bot's plain-text comments younger than 26 hours are editable; own editing does not require provider write permission. The existing reply association is preserved. The current row version and MAX publication MID are rechecked before writing. Marked-up or other authors' comments remain read-only. No automatic provider retry; an accepted edit followed by failed readback remains uncertain.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MAXCommentEditInput'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+    delete:
+      tags: [MAXComments]
+      operationId: deleteWorkspacePostMAXComment
+      summary: Delete a public MAX comment
+      description: Requires posts.delete and current bot administrator/read_all_messages/delete authority. The current row version and MAX publication MID are fenced before the single provider call. Reads, own edits and deletes of old comments remain available in archived provider channels when authority remains valid. A failed GET is never proof of deletion.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MAXCommentDeleteInput'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
+        default: {$ref: '#/components/responses/Problem'}
+  /workspaces/{workspace_id}/posts/{post_id}/max-comments/operations/{operation_id}/reconcile:
+    parameters:
+      - {$ref: '#/components/parameters/WorkspaceId'}
+      - {$ref: '#/components/parameters/PostId'}
+      - name: operation_id
+        in: path
+        required: true
+        schema: {type: string, pattern: '^mco_[0-9a-f]{32}$'}
+    post:
+      tags: [MAXComments]
+      operationId: reconcileWorkspacePostMAXCommentSend
+      summary: Explicitly identify an already received reply for an uncertain send
+      description: Performs a scoped read-only MAX lookup and a local link, never a resend. Requires posts.write. Only a plain-text uncertain SEND by the exact current bot can be linked; root, author, text, reply and creation time must match the private durable attempt. An uncertain send blocks another SEND for this publication but does not block reading or editing/deleting other comments.
+      security: [{sessionCookie: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_root_message_id, message_id]
+              properties:
+                expected_root_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+                message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+      responses:
+        '200': {$ref: '#/components/responses/MAXComments'}
         default: {$ref: '#/components/responses/Problem'}
   /workspaces/{workspace_id}/posts/{post_id}/comments:
     parameters:
@@ -3033,6 +3450,11 @@ components:
     PostReviewList:
       description: Review decisions
       content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/PostReview'}}}}
+    MAXComments:
+      description: Observed public MAX inbox, authority, coverage and durable operation states
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/MAXCommentsView'}
     PostComment:
       description: Post comment
       content: {application/json: {schema: {$ref: '#/components/schemas/PostComment'}}}
@@ -3049,6 +3471,121 @@ components:
       description: User notifications
       content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Notification'}}}}
   schemas:
+    MAXCommentMessageId:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$'
+    MAXCommentWriteFence:
+      type: object
+      required: [expected_root_message_id, client_request_id]
+      properties:
+        expected_root_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        client_request_id:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{16,80}$'
+          description: Permanent key for this single attempt. Reusing it with another payload or publication is rejected; an unknown result must not be resent using a new key.
+    MAXCommentSendInput:
+      allOf:
+        - {$ref: '#/components/schemas/MAXCommentWriteFence'}
+        - type: object
+          required: [text]
+          properties:
+            text: {type: string, minLength: 1, maxLength: 4000}
+            format: {type: string, enum: ['', markdown, html]}
+            reply_to_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+      unevaluatedProperties: false
+    MAXCommentEditInput:
+      allOf:
+        - {$ref: '#/components/schemas/MAXCommentWriteFence'}
+        - type: object
+          required: [text, expected_version]
+          properties:
+            text: {type: string, minLength: 1, maxLength: 4000}
+            format: {type: string, enum: ['', markdown, html]}
+            expected_version: {type: integer, format: int64, minimum: 1}
+      unevaluatedProperties: false
+    MAXCommentDeleteInput:
+      allOf:
+        - {$ref: '#/components/schemas/MAXCommentWriteFence'}
+        - type: object
+          required: [expected_version]
+          properties:
+            expected_version: {type: integer, format: int64, minimum: 1}
+      unevaluatedProperties: false
+    MAXCommentOperation:
+      type: object
+      required: [operation_id, client_request_id, kind, state]
+      properties:
+        operation_id: {type: string, pattern: '^mco_[0-9a-f]{32}$'}
+        client_request_id: {type: string, pattern: '^[A-Za-z0-9_-]{16,80}$'}
+        kind: {type: string, enum: [send, edit, delete]}
+        state: {type: string, enum: [sending, succeeded, rejected, uncertain]}
+        message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+    MAXCommentView:
+      type: object
+      required: [message_id, text, sender_name, sender_is_bot, created_at, updated_at, deleted_at, version, is_own, can_edit, can_delete]
+      properties:
+        message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        text: {type: string, maxLength: 4000}
+        sender_name: {type: string}
+        sender_is_bot: {type: boolean}
+        reply_to_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        deleted_at: {type: [string, 'null'], format: date-time}
+        version: {type: integer, format: int64, minimum: 1}
+        is_own:
+          type: boolean
+          description: True only for an explicit sender identity matching the current connected bot, never inferred from sender_is_bot alone.
+        can_edit: {type: boolean}
+        can_delete: {type: boolean}
+    MAXCommentsView:
+      type: object
+      required: [post_id, root_message_id, comments, operations, capabilities, coverage, metrics]
+      properties:
+        post_id: {type: integer, format: int64, minimum: 1}
+        root_message_id: {$ref: '#/components/schemas/MAXCommentMessageId'}
+        comments:
+          type: array
+          maxItems: 100
+          items: {$ref: '#/components/schemas/MAXCommentView'}
+        operations:
+          type: array
+          description: Every active sending/uncertain operation, the 10 most recent operations, and optionally requested finished keys; scoped to this current MAX publication.
+          items: {$ref: '#/components/schemas/MAXCommentOperation'}
+        operation: {$ref: '#/components/schemas/MAXCommentOperation'}
+        capabilities:
+          type: object
+          required: [can_read, can_reply, can_delete]
+          properties:
+            can_read: {type: boolean}
+            can_reply: {type: boolean}
+            can_delete: {type: boolean}
+            read_only_reason: {type: string, enum: [workspace_read_only]}
+            reply_unavailable_reason: {type: string, enum: [workspace_read_only, missing_write_permission, channel_not_active]}
+        coverage:
+          type: object
+          required: [kind, complete, page_limit, last_synced_at, truncated]
+          properties:
+            kind: {type: string, const: latest_100}
+            complete: {type: boolean, const: false}
+            page_limit: {type: integer, const: 100}
+            last_synced_at: {type: [string, 'null'], format: date-time}
+            truncated:
+              type: boolean
+              description: Latest provider page reached 100 entries. False does not imply complete history.
+        metrics:
+          type: object
+          description: Aggregates of all locally observed rows for this publication, separate from the 100-row response limit. Values remain null until a successful sync. Current active rows and known tombstones are observed coverage, never a provider total.
+          required: [observed_total, observed_inbound, observed_replies, observed_deleted, unique_authors, response_rate, median_response_seconds, total]
+          properties:
+            observed_total: {type: [integer, 'null'], format: int64, minimum: 0}
+            observed_inbound: {type: [integer, 'null'], format: int64, minimum: 0}
+            observed_replies: {type: [integer, 'null'], format: int64, minimum: 0}
+            observed_deleted: {type: [integer, 'null'], format: int64, minimum: 0}
+            unique_authors: {type: [integer, 'null'], format: int64, minimum: 0}
+            response_rate: {type: [number, 'null'], minimum: 0, maximum: 1}
+            median_response_seconds: {type: [number, 'null'], minimum: 0}
+            total: {type: 'null'}
     ProblemEnvelope:
       type: object
       required: [error]
@@ -3126,6 +3663,9 @@ components:
           type: boolean
           description: True when the separate Yandex Cloud Search API Wordstat credentials are configured.
         writes_enabled: {type: boolean}
+        external_details_available: {type: boolean, default: false}
+        external_edit_available: {type: boolean, default: false}
+        external_copy_ai_available: {type: boolean, default: false}
         auto_launch_enabled:
           type: boolean
           description: >
@@ -3491,6 +4031,267 @@ components:
         ends_at: {type: [string, 'null'], format: date}
         timezone: {type: string, minLength: 1, maxLength: 128}
         synced_at: {type: string, format: date-time}
+    DirectExternalEditableField:
+      type: string
+      enum: [name, title, title2, text, titles, texts, href]
+    DirectExternalAd:
+      type: object
+      required: [provider_ad_id, provider_ad_group_id, ad_type, provider_status, provider_state, title, title2, text, titles, texts, href, editable_fields, read_only_reason]
+      properties:
+        provider_ad_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        provider_ad_group_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        ad_type: {type: string}
+        provider_status: {type: string}
+        provider_state: {type: string}
+        title: {type: [string, 'null']}
+        title2: {type: [string, 'null']}
+        text: {type: [string, 'null']}
+        titles: {type: array, items: {type: string}}
+        texts: {type: array, items: {type: string}}
+        href: {type: [string, 'null']}
+        editable_fields: {type: array, items: {$ref: '#/components/schemas/DirectExternalEditableField'}}
+        read_only_reason: {type: [string, 'null'], enum: [writes_unavailable, account_read_only, member_read_only, edit_in_progress, campaign_archived, ad_archived, ad_fields_unavailable, unsupported_ad_type, null]}
+    DirectExternalDetail:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalCampaign'}
+        - type: object
+          required: [connection_id, version, observed_hash, revision_id, bookmarked, edit_state, editable_fields, read_only_reason, ads]
+          properties:
+            connection_id: {type: string}
+            version: {type: integer, format: int64, minimum: 1}
+            observed_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+            revision_id: {type: string, pattern: '^dxr_[0-9a-f]{32}$'}
+            bookmarked: {type: boolean}
+            edit_state: {type: string, enum: [idle, updating, uncertain]}
+            editable_fields: {type: array, items: {$ref: '#/components/schemas/DirectExternalEditableField'}}
+            read_only_reason: {type: [string, 'null'], enum: [writes_unavailable, account_read_only, member_read_only, edit_in_progress, campaign_archived, ad_archived, ad_fields_unavailable, unsupported_ad_type, null]}
+            ads: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/DirectExternalAd'}}
+            controls: {$ref: '#/components/schemas/DirectExternalControls'}
+            last_operations: {type: array, maxItems: 100, items: {$ref: '#/components/schemas/DirectExternalOperation'}}
+    DirectExternalMicros:
+      type: string
+      pattern: '^[1-9][0-9]{0,18}$'
+      description: Positive int64 micros in the provider currency, encoded as a decimal string without floating point conversion.
+    DirectExternalControlFence:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [client_request_id]
+          properties:
+            client_request_id: {type: string, format: uuid}
+    DirectExternalBudgetPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [budget_key, amount_micros, currency_code]
+          properties:
+            budget_key: {type: string, enum: [daily, search_weekly, network_weekly]}
+            amount_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+            currency_code: {type: string, pattern: '^[A-Z]{3}$'}
+    DirectExternalGroupFields:
+      type: object
+      description: Omitted fields remain unchanged. Empty negative_keywords clears the group list. New region IDs must come from the current provider dictionary; exact signed IDs already selected in the group may be preserved. Negative IDs exclude a region, and 0 means worldwide and cannot be combined with negative IDs. Negative phrases contain at most 7 words of at most 35 characters each; their aggregate length is at most 4096 Unicode characters, excluding whitespace, hyphens and keyword operators.
+      properties:
+        name: {type: string, minLength: 1, maxLength: 255}
+        region_ids: {type: array, minItems: 1, maxItems: 1000, uniqueItems: true, items: {type: integer, format: int64, minimum: -9007199254740991, maximum: 9007199254740991}}
+        negative_keywords: {type: array, maxItems: 4096, items: {type: string, minLength: 1, maxLength: 4096}}
+    DirectExternalGroupPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - {$ref: '#/components/schemas/DirectExternalGroupFields'}
+    DirectExternalGroupCreate:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalGroupPatch'}
+        - type: object
+          required: [name, region_ids]
+    DirectExternalKeywordPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [keyword]
+          properties:
+            keyword: {type: string, minLength: 1, maxLength: 4096}
+    DirectExternalBidPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [currency_code]
+          description: At least one bid is required. Automatic strategy bids and autotargeting are read-only; the operation never changes the bidding strategy.
+          properties:
+            currency_code: {type: string, pattern: '^[A-Z]{3}$'}
+            search_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+            network_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+    DirectExternalStateInput:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalControlFence'}
+        - type: object
+          required: [action]
+          properties:
+            action: {type: string, enum: [pause, resume]}
+            confirm_spend: {type: boolean, description: Explicit confirmation required for resume after reviewing the current provider budget and available spend data.}
+    DirectExternalOperationReconcile:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [provider_result_id]
+          properties:
+            provider_result_id: {type: string, pattern: '^[1-9][0-9]*$'}
+    DirectExternalOperation:
+      type: object
+      required: [client_request_id, operation_id, kind, state, created_at, updated_at]
+      properties:
+        client_request_id: {type: string, format: uuid}
+        operation_id: {type: string, pattern: '^dxe_[0-9a-f]{32}$'}
+        kind: {type: string, enum: [budget, group, keyword, bid, state, create_group, create_keyword]}
+        state: {type: string, enum: [updating, uncertain, succeeded, rejected]}
+        provider_result_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    DirectExternalRegion:
+      type: object
+      required: [id, name, parent_id]
+      properties:
+        id: {type: integer, format: int64, minimum: 0, maximum: 9007199254740991}
+        name: {type: string}
+        parent_id: {type: [integer, 'null'], format: int64}
+    DirectExternalBudget:
+      type: object
+      required: [budget_key, amount_micros, strategy_type, minimum_micros, maximum_micros, increment_micros, editable, read_only_reason, notice]
+      properties:
+        budget_key: {type: string, enum: [daily, search_weekly, network_weekly]}
+        amount_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        strategy_type: {type: string}
+        minimum_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        maximum_micros: {type: [string, 'null'], pattern: '^[1-9][0-9]{0,18}$'}
+        increment_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        editable: {type: boolean}
+        read_only_reason: {type: [string, 'null']}
+        notice: {type: [string, 'null']}
+    DirectExternalKeyword:
+      type: object
+      required: [provider_keyword_id, provider_group_id, keyword, provider_state, search_bid_micros, network_bid_micros, editable_fields, read_only_reason]
+      properties:
+        provider_keyword_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        provider_group_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        keyword: {type: string}
+        provider_state: {type: string}
+        search_bid_micros: {type: [string, 'null'], pattern: '^[0-9]{1,19}$'}
+        network_bid_micros: {type: [string, 'null'], pattern: '^[0-9]{1,19}$'}
+        editable_fields: {type: array, items: {type: string, enum: [keyword, search_bid_micros, network_bid_micros]}}
+        read_only_reason: {type: [string, 'null']}
+    DirectExternalGroup:
+      type: object
+      required: [provider_group_id, name, group_type, region_ids, negative_keywords, editable_fields, read_only_reason, can_create_keyword, keywords]
+      properties:
+        provider_group_id: {type: string, pattern: '^[1-9][0-9]*$'}
+        name: {type: string}
+        group_type: {type: string}
+        region_ids: {type: array, items: {type: integer, format: int64, minimum: -9007199254740991, maximum: 9007199254740991}}
+        negative_keywords: {type: array, items: {type: string}}
+        editable_fields: {type: array, items: {type: string, enum: [name, region_ids, negative_keywords]}}
+        read_only_reason: {type: [string, 'null']}
+        can_create_keyword: {type: boolean}
+        keywords: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/DirectExternalKeyword'}}
+    DirectExternalControls:
+      type: object
+      required: [regions, currency_code, provider_state, search_strategy, network_strategy, budgets, groups, can_create_group, create_group_reason, state_actions, spend, minimum_bid_micros, maximum_bid_micros, bid_increment_micros]
+      properties:
+        regions: {type: array, maxItems: 20000, items: {$ref: '#/components/schemas/DirectExternalRegion'}}
+        currency_code: {type: string}
+        provider_state: {type: string}
+        search_strategy: {type: string}
+        network_strategy: {type: string}
+        budgets: {type: array, maxItems: 3, items: {$ref: '#/components/schemas/DirectExternalBudget'}}
+        groups: {type: array, maxItems: 1000, items: {$ref: '#/components/schemas/DirectExternalGroup'}}
+        can_create_group: {type: boolean}
+        create_group_reason: {type: [string, 'null']}
+        state_actions:
+          type: object
+          required: [can_pause, can_resume, read_only_reason]
+          properties:
+            can_pause: {type: boolean}
+            can_resume: {type: boolean}
+            read_only_reason: {type: [string, 'null']}
+        spend:
+          type: object
+          description: No spending total is fabricated when a dated provider report has not been requested.
+          required: [amount_micros, observed_at, from, to, reason]
+          properties:
+            amount_micros: {type: [string, 'null']}
+            observed_at: {type: [string, 'null'], format: date-time}
+            from: {type: [string, 'null'], format: date}
+            to: {type: [string, 'null'], format: date}
+            reason: {type: string}
+        minimum_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        maximum_bid_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+        bid_increment_micros: {$ref: '#/components/schemas/DirectExternalMicros'}
+    DirectExternalDetailEnvelope:
+      type: object
+      required: [campaign]
+      properties:
+        campaign: {$ref: '#/components/schemas/DirectExternalDetail'}
+    DirectExternalEditFence:
+      type: object
+      required: [expected_connection_id, expected_version, expected_observed_hash, expected_revision_id]
+      properties:
+        expected_connection_id: {type: string, minLength: 1}
+        expected_version: {type: integer, format: int64, minimum: 1}
+        expected_observed_hash: {type: string, pattern: '^[0-9a-f]{64}$'}
+        expected_revision_id: {type: string, pattern: '^dxr_[0-9a-f]{32}$'}
+    DirectExternalNamePatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [name]
+          properties:
+            name: {type: string, minLength: 1, maxLength: 255}
+    DirectExternalCopyFields:
+      type: object
+      description: Only chosen editable copy fields are submitted; title2 null explicitly clears the second headline.
+      properties:
+        title: {type: string, minLength: 1, maxLength: 200}
+        title2: {type: [string, 'null'], maxLength: 200}
+        text: {type: string, minLength: 1, maxLength: 200}
+        titles: {type: array, minItems: 1, maxItems: 7, items: {type: string, minLength: 1, maxLength: 200}}
+        texts: {type: array, minItems: 1, maxItems: 3, items: {type: string, minLength: 1, maxLength: 200}}
+        href: {type: string, format: uri, maxLength: 1024}
+    DirectExternalAdPatch:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - {$ref: '#/components/schemas/DirectExternalCopyFields'}
+    DirectExternalBookmarkInput:
+      type: object
+      required: [expected_connection_id]
+      properties:
+        expected_connection_id: {type: string, minLength: 1}
+    DirectExternalCopyInput:
+      allOf:
+        - {$ref: '#/components/schemas/DirectExternalEditFence'}
+        - type: object
+          required: [brief]
+          properties:
+            brief: {type: string, minLength: 10, maxLength: 4000}
+            current_draft: {$ref: '#/components/schemas/DirectExternalCopyFields'}
+    DirectExternalCopyEnvelope:
+      type: object
+      required: [suggestion]
+      properties:
+        suggestion:
+          type: object
+          required: [variants, rationale, risk_warnings]
+          properties:
+            variants:
+              type: array
+              minItems: 3
+              maxItems: 3
+              items:
+                type: object
+                required: [title, text]
+                properties:
+                  title: {type: string}
+                  text: {type: string}
+            rationale: {type: array, items: {type: string}}
+            risk_warnings: {type: array, items: {type: string}}
     DirectExternalCampaignListEnvelope:
       type: object
       required: [items, synced_at]
@@ -3776,10 +4577,18 @@ components:
           const: ok
         max_configured:
           type: boolean
+        max_comments_configured:
+          type: boolean
+          description: The configured MAX client supports the provider comments API. Current workspace, publication and MAX rights still gate each endpoint.
         openai_configured:
           type: boolean
         research_configured:
           type: boolean
+        content_discovery_configured:
+          type: boolean
+        content_search_configured:
+          type: boolean
+          description: Server-side Exa or Tavily retrieval is configured for content discovery. Credentials are never returned.
         content_formatting_configured:
           type: boolean
         observability_access:
@@ -3947,7 +4756,7 @@ components:
           type: integer
           format: int64
           minimum: 0
-          description: limit multiplied by unit_scale; authoritative for hard enforcement.
+          description: limit multiplied by unit_scale; authoritative for hard enforcement only when unlimited is false.
         unit:
           type: string
           description: User-facing unit such as channel, seat, byte, request or medium_equivalent_image.
@@ -3959,6 +4768,9 @@ components:
           description: |
             Ledger base units in one displayed unit. ai_images_monthly uses 9:
             low=1 credit, medium/default=9 and high=36.
+        unlimited:
+          type: boolean
+          description: Absent means false. True means the workspace has no tariff cap for this metric. Numeric limits remain the immutable base-plan allowance and are not enforced when unlimited is true.
         hard_limit: {type: boolean}
     BillingCatalogEntry:
       type: object
@@ -4147,6 +4959,9 @@ components:
         - image_credit_costs
       properties:
         workspace_id: {type: string}
+        complimentary_access:
+          type: boolean
+          description: Absent means false. Operator-granted access inherited only from this workspace owner; independent of paid plans, payment contracts and member roles. Tariff caps and AI paid-feature gates do not apply, while technical safety limits remain.
         subscription: {$ref: '#/components/schemas/WorkspaceSubscription'}
         entitlements:
           type: array
@@ -4690,6 +5505,33 @@ components:
         updated_at:
           type: string
           format: date-time
+    MAXVideoURLs:
+      type: object
+      description: Actual MAX playback sources. Unsafe, null and absent provider fields are omitted. No URL is fetched by the backend.
+      properties:
+        mp4_1080: {type: string, format: uri, maxLength: 4096}
+        mp4_720: {type: string, format: uri, maxLength: 4096}
+        mp4_480: {type: string, format: uri, maxLength: 4096}
+        mp4_360: {type: string, format: uri, maxLength: 4096}
+        mp4_240: {type: string, format: uri, maxLength: 4096}
+        mp4_144: {type: string, format: uri, maxLength: 4096}
+        hls: {type: string, format: uri, maxLength: 4096}
+    MAXVideoPreview:
+      type: object
+      required: [attachment_id, available, urls]
+      properties:
+        attachment_id: {type: integer, format: int64, minimum: 1}
+        available:
+          type: boolean
+          description: At least one safe playback source was returned. This is not a processing-status field.
+        urls:
+          oneOf:
+            - {$ref: '#/components/schemas/MAXVideoURLs'}
+            - {type: 'null'}
+        thumbnail_url: {type: string, format: uri, maxLength: 4096}
+        width: {type: integer, minimum: 0}
+        height: {type: integer, minimum: 0}
+        duration_ms: {type: integer, format: int64, minimum: 0}
     PostAttachmentMutation:
       type: object
       required: [attachment, post]
@@ -4802,6 +5644,12 @@ components:
         max_stats_synced_at:
           type: [string, 'null']
           format: date-time
+        publication_version_known:
+          type: boolean
+          description: False for historical publications until a successful delivery establishes the sent version.
+        publication_has_changes:
+          type: boolean
+          description: Whether the current content differs from the last successfully sent version, including attachment order.
         max_is_pinned:
           type: boolean
         origin:
@@ -5118,6 +5966,90 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ResearchSource'
+    ContentDiscoveryInput:
+      type: object
+      properties:
+        topic: {type: string, maxLength: 500, description: Optional when an accessible channel is selected; otherwise at least two characters.}
+        content_kind: {type: string, enum: [auto, idea, article, meme, video], default: auto, description: Auto selects topics and formats from server-owned channel context and recent published text and media types.}
+        channel_id: {type: integer, format: int64, minimum: 1}
+        format: {$ref: '#/components/schemas/PostFormat'}
+    ContentDiscoveryCard:
+      type: object
+      required: [id, content_kind, title, summary, source, draft]
+      properties:
+        id: {type: string, pattern: '^[0-9a-f]{16}$'}
+        candidate_id: {type: string, readOnly: true, description: Server-saved actor/workspace-scoped candidate authority for draft transfer.}
+        content_kind: {type: string, enum: [idea, article, meme, video]}
+        title: {type: string, minLength: 1, maxLength: 120}
+        summary: {type: string, minLength: 1, maxLength: 350}
+        source: {$ref: '#/components/schemas/ResearchSource'}
+        draft:
+          allOf:
+            - {$ref: '#/components/schemas/ResearchDraft'}
+            - type: object
+              properties:
+                content: {type: string, minLength: 1, maxLength: 4000}
+        preview_image_url: {type: string, format: uri, description: Grounded image associated with this source. Draft transfer separately checks and copies actual available media.}
+    ContentDiscoveryResult:
+      type: object
+      required: [topic, content_kind, cards]
+      properties:
+        topic: {type: string}
+        content_kind: {type: string, enum: [auto, idea, article, meme, video], description: Requested mode. Auto can return cards with different content kinds.}
+        cards:
+          type: array
+          maxItems: 3
+          items: {$ref: '#/components/schemas/ContentDiscoveryCard'}
+        context_analysis: {$ref: '#/components/schemas/ContentContextAnalysis'}
+        empty_reason:
+          type: string
+          enum: [no_sources, no_matching_materials]
+          description: Optional explanation for an empty successful selection; provider failures return a problem response instead.
+    ContentContextAnalysis:
+      type: object
+      required: [status, images_analyzed, videos_analyzed, audio_analyzed, cached, warnings]
+      properties:
+        status: {type: string, enum: [text_only, ready, partial, unavailable]}
+        images_analyzed: {type: integer, minimum: 0, maximum: 3}
+        videos_analyzed: {type: integer, minimum: 0, maximum: 1}
+        audio_analyzed: {type: integer, minimum: 0, maximum: 1, description: Successfully analyzed audio fragments extracted from videos.}
+        cached: {type: boolean}
+        summary: {type: string, maxLength: 1200, description: Bounded semantic description of genuinely analyzed content. Untrusted editorial data.}
+        sample_limit_seconds: {type: integer, minimum: 1, maximum: 30, description: Video/audio sampling is limited to the first fragment; this does not represent complete analysis of a long clip.}
+        warnings: {type: array, items: {type: string}, maxItems: 6}
+    ContentDiscoveryDraftInput:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, client_request_id]
+      properties:
+        candidate_id: {type: string, minLength: 8, maxLength: 80}
+        client_request_id: {type: string, format: uuid}
+        channel_id: {type: integer, format: int64, minimum: 1}
+        include_media: {type: boolean, default: true}
+    ContentDiscoveryDraftResult:
+      type: object
+      required: [post, media_transfer]
+      properties:
+        post: {$ref: '#/components/schemas/Post'}
+        media_transfer: {$ref: '#/components/schemas/ContentDiscoveryMediaTransfer'}
+    ContentDiscoveryMediaTransfer:
+      type: object
+      required: [status, requested_count, copied_count, items, warnings]
+      properties:
+        status: {type: string, enum: [complete, partial, unavailable, skipped]}
+        requested_count: {type: integer, minimum: 0}
+        copied_count: {type: integer, minimum: 0}
+        warnings: {type: array, items: {type: string}}
+        items:
+          type: array
+          items:
+            type: object
+            required: [type, status]
+            properties:
+              type: {type: string, enum: [image, video]}
+              status: {type: string, enum: [copied, unavailable, skipped]}
+              reason: {type: string}
+              attachment_id: {type: integer, format: int64, minimum: 1, description: Present only for an attachment that has actually been copied into private storage and attached to the saved draft.}
     AnalyticsContentScope:
       type: object
       required: [kind, channels_count]
@@ -5136,6 +6068,7 @@ components:
         participants_count: {type: integer, minimum: 0}
     AnalyticsContentSummary:
       type: object
+      description: Comment observations aggregate current MAX threads of publications selected by the report's publication period, not every comment created in that period. Unknown or unreconstructable as-of observations remain null.
       required:
         - posts_total
         - published_posts
@@ -5156,6 +6089,11 @@ components:
         views_change: {type: [integer, 'null'], format: int64}
         views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
         average_views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
+        observed_comments: {type: [integer, 'null'], format: int64, minimum: 0}
+        observed_comment_authors: {type: [integer, 'null'], format: int64, minimum: 0}
+        comments_synced_posts: {type: integer, minimum: 0}
+        comments_last_synced_at: {type: [string, 'null'], format: date-time}
+        comments_coverage_complete: {type: boolean, const: false}
     AnalyticsContentPost:
       type: object
       required:
@@ -5183,10 +6121,21 @@ components:
         views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
         views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
         score: {type: [number, 'null'], format: double, minimum: 0}
+        comparison_views: {type: [integer, 'null'], format: int64, minimum: 0}
+        comparison_captured_at: {type: [string, 'null'], format: date-time}
+        comparison_window_hours: {type: integer, const: 24}
         max_message_url: {type: string, format: uri}
         max_stats_synced_at: {type: [string, 'null'], format: date-time}
         publication_state: {type: string, enum: [published, removed]}
         removed_from_max: {type: boolean}
+        observed_comments:
+          type: [integer, 'null']
+          format: int64
+          minimum: 0
+          description: Active comments observed on this selected MAX publication, not a provider total. Null before successful sync or when the requested as-of snapshot cannot be reconstructed.
+        comments_last_synced_at: {type: [string, 'null'], format: date-time}
+        comments_coverage_complete: {type: boolean, const: false}
+        comments_truncated: {type: boolean}
     AnalyticsHeatmapCell:
       type: object
       required: [weekday, hour, posts, views_per_1k_audience, views_per_hour, score]
@@ -5207,6 +6156,8 @@ components:
         views_per_1k_audience: {type: [number, 'null'], format: double, minimum: 0}
         views_per_hour: {type: [number, 'null'], format: double, minimum: 0}
         score: {type: number, format: double, minimum: 0}
+        total_sample_size: {type: integer, minimum: 10}
+        comparison_window_hours: {type: integer, const: 24}
         next_at: {type: string, format: date-time}
     WorkspaceContentAnalytics:
       type: object
@@ -5231,6 +6182,8 @@ components:
           oneOf:
             - {$ref: '#/components/schemas/AnalyticsBestTime'}
             - {type: 'null'}
+        comparison_window_hours: {type: integer, const: 24}
+        comparable_posts: {type: integer, minimum: 0}
         timezone_offset_minutes: {type: integer, minimum: -840, maximum: 840}
     WorkspaceContentAnalyticsEnvelope:
       type: object
@@ -5261,6 +6214,7 @@ components:
         max_stats_synced_at: {type: [string, 'null'], format: date-time}
     WorkspacePostAnalyticsSummary:
       type: object
+      description: Comment fields apply only to the selected MAX publication/root and effective report cutoff. They describe observed coverage, not a provider total or complete history.
       required:
         - views
         - views_change
@@ -5303,6 +6257,10 @@ components:
         series_truncated:
           type: boolean
           description: True when older observations were omitted and summary window metrics use only the returned series.
+        observed_comments: {type: [integer, 'null'], format: int64, minimum: 0}
+        comments_last_synced_at: {type: [string, 'null'], format: date-time}
+        comments_coverage_complete: {type: boolean, const: false}
+        comments_truncated: {type: boolean}
     WorkspacePostAnalyticsSeriesPoint:
       type: object
       required: [captured_at, views, delta, interval_views_per_hour, correction]

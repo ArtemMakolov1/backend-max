@@ -171,6 +171,11 @@ func (s *Store) CreateBillingCheckoutAttempt(
 	if err := requireBillingOwner(ctx, tx, actorUserID, workspaceID); err != nil {
 		return BillingPaymentAttempt{}, err
 	}
+	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
+		return BillingPaymentAttempt{}, err
+	} else if active {
+		return BillingPaymentAttempt{}, ErrBillingComplimentaryAccess
+	}
 	var currentTermsAccepted, currentPersonalDataAccepted bool
 	if err := tx.QueryRowContext(ctx, `SELECT
 EXISTS(SELECT 1 FROM user_consents WHERE owner_id=$1 AND document='terms' AND version=$2),
@@ -585,6 +590,11 @@ func (s *Store) ResumeBillingSubscription(ctx context.Context, actorUserID, work
 	if err := requireBillingOwner(ctx, tx, actorUserID, workspaceID); err != nil {
 		return err
 	}
+	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
+		return err
+	} else if active {
+		return ErrBillingComplimentaryAccess
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE billing_subscription_contracts
 SET cancel_at_period_end=FALSE,version=version+1,updated_at=$2
 WHERE workspace_id=$1 AND status IN ('active','past_due') AND cancel_at_period_end=TRUE
@@ -676,6 +686,7 @@ FROM billing_subscription_contracts c
 JOIN billing_subscription_periods p ON p.id=c.current_period_id
 JOIN workspaces w ON w.id=c.workspace_id AND w.archived_at IS NULL
 WHERE c.status IN ('active','past_due') AND c.next_charge_at<=$1
+  AND NOT workspace_has_complimentary_access(c.workspace_id)
 ORDER BY c.next_charge_at,c.workspace_id LIMIT $2`, now.UTC(), limit)
 	if err != nil {
 		return nil, err
@@ -693,10 +704,16 @@ ORDER BY c.next_charge_at,c.workspace_id LIMIT $2`, now.UTC(), limit)
 	return result, rows.Err()
 }
 
+// Include a create with an unknown outcome when a later complimentary grant
+// prevents its retry. Leave the original attempt intact so a late verified
+// provider response or canonical webhook can still attach and reconcile it.
 func (s *Store) CountManualReviewBillingAttempts(ctx context.Context) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM billing_payment_attempts
-WHERE status='manual_review'`).Scan(&count)
+WHERE status='manual_review' OR (
+  status='prepared' AND provider_create_started_at IS NOT NULL
+  AND provider_payment_id IS NULL AND workspace_has_complimentary_access(workspace_id)
+)`).Scan(&count)
 	return count, err
 }
 
@@ -762,6 +779,11 @@ func (s *Store) PrepareBillingRenewal(
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
 		"maxstudio:billing:"+workspaceID); err != nil {
 		return nil, false, err
+	}
+	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
+		return nil, false, err
+	} else if active {
+		return nil, false, nil
 	}
 	var contract BillingContract
 	var periodID int64
@@ -877,7 +899,7 @@ func (s *Store) ListBillingAttemptsForWorker(ctx context.Context, now time.Time,
   WHERE next_attempt_at<=$1
     AND (worker_lease_until IS NULL OR worker_lease_until<$1)
     AND (
-	      status='prepared' OR
+	      (status='prepared' AND NOT workspace_has_complimentary_access(workspace_id)) OR
       (status='pending' AND provider_payment_id IS NOT NULL)
     )
   ORDER BY next_attempt_at,created_at,id
@@ -962,6 +984,11 @@ func (s *Store) BeginBillingProviderCreate(
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`,
 		"maxstudio:billing:"+workspaceID); err != nil {
 		return BillingPaymentAttempt{}, err
+	}
+	if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
+		return BillingPaymentAttempt{}, err
+	} else if active {
+		return BillingPaymentAttempt{}, ErrBillingComplimentaryAccess
 	}
 	attempt, err := scanBillingPaymentAttempt(tx.QueryRowContext(ctx,
 		billingAttemptSelect+` WHERE a.id=$1 FOR UPDATE`, attemptID))
@@ -1231,6 +1258,11 @@ WHERE o.token_hash=$1 AND o.workspace_id=$2 AND c.status IN ('active','past_due'
 	}
 	switch targetStatus {
 	case "accepted":
+		if active, err := workspaceComplimentaryAccess(ctx, tx, workspaceID); err != nil {
+			return err
+		} else if active {
+			return ErrBillingComplimentaryAccess
+		}
 		if retentionUsed || paymentMethodID == "" {
 			return ErrBillingConflict
 		}

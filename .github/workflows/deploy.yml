@@ -60,7 +60,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.25.12"
+          go-version: "1.26.8"
           cache: true
       - name: Verify dependencies and reachable vulnerabilities
         shell: bash
@@ -257,6 +257,10 @@ jobs:
           BILLING_LIVE_ENABLED: ${{ vars.BILLING_LIVE_ENABLED || 'false' }}
           YOOKASSA_RECEIPTS_CONFIRMED: ${{ vars.YOOKASSA_RECEIPTS_CONFIRMED || 'false' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          OPENAI_RESEARCH_MODEL: ${{ vars.OPENAI_RESEARCH_MODEL || 'gpt-6-luna' }}
+          OPENAI_IMAGE_MODEL: ${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}
           YOOKASSA_SHOP_ID: ${{ secrets.YOOKASSA_SHOP_ID }}
           YOOKASSA_SECRET_KEY: ${{ secrets.YOOKASSA_SECRET_KEY }}
           YOOKASSA_DATA_KEY: ${{ secrets.YOOKASSA_DATA_KEY }}

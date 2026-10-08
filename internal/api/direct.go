@@ -29,6 +29,9 @@ type directConnectionResponse struct {
 }
 
 type directIntegrationResponse struct {
+	ExternalDetailsAvailable      bool                      `json:"external_details_available"`
+	ExternalEditAvailable         bool                      `json:"external_edit_available"`
+	ExternalCopyAIAvailable       bool                      `json:"external_copy_ai_available"`
 	Configured                    bool                      `json:"configured"`
 	WordstatConfigured            bool                      `json:"wordstat_configured"`
 	WritesEnabled                 bool                      `json:"writes_enabled"`
@@ -141,6 +144,7 @@ type directConsentRequest struct {
 
 func (s *Server) registerDirectAdvertisingRoutes(r chi.Router) {
 	r.Route("/advertising/direct", func(r chi.Router) {
+		s.registerDirectExternalEditingRoutes(r)
 		r.Get("/", s.getDirectIntegration)
 		r.Post("/connect/start", s.startDirectConnection)
 		r.Post("/connect/complete", s.completeDirectConnection)
@@ -175,7 +179,10 @@ func (s *Server) getDirectIntegration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response := directIntegrationResponse{
-		Configured: status.Configured, WordstatConfigured: status.WordstatConfigured,
+		ExternalDetailsAvailable: s.app.DirectExternalDetailsConfigured(),
+		ExternalEditAvailable:    s.app.DirectExternalEditConfigured(),
+		ExternalCopyAIAvailable:  s.app.DirectExternalCopyAIConfigured(),
+		Configured:               status.Configured, WordstatConfigured: status.WordstatConfigured,
 		WritesEnabled:                 status.WritesEnabled,
 		AutoLaunchEnabled:             status.AutoLaunchEnabled,
 		MaxCampaignWeeklyBudgetMinor:  store.DirectMaxCampaignWeeklyBudgetMinor,
@@ -474,21 +481,25 @@ func (s *Server) suggestDirectCampaign(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, app.ErrResearchNotConfigured)
 		return
 	}
-	release, err := s.aiLimiter.acquireForWorkspaceMetric(
-		r.Context(), access.UserID, workspace, store.AIOperationResearch,
-		store.UsageMetricAIResearchRequests, 1, s.now().UTC())
-	if err != nil {
-		s.writeError(w, err)
-		return
-	}
-	defer release()
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
 	ctx, cancel := contextWithTimeout(r, AIHandlerTimeout)
 	defer cancel()
-	result, err := s.app.SuggestDirectCampaign(ctx, access.UserID, access.WorkspaceID,
+	result, err := s.app.SuggestDirectCampaignWithBeforeGenerate(ctx, access.UserID, access.WorkspaceID,
 		openairesearch.SuggestDirectCampaignRequest{
 			Objective: request.Objective, Brief: request.Brief, LandingURL: request.LandingURL,
 			Audience: request.Audience, Regions: request.Regions,
 			WeeklyBudgetMinor: request.WeeklyBudgetMinor, CurrencyCode: request.CurrencyCode,
+		}, func() error {
+			var err error
+			release, err = s.aiLimiter.acquireForWorkspaceMetric(
+				ctx, access.UserID, workspace, store.AIOperationResearch,
+				store.UsageMetricAIResearchRequests, 1, s.now().UTC())
+			return err
 		})
 	if err != nil {
 		s.writeError(w, err)
