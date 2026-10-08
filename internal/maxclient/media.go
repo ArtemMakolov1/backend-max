@@ -65,7 +65,11 @@ func (c *Client) UploadMedia(ctx context.Context, mediaType MediaType, filename 
 
 	uploadURL, err := validateUploadURL(reservation.URL)
 	if err != nil {
-		return MediaToken{}, fmt.Errorf("MAX %s upload URL: %w", label, err)
+		return MediaToken{}, &Error{
+			StatusCode: http.StatusBadGateway,
+			Code:       "upload_url_rejected",
+			Message:    fmt.Sprintf("MAX %s upload URL was rejected: %v", label, err),
+		}
 	}
 
 	responseBody, responseStatus, responseHeaders, err := c.streamMultipartUpload(
@@ -132,6 +136,12 @@ func (c *Client) streamMultipartUpload(
 	}()
 
 	uploadClient := *c.httpClient
+	// http.Client.Timeout covers the whole request, including streaming the
+	// request body. A max-size video cannot cross a typical total-deadline
+	// configuration (for example 75 seconds), so the upload copy drops it and
+	// relies on the caller's context plus the transport-level dial, TLS and
+	// response-header timeouts to bound the exchange.
+	uploadClient.Timeout = 0
 	callerRedirectPolicy := uploadClient.CheckRedirect
 	uploadClient.CheckRedirect = func(next *http.Request, via []*http.Request) error {
 		if len(via) >= maxUploadRedirects {
@@ -160,10 +170,21 @@ func (c *Client) streamMultipartUpload(
 	_ = pipeReader.Close()
 	streamErr := <-streamDone
 	if requestErr != nil {
-		if streamErr != nil && !errors.Is(streamErr, io.ErrClosedPipe) && !errors.Is(streamErr, context.Canceled) {
-			return nil, 0, nil, streamErr
+		if errors.Is(requestErr, context.Canceled) || errors.Is(requestErr, context.DeadlineExceeded) {
+			return nil, 0, nil, requestErr
 		}
-		return nil, 0, nil, fmt.Errorf("upload %s to MAX storage: %w", label, requestErr)
+		cause := requestErr
+		if streamErr != nil && !errors.Is(streamErr, io.ErrClosedPipe) && !errors.Is(streamErr, context.Canceled) {
+			cause = streamErr
+		}
+		// Transport-level upload failures previously surfaced as opaque 500s.
+		// Keep them structured so callers report an upstream (502) failure and
+		// the exact cause stays visible in logs.
+		return nil, 0, nil, &Error{
+			StatusCode: http.StatusBadGateway,
+			Code:       "upload_transport_failed",
+			Message:    fmt.Sprintf("upload %s to MAX storage: %v", label, cause),
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
