@@ -405,7 +405,7 @@ URL в отчет и черновик добавляет сервер. Ссыл�
 
 ## Разработка без Docker для backend
 
-Нужны Go 1.26.8+ и доступный PostgreSQL. Укажите адреса вручную:
+Нужны Go 1.26.9+ и доступный PostgreSQL. Укажите адреса вручную:
 
 ```dotenv
 DATABASE_URL=postgresql://maxstudio_app:...@localhost:6432/maxstudio?sslmode=disable

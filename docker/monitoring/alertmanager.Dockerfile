@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
-FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.23@sha256:a8fa79c5bd40d880b52bd3b6d7669ecdcfd00e85facdd427d279efb5ddd79cb1 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.9-alpine3.23@sha256:6750308561953d451210ed1a8086d36c8c8bdcbf672d38d9d0d424b8a7a0216c AS build
+
+ENV GOTOOLCHAIN=local
 
 ARG SOURCE_COMMIT=73c6bfe7393929211294c1954f30d8ed78e4d0ad
 ARG SOURCE_SHA256=5c5c72ec6b4c4746d523f2ed1994dfec4b94f7457e530ee6fb16cfec158e545e
@@ -31,12 +33,12 @@ RUN apk add --no-cache patch \
 # Keep this native test stage shared by both target architectures. The upstream
 # regression checks the contention metric only when GOMAXPROCS is above one.
 # Set it explicitly for tests without changing the production runtime setting.
-RUN go get google.golang.org/grpc@v1.83.2 \
+RUN go get google.golang.org/grpc@v1.83.2 golang.org/x/net@v0.60.0 \
     && go mod tidy \
     && go mod download \
     && go mod verify \
     && go build -trimpath \
-      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.34.1-maxposty.2 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.34.1" \
+      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.34.1-maxposty.3 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.34.1" \
       -o ./ ./cmd/alertmanager ./cmd/amtool \
     && GOMAXPROCS=4 go test -count=1 ./...
 
@@ -44,7 +46,7 @@ ARG TARGETARCH
 ARG TARGETOS
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath \
-      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.34.1-maxposty.2 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.34.1" \
+      -ldflags="-s -w -X github.com/prometheus/common/version.Version=0.34.1-maxposty.3 -X github.com/prometheus/common/version.Revision=${SOURCE_COMMIT} -X github.com/prometheus/common/version.Branch=v0.34.1" \
       -o /out/ ./cmd/alertmanager ./cmd/amtool \
     && mkdir -p /out/runtime/alertmanager \
     && chmod g+w /out/runtime/alertmanager
@@ -52,7 +54,7 @@ RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
 FROM busybox:1.37.0-uclibc@sha256:39e0df8c4d65953b55c344f017e1ff2e0031a7454b3c24e6b76d402f207e315a
 
 LABEL org.opencontainers.image.source="https://github.com/prometheus/alertmanager" \
-      org.opencontainers.image.version="0.34.1-maxposty.2" \
+      org.opencontainers.image.version="0.34.1-maxposty.3" \
       org.opencontainers.image.revision="73c6bfe7393929211294c1954f30d8ed78e4d0ad"
 
 COPY --from=build /out/alertmanager /out/amtool /bin/
