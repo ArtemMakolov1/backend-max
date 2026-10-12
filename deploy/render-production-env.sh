@@ -79,6 +79,8 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_s3_bucket=''
   rendered_s3_region=''
   rendered_openai_key=''
+  rendered_deepseek_key=''
+  rendered_qwen_key=''
   rendered_exa_key=''
   rendered_tavily_key=''
   rendered_alertmanager_webhook_url=''
@@ -124,6 +126,12 @@ else
   rendered_s3_bucket=${S3_BUCKET:-}
   rendered_s3_region=${S3_REGION:-}
   rendered_openai_key=${OPENAI_API_KEY:-}
+  rendered_deepseek_key=${DEEPSEEK_API_KEY:-}
+  rendered_qwen_key=${QWEN_API_KEY:-}
+  if [[ -n "$rendered_deepseek_key" && ( ${#rendered_deepseek_key} -gt 4096 || ! "$rendered_deepseek_key" =~ ^[A-Za-z0-9._~:/+@,=-]+$ ) ]]; then
+    echo "Deployment secret contains unsupported characters: DEEPSEEK_API_KEY" >&2
+    exit 1
+  fi
   rendered_exa_key=${EXA_API_KEY:-}
   rendered_tavily_key=${TAVILY_API_KEY:-}
   for name in EXA_API_KEY TAVILY_API_KEY; do
@@ -204,6 +212,14 @@ fi
   printf 'MEDIA_CLEANUP_INTERVAL=%s\n' "${MEDIA_CLEANUP_INTERVAL:-15m}"
   printf 'MEDIA_CLEANUP_BATCH_SIZE=%s\n' "${MEDIA_CLEANUP_BATCH_SIZE:-50}"
   printf 'OPENAI_API_KEY=%s\n' "$rendered_openai_key"
+  printf 'TEXT_AI_PROVIDER=%s\n' "${TEXT_AI_PROVIDER:-deepseek}"
+  printf 'DEEPSEEK_API_KEY=%s\n' "$rendered_deepseek_key"
+  printf 'DEEPSEEK_API_BASE_URL=https://api.deepseek.com\n'
+  printf 'DEEPSEEK_TEXT_MODEL=%s\n' "${DEEPSEEK_TEXT_MODEL:-deepseek-flash}"
+  printf 'IMAGE_AI_PROVIDER=%s\n' "${IMAGE_AI_PROVIDER:-qwen}"
+  printf 'QWEN_API_KEY=%s\n' "$rendered_qwen_key"
+  printf 'QWEN_API_BASE_URL=%s\n' "${QWEN_API_BASE_URL:-https://dashscope-intl.aliyuncs.com}"
+  printf 'QWEN_IMAGE_MODEL=%s\n' "${QWEN_IMAGE_MODEL:-qwen-image-3.0-pro}"
   printf 'EXA_API_KEY=%s\n' "$rendered_exa_key"
   printf 'TAVILY_API_KEY=%s\n' "$rendered_tavily_key"
   printf 'OPENAI_API_BASE_URL=https://api.openai.com\n'

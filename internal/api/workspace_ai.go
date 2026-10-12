@@ -155,6 +155,10 @@ func (s *Server) generateWorkspaceResearch(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, app.ErrResearchNotConfigured)
 		return
 	}
+	if err := s.app.ValidateResearchSources(); err != nil {
+		s.writeError(w, err)
+		return
+	}
 	release, err := s.aiLimiter.acquireForWorkspace(
 		r.Context(), access.UserID, workspace, store.AIOperationResearch, s.now().UTC())
 	if err != nil {

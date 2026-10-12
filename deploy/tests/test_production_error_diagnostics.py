@@ -41,6 +41,15 @@ def provider_record(**extra):
 
 
 class SanitizerTests(unittest.TestCase):
+    def test_deepseek_failures_keep_existing_secret_safe_diagnostic_contract(self):
+        safe = diagnostic.sanitize_record(record("; ".join(SECRETS), msg="DeepSeek text request failed", status=401))
+        self.assertEqual(safe["category"], "provider_http")
+        self.assertEqual(safe["provider_status"], 401)
+        self.assert_safe(safe)
+        wrapped = diagnostic.sanitize_record(record("call DeepSeek Responses API: " + "; ".join(SECRETS)))
+        self.assertEqual(wrapped["prefix_chain"], ["call DeepSeek Responses API"])
+        self.assert_safe(wrapped)
+
     def assert_safe(self, value):
         rendered = json.dumps(value)
         for secret in SECRETS:

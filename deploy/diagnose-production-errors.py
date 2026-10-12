@@ -88,6 +88,11 @@ PREFIXES = {
     "call OpenAI Responses API": "provider_transport",
     "read OpenAI Responses response": "provider_response_read",
     "decode OpenAI Responses response": "provider_response_json_decode",
+    "encode DeepSeek Responses request": "provider_request_encoding",
+    "create DeepSeek Responses request": "provider_request_creation",
+    "call DeepSeek Responses API": "provider_transport",
+    "read DeepSeek Responses response": "provider_response_read",
+    "decode DeepSeek Responses response": "provider_response_json_decode",
     "decode structured post draft": "provider_structured_json_decode",
 }
 EXACT_ERRORS = {
@@ -97,6 +102,7 @@ EXACT_ERRORS = {
     "invalid discovery candidate payload": "discovery_candidates_validation",
     "saved discovery candidate is invalid": "discovery_candidates_decode",
     "OpenAI Responses response is too large": "provider_response_size",
+    "DeepSeek Responses response is too large": "provider_response_size",
     "context deadline exceeded": "deadline_exceeded",
     "context canceled": "request_canceled",
     "sql: database is closed": "database_unavailable",
@@ -233,7 +239,7 @@ def sanitize_record(record):
             "transport_kind": (kind if isinstance(kind, str) and kind in CONTENT_SEARCH_TRANSPORTS else "unknown")
                               if code in ("request_failed", "response_unreadable") else None,
         }
-    if record.get("msg") == "OpenAI research request failed":
+    if record.get("msg") in ("OpenAI research request failed", "DeepSeek text request failed"):
         status = record.get("status")
         code = record.get("code")
         error = record.get("error")
@@ -358,7 +364,7 @@ class BoundedDiagnostics:
         if isinstance(record, dict) and record.get("level") == "WARN":
             if record.get("msg") == "content source retrieval failed":
                 self.warning_counts["content_source_retrieval_failed"] += 1
-            elif record.get("msg") == "OpenAI research request failed":
+            elif record.get("msg") in ("OpenAI research request failed", "DeepSeek text request failed"):
                 self.warning_counts["openai_research_request_failed"] += 1
                 status = record.get("status")
                 if type(status) is int and 100 <= status <= 599:

@@ -36,6 +36,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     AUTH_SESSION_TTL|WORKSPACE_MAX_OWNED_TEAM_WORKSPACES|OAUTH_TRUST_X_REAL_IP|OAUTH_RATE_LIMIT_AT_EDGE|MAX_API_BASE_URL|MAX_BOT_TOKEN|\
     MAX_WEBHOOK_SECRET|MAX_WEBHOOK_URL|MAX_CA_CERT_FILE|S3_HOST|S3_ACCESS_KEY|S3_SECRET_KEY|S3_BUCKET|S3_REGION|\
     MEDIA_USER_MAX_FILES|MEDIA_USER_MAX_BYTES|MEDIA_ORPHAN_GRACE_PERIOD|MEDIA_CLEANUP_INTERVAL|MEDIA_CLEANUP_BATCH_SIZE|\
+    TEXT_AI_PROVIDER|DEEPSEEK_API_KEY|DEEPSEEK_API_BASE_URL|DEEPSEEK_TEXT_MODEL|IMAGE_AI_PROVIDER|QWEN_API_KEY|QWEN_API_BASE_URL|QWEN_IMAGE_MODEL|\
     EXA_API_KEY|TAVILY_API_KEY|OPENAI_API_KEY|OPENAI_API_BASE_URL|OPENAI_IMAGE_MODEL|\
     OPENAI_RESEARCH_MODEL|AI_GLOBAL_MAX_CONCURRENT|AI_USER_MAX_CONCURRENT|AI_IMAGE_PER_MINUTE|AI_IMAGE_PER_DAY|\
     AI_RESEARCH_PER_MINUTE|AI_RESEARCH_PER_DAY|AI_LEASE_TTL|BILLING_ENFORCEMENT_ENABLED|BILLING_LIVE_ENABLED|YOOKASSA_RECEIPTS_CONFIRMED|YOOKASSA_SHOP_ID|YOOKASSA_SECRET_KEY|YOOKASSA_DATA_KEY|YOOKASSA_RETURN_URL|SCHEDULER_INTERVAL|BACKUP_RETENTION_DAYS|PITR_RETENTION_DAYS|\
@@ -106,8 +107,53 @@ for key in EXA_API_KEY TAVILY_API_KEY; do
     exit 1
   fi
 done
-if [[ -n "$(env_value EXA_API_KEY)" || -n "$(env_value TAVILY_API_KEY)" ]] && [[ -z "$(env_value OPENAI_API_KEY)" ]]; then
-  echo "EXA_API_KEY or TAVILY_API_KEY requires OPENAI_API_KEY for grounded synthesis" >&2
+text_ai_provider=$(env_value TEXT_AI_PROVIDER)
+text_ai_provider=${text_ai_provider:-deepseek}
+case "$text_ai_provider" in
+  deepseek) text_api_key=$(env_value DEEPSEEK_API_KEY) ;;
+  openai) text_api_key=$(env_value OPENAI_API_KEY) ;;
+  *) echo "TEXT_AI_PROVIDER must be deepseek or openai" >&2; exit 1 ;;
+esac
+deepseek_api_base_url=$(env_value DEEPSEEK_API_BASE_URL)
+if [[ -n "$deepseek_api_base_url" && "$deepseek_api_base_url" != "https://api.deepseek.com" ]]; then
+  echo "DEEPSEEK_API_BASE_URL must be https://api.deepseek.com" >&2
+  exit 1
+fi
+deepseek_api_key=$(env_value DEEPSEEK_API_KEY)
+if [[ -n "$deepseek_api_key" && ( ${#deepseek_api_key} -gt 4096 || ! "$deepseek_api_key" =~ ^[A-Za-z0-9._~:/+@,=-]+$ ) ]]; then
+  echo "Production environment key contains unsupported characters: DEEPSEEK_API_KEY" >&2
+  exit 1
+fi
+deepseek_text_model=$(env_value DEEPSEEK_TEXT_MODEL)
+if [[ -n "$deepseek_text_model" && ( ${#deepseek_text_model} -gt 128 || ! "$deepseek_text_model" =~ ^[A-Za-z0-9._:-]+$ ) ]]; then
+  echo "Production environment key contains unsupported characters: DEEPSEEK_TEXT_MODEL" >&2
+  exit 1
+fi
+image_ai_provider=$(env_value IMAGE_AI_PROVIDER)
+image_ai_provider=${image_ai_provider:-qwen}
+if [[ "$image_ai_provider" != "qwen" && "$image_ai_provider" != "openai" ]]; then
+  echo "IMAGE_AI_PROVIDER must be qwen or openai" >&2
+  exit 1
+fi
+qwen_api_base_url=$(env_value QWEN_API_BASE_URL)
+qwen_api_base_url=${qwen_api_base_url%/}
+qwen_workspace_origin='^https://[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.(ap-southeast-1|cn-beijing|us-east-1|cn-hongkong|eu-central-1|ap-northeast-1)\.maas\.aliyuncs\.com$'
+if [[ -n "$qwen_api_base_url" && "$qwen_api_base_url" != "https://dashscope-intl.aliyuncs.com" && "$qwen_api_base_url" != "https://dashscope.aliyuncs.com" && ! "$qwen_api_base_url" =~ $qwen_workspace_origin ]]; then
+  echo "QWEN_API_BASE_URL must use an official Alibaba Cloud Model Studio HTTPS origin" >&2
+  exit 1
+fi
+qwen_api_key=$(env_value QWEN_API_KEY)
+if [[ -n "$qwen_api_key" && ( ${#qwen_api_key} -gt 4096 || ! "$qwen_api_key" =~ ^[A-Za-z0-9._~:/+@,=-]+$ ) ]]; then
+  echo "Production environment key contains unsupported characters: QWEN_API_KEY" >&2
+  exit 1
+fi
+qwen_image_model=$(env_value QWEN_IMAGE_MODEL)
+if [[ -n "$qwen_image_model" && ( ${#qwen_image_model} -gt 128 || ! "$qwen_image_model" =~ ^[A-Za-z0-9._:-]+$ ) ]]; then
+  echo "Production environment key contains unsupported characters: QWEN_IMAGE_MODEL" >&2
+  exit 1
+fi
+if [[ -n "$(env_value EXA_API_KEY)" || -n "$(env_value TAVILY_API_KEY)" ]] && [[ -z "$text_api_key" ]]; then
+  echo "EXA_API_KEY or TAVILY_API_KEY requires the selected TEXT_AI_PROVIDER API key for grounded synthesis" >&2
   exit 1
 fi
 
@@ -387,7 +433,7 @@ case "$bootstrap_mode" in
     expect_exact DIRECT_API_BASE_URL "https://api-sandbox.direct.yandex.com/json/v5"
     expect_exact DIRECT_WRITES_ENABLED "false"
     expect_exact DIRECT_AUTO_LAUNCH_ENABLED "false"
-    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY EXA_API_KEY TAVILY_API_KEY YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY YOOKASSA_RETURN_URL SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+    for key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID YANDEX_CLIENT_SECRET YANDEX_REDIRECT_URI YANDEX_ALLOWED_USERS OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN MAX_WEBHOOK_SECRET S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY DEEPSEEK_API_KEY QWEN_API_KEY EXA_API_KEY TAVILY_API_KEY YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY YOOKASSA_RETURN_URL SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
       if [[ -n "$(env_value "$key")" ]]; then
         echo "$key must be empty in fail-closed bootstrap mode" >&2
         exit 1

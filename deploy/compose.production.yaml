@@ -231,6 +231,14 @@ services:
       YOOKASSA_RECEIPTS_CONFIRMED: ${YOOKASSA_RECEIPTS_CONFIRMED}
       OPENAI_API_BASE_URL: ${OPENAI_API_BASE_URL}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
+      TEXT_AI_PROVIDER: ${TEXT_AI_PROVIDER:-deepseek}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_API_BASE_URL: ${DEEPSEEK_API_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_TEXT_MODEL: ${DEEPSEEK_TEXT_MODEL:-deepseek-flash}
+      IMAGE_AI_PROVIDER: ${IMAGE_AI_PROVIDER:-qwen}
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      QWEN_API_BASE_URL: ${QWEN_API_BASE_URL:-https://dashscope-intl.aliyuncs.com}
+      QWEN_IMAGE_MODEL: ${QWEN_IMAGE_MODEL:-qwen-image-3.0-pro}
       EXA_API_KEY: ${EXA_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       SMTP_HOST: ${SMTP_HOST}
@@ -314,7 +322,7 @@ services:
       - database
 
   postgres-exporter:
-    image: ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.8.3@sha256:dc577eda187be7c8c55c359def87643cd26dea62373a00b3e63fbcccc46a0f33
+    image: ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.9.1@sha256:34453c8d1b299b6fe480eb782f626f50c5bd986c720a2fae714c28ddcea9ecfc
     restart: unless-stopped
     command:
       - --collector.long_running_transactions
@@ -356,7 +364,7 @@ services:
       - monitoring
 
   pgbouncer-exporter:
-    image: ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.8.3@sha256:57532238e7d5b182e44648dac084d4d5acf5176f3d7aabe644e0496b691136a5
+    image: ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.9.1@sha256:1c959e07a965732824085554446886f83d0e9c0c323ff0ab210f036b2f1d7c87
     restart: unless-stopped
     environment:
       PGBOUNCER_EXPORTER_CONNECTION_STRING: postgresql://${POSTGRES_MONITOR_USER}:${POSTGRES_MONITOR_PASSWORD}@pgbouncer:6432/pgbouncer?sslmode=disable
@@ -385,7 +393,7 @@ services:
       - monitoring
 
   node-exporter:
-    image: ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.8.1@sha256:77b0099bb6d4ac3268f90d01df13ca8f9266394ffbf1a9acb0a62fe49995fadf
+    image: ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.9.1@sha256:7dceac589965ee8ed794de9fc1bf4be194331fb6224b6715eaefeb9d6c4da717
     restart: unless-stopped
     command:
       - --path.procfs=/host/proc
@@ -420,7 +428,7 @@ services:
       - monitoring
 
   alertmanager:
-    image: ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.8.2@sha256:fae6b44fad35877bf49ad2bac4cd9b9688bef7b0ecaa84959b7936e32f5a623a
+    image: ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.9.1@sha256:ffee0dba12bf417a33ca0148f266d53abe2b37700fe4211a7c383d2bd2a6dce5
     restart: unless-stopped
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
@@ -454,7 +462,7 @@ services:
       - monitoring
 
   prometheus:
-    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    image: ghcr.io/artemmakolov1/maxposty-prometheus:v3.15.0-go1.27.2.1@sha256:c66333fad371671d2cc959cb9797c63fb4de410b25b3cf5fb5f83d867d0d8840
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -504,7 +512,7 @@ services:
   grafana:
     # The required Prometheus datasource is baked into this immutable image.
     # Runtime plugin downloads and automatic updates are disabled.
-    image: ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261004-prometheus.2@sha256:d53ad9b2aafeb88b924b0b521224f549414a12248a54c13eb635d3954f6593c3
+    image: ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261010-prometheus.1@sha256:fd7d5b6f50be28b578ecfaad8ca5d416c097e8dc10116f1b6476f179c116789a
     restart: unless-stopped
     environment:
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL}

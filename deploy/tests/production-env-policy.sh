@@ -9,10 +9,20 @@ for smtp_key in SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL 
   grep -F "          $smtp_key: \${{ secrets.$smtp_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $smtp_key: \${$smtp_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
-for search_key in EXA_API_KEY TAVILY_API_KEY; do
+for search_key in EXA_API_KEY TAVILY_API_KEY DEEPSEEK_API_KEY; do
   grep -F "          $search_key: \${{ secrets.$search_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "          $search_key: \${{ secrets.$search_key }}" "$repo_root/.github/workflows/recover-s3-production.yml" >/dev/null
   grep -F "      $search_key: \${$search_key:-}" "$repo_root/deploy/compose.production.yaml" >/dev/null
+done
+for workflow in deploy.yml recover-s3-production.yml; do
+  grep -F "          TEXT_AI_PROVIDER: \${{ vars.TEXT_AI_PROVIDER || 'deepseek' }}" "$repo_root/.github/workflows/$workflow" >/dev/null
+  grep -F "          DEEPSEEK_TEXT_MODEL: \${{ vars.DEEPSEEK_TEXT_MODEL || 'deepseek-flash' }}" "$repo_root/.github/workflows/$workflow" >/dev/null
+done
+for compose_file in compose.yaml deploy/compose.production.yaml; do
+  grep -F '      TEXT_AI_PROVIDER: ${TEXT_AI_PROVIDER:-deepseek}' "$repo_root/$compose_file" >/dev/null
+  grep -F '      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}' "$repo_root/$compose_file" >/dev/null
+  grep -F '      DEEPSEEK_API_BASE_URL: ${DEEPSEEK_API_BASE_URL:-https://api.deepseek.com}' "$repo_root/$compose_file" >/dev/null
+  grep -F '      DEEPSEEK_TEXT_MODEL: ${DEEPSEEK_TEXT_MODEL:-deepseek-flash}' "$repo_root/$compose_file" >/dev/null
 done
 for billing_key in YOOKASSA_SHOP_ID YOOKASSA_SECRET_KEY YOOKASSA_DATA_KEY; do
   grep -F "          $billing_key: \${{ secrets.$billing_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
@@ -70,6 +80,10 @@ render_production() {
     BILLING_LIVE_ENABLED=false \
     YOOKASSA_RECEIPTS_CONFIRMED=false \
     OPENAI_API_KEY= \
+    QWEN_API_KEY= \
+    TEXT_AI_PROVIDER=deepseek \
+    DEEPSEEK_API_KEY= \
+    DEEPSEEK_TEXT_MODEL=deepseek-flash \
     EXA_API_KEY= \
     TAVILY_API_KEY= \
     "$@" \
@@ -80,6 +94,10 @@ production_env="$sandbox/production.env"
 render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
 grep -Fx 'OPENAI_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'TEXT_AI_PROVIDER=deepseek' "$production_env" >/dev/null
+grep -Fx 'DEEPSEEK_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'DEEPSEEK_API_BASE_URL=https://api.deepseek.com' "$production_env" >/dev/null
+grep -Fx 'DEEPSEEK_TEXT_MODEL=deepseek-flash' "$production_env" >/dev/null
 grep -Fx 'EXA_API_KEY=' "$production_env" >/dev/null
 grep -Fx 'TAVILY_API_KEY=' "$production_env" >/dev/null
 grep -Fx 'OPENAI_RESEARCH_MODEL=gpt-6-luna' "$production_env" >/dev/null
@@ -125,7 +143,8 @@ grep -Fx 'SMTP_FROM_NAME=MaxPosty' "$production_env" >/dev/null
 # Production overrides must survive workflow -> render -> compose so a model
 # rollback never silently falls back to a different provider default.
 configured_ai_env="$sandbox/configured-ai.env"
-render_production "$configured_ai_env" OPENAI_RESEARCH_MODEL=gpt-5.4-mini OPENAI_IMAGE_MODEL=gpt-image-2
+render_production "$configured_ai_env" TEXT_AI_PROVIDER=openai OPENAI_RESEARCH_MODEL=gpt-5.4-mini OPENAI_IMAGE_MODEL=gpt-image-2
+grep -Fx 'TEXT_AI_PROVIDER=openai' "$configured_ai_env" >/dev/null
 grep -Fx 'OPENAI_RESEARCH_MODEL=gpt-5.4-mini' "$configured_ai_env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$configured_ai_env"
 
@@ -137,7 +156,7 @@ for search_mode in exa tavily both; do
   [[ "$search_mode" == tavily ]] || exa_key=synthetic-exa-secret
   [[ "$search_mode" == exa ]] || tavily_key=synthetic-tavily-secret
   configured_search_env="$sandbox/search-$search_mode.env"
-  render_production "$configured_search_env" OPENAI_API_KEY=synthetic-openai-secret \
+  render_production "$configured_search_env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
     EXA_API_KEY="$exa_key" TAVILY_API_KEY="$tavily_key"
   grep -Fx "EXA_API_KEY=$exa_key" "$configured_search_env" >/dev/null
   grep -Fx "TAVILY_API_KEY=$tavily_key" "$configured_search_env" >/dev/null
@@ -145,7 +164,7 @@ for search_mode in exa tavily both; do
 done
 
 # Old env files remain valid when optional provider keys are entirely absent.
-awk -F= '$1 != "EXA_API_KEY" && $1 != "TAVILY_API_KEY" { print }' \
+awk -F= '$1 != "EXA_API_KEY" && $1 != "TAVILY_API_KEY" && $1 != "TEXT_AI_PROVIDER" && $1 !~ /^DEEPSEEK_/ { print }' \
   "$production_env" >"$sandbox/legacy-search.env"
 "$repo_root/deploy/validate-production-env.sh" "$sandbox/legacy-search.env"
 for search_key in EXA_API_KEY TAVILY_API_KEY; do
@@ -170,6 +189,56 @@ for search_key in EXA_API_KEY TAVILY_API_KEY; do
     fi
   done
 done
+
+# Search may synthesize on either explicitly selected provider, but an image key
+# must not accidentally enable DeepSeek text or silently choose OpenAI text.
+for provider in deepseek openai; do
+  selected_key=DEEPSEEK_API_KEY
+  other_key=OPENAI_API_KEY
+  if [[ "$provider" == openai ]]; then
+    selected_key=OPENAI_API_KEY
+    other_key=DEEPSEEK_API_KEY
+  fi
+  render_production "$sandbox/selected-$provider.env" TEXT_AI_PROVIDER="$provider" \
+    "$selected_key=synthetic-selected-secret" EXA_API_KEY=synthetic-exa-secret
+  "$repo_root/deploy/validate-production-env.sh" "$sandbox/selected-$provider.env"
+  if render_production "$sandbox/unselected-$provider.env" TEXT_AI_PROVIDER="$provider" \
+    "$other_key=synthetic-unselected-secret" EXA_API_KEY=synthetic-exa-secret >"$sandbox/provider-error.log" 2>&1; then
+    echo "Search accepted only an unselected provider key" >&2
+    exit 1
+  fi
+  if grep -F 'synthetic-' "$sandbox/provider-error.log" >/dev/null; then
+    echo "Provider validation disclosed credentials" >&2
+    exit 1
+  fi
+done
+
+render_production "$sandbox/deepseek-model.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret DEEPSEEK_TEXT_MODEL=deepseek-custom
+grep -Fx 'DEEPSEEK_TEXT_MODEL=deepseek-custom' "$sandbox/deepseek-model.env" >/dev/null
+render_production "$sandbox/images-only.env" OPENAI_API_KEY=synthetic-openai-secret
+grep -Fx 'TEXT_AI_PROVIDER=deepseek' "$sandbox/images-only.env" >/dev/null
+grep -Fx 'DEEPSEEK_API_KEY=' "$sandbox/images-only.env" >/dev/null
+
+for unsafe_key in $'synthetic-deepseek-secret\ninjection' $'synthetic-deepseek-secret\r' $'\nsynthetic-deepseek-secret' 'synthetic-deepseek-secret$unsafe'; do
+  if render_production "$sandbox/deepseek-unsafe.env" DEEPSEEK_API_KEY="$unsafe_key" >"$sandbox/provider-error.log" 2>&1; then
+    echo "Production render accepted unsafe DeepSeek credentials" >&2
+    exit 1
+  fi
+  if grep -F 'synthetic-deepseek-secret' "$sandbox/provider-error.log" >/dev/null; then
+    echo "Provider validation disclosed malformed credentials" >&2
+    exit 1
+  fi
+done
+if render_production "$sandbox/unknown-text-provider.env" TEXT_AI_PROVIDER=unknown >/dev/null 2>&1; then
+  echo "Production render accepted an unknown text provider" >&2
+  exit 1
+fi
+awk -F= '$1 == "DEEPSEEK_API_BASE_URL" { print "DEEPSEEK_API_BASE_URL=https://evil.example"; next } { print }' \
+  "$production_env" >"$sandbox/unsafe-deepseek-origin.env"
+if "$repo_root/deploy/validate-production-env.sh" "$sandbox/unsafe-deepseek-origin.env" >/dev/null 2>&1; then
+  echo "Production validation accepted an unpinned DeepSeek origin" >&2
+  exit 1
+fi
 
 configured_smtp_env="$sandbox/configured-smtp.env"
 render_production "$configured_smtp_env" \
@@ -446,6 +515,8 @@ env \
   S3_BUCKET=must-not-leak \
   S3_REGION=must-not-leak \
   OPENAI_API_KEY=must-not-leak \
+  DEEPSEEK_API_KEY=must-not-leak \
+  QWEN_API_KEY=must-not-leak \
   EXA_API_KEY=must-not-leak \
   TAVILY_API_KEY=must-not-leak \
   SMTP_HOST=must-not-leak \
@@ -454,7 +525,7 @@ env \
   SMTP_FROM_EMAIL=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY EXA_API_KEY TAVILY_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY DEEPSEEK_API_KEY QWEN_API_KEY EXA_API_KEY TAVILY_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \
@@ -464,3 +535,23 @@ for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_A
     exit 1
   fi
 done
+
+# Selected image provider is independent of text/search and carries no implicit OpenAI fallback.
+for workflow in deploy.yml recover-s3-production.yml; do
+  grep -F '          QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}' "$repo_root/.github/workflows/$workflow" >/dev/null
+  grep -F "          IMAGE_AI_PROVIDER: \${{ vars.IMAGE_AI_PROVIDER || 'qwen' }}" "$repo_root/.github/workflows/$workflow" >/dev/null
+done
+grep -F '      QWEN_API_KEY: ${QWEN_API_KEY:-}' "$repo_root/deploy/compose.production.yaml" >/dev/null
+qwen_env="$sandbox/qwen.env"
+render_production "$qwen_env" QWEN_API_KEY=synthetic-qwen-key
+grep -Fx 'IMAGE_AI_PROVIDER=qwen' "$qwen_env" >/dev/null
+grep -Fx 'QWEN_API_KEY=synthetic-qwen-key' "$qwen_env" >/dev/null
+grep -Fx 'QWEN_API_BASE_URL=https://dashscope-intl.aliyuncs.com' "$qwen_env" >/dev/null
+grep -Fx 'QWEN_IMAGE_MODEL=qwen-image-3.0-pro' "$qwen_env" >/dev/null
+for unsafe_origin in http://dashscope-intl.aliyuncs.com https://dashscope-intl.aliyuncs.com.evil.example https://private-provider.example; do
+  if render_production "$sandbox/unsafe-qwen.env" QWEN_API_BASE_URL="$unsafe_origin" >"$sandbox/qwen-failure.log" 2>&1; then
+    echo 'Qwen production validation accepted an unofficial origin' >&2
+    exit 1
+  fi
+done
+render_production "$sandbox/workspace-qwen.env" QWEN_API_BASE_URL=https://workspace-1.ap-southeast-1.maas.aliyuncs.com

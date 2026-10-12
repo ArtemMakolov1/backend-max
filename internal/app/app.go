@@ -27,8 +27,8 @@ var (
 	ErrMAXNotConfigured             = errors.New("MAX integration is not configured")
 	ErrMAXChannelEventRequired      = errors.New("MAX channel event is required to discover the channel id")
 	ErrMAXChannelMetadataIncomplete = errors.New("MAX channel metadata is incomplete")
-	ErrOpenAINotConfigured          = errors.New("OpenAI integration is not configured")
-	ErrResearchNotConfigured        = errors.New("OpenAI research integration is not configured")
+	ErrOpenAINotConfigured          = errors.New("image AI integration is not configured")
+	ErrResearchNotConfigured        = errors.New("text AI integration is not configured")
 	ErrConflict                     = errors.New("resource state conflict")
 	ErrApprovalRequired             = errors.New("the current post revision must be approved before scheduling or publishing")
 	ErrNotEnoughPostsForBrandKit    = errors.New("not enough posts with text to suggest a brand kit")
@@ -281,9 +281,40 @@ func (a *App) Media() *media.Store { return a.media }
 
 func (a *App) MAXConfigured() bool { return a.max != nil }
 
-func (a *App) OpenAIConfigured() bool { return a.images != nil || a.research != nil }
+func (a *App) OpenAIConfigured() bool {
+	return (a.images != nil && a.ImageAIProvider() == "openai") || (a.research != nil && a.TextAIProvider() == "openai")
+}
+
+func (a *App) ImageGenerationConfigured() bool { return a.images != nil }
+
+func (a *App) ImageAIProvider() string {
+	if provider, ok := a.images.(interface{ ImageAIProvider() string }); ok {
+		return provider.ImageAIProvider()
+	}
+	if a.images != nil {
+		return "openai"
+	}
+	return ""
+}
 
 func (a *App) ResearchConfigured() bool { return a.research != nil }
+
+func (a *App) TextAIProvider() string {
+	if provider, ok := a.research.(interface{ TextAIProvider() string }); ok {
+		return provider.TextAIProvider()
+	}
+	if a.research != nil {
+		return "openai"
+	}
+	return ""
+}
+
+func (a *App) ValidateResearchSources() error {
+	if validator, ok := a.research.(interface{ ValidateResearchSources() error }); ok {
+		return validator.ValidateResearchSources()
+	}
+	return nil
+}
 
 func (a *App) ContentFormattingConfigured() bool {
 	_, ok := a.research.(ContentFormatter)

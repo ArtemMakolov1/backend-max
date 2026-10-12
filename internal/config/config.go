@@ -31,6 +31,12 @@ const (
 	defaultFrontendOrigin            = "http://localhost:4321"
 	defaultMAXAPIBaseURL             = "https://platform-api2.max.ru"
 	defaultOpenAIAPIBaseURL          = "https://api.openai.com"
+	defaultDeepSeekAPIBaseURL        = "https://api.deepseek.com"
+	defaultDeepSeekTextModel         = "deepseek-flash"
+	defaultTextAIProvider            = "deepseek"
+	defaultImageAIProvider           = "qwen"
+	defaultQwenAPIBaseURL            = "https://dashscope-intl.aliyuncs.com"
+	defaultQwenImageModel            = "qwen-image-3.0-pro"
 	defaultDirectAPIBaseURL          = "https://api.direct.yandex.com/json/v501"
 	defaultDirectSandboxAPIBaseURL   = "https://api-sandbox.direct.yandex.com/json/v5"
 	defaultWordstatAPIBaseURL        = "https://searchapi.api.cloud.yandex.net"
@@ -101,6 +107,14 @@ type Config struct {
 	AuthSessionTTL            time.Duration
 	MaxOwnedTeamWorkspaces    int
 	OpenAIAPIKey              string
+	TextAIProvider            string
+	DeepSeekAPIKey            string
+	DeepSeekAPIBaseURL        string
+	DeepSeekTextModel         string
+	ImageAIProvider           string
+	QwenAPIKey                string
+	QwenAPIBaseURL            string
+	QwenImageModel            string
 	ExaAPIKey                 string
 	TavilyAPIKey              string
 	OpenAIAPIBaseURL          string
@@ -295,6 +309,14 @@ func Load() (Config, error) {
 		AuthSessionTTL:            sessionTTL,
 		MaxOwnedTeamWorkspaces:    maxOwnedTeamWorkspaces,
 		OpenAIAPIKey:              strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		TextAIProvider:            env("TEXT_AI_PROVIDER", defaultTextAIProvider),
+		DeepSeekAPIKey:            strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY")),
+		DeepSeekAPIBaseURL:        env("DEEPSEEK_API_BASE_URL", defaultDeepSeekAPIBaseURL),
+		DeepSeekTextModel:         env("DEEPSEEK_TEXT_MODEL", defaultDeepSeekTextModel),
+		ImageAIProvider:           env("IMAGE_AI_PROVIDER", defaultImageAIProvider),
+		QwenAPIKey:                strings.TrimSpace(os.Getenv("QWEN_API_KEY")),
+		QwenAPIBaseURL:            env("QWEN_API_BASE_URL", defaultQwenAPIBaseURL),
+		QwenImageModel:            env("QWEN_IMAGE_MODEL", defaultQwenImageModel),
 		ExaAPIKey:                 strings.TrimSpace(os.Getenv("EXA_API_KEY")),
 		TavilyAPIKey:              strings.TrimSpace(os.Getenv("TAVILY_API_KEY")),
 		OpenAIAPIBaseURL:          env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL),
@@ -374,6 +396,34 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.OpenAIAPIBaseURL = strings.TrimSuffix(cfg.OpenAIAPIBaseURL, "/")
+	if cfg.TextAIProvider != "deepseek" && cfg.TextAIProvider != "openai" {
+		return Config{}, fmt.Errorf("TEXT_AI_PROVIDER must be deepseek or openai")
+	}
+	if err := validateDeepSeekAPIBaseURL(cfg.DeepSeekAPIBaseURL); err != nil {
+		return Config{}, err
+	}
+	cfg.DeepSeekAPIBaseURL = strings.TrimSuffix(cfg.DeepSeekAPIBaseURL, "/")
+	if raw := os.Getenv("DEEPSEEK_API_KEY"); strings.ContainsAny(raw, "\r\n") || len(cfg.DeepSeekAPIKey) > 4096 ||
+		(cfg.DeepSeekAPIKey != "" && !searchAPIKeyPattern.MatchString(cfg.DeepSeekAPIKey)) {
+		return Config{}, fmt.Errorf("DEEPSEEK_API_KEY contains unsupported characters or exceeds its size bound")
+	}
+	if len(cfg.DeepSeekTextModel) > 128 || !regexp.MustCompile(`^[A-Za-z0-9._:-]+$`).MatchString(cfg.DeepSeekTextModel) {
+		return Config{}, fmt.Errorf("DEEPSEEK_TEXT_MODEL contains unsupported characters or exceeds its size bound")
+	}
+	if cfg.ImageAIProvider != "qwen" && cfg.ImageAIProvider != "openai" {
+		return Config{}, fmt.Errorf("IMAGE_AI_PROVIDER must be qwen or openai")
+	}
+	if err := validateQwenAPIBaseURL(cfg.QwenAPIBaseURL); err != nil {
+		return Config{}, err
+	}
+	cfg.QwenAPIBaseURL = strings.TrimSuffix(cfg.QwenAPIBaseURL, "/")
+	if raw := os.Getenv("QWEN_API_KEY"); strings.ContainsAny(raw, "\r\n") || len(cfg.QwenAPIKey) > 4096 ||
+		(cfg.QwenAPIKey != "" && !searchAPIKeyPattern.MatchString(cfg.QwenAPIKey)) {
+		return Config{}, fmt.Errorf("QWEN_API_KEY contains unsupported characters or exceeds its size bound")
+	}
+	if len(cfg.QwenImageModel) > 128 || !regexp.MustCompile(`^[A-Za-z0-9._:-]+$`).MatchString(cfg.QwenImageModel) {
+		return Config{}, fmt.Errorf("QWEN_IMAGE_MODEL contains unsupported characters or exceeds its size bound")
+	}
 	for _, name := range []string{"EXA_API_KEY", "TAVILY_API_KEY"} {
 		raw := os.Getenv(name)
 		key := strings.TrimSpace(raw)
@@ -381,8 +431,8 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("%s contains unsupported characters or exceeds its size bound", name)
 		}
 	}
-	if !cfg.AuthBootstrapMode && (cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "") && cfg.OpenAIAPIKey == "" {
-		return Config{}, fmt.Errorf("EXA_API_KEY or TAVILY_API_KEY requires OPENAI_API_KEY for grounded synthesis")
+	if !cfg.AuthBootstrapMode && (cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "") && !cfg.TextAIConfigured() {
+		return Config{}, fmt.Errorf("EXA_API_KEY or TAVILY_API_KEY requires the selected TEXT_AI_PROVIDER API key for grounded synthesis")
 	}
 	if cfg.MAXBotToken != "" && !maxWebhookSecretPattern.MatchString(cfg.MAXWebhookSecret) {
 		return Config{}, fmt.Errorf("MAX_WEBHOOK_SECRET is required with MAX_BOT_TOKEN and must contain 5-256 letters, digits, underscores or hyphens")
@@ -439,8 +489,8 @@ func Load() (Config, error) {
 			len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
 		}
-		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "" || cfg.YooKassaConfigured() {
-			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX, OpenAI and search integrations to be disabled")
+		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.DeepSeekAPIKey != "" || cfg.QwenAPIKey != "" || cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "" || cfg.YooKassaConfigured() {
+			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX, AI and search integrations to be disabled")
 		}
 		if s3Parts != 0 || cfg.S3Bucket != "" || cfg.S3Region != "" {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires S3 storage to be disabled")
@@ -516,6 +566,30 @@ func Load() (Config, error) {
 
 func (c Config) YandexAuthEnabled() bool {
 	return c.YandexClientID != "" && c.YandexClientSecret != "" && c.YandexRedirectURI != ""
+}
+
+// TextAIConfigured reports whether the explicitly selected text provider has a
+// key. An OpenAI image key never enables DeepSeek text through an implicit fallback.
+func (c Config) TextAIConfigured() bool {
+	switch c.TextAIProvider {
+	case "deepseek":
+		return c.DeepSeekAPIKey != ""
+	case "openai":
+		return c.OpenAIAPIKey != ""
+	default:
+		return false
+	}
+}
+
+func (c Config) ImageAIConfigured() bool {
+	switch c.ImageAIProvider {
+	case "qwen":
+		return c.QwenAPIKey != ""
+	case "openai":
+		return c.OpenAIAPIKey != ""
+	default:
+		return false
+	}
 }
 
 func (c Config) DirectConfigured() bool {
@@ -613,6 +687,27 @@ func validateOpenAIAPIBaseURL(raw string) error {
 		return fmt.Errorf("OPENAI_API_BASE_URL must be exactly %s (one trailing slash is allowed)", official)
 	}
 	return nil
+}
+
+func validateDeepSeekAPIBaseURL(raw string) error {
+	normalized := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if normalized != defaultDeepSeekAPIBaseURL {
+		return fmt.Errorf("DEEPSEEK_API_BASE_URL must be exactly %s (one trailing slash is allowed)", defaultDeepSeekAPIBaseURL)
+	}
+	return nil
+}
+
+func validateQwenAPIBaseURL(raw string) error {
+	normalized := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if normalized == defaultQwenAPIBaseURL || normalized == "https://dashscope.aliyuncs.com" {
+		return nil
+	}
+	// Official workspace domains have one bounded workspace label and one
+	// documented region. A general aliyuncs.com suffix is not an API origin.
+	if regexp.MustCompile(`^https://[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.(?:ap-southeast-1|cn-beijing|us-east-1|cn-hongkong|eu-central-1|ap-northeast-1)\.maas\.aliyuncs\.com$`).MatchString(normalized) {
+		return nil
+	}
+	return fmt.Errorf("QWEN_API_BASE_URL must use an official Alibaba Cloud Model Studio HTTPS origin")
 }
 
 func validateFrontendOrigin(raw string) (*url.URL, error) {

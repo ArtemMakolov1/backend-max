@@ -15,6 +15,17 @@ on:
           - node-exporter
           - alertmanager
           - grafana
+          - prometheus
+      prometheus_image:
+        description: Required ghcr Prometheus repository@sha256 digest for Grafana-only builds
+        type: string
+        required: false
+        default: ""
+      grafana_image:
+        description: Optional existing Grafana repository@sha256 digest to verify without rebuilding
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -37,6 +48,7 @@ jobs:
       node_exporter: ${{ steps.build.outputs.node_exporter }}
       alertmanager: ${{ steps.build.outputs.alertmanager }}
       grafana: ${{ steps.build.outputs.grafana }}
+      prometheus: ${{ steps.build.outputs.prometheus }}
       components: ${{ steps.build.outputs.components }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -54,18 +66,33 @@ jobs:
         shell: bash
         env:
           REQUESTED_COMPONENT: ${{ inputs.component || 'all' }}
+          GRAFANA_PROMETHEUS_IMAGE: ${{ inputs.prometheus_image }}
+          REUSE_GRAFANA_IMAGE: ${{ inputs.grafana_image }}
         run: |
           set -euo pipefail
+          owner=${GITHUB_REPOSITORY_OWNER,,}
           case "$REQUESTED_COMPONENT" in
-            all|postgres-exporter|pgbouncer-exporter|node-exporter|alertmanager|grafana) ;;
+            all|postgres-exporter|pgbouncer-exporter|node-exporter|alertmanager|grafana|prometheus) ;;
             *) echo 'Unsupported monitoring component' >&2; exit 1 ;;
           esac
+          if [[ "$REQUESTED_COMPONENT" == grafana ]] &&
+            [[ ! "$GRAFANA_PROMETHEUS_IMAGE" =~ ^ghcr[.]io/${owner}/maxposty-prometheus@sha256:[0-9a-f]{64}$ ]]; then
+            echo 'Grafana-only builds require the immutable patched Prometheus digest' >&2
+            exit 1
+          fi
+          if [[ -n "$REUSE_GRAFANA_IMAGE" ]] &&
+            { [[ "$REQUESTED_COMPONENT" != grafana ]] ||
+              [[ ! "$REUSE_GRAFANA_IMAGE" =~ ^ghcr[.]io/${owner}/maxposty-grafana@sha256:[0-9a-f]{64}$ ]]; }; then
+            echo 'Only a Grafana-only run may reuse its immutable repository digest' >&2
+            exit 1
+          fi
           components=$(jq -cn --arg component "$REQUESTED_COMPONENT" \
-            'if $component == "all" then ["postgres-exporter", "pgbouncer-exporter", "node-exporter", "alertmanager", "grafana"] else [$component] end')
+            'if $component == "all" then ["postgres-exporter", "pgbouncer-exporter", "node-exporter", "alertmanager", "grafana", "prometheus"] else [$component] end')
           printf 'components=%s\n' "$components" >>"$GITHUB_OUTPUT"
-          owner=${GITHUB_REPOSITORY_OWNER,,}
-          docker buildx create --name maxposty-monitoring-builder --driver docker-container --use
-          docker buildx inspect --bootstrap
+          if [[ -z "$REUSE_GRAFANA_IMAGE" ]]; then
+            docker buildx create --name maxposty-monitoring-builder --driver docker-container --use
+            docker buildx inspect --bootstrap
+          fi
 
           build_image() {
             local component=$1
@@ -76,28 +103,64 @@ jobs:
             fi
             local repository="ghcr.io/${owner}/maxposty-${component}"
             local metadata="$RUNNER_TEMP/${component}.json"
-            docker buildx build \
-              --platform linux/amd64,linux/arm64 \
-              --file "$dockerfile" \
-              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-              --tag "${repository}:${version}" \
-              --provenance=mode=max \
-              --sbom=true \
-              --metadata-file "$metadata" \
-              --push \
-              .
             local digest
-            digest=$(jq -er '."containerimage.digest"' "$metadata")
+            if [[ "$component" == grafana && -n "$REUSE_GRAFANA_IMAGE" ]]; then
+              digest=${REUSE_GRAFANA_IMAGE##*@}
+              docker buildx imagetools inspect "${repository}:${version}" \
+                --format '{{json .Manifest}}' >"$metadata"
+              # Reuse only this exact published tag/digest with both runtime
+              # architectures and their original attestation manifests.
+              jq -e --arg digest "$digest" '
+                .digest == $digest and
+                any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "amd64") and
+                any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "arm64") and
+                (.manifests as $manifests | all($manifests[] | select(.platform.os == "linux");
+                  .digest as $platform | any($manifests[];
+                    .annotations["vnd.docker.reference.type"] == "attestation-manifest" and
+                    .annotations["vnd.docker.reference.digest"] == $platform)))
+              ' "$metadata" >/dev/null
+            else
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                --file "$dockerfile" \
+                --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+                --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+                --tag "${repository}:${version}" \
+                --provenance=mode=max \
+                --sbom=true \
+                --metadata-file "$metadata" \
+                --push \
+                .
+              digest=$(jq -er '."containerimage.digest"' "$metadata")
+            fi
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             printf '%s=%s@%s\n' "${component//-/_}" "$repository" "$digest" >>"$GITHUB_OUTPUT"
+            printf '%s=%s:%s@%s\n' "$component" "$repository" "$version" "$digest" >>"$RUNNER_TEMP/monitoring-images.txt"
+            printf '%s: `%s:%s@%s`\n' "$component" "$repository" "$version" "$digest" >>"$GITHUB_STEP_SUMMARY"
           }
 
-          build_image postgres-exporter v0.20.1-go1.26.8.3 docker/monitoring/postgres-exporter.Dockerfile
-          build_image pgbouncer-exporter v0.12.1-go1.26.8.3 docker/monitoring/pgbouncer-exporter.Dockerfile
-          build_image node-exporter v1.12.1-go1.26.8.1 docker/monitoring/node-exporter.Dockerfile
-          build_image alertmanager v0.34.1-go1.26.8.2 docker/monitoring/alertmanager.Dockerfile
-          build_image grafana nightly-20261004-prometheus.2 docker/monitoring/grafana.Dockerfile
+          build_image postgres-exporter v0.20.1-go1.26.9.1 docker/monitoring/postgres-exporter.Dockerfile
+          build_image pgbouncer-exporter v0.12.1-go1.26.9.1 docker/monitoring/pgbouncer-exporter.Dockerfile
+          build_image node-exporter v1.12.1-go1.26.9.1 docker/monitoring/node-exporter.Dockerfile
+          build_image alertmanager v0.34.1-go1.26.9.1 docker/monitoring/alertmanager.Dockerfile
+          build_image prometheus v3.15.0-go1.27.2.1 docker/monitoring/prometheus.Dockerfile
+          build_image grafana nightly-20261010-prometheus.1 docker/monitoring/grafana.Dockerfile
+      - name: Verify Grafana datasource registration, frontend and backend query
+        if: ${{ steps.build.outputs.grafana != '' }}
+        shell: bash
+        env:
+          GRAFANA_IMAGE: ${{ steps.build.outputs.grafana }}
+          # Both full and single-component builds validate the exact patched
+          # Prometheus digest that will be deployed with Grafana.
+          PROMETHEUS_IMAGE: ${{ steps.build.outputs.prometheus || inputs.prometheus_image }}
+        run: bash docker/monitoring/test-grafana.sh
+      - name: Upload immutable monitoring image references
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: monitoring-image-references
+          path: ${{ runner.temp }}/monitoring-images.txt
+          if-no-files-found: error
+          retention-days: 30
       - name: Remove registry credentials
         if: ${{ always() }}
         shell: bash
@@ -127,6 +190,8 @@ jobs:
             needs.build.outputs.node_exporter ||
             matrix.component == 'alertmanager' &&
             needs.build.outputs.alertmanager ||
+            matrix.component == 'prometheus' &&
+            needs.build.outputs.prometheus ||
             needs.build.outputs.grafana }}
     steps:
       - name: Log in to GitHub Container Registry

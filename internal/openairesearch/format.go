@@ -83,7 +83,7 @@ func (c *Client) FormatContent(ctx context.Context, request FormatRequest) (Form
 		return FormatResult{}, responseError(response, "invalid_structured_output", err.Error())
 	}
 	if !outputSignature.equal(inputSignature) {
-		return FormatResult{}, responseError(response, "content_changed", "OpenAI changed the visible post text")
+		return FormatResult{}, responseError(response, "content_changed", "AI changed the visible post text")
 	}
 	return result, nil
 }

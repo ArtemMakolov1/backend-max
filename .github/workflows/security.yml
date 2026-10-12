@@ -27,7 +27,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.8"
+          go-version: "1.26.9"
           cache: true
       - name: Install govulncheck v1.6.0
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
@@ -69,22 +69,22 @@ jobs:
         platform: [linux/amd64, linux/arm64]
         include:
           - component: postgres-exporter
-            image: "ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.8.3@sha256:dc577eda187be7c8c55c359def87643cd26dea62373a00b3e63fbcccc46a0f33"
+            image: "ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.9.1@sha256:34453c8d1b299b6fe480eb782f626f50c5bd986c720a2fae714c28ddcea9ecfc"
             trivyignores: ""
           - component: pgbouncer-exporter
-            image: "ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.8.3@sha256:57532238e7d5b182e44648dac084d4d5acf5176f3d7aabe644e0496b691136a5"
+            image: "ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.9.1@sha256:1c959e07a965732824085554446886f83d0e9c0c323ff0ab210f036b2f1d7c87"
             trivyignores: ""
           - component: node-exporter
-            image: "ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.8.1@sha256:77b0099bb6d4ac3268f90d01df13ca8f9266394ffbf1a9acb0a62fe49995fadf"
+            image: "ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.9.1@sha256:7dceac589965ee8ed794de9fc1bf4be194331fb6224b6715eaefeb9d6c4da717"
             trivyignores: ""
           - component: alertmanager
-            image: "ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.8.2@sha256:fae6b44fad35877bf49ad2bac4cd9b9688bef7b0ecaa84959b7936e32f5a623a"
+            image: "ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.9.1@sha256:ffee0dba12bf417a33ca0148f266d53abe2b37700fe4211a7c383d2bd2a6dce5"
             trivyignores: ""
           - component: prometheus
-            image: "prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e"
+            image: "ghcr.io/artemmakolov1/maxposty-prometheus:v3.15.0-go1.27.2.1@sha256:c66333fad371671d2cc959cb9797c63fb4de410b25b3cf5fb5f83d867d0d8840"
             trivyignores: ""
           - component: grafana
-            image: "ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261004-prometheus.2@sha256:d53ad9b2aafeb88b924b0b521224f549414a12248a54c13eb635d3954f6593c3"
+            image: "ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261010-prometheus.1@sha256:fd7d5b6f50be28b578ecfaad8ca5d416c097e8dc10116f1b6476f179c116789a"
             trivyignores: ""
     env:
       TRIVY_PLATFORM: ${{ matrix.platform }}
@@ -130,7 +130,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.8"
+          go-version: "1.26.9"
           cache: true
       - name: Verify dependency checksums and module graph
         run: |
@@ -151,7 +151,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.8"
+          go-version: "1.26.9"
           cache: true
       - uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a # v4.37.1
         with:

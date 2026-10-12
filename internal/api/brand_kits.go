@@ -79,6 +79,7 @@ func (s *Server) decodeBrandedWorkspaceResearchRequest(
 	if !s.decodeJSON(w, r, &request) {
 		return openairesearch.Request{}, false
 	}
+	request.ExamplePostsOverride = len(request.ExamplePosts) > 0
 	context, err := s.app.Store().ResolveWorkspaceBrandContext(
 		r.Context(), access.UserID, access.WorkspaceID, request.ChannelTemplateID, request.ChannelID,
 	)
@@ -91,6 +92,35 @@ func (s *Server) decodeBrandedWorkspaceResearchRequest(
 		profile = overlayBrandProfile(profile, context.Template.BrandProfile)
 	}
 	request.Request = applyBrandProfileDefaults(request.Request, profile)
+	if strings.TrimSpace(request.Tone) == "" {
+		request.Tone = "Естественный и понятный"
+	}
+	channelID := request.ChannelID
+	if channelID == nil && context.Template != nil {
+		channelID = context.Template.ChannelID
+	}
+	if channelID != nil {
+		samples, err := s.app.Store().ListChannelStyleSamplesForWorkspace(
+			r.Context(), access.UserID, access.WorkspaceID, *channelID,
+		)
+		if err != nil {
+			s.writeError(w, err)
+			return openairesearch.Request{}, false
+		}
+		request.ChannelPosts = make([]openairesearch.ChannelPostStyle, 0, min(len(samples), openairesearch.MaxChannelStylePosts))
+		for _, sample := range samples {
+			text := []rune(sample.Text)
+			if len(text) > openairesearch.MaxChannelStyleSampleRunes {
+				text = text[:openairesearch.MaxChannelStyleSampleRunes]
+			}
+			request.ChannelPosts = append(request.ChannelPosts, openairesearch.ChannelPostStyle{
+				Text: string(text), Format: sample.Format, CharacterCount: sample.CharacterCount,
+			})
+			if len(request.ChannelPosts) == openairesearch.MaxChannelStylePosts {
+				break
+			}
+		}
+	}
 	if err := openairesearch.ValidateRequest(request.Request); err != nil {
 		s.writeError(w, err)
 		return openairesearch.Request{}, false
