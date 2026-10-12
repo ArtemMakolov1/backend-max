@@ -201,7 +201,7 @@ func TestDeepSeekResearchEmptyFailedAndCancelledRetrievalSkipsSynthesis(t *testi
 			if calls != 0 || err == nil || strings.Contains(err.Error(), "private provider body") {
 				t.Fatalf("retrieval failure called synthesis or leaked details: calls=%d err=%v", calls, err)
 			}
-			if test.searchErr == context.Canceled {
+			if errors.Is(test.searchErr, context.Canceled) {
 				if !errors.Is(err, context.Canceled) {
 					t.Fatal("cancellation was lost")
 				}

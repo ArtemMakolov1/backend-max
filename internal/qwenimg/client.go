@@ -105,11 +105,11 @@ func New(baseURL, apiKey, model string, httpClient *http.Client) (*Client, error
 	if err != nil || !parsed.IsAbs() || parsed.Host == "" ||
 		(parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.User != nil ||
 		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" || parsed.Path != "" {
-		return nil, errors.New("Qwen API base URL must be an absolute HTTP(S) origin")
+		return nil, errors.New("qwen API base URL must be an absolute HTTP(S) origin")
 	}
 	apiKey, model = strings.TrimSpace(apiKey), strings.TrimSpace(model)
 	if apiKey == "" || model == "" || httpClient == nil || strings.ContainsAny(apiKey, "\r\n") {
-		return nil, errors.New("Qwen API key, model and HTTP client are required")
+		return nil, errors.New("qwen API key, model and HTTP client are required")
 	}
 	return &Client{baseURL: baseURL, apiKey: apiKey, model: model, httpClient: httpClient,
 		// This fetcher has its own transport, public DNS/IP validation and no
@@ -130,12 +130,12 @@ func (c *Client) Validate(request openaiimg.GenerateRequest) error {
 	switch request.Size {
 	case "", "auto", "1024x1024", "1536x1024", "1024x1536":
 	default:
-		return errors.New("Qwen image size must be auto, 1024x1024, 1536x1024 or 1024x1536")
+		return errors.New("qwen image size must be auto, 1024x1024, 1536x1024 or 1024x1536")
 	}
 	// Quality is an existing MaxPosty billing option, not a Qwen parameter.
 	// Use one fixed tier so unsupported levels cannot imply an upstream effect.
 	if request.Quality != "" && request.Quality != "medium" {
-		return errors.New("Qwen image quality must be medium")
+		return errors.New("qwen image quality must be medium")
 	}
 	return nil
 }
