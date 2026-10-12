@@ -188,6 +188,39 @@ class ProtectionTests(unittest.TestCase):
         (rollback / ".env.production").write_text("PRIVATE_PASSWORD=do-not-read\n", encoding="utf-8")
         self.assertEqual(maintenance.release_refs(self.installation), {CANDIDATE, OWN_REF, MONITOR_REF})
 
+    def test_inspect_emits_only_public_release_refs_and_activation_metadata(self):
+        rollback = self.release("2" * 40, OWN_REF, MONITOR_REF)
+        (rollback / ".release.next").write_text("BACKEND_IMAGE=" + CANDIDATE + "\n", encoding="utf-8")
+        (rollback / ".env.production").write_text("PRIVATE_PASSWORD=DO_NOT_READ\n", encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            maintenance.release_refs(self.installation, report_metadata=True)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        current = next(record for record in records if record["current"])
+        previous = next(record for record in records if record["source_sha"] == "2" * 40)
+        self.assertEqual(current["source_sha"], "1" * 40)
+        self.assertEqual(previous["completed_backend_image"], OWN_REF)
+        self.assertEqual(previous["pending_backend_image"], CANDIDATE)
+        self.assertIsInstance(previous["completed_mtime_ns"], int)
+        self.assertNotIn("PRIVATE_PASSWORD", output.getvalue())
+        self.assertNotIn("DO_NOT_READ", output.getvalue())
+
+    def test_own_image_metadata_filters_foreign_tags_and_all_private_fields(self):
+        own = image()
+        own["RepoTags"].append("private.registry.example/private_team:PRIVATE_TAG")
+        own["Config"]["Labels"]["private-label"] = "PRIVATE_LABEL"
+        own["Config"]["Env"] = ["PRIVATE_PASSWORD"]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            maintenance.report_own_image(own, {OLD_ID}, set(), "container_or_release_referenced")
+        value = json.loads(output.getvalue())
+        self.assertTrue(value["protected"])
+        self.assertEqual(value["foreign_tag_count"], 1)
+        self.assertEqual(value["size_bytes"], 12345)
+        self.assertEqual(value["source"], maintenance.SOURCE)
+        for forbidden in ("private.registry", "PRIVATE_TAG", "PRIVATE_LABEL", "PRIVATE_PASSWORD"):
+            self.assertNotIn(forbidden, output.getvalue())
+
     def test_external_current_and_symlink_metadata_fail_closed(self):
         (self.current / ".release").unlink()
         (self.current / ".release").symlink_to(self.current / ".env.production")

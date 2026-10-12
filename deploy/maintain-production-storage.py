@@ -173,7 +173,7 @@ def read_regular(path, limit):
         os.close(descriptor)
 
 
-def release_refs(installation):
+def release_refs(installation, report_metadata=False):
     """Preserve every retained bundle, a conservative superset of rollback."""
     installation = installation.resolve(strict=True)
     releases = installation / "releases"
@@ -189,12 +189,15 @@ def release_refs(installation):
     if len(entries) > MAX_RELEASES:
         raise MaintenanceError("release_inventory_limit")
     protected = set()
-    for release in entries:
+    for release in sorted(entries):
         if not COMMIT.fullmatch(release.name):
             continue
         if release.is_symlink() or not release.is_dir():
             raise MaintenanceError("invalid_release_directory")
         metadata_found = False
+        metadata = {"completed_backend_image": None, "completed_mtime_ns": None,
+                    "pending_backend_image": None, "pending_mtime_ns": None}
+        release_images = set()
         for name in (".release", ".release.next"):
             path = release / name
             if not path.exists() and not path.is_symlink():
@@ -204,6 +207,10 @@ def release_refs(installation):
             if len(backend) != 1 or not BACKEND_REF.fullmatch(backend[0]):
                 raise MaintenanceError("invalid_release_image")
             protected.add(backend[0])
+            release_images.add(backend[0])
+            kind = "completed" if name == ".release" else "pending"
+            metadata[kind + "_backend_image"] = backend[0]
+            metadata[kind + "_mtime_ns"] = path.lstat().st_mtime_ns
             metadata_found = True
         if release == accepted and not metadata_found:
             raise MaintenanceError("missing_current_image")
@@ -217,10 +224,17 @@ def release_refs(installation):
                     reference = match[1]
                     if DIGEST_REF.fullmatch(reference) or TAG_REF.fullmatch(reference):
                         protected.add(reference)
+                        release_images.add(reference)
                     elif TAGGED_DIGEST_REF.fullmatch(reference):
                         tagged_repository, digest = reference.split("@")
                         repository = tagged_repository.rsplit(":", 1)[0]
                         protected.update((reference, tagged_repository, repository + "@" + digest))
+                        release_images.update((reference, tagged_repository, repository + "@" + digest))
+        if len(release_images) > 64:
+            raise MaintenanceError("release_image_metadata_limit")
+        if report_metadata:
+            emit("release_metadata", source_sha=release.name, current=release == accepted,
+                 own_image_refs=sorted(release_images), **metadata)
     return protected
 
 
@@ -256,8 +270,8 @@ def classify_image(image, protected_ids, protected_refs, now):
     return "eligible"
 
 
-def protection(installation, candidate, images):
-    refs = release_refs(installation)
+def protection(installation, candidate, images, report_metadata=False):
+    refs = release_refs(installation, report_metadata=report_metadata)
     if candidate:
         refs.add(candidate)
     ids = container_image_ids()
@@ -275,6 +289,33 @@ def protection(installation, candidate, images):
         if refs.intersection((image.get("RepoTags") or []) + (image.get("RepoDigests") or [])):
             ids.add(image["Id"])
     return ids, refs
+
+
+def report_own_image(image, protected_ids, protected_refs, classification):
+    """Public own refs only; never emit foreign tags, labels or raw fields."""
+    source = ((image.get("Config") or {}).get("Labels") or {}).get("org.opencontainers.image.source")
+    if not isinstance(source, str) or source.lower() != SOURCE:
+        return
+    tags = image.get("RepoTags") or []
+    digests = image.get("RepoDigests") or []
+    refs = sorted(set(ref for ref in tags + digests if isinstance(ref, str) and
+                      (TAG_REF.fullmatch(ref) or DIGEST_REF.fullmatch(ref))))
+    if not refs:
+        return
+    if len(refs) > 64:
+        raise MaintenanceError("image_metadata_limit")
+    created = image.get("Created")
+    try:
+        parsed = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+        created = parsed.isoformat() if parsed.tzinfo else None
+    except (AttributeError, TypeError, ValueError):
+        created = None
+    size = image.get("Size")
+    emit("own_image_metadata", image_id=image["Id"], own_image_refs=refs,
+         size_bytes=size if type(size) is int and size >= 0 else None, created=created,
+         source=SOURCE, protected=image["Id"] in protected_ids or bool(protected_refs.intersection(refs)),
+         classification=classification, foreign_tag_count=sum(not TAG_REF.fullmatch(ref) for ref in tags),
+         foreign_digest_count=sum(not DIGEST_REF.fullmatch(ref) for ref in digests))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -358,12 +399,14 @@ def main(argv=None):
         fcntl.flock(descriptor, (fcntl.LOCK_EX if cleanup else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         report_storage(installation)
         images = [inspect_image(value) for value in image_ids()]
-        protected_ids, protected_refs = protection(installation, args.candidate_backend_image, images)
+        protected_ids, protected_refs = protection(installation, args.candidate_backend_image, images, report_metadata=not cleanup)
         now = datetime.datetime.now(datetime.timezone.utc)
         eligible = {}
         counts = {}
         for image in images:
             reason = classify_image(image, protected_ids, protected_refs, now)
+            if not cleanup:
+                report_own_image(image, protected_ids, protected_refs, reason)
             counts[reason] = counts.get(reason, 0) + 1
             if reason == "eligible":
                 if all(public_digest_exists(ref) for ref in image["RepoDigests"]):
