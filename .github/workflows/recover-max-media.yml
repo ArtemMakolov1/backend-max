@@ -46,7 +46,7 @@ jobs:
       VPS_PORT: ${{ vars.VPS_PORT || '22' }}
       VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Restrict the operation and production target
@@ -75,7 +75,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$inventory_id/attempts/$inventory_attempt" >"$RUNNER_TEMP/max-media-inventory-run.json"
           jq -e --arg sha "$GITHUB_SHA" '.head_sha == $sha and .head_branch == "main" and .event == "workflow_dispatch" and .path == ".github/workflows/recover-max-media.yml" and .conclusion == "success"' "$RUNNER_TEMP/max-media-inventory-run.json" >/dev/null
           echo "Successful inventory used the unchanged reviewed workflow and tool"
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.VERIFIED_SOURCE }}
           path: verified-source
