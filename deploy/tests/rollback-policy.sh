@@ -2,6 +2,7 @@
 set -euo pipefail
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
+python3 -m unittest discover -s "$repo_root/deploy/tests" -p 'test_disk_preflight.py'
 new_sha=1111111111111111111111111111111111111111
 old_sha=0000000000000000000000000000000000000000
 image="ghcr.io/example/backend@sha256:$(printf 'a%.0s' {1..64})"

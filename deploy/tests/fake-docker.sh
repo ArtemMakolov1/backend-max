@@ -12,6 +12,31 @@ if [[ ${1:-} == "compose" && ${2:-} == "version" ]]; then
   exit 0
 fi
 
+if [[ ${1:-} == "info" ]]; then
+  if [[ "$*" == *'.DockerRootDir'* ]]; then
+    printf '%s\n' "$TEST_EMPTY_DIR"
+  else
+    printf 'x86_64\n'
+  fi
+  exit 0
+fi
+if [[ ${1:-} == "image" && ${2:-} == "inspect" ]]; then
+  printf 'sha256:%s linux amd64\n' "$(printf 'c%.0s' {1..64})"
+  exit 0
+fi
+if [[ ${1:-} == "volume" && ${2:-} == "ls" ]]; then
+  exit 0
+fi
+if [[ ${1:-} == "exec" ]]; then
+  case ${3:-} in
+    df) df "${4:?}" "$TEST_EMPTY_DIR" ;;
+    stat) stat -c %d "$TEST_EMPTY_DIR" ;;
+    sh) printf '67108864\n' ;;
+    *) exit 64 ;;
+  esac
+  exit 0
+fi
+
 if [[ ${1:-} == "network" && ${2:-} == "inspect" ]]; then
   case "$*" in
     *'.Driver'*) printf 'bridge\n' ;;
@@ -24,6 +49,13 @@ if [[ ${1:-} == "network" && ${2:-} == "inspect" ]]; then
 fi
 
 if [[ ${1:-} == "inspect" ]]; then
+  if [[ "$*" == *'.State.Running'* ]]; then
+    printf 'true\n'
+    exit 0
+  elif [[ "$*" == *'.Mounts'* ]]; then
+    printf 'volume:maxposty-backend_postgres-data\n'
+    exit 0
+  fi
   container_id=${!#}
   if [[ "$container_id" == "new-backend-id" && \
     ("$TEST_SCENARIO" == "initial-health-fail" || "$TEST_SCENARIO" == "new-backend-health-fail") ]]; then
@@ -68,6 +100,16 @@ fi
 if [[ "$*" == *" ps -q "* ]]; then
   service=${!#}
   printf '%s-%s-id\n' "$bundle_kind" "$service"
+  exit 0
+fi
+
+if [[ "$*" == *" ps -aq postgres" ]]; then
+  printf '%s\n' "$(printf 'b%.0s' {1..64})"
+  exit 0
+fi
+
+if [[ "$*" == *" config --images" ]]; then
+  printf 'ghcr.io/example/backend@sha256:%s\n' "$(printf 'a%.0s' {1..64})"
   exit 0
 fi
 

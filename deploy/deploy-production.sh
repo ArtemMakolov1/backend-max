@@ -7,7 +7,7 @@ if [[ ! "$image" =~ ^ghcr\.io/[a-z0-9._-]+/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]
   exit 2
 fi
 
-for command_name in awk date docker find flock ln mv readlink sha256sum tar; do
+for command_name in awk date df docker find flock ln mv python3 readlink sha256sum stat tar; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "Required deployment command is missing: $command_name" >&2
     exit 1
@@ -178,6 +178,184 @@ compose() {
     --env-file "$release_file" \
     --file "$bundle_dir/deploy/compose.production.yaml" \
     "$@"
+}
+
+disk_preflight() {
+  # Metadata only: no image/volume cleanup, dumps, environment-file output, or
+  # service changes. Both calls run under .deploy.lock before writes are frozen.
+  python3 - "$1" "$installation_dir" "$release_dir" "$next_env" "$next_release" \
+    "$current_dir" "$current_env" "$current_release" <<'DISK_PREFLIGHT_PY'
+import json
+import os
+import re
+import selectors
+import subprocess
+import sys
+import time
+
+phase, install_dir, next_dir, next_env, next_release, old_dir, old_env, old_release = sys.argv[1:]
+
+def blocked(reason):
+    raise SystemExit("Storage preflight (" + phase + ") blocked: " + reason)
+
+def probe(args, allow_missing=False):
+    # Bound both duration and output; never forward Docker/psql diagnostics,
+    # which may contain private connection information.
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               env=dict(os.environ, LC_ALL="C"))
+    output = {"out": bytearray(), "err": bytearray()}
+    selector = selectors.DefaultSelector()
+    for pipe, name in ((process.stdout, "out"), (process.stderr, "err")):
+        selector.register(pipe, selectors.EVENT_READ, name)
+    deadline = time.monotonic() + 20
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                blocked("metadata probe timed out")
+            for key, _ in selector.select(min(remaining, 1)):
+                data = os.read(key.fileobj.fileno(), 8192)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                output[key.data].extend(data)
+                if len(output[key.data]) > (262144 if key.data == "out" else 4096):
+                    blocked("metadata probe exceeded output limit")
+        code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        if code:
+            error = output["err"].decode("utf-8", errors="replace").strip()
+            if allow_missing and re.fullmatch(r"(?:Error response from daemon:|Error:) No such image: [^\r\n]+", error):
+                return None
+            blocked("metadata probe failed")
+        return output["out"].decode("utf-8").strip()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+def compose_args(directory, env_file, release_file, *args):
+    return ["docker", "compose", "--project-name", "maxposty-backend", "--env-file", env_file,
+            "--env-file", release_file, "--file", directory + "/deploy/compose.production.yaml", *args]
+
+def integer(value):
+    if not re.fullmatch(r"[0-9]{1,16}", str(value)):
+        blocked("invalid numeric metadata")
+    result = int(value)
+    if result > 2 ** 53:
+        blocked("numeric metadata is out of range")
+    return result
+
+def filesystem(args):
+    measurements = []
+    for flag in ("-Pk", "-Pi"):
+        rows = probe(args[:-1] + [flag, args[-1]]).splitlines()
+        if len(rows) != 2:
+            blocked("filesystem metadata is unavailable")
+        fields = rows[1].split()
+        if len(fields) < 6:
+            blocked("filesystem metadata is malformed")
+        measurements.append((fields[0], integer(fields[3])))
+    if measurements[0][0] != measurements[1][0]:
+        blocked("filesystem changed during inspection")
+    # st_dev is identical for host paths and the bind-mounted local PG volume;
+    # df source labels can differ for two mounts of the same filesystem.
+    device = integer(probe(args[:-2] + ["stat", "-c", "%d", args[-1]]))
+    return device, measurements[0][1] * 1024, measurements[1][1]
+
+try:
+    if phase not in ("before-pull", "after-pull"):
+        blocked("invalid phase")
+    docker_root = probe(["docker", "info", "--format", "{{.DockerRootDir}}"])
+    if not docker_root.startswith("/") or "\n" in docker_root:
+        blocked("Docker data root is unavailable")
+    backup_path = install_dir + "/backups"
+    if not os.path.isdir(backup_path):
+        if os.path.lexists(backup_path):
+            blocked("backup destination is not a directory")
+        backup_path = install_dir
+    filesystems = {"docker": filesystem(["df", docker_root]),
+                   "backup": filesystem(["df", backup_path])}
+    # The physical database size includes indexes and unused space. Reserve an
+    # additional 25% for growth, with a 64 MiB floor for a fresh bootstrap dump.
+    snapshot = 64 * 1024 ** 2
+    if old_dir:
+        pg_id = probe(compose_args(old_dir, old_env, old_release, "ps", "-aq", "postgres"))
+        if not re.fullmatch(r"[0-9a-f]{64}", pg_id):
+            blocked("current PostgreSQL container is unavailable")
+        if probe(["docker", "inspect", "--format", "{{.State.Running}}", pg_id]) != "true":
+            blocked("current PostgreSQL is not running")
+        mount = probe(["docker", "inspect", "--format",
+                       '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Type}}:{{.Name}}{{end}}{{end}}', pg_id])
+        if mount != "volume:maxposty-backend_postgres-data":
+            blocked("PostgreSQL data volume does not match the production contract")
+        filesystems["postgres"] = filesystem(["docker", "exec", pg_id, "df", "/var/lib/postgresql"])
+        size = integer(probe(["docker", "exec", pg_id, "sh", "-ec",
+            'PGCONNECT_TIMEOUT=3 PGOPTIONS="-c statement_timeout=5000 -c default_transaction_read_only=on" '
+            'PGPASSWORD="$POSTGRES_PASSWORD" psql --host=127.0.0.1 --no-password '
+            '--username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --tuples-only --no-align '
+            '--command="SELECT pg_database_size(current_database());"']))
+        if not size:
+            blocked("database snapshot estimate is unavailable")
+        snapshot = max(snapshot, (size * 5 + 3) // 4)
+    elif probe(["docker", "volume", "ls", "--filter", "name=^maxposty-backend_postgres-data$", "--format", "{{.Name}}"]):
+        blocked("existing PostgreSQL data requires an accepted current release")
+
+    refs = set(probe(compose_args(next_dir, next_env, next_release, "config", "--images")).splitlines())
+    if not refs or len(refs) > 32:
+        blocked("image metadata is unavailable")
+    missing_bytes = missing_count = 0
+    raw_arch = probe(["docker", "info", "--format", "{{.Architecture}}"])
+    architecture = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(raw_arch)
+    if architecture is None:
+        blocked("Docker architecture is unsupported")
+    for ref in sorted(refs):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}", ref):
+            blocked("image is not pinned to an immutable digest")
+        local_image = probe(["docker", "image", "inspect", "--format", "{{.ID}} {{.Os}} {{.Architecture}}", ref], allow_missing=True)
+        if local_image is not None:
+            if not re.fullmatch(r"sha256:[0-9a-f]{64} [a-z0-9]+ [a-z0-9]+", local_image):
+                blocked("local image metadata is malformed")
+            if local_image.split()[1:] == ["linux", architecture]:
+                continue
+        if phase == "after-pull":
+            blocked("required image is still missing after pull")
+        manifests = json.loads(probe(["docker", "manifest", "inspect", "--verbose", ref]))
+        if not isinstance(manifests, list):
+            manifests = [manifests]
+        matches = [entry for entry in manifests if
+                   entry.get("Descriptor", {}).get("platform", {}).get("architecture") == architecture and
+                   entry.get("Descriptor", {}).get("platform", {}).get("os") == "linux"]
+        if len(matches) != 1:
+            blocked("native image manifest is unavailable")
+        entry = matches[0]
+        manifest = entry.get("OCIManifest", entry.get("SchemaV2Manifest", {}))
+        layers = manifest.get("layers", [])
+        if not layers or len(layers) > 128:
+            blocked("image layer metadata is unavailable")
+        # Keep room for compressed downloads and unpacking. Cached images add
+        # no pull reserve; shared missing layers are deliberately overestimated.
+        missing_bytes += 3 * sum(integer(layer["size"]) for layer in layers)
+        missing_count += 1
+
+    for role, (device, available_bytes, available_inodes) in filesystems.items():
+        required_bytes = 512 * 1024 ** 2
+        required_inodes = 4096
+        if device == filesystems["docker"][0]:
+            required_bytes += missing_bytes
+            required_inodes += 8192 * missing_count
+        if device == filesystems["backup"][0]:
+            required_bytes += snapshot
+        print("Storage preflight (" + phase + ") " + role + ": available_bytes=" + str(available_bytes) +
+              " required_bytes=" + str(required_bytes) + " available_inodes=" + str(available_inodes) +
+              " required_inodes=" + str(required_inodes), flush=True)
+        if available_bytes < required_bytes or available_inodes < required_inodes:
+            blocked(role + " filesystem has insufficient reserve; no services were stopped")
+except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
+    blocked("metadata could not be verified")
+DISK_PREFLIGHT_PY
 }
 
 wait_for_health() {
@@ -520,8 +698,10 @@ trap restore_previous_release EXIT
 install -d -m 755 "$installation_dir/runtime" "$installation_dir/runtime/metrics"
 "$alertmanager_renderer" "$next_env" "$alertmanager_config"
 compose "$release_dir" "$next_env" "$next_release" config >/dev/null
+disk_preflight before-pull
 compose "$release_dir" "$next_env" "$next_release" pull \
   backend migrate runtime-storage-init postgres pgbouncer postgres-exporter pgbouncer-exporter node-exporter alertmanager prometheus grafana
+disk_preflight after-pull
 
 stack_mutated=true
 
