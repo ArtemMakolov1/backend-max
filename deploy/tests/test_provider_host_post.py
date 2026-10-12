@@ -82,7 +82,8 @@ class ProviderTests(unittest.TestCase):
         invalid = [b'', b'not-json', b'[]', b'x' * (remote.MAX_INPUT_BYTES + 1),
                    b'{"exa":"one","exa":"two","tavily":"three"}']
         invalid += [json.dumps(item).encode() for item in (
-            {**KEYS, "extra": PRIVATE}, {"exa": KEYS['exa']}, {**KEYS, "exa": None},
+            {**KEYS, "extra": PRIVATE}, {"exa": KEYS['exa']}, {"exa": None, "tavily": ""},
+            {"exa": "", "tavily": ""}, {**KEYS, "exa": False},
             {**KEYS, "exa": 'key\nInjected: value'}, {**KEYS, "exa": 'key\x00'},
             {**KEYS, "exa": 'ключ'}, {**KEYS, "exa": 'x' * 2049})]
         for data in invalid:
@@ -113,6 +114,23 @@ class ProviderTests(unittest.TestCase):
                          [remote.result(provider, status=200) for provider in remote.PROVIDERS])
         for value in (*KEYS.values(), PRIVATE):
             self.assertNotIn(value, output.getvalue())
+
+    def test_optional_missing_key_skips_http_and_emits_only_explicit_missing_status(self):
+        for provider in remote.PROVIDERS:
+            for missing in (None, ""):
+                keys = {name: KEYS[name] if name == provider else missing for name in remote.PROVIDERS}
+                output = io.StringIO()
+                with patch.object(sys, 'argv', ['validation']), \
+                        patch.object(sys, 'stdin', type('Input', (), {'buffer': io.BytesIO(json.dumps(keys).encode())})()), \
+                        patch.object(remote, 'probe', return_value=remote.result(provider, status=200)) as probe, \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(remote.main(), 0)
+                    probe.assert_called_once_with(provider, KEYS[provider])
+                records = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual(records, [remote.result(name, status=200) if name == provider
+                                           else remote.result(name, 'credential_missing') for name in remote.PROVIDERS])
+                for key in KEYS.values():
+                    self.assertNotIn(key, output.getvalue())
 
     def test_tls_proxy_redirect_policy_and_http_errors_never_read_bodies(self):
         for status in (200, 401, 402, 429, 503, True, '200', 600):
@@ -218,11 +236,11 @@ class RunnerTests(unittest.TestCase):
                 self.captured = self.getvalue()
                 super().close()
         process = Process(); process.stdin = Input()
-        with patch.object(runner.subprocess, 'Popen', return_value=process) as popen:
+        with patch.dict(os.environ, {}, clear=True), patch.object(runner.subprocess, 'Popen', return_value=process) as popen:
             records, code = runner.invoke('print("reviewed source")', payload)
         command = popen.call_args.args[0]
-        self.assertEqual(command[-2], 'maxposty-deploy@77.91.94.235')
-        self.assertNotIn('178.159.94.83', json.dumps(command))
+        self.assertEqual(command[-2], 'maxposty-deploy@178.159.94.83')
+        self.assertNotIn('77.91.94.235', json.dumps(command))
         self.assertIn('StrictHostKeyChecking=yes', command)
         self.assertIn('IdentitiesOnly=yes', command)
         self.assertEqual(command[command.index('-p') + 1], '22')
@@ -234,6 +252,60 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn(value, json.dumps(popen.call_args.kwargs, default=str))
             self.assertNotIn(value, json.dumps(records))
         self.assertEqual(code, 0)
+
+    def test_reviewed_backend_target_overrides_preserve_pinned_ssh(self):
+        environment = {'VPS_HOST': 'backend.example.com', 'VPS_PORT': '2222', 'VPS_USER': 'backend-deploy'}
+        stdout = b''.join(json.dumps(remote.result(provider, status=200)).encode() + b'\n' for provider in remote.PROVIDERS)
+        class Process:
+            def __init__(self):
+                self.stdin, self.stdout = io.BytesIO(), io.BytesIO(stdout)
+            def poll(self): return 0
+            def wait(self, timeout): return 0
+        with patch.dict(os.environ, environment, clear=True), \
+                patch.object(runner.subprocess, 'Popen', return_value=Process()) as popen:
+            runner.invoke('print("reviewed source")', json.dumps(KEYS).encode())
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-2], 'backend-deploy@backend.example.com')
+        self.assertEqual(command[command.index('-p') + 1], '2222')
+        self.assertIn('StrictHostKeyChecking=yes', command)
+        self.assertIn('IdentitiesOnly=yes', command)
+        self.assertIn('UserKnownHostsFile=', ' '.join(command))
+
+    def test_invalid_target_variables_fail_before_ssh_or_secret_output(self):
+        invalid = {'VPS_HOST': ('', '-option', 'host.example;command', 'host..example', 'https://host.example', 'host\n' + PRIVATE),
+                   'VPS_PORT': ('', '0', '022', '65536', '22;command'),
+                   'VPS_USER': ('', '-option', 'root@host.example', 'user\n' + PRIVATE)}
+        for name, values in invalid.items():
+            for value in values:
+                output = io.StringIO()
+                with patch.dict(os.environ, {'EXA_API_KEY': KEYS['exa'], name: value}, clear=True), \
+                        patch.object(sys, 'argv', ['runner']), patch.object(runner, 'invoke') as invoke, \
+                        contextlib.redirect_stdout(output):
+                    self.assertEqual(runner.main(), 1)
+                    invoke.assert_not_called()
+                for secret in (*KEYS.values(), PRIVATE):
+                    self.assertNotIn(secret, output.getvalue())
+
+    def test_http_200_required_for_every_configured_provider_and_missing_is_explicit(self):
+        success = [remote.result(provider, status=200) for provider in remote.PROVIDERS]
+        missing = [remote.result('exa', status=200), remote.result('tavily', 'credential_missing')]
+        cases = [(KEYS, success, 0, 0), ({'exa': KEYS['exa']}, missing, 0, 0),
+                 ({'exa': KEYS['exa'], 'tavily': ''}, missing, 0, 0), (KEYS, success, 1, 1),
+                 (KEYS, missing, 0, 1), ({'exa': KEYS['exa']}, success, 0, 1)]
+        for provider in remote.PROVIDERS:
+            for record in (remote.result(provider, status=403), remote.result(provider, status=429),
+                           remote.result(provider, 'tls'), remote.result(provider, 'timeout')):
+                cases.append((KEYS, [record if name == provider else remote.result(name, status=200)
+                                     for name in remote.PROVIDERS], 0, 1))
+        for keys, records, ssh_code, expected in cases:
+            environment = {name.upper() + '_API_KEY': value for name, value in keys.items()}
+            output = io.StringIO()
+            with patch.dict(os.environ, environment, clear=True), patch.object(sys, 'argv', ['runner']), \
+                    patch.object(runner, 'invoke', return_value=(records, ssh_code)), contextlib.redirect_stdout(output):
+                self.assertEqual(runner.main(), expected)
+            self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()], records)
+            for key in KEYS.values():
+                self.assertNotIn(key, output.getvalue())
 
     def test_untrusted_ssh_output_cannot_cross_allowlist(self):
         valid = [remote.result(provider, status=200) for provider in remote.PROVIDERS]
@@ -276,7 +348,14 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("ref: ${{ github.sha }}", workflow)
         self.assertIn("persist-credentials: false", workflow)
         self.assertIn("if: ${{ always() }}", workflow)
-        for forbidden in ('  push:', '  schedule:', '    inputs:', 'OPENAI_API_KEY', 'upload-artifact',
+        self.assertIn("options: [exa, tavily]", workflow)
+        self.assertIn("default: exa", workflow)
+        self.assertIn("VPS_HOST: ${{ vars.VPS_HOST || '178.159.94.83' }}", workflow)
+        self.assertIn("VPS_PORT: ${{ vars.VPS_PORT || '22' }}", workflow)
+        self.assertIn("VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}", workflow)
+        self.assertIn("EXA_API_KEY: ${{ inputs.provider == 'exa' && secrets.EXA_API_KEY || '' }}", workflow)
+        self.assertIn("TAVILY_API_KEY: ${{ inputs.provider == 'tavily' && secrets.TAVILY_API_KEY || '' }}", workflow)
+        for forbidden in ('  push:', '  schedule:', 'OPENAI_API_KEY', 'upload-artifact',
                           'ssh-keyscan', '.env.production', 'scp ', 'contents: write', 'packages: write'):
             self.assertNotIn(forbidden, workflow)
 

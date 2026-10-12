@@ -1,4 +1,4 @@
-"""One fixed authenticated POST per source; never read or print a response body."""
+"""One fixed POST per configured source; never read or print a response body."""
 import contextlib
 import errno
 import json
@@ -14,7 +14,7 @@ PROVIDERS = ("exa", "tavily")
 MAX_INPUT_BYTES = 16384
 QUERY = "public information about the solar system"
 RESULTS = frozenset(("http", "dns", "tls", "timeout", "no_route", "connection_refused",
-                     "connection_reset", "unknown", "invalid_input", "ssh_failed"))
+                     "connection_reset", "unknown", "invalid_input", "credential_missing", "ssh_failed"))
 
 
 @contextlib.contextmanager
@@ -43,7 +43,10 @@ def credentials(data):
     value = json.loads(data, object_pairs_hook=unique_object)
     if not isinstance(value, dict) or set(value) != set(PROVIDERS):
         raise ValueError()
-    if any(not isinstance(key, str) or not re.fullmatch(r"[!-~]{1,2048}", key) for key in value.values()):
+    if any(key is not None and (not isinstance(key, str) or
+           (key != "" and not re.fullmatch(r"[!-~]{1,2048}", key))) for key in value.values()):
+        raise ValueError()
+    if not any(value.values()):
         raise ValueError()
     return value
 
@@ -122,7 +125,8 @@ def main():
         emit([result(provider, "invalid_input") for provider in PROVIDERS])
         return 1
     try:
-        emit([probe(provider, keys[provider]) for provider in PROVIDERS])
+        emit([probe(provider, keys[provider]) if keys[provider] else result(provider, "credential_missing")
+              for provider in PROVIDERS])
         return 0
     finally:
         keys.clear()
