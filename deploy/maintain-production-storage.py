@@ -32,19 +32,29 @@ MAX_CONTAINERS = 512
 MAX_RELEASES = 256
 MAX_OUTPUT = 4 * 1024 * 1024
 COMMAND_TIMEOUT = 30
+OPERATIONS = frozenset(("docker_command", "image_inspect", "image_inventory", "container_inventory",
+                        "container_image", "release_image", "docker_root", "docker_usage", "image_remove"))
 
 
 class MaintenanceError(Exception):
     """Only fixed, local diagnostic codes may cross the output boundary."""
+    def __init__(self, code, operation="docker_command"):
+        super().__init__(code)
+        self.operation = operation if operation in OPERATIONS else "docker_command"
 
 
 def emit(event, **fields):
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
-def run(argv, limit=MAX_OUTPUT, missing_ok=False):
+def run(argv, limit=MAX_OUTPUT, missing_ok=False, operation="docker_command"):
     """Never invoke a shell; cap stdout and discard all raw stderr."""
-    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if operation not in OPERATIONS:
+        raise MaintenanceError("invalid_operation")
+    try:
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
+        raise MaintenanceError("command_unavailable", operation) from None
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     selector.register(process.stderr, selectors.EVENT_READ)
@@ -55,7 +65,7 @@ def run(argv, limit=MAX_OUTPUT, missing_ok=False):
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise MaintenanceError("command_timeout")
+                raise MaintenanceError("command_timeout", operation)
             for key, _ in selector.select(min(remaining, 1)):
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
@@ -64,7 +74,7 @@ def run(argv, limit=MAX_OUTPUT, missing_ok=False):
                     destination = result if key.fileobj is process.stdout else error_output
                     destination.extend(chunk)
                     if len(result) > limit or len(error_output) > 65536:
-                        raise MaintenanceError("command_output_limit")
+                        raise MaintenanceError("command_output_limit", operation)
         if process.wait(timeout=max(0.1, deadline - time.monotonic())) != 0:
             # Only Docker's exact not-found error for this validated public
             # image reference is optional; daemon/auth/permission failures stop
@@ -74,7 +84,7 @@ def run(argv, limit=MAX_OUTPUT, missing_ok=False):
                     b"Error response from daemon: No such image: " + expected,
                     b"Error: No such image: " + expected):
                 return None
-            raise MaintenanceError("command_failed")
+            raise MaintenanceError("command_failed", operation)
         return result.decode("utf-8", errors="strict")
     finally:
         selector.close()
@@ -93,28 +103,29 @@ def inspect_image(image_id):
     template = ('{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},'
                 '"RepoDigests":{{json .RepoDigests}},"Created":{{json .Created}},'
                 '"Size":{{json .Size}},"Config":{"Labels":{'
-                '"org.opencontainers.image.source":{{json (index .Config.Labels '
-                '"org.opencontainers.image.source")}}}}}')
-    image = json.loads(run(["docker", "image", "inspect", "--format", template, image_id], 65536))
+                '"org.opencontainers.image.source":{{if .Config}}{{if .Config.Labels}}'
+                '{{json (index .Config.Labels "org.opencontainers.image.source")}}'
+                '{{else}}null{{end}}{{else}}null{{end}}}}}')
+    image = json.loads(run(["docker", "image", "inspect", "--format", template, image_id], 65536, operation="image_inspect"))
     if not isinstance(image, dict) or image.get("Id") != image_id:
         raise MaintenanceError("invalid_image_inventory")
     return image
 
 
 def image_ids():
-    ids = sorted(set(run(["docker", "image", "ls", "--all", "--quiet", "--no-trunc"], 65536).splitlines()))
+    ids = sorted(set(run(["docker", "image", "ls", "--all", "--quiet", "--no-trunc"], 65536, operation="image_inventory").splitlines()))
     if len(ids) > MAX_IMAGES or any(not IMAGE_ID.fullmatch(value) for value in ids):
         raise MaintenanceError("image_inventory_limit")
     return ids
 
 
 def container_image_ids():
-    containers = run(["docker", "container", "ls", "--all", "--quiet", "--no-trunc"], 65536).splitlines()
+    containers = run(["docker", "container", "ls", "--all", "--quiet", "--no-trunc"], 65536, operation="container_inventory").splitlines()
     if len(containers) > MAX_CONTAINERS or any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in containers):
         raise MaintenanceError("container_inventory_limit")
     protected = set()
     for container in containers:
-        image_id = run(["docker", "container", "inspect", "--format", "{{.Image}}", container], 256).strip()
+        image_id = run(["docker", "container", "inspect", "--format", "{{.Image}}", container], 256, operation="container_image").strip()
         if not IMAGE_ID.fullmatch(image_id):
             raise MaintenanceError("invalid_container_image")
         protected.add(image_id)
@@ -225,7 +236,7 @@ def protection(installation, candidate, images):
     # A release's OCI index digest and a local platform digest need not be
     # identical. Resolve every retained ref through Docker without pulling.
     for ref in sorted(refs):
-        resolved = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref], 256, missing_ok=True)
+        resolved = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref], 256, missing_ok=True, operation="release_image")
         if resolved is None and ref == candidate:
             raise MaintenanceError("candidate_image_not_available")
         value = resolved.splitlines() if resolved is not None else []
@@ -269,7 +280,7 @@ def public_digest_exists(ref):
 
 
 def report_storage(installation):
-    docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"], 4096).strip()
+    docker_root = run(["docker", "info", "--format", "{{.DockerRootDir}}"], 4096, operation="docker_root").strip()
     if not re.fullmatch(r"(/[A-Za-z0-9_.-]+)+", docker_root):
         raise MaintenanceError("invalid_docker_root")
     for scope, path in (("installation", installation), ("docker", docker_root)):
@@ -277,7 +288,7 @@ def report_storage(installation):
         emit("filesystem", scope=scope, total_bytes=space.f_blocks * space.f_frsize,
              free_bytes=space.f_bfree * space.f_frsize, available_bytes=space.f_bavail * space.f_frsize,
              total_inodes=space.f_files, free_inodes=space.f_ffree, available_inodes=space.f_favail)
-    records = run(["docker", "system", "df", "--format", "{{json .}}"], 65536).splitlines()
+    records = run(["docker", "system", "df", "--format", "{{json .}}"], 65536, operation="docker_usage").splitlines()
     for raw in records:
         record = json.loads(raw)
         kind = record.get("Type")
@@ -346,7 +357,7 @@ def main(argv=None):
                 if classify_image(image, ids, refs, datetime.datetime.now(datetime.timezone.utc)) != "eligible" or not all(public_digest_exists(ref) for ref in image["RepoDigests"]):
                     raise MaintenanceError("image_protection_changed")
                 try:
-                    run(["docker", "image", "rm", "--no-prune", image_id], 65536)
+                    run(["docker", "image", "rm", "--no-prune", image_id], 65536, operation="image_remove")
                 except MaintenanceError:
                     emit("image_retained", image_id=image_id, reason="docker_refused_no_force_removal")
                     continue
@@ -362,7 +373,7 @@ if __name__ == "__main__":
     try:
         main()
     except MaintenanceError as error:
-        emit("maintenance_failed", code=str(error))
+        emit("maintenance_failed", code=str(error), operation=error.operation)
         sys.exit(1)
     except Exception:
         emit("maintenance_failed", code="inspection_failed")

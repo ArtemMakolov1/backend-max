@@ -5,6 +5,7 @@ import datetime
 import importlib.util
 import io
 import json
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -85,6 +86,23 @@ class SelectionTests(unittest.TestCase):
             own["Id"] = value
             self.assertEqual(self.classify(own), "invalid_image_id")
 
+    def test_image_inspection_without_labels_remains_safe_and_ineligible(self):
+        unlabeled = image()
+        unlabeled["Config"] = {"Labels": {"org.opencontainers.image.source": None}}
+        with patch.object(maintenance, "run", return_value=json.dumps(unlabeled)) as command:
+            inspected = maintenance.inspect_image(OLD_ID)
+        self.assertEqual(self.classify(inspected), "foreign_source")
+        template = command.call_args.args[0][4]
+        self.assertIn("{{if .Config}}{{if .Config.Labels}}", template)
+        self.assertEqual(command.call_args.kwargs["operation"], "image_inspect")
+
+    def test_failed_command_exposes_only_fixed_operation_and_code(self):
+        with self.assertRaises(maintenance.MaintenanceError) as caught:
+            maintenance.run([sys.executable, "-c", "import sys; sys.stderr.write('PRIVATE_FIXTURE_ERROR'); sys.exit(1)"], operation="image_inventory")
+        self.assertEqual(str(caught.exception), "command_failed")
+        self.assertEqual(caught.exception.operation, "image_inventory")
+        self.assertNotIn("PRIVATE_FIXTURE_ERROR", str(caught.exception))
+
 
 class ProtectionTests(unittest.TestCase):
     def setUp(self):
@@ -134,7 +152,7 @@ class ProtectionTests(unittest.TestCase):
     def test_stopped_container_ids_are_protected(self):
         container = "f" * 64
         calls = []
-        def fake_run(argv, limit=maintenance.MAX_OUTPUT, missing_ok=False):
+        def fake_run(argv, limit=maintenance.MAX_OUTPUT, missing_ok=False, operation="docker_command"):
             calls.append(argv)
             return container + "\n" if argv[1:3] == ["container", "ls"] else OTHER_ID + "\n"
         with patch.object(maintenance, "run", fake_run):
@@ -158,7 +176,7 @@ class ProtectionTests(unittest.TestCase):
     def call_main(self, approved=OLD_ID, protection_results=None, remote=True):
         output = io.StringIO()
         commands = []
-        def fake_run(argv, limit=maintenance.MAX_OUTPUT, missing_ok=False):
+        def fake_run(argv, limit=maintenance.MAX_OUTPUT, missing_ok=False, operation="docker_command"):
             commands.append(argv)
             return "Deleted\n"
         protections = protection_results or [(set(), set()), (set(), set())]
