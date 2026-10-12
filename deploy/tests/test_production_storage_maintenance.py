@@ -6,6 +6,7 @@ import http.server
 import importlib.util
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,14 @@ class SelectionTests(unittest.TestCase):
         own["RepoTags"] = []
         own["RepoDigests"] = [MONITOR_REF]
         self.assertEqual(self.classify(own), "eligible")
+
+    def test_own_digest_and_tagged_digest_aliases_in_repotags_are_recognized(self):
+        for reference in (OWN_REF, "ghcr.io/artemmakolov1/backend-max:old@" + OWN_REF.split("@")[1]):
+            own = image()
+            own["RepoTags"] = [reference]
+            self.assertEqual(self.classify(own), "eligible")
+            self.assertEqual(self.classify(own, refs=[OWN_REF]), "release_or_candidate_referenced")
+        self.assertEqual(maintenance.canonical_digest("ghcr.io/artemmakolov1/backend-max:old@" + OWN_REF.split("@")[1]), OWN_REF)
 
     def test_all_container_refs_and_current_rollback_candidate_refs_preserved(self):
         self.assertEqual(self.classify(ids=[OLD_ID]), "container_or_release_referenced")
@@ -205,6 +214,43 @@ class ProtectionTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_PASSWORD", output.getvalue())
         self.assertNotIn("DO_NOT_READ", output.getvalue())
 
+    def historical_releases(self):
+        rollback_one = self.release("2" * 40, OWN_REF, MONITOR_REF)
+        rollback_two_ref = "ghcr.io/artemmakolov1/backend-max@sha256:" + "e" * 64
+        historical_ref = "ghcr.io/artemmakolov1/backend-max@sha256:" + "f" * 64
+        pending_ref = "ghcr.io/artemmakolov1/backend-max@sha256:" + "a" * 64
+        rollback_two = self.release("3" * 40, rollback_two_ref, MONITOR_REF)
+        historical = self.release("4" * 40, historical_ref, MONITOR_REF)
+        pending = self.release("5" * 40, pending_ref, MONITOR_REF)
+        (pending / ".release").unlink()
+        (pending / ".release.next").write_text("BACKEND_IMAGE=" + pending_ref + "\n", encoding="utf-8")
+        for release, timestamp in ((self.current, 4000000), (rollback_one, 3000000), (rollback_two, 2000000), (historical, 1000000)):
+            os.utime(release / ".release", ns=(timestamp, timestamp))
+        return rollback_one, rollback_two, historical, pending, rollback_two_ref, historical_ref, pending_ref
+
+    def test_historical_cache_eligible_only_opt_in_current_two_prior_pending_preserved(self):
+        _, _, _, _, prior_ref, historical_ref, pending_ref = self.historical_releases()
+        all_refs = maintenance.release_refs(self.installation)
+        recovery_refs = maintenance.release_refs(self.installation, release_protection="current_and_two_rollbacks")
+        for reference in (CANDIDATE, OWN_REF, prior_ref, pending_ref, MONITOR_REF):
+            self.assertIn(reference, recovery_refs)
+        historical_image = image()
+        historical_image["RepoDigests"] = [historical_ref]
+        self.assertEqual(maintenance.classify_image(historical_image, set(), all_refs, NOW), "release_or_candidate_referenced")
+        self.assertEqual(maintenance.classify_image(historical_image, set(), recovery_refs, NOW), "eligible")
+        self.assertEqual(maintenance.classify_image(historical_image, {OLD_ID}, recovery_refs, NOW), "container_or_release_referenced")
+
+    def test_ambiguous_completed_timestamps_and_missing_current_fail_closed(self):
+        previous, earlier, _, _, _, _, _ = self.historical_releases()
+        for timestamp in (4000000, 5000000, 2000000):
+            os.utime(previous / ".release", ns=(timestamp, timestamp))
+            with self.assertRaisesRegex(maintenance.MaintenanceError, "ambiguous_completed_release_order"):
+                maintenance.release_refs(self.installation, release_protection="current_and_two_rollbacks")
+        (self.current / ".release").unlink()
+        (self.current / ".release.next").write_text("BACKEND_IMAGE=" + CANDIDATE + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(maintenance.MaintenanceError, "missing_completed_current_release"):
+            maintenance.release_refs(self.installation, release_protection="current_and_two_rollbacks")
+
     def test_own_image_metadata_filters_foreign_tags_and_all_private_fields(self):
         own = image()
         own["RepoTags"].append("private.registry.example/private_team:PRIVATE_TAG")
@@ -220,6 +266,22 @@ class ProtectionTests(unittest.TestCase):
         self.assertEqual(value["source"], maintenance.SOURCE)
         for forbidden in ("private.registry", "PRIVATE_TAG", "PRIVATE_LABEL", "PRIVATE_PASSWORD"):
             self.assertNotIn(forbidden, output.getvalue())
+
+    def test_frontend_inventory_is_public_only_and_never_cleanup_eligible(self):
+        frontend_ref = "ghcr.io/artemmakolov1/frontend-max@sha256:" + "b" * 64
+        frontend = image()
+        frontend["RepoTags"] = [frontend_ref]
+        frontend["RepoDigests"] = [frontend_ref]
+        frontend["Config"]["Labels"]["org.opencontainers.image.source"] = "https://github.com/ArtemMakolov1/frontend-max"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            maintenance.report_own_image(frontend, {OLD_ID}, set(), "container_or_release_referenced")
+        record = json.loads(output.getvalue())
+        self.assertEqual(record["repository_scope"], "frontend")
+        self.assertFalse(record["cleanup_supported"])
+        self.assertEqual(record["tag_shape_counts"], {"own_digest": 1})
+        self.assertTrue(record["protected"])
+        self.assertNotEqual(maintenance.classify_image(frontend, set(), set(), NOW), "eligible")
 
     def test_external_current_and_symlink_metadata_fail_closed(self):
         (self.current / ".release").unlink()

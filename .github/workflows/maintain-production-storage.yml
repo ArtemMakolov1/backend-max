@@ -19,6 +19,11 @@ on:
         type: string
         default: ''
         required: false
+      allow_historical_release_cache:
+        description: Opt in to historical cache review while preserving current, two prior completed releases and all pending
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: read
@@ -43,6 +48,7 @@ jobs:
       MODE: ${{ inputs.mode }}
       CANDIDATE_BACKEND_IMAGE: ${{ inputs.candidate_backend_image }}
       APPROVED_IMAGE_IDS: ${{ inputs.approved_image_ids }}
+      RELEASE_PROTECTION: ${{ inputs.allow_historical_release_cache && 'current_and_two_rollbacks' || 'all_retained' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -58,6 +64,7 @@ jobs:
           [[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid production target" >&2; exit 1; }
           [[ "$VPS_DEPLOY_DIR" =~ ^(/[A-Za-z0-9_-]+)+$ ]] || { echo "Invalid deployment directory" >&2; exit 1; }
           [[ "$MODE" == inspect || "$MODE" == cleanup_unused_images ]] || { echo "Invalid maintenance mode" >&2; exit 1; }
+          [[ "$RELEASE_PROTECTION" == all_retained || "$RELEASE_PROTECTION" == current_and_two_rollbacks ]] || { echo "Invalid release protection" >&2; exit 1; }
           [[ -z "$CANDIDATE_BACKEND_IMAGE" || "$CANDIDATE_BACKEND_IMAGE" =~ ^ghcr\.io/artemmakolov1/backend-max@sha256:[0-9a-f]{64}$ ]] || { echo "Invalid candidate image" >&2; exit 1; }
           [[ -z "$APPROVED_IMAGE_IDS" || "$APPROVED_IMAGE_IDS" =~ ^sha256:[0-9a-f]{64}(,sha256:[0-9a-f]{64})*$ ]] || { echo "Invalid approved image IDs" >&2; exit 1; }
           if [[ "$MODE" == cleanup_unused_images ]]; then
@@ -98,7 +105,7 @@ jobs:
           # Inputs contain only the validated fixed path, choices and public
           # digests/IDs. The reviewed script runs from stdin without artifacts.
           # shellcheck disable=SC2029
-          if ! ssh "${ssh_options[@]}" "$target" "python3 - '$VPS_DEPLOY_DIR' '$MODE' '$CANDIDATE_BACKEND_IMAGE' '$APPROVED_IMAGE_IDS'" \
+          if ! ssh "${ssh_options[@]}" "$target" "python3 - '$VPS_DEPLOY_DIR' '$MODE' '$CANDIDATE_BACKEND_IMAGE' '$APPROVED_IMAGE_IDS' '$RELEASE_PROTECTION'" \
               <deploy/maintain-production-storage.py 2>/dev/null; then
             echo "Production storage maintenance did not complete" >&2
             exit 1

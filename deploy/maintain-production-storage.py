@@ -27,6 +27,11 @@ TAGGED_DIGEST_REF = re.compile(REPOSITORY + r":[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}
 BACKEND_REF = re.compile(r"ghcr\.io/artemmakolov1/backend-max@sha256:[0-9a-f]{64}\Z")
 COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 SOURCE = "https://github.com/artemmakolov1/backend-max"
+FRONTEND_SOURCE = "https://github.com/artemmakolov1/frontend-max"
+FRONTEND_REPOSITORY = r"ghcr\.io/artemmakolov1/(?:frontend-max|maxposty-[a-z0-9][a-z0-9._-]*)"
+FRONTEND_DIGEST_REF = re.compile(FRONTEND_REPOSITORY + r"@sha256:[0-9a-f]{64}\Z")
+FRONTEND_TAG_REF = re.compile(FRONTEND_REPOSITORY + r":[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
+FRONTEND_TAGGED_DIGEST_REF = re.compile(FRONTEND_REPOSITORY + r":[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}@sha256:[0-9a-f]{64}\Z")
 MAX_IMAGES = 512
 MAX_CONTAINERS = 512
 MAX_RELEASES = 256
@@ -36,6 +41,7 @@ OPERATIONS = frozenset(("docker_command", "image_inspect", "image_inventory", "c
                         "container_image", "release_image", "docker_root", "docker_usage", "image_remove"))
 FAILURE_REASONS = frozenset(("template_error", "field_missing", "no_such_image", "daemon_permission", "no_space", "other"))
 PUBLIC_TEMPLATE_FIELDS = frozenset(("Id", "ID", "Created", "Config", "Labels", "Size", "RepoTags", "RepoDigests", "Image"))
+RELEASE_PROTECTIONS = ("all_retained", "current_and_two_rollbacks")
 
 
 class MaintenanceError(Exception):
@@ -65,6 +71,36 @@ def classify_stderr(raw):
                 return "field_missing", field
         return "template_error", None
     return "other", None
+
+
+def own_ref_expansion(reference, frontend=False):
+    """Recognize only fixed own repos, including digest refs in RepoTags."""
+    if not isinstance(reference, str):
+        return set()
+    digest, tag, tagged_digest = ((FRONTEND_DIGEST_REF, FRONTEND_TAG_REF, FRONTEND_TAGGED_DIGEST_REF)
+                                  if frontend else (DIGEST_REF, TAG_REF, TAGGED_DIGEST_REF))
+    if digest.fullmatch(reference) or tag.fullmatch(reference):
+        return {reference}
+    if tagged_digest.fullmatch(reference):
+        tagged_repository, sha = reference.split("@")
+        return {reference, tagged_repository, tagged_repository.rsplit(":", 1)[0] + "@" + sha}
+    return set()
+
+
+def normalized_image_refs(image):
+    result = set()
+    for reference in (image.get("RepoTags") or []) + (image.get("RepoDigests") or []):
+        result.update(own_ref_expansion(reference))
+    return result
+
+
+def canonical_digest(reference):
+    if isinstance(reference, str) and DIGEST_REF.fullmatch(reference):
+        return reference
+    if isinstance(reference, str) and TAGGED_DIGEST_REF.fullmatch(reference):
+        tagged_repository, sha = reference.split("@")
+        return tagged_repository.rsplit(":", 1)[0] + "@" + sha
+    return None
 
 
 def emit(event, **fields):
@@ -173,7 +209,29 @@ def read_regular(path, limit):
         os.close(descriptor)
 
 
-def release_refs(installation, report_metadata=False):
+def selected_release_shas(records, policy):
+    """Opt-in cache retention uses only completed activation metadata."""
+    if policy == "all_retained":
+        return {record["source_sha"] for record in records}
+    if policy != "current_and_two_rollbacks":
+        raise MaintenanceError("invalid_release_protection")
+    current = [record for record in records if record["current"]]
+    if len(current) != 1 or not current[0]["completed_backend_image"]:
+        raise MaintenanceError("missing_completed_current_release")
+    completed = [record for record in records if record["completed_backend_image"]]
+    times = [record["completed_mtime_ns"] for record in completed]
+    if any(type(value) is not int or value <= 0 for value in times) or len(times) != len(set(times)):
+        raise MaintenanceError("ambiguous_completed_release_order")
+    current_time = current[0]["completed_mtime_ns"]
+    previous = [record for record in completed if not record["current"]]
+    if any(record["completed_mtime_ns"] >= current_time for record in previous):
+        raise MaintenanceError("ambiguous_completed_release_order")
+    previous.sort(key=lambda record: record["completed_mtime_ns"], reverse=True)
+    return ({current[0]["source_sha"]} | {record["source_sha"] for record in previous[:2]} |
+            {record["source_sha"] for record in records if record["pending_backend_image"]})
+
+
+def release_refs(installation, report_metadata=False, release_protection="all_retained"):
     """Preserve every retained bundle, a conservative superset of rollback."""
     installation = installation.resolve(strict=True)
     releases = installation / "releases"
@@ -188,7 +246,7 @@ def release_refs(installation, report_metadata=False):
     entries = list(itertools.islice(releases.iterdir(), MAX_RELEASES + 1))
     if len(entries) > MAX_RELEASES:
         raise MaintenanceError("release_inventory_limit")
-    protected = set()
+    records = []
     for release in sorted(entries):
         if not COMMIT.fullmatch(release.name):
             continue
@@ -206,7 +264,6 @@ def release_refs(installation, report_metadata=False):
             backend = [line.removeprefix("BACKEND_IMAGE=") for line in lines if line.startswith("BACKEND_IMAGE=")]
             if len(backend) != 1 or not BACKEND_REF.fullmatch(backend[0]):
                 raise MaintenanceError("invalid_release_image")
-            protected.add(backend[0])
             release_images.add(backend[0])
             kind = "completed" if name == ".release" else "pending"
             metadata[kind + "_backend_image"] = backend[0]
@@ -223,18 +280,23 @@ def release_refs(installation, report_metadata=False):
                 if match:
                     reference = match[1]
                     if DIGEST_REF.fullmatch(reference) or TAG_REF.fullmatch(reference):
-                        protected.add(reference)
                         release_images.add(reference)
                     elif TAGGED_DIGEST_REF.fullmatch(reference):
                         tagged_repository, digest = reference.split("@")
                         repository = tagged_repository.rsplit(":", 1)[0]
-                        protected.update((reference, tagged_repository, repository + "@" + digest))
                         release_images.update((reference, tagged_repository, repository + "@" + digest))
         if len(release_images) > 64:
             raise MaintenanceError("release_image_metadata_limit")
+        records.append({"source_sha": release.name, "current": release == accepted,
+                        "own_image_refs": sorted(release_images), **metadata})
+    selected = selected_release_shas(records, release_protection)
+    protected = set()
+    for record in records:
+        keep = record["source_sha"] in selected
+        if keep:
+            protected.update(record["own_image_refs"])
         if report_metadata:
-            emit("release_metadata", source_sha=release.name, current=release == accepted,
-                 own_image_refs=sorted(release_images), **metadata)
+            emit("release_metadata", protection_policy=release_protection, protected=keep, **record)
     return protected
 
 
@@ -248,11 +310,11 @@ def classify_image(image, protected_ids, protected_refs, now):
     digests = image.get("RepoDigests") or []
     if not isinstance(tags, list) or not isinstance(digests, list):
         return "invalid_references"
-    if any(not isinstance(ref, str) or not TAG_REF.fullmatch(ref) for ref in tags):
+    if any(not own_ref_expansion(ref) for ref in tags):
         return "foreign_tag"
-    if not digests or any(not isinstance(ref, str) or not DIGEST_REF.fullmatch(ref) for ref in digests):
+    if not digests or any(canonical_digest(ref) is None for ref in digests):
         return "missing_or_foreign_digest"
-    if protected_refs.intersection(tags + digests):
+    if protected_refs.intersection(normalized_image_refs(image)):
         return "release_or_candidate_referenced"
     config = image.get("Config") or {}
     labels = (config.get("Labels") or {}) if isinstance(config, dict) else {}
@@ -270,8 +332,8 @@ def classify_image(image, protected_ids, protected_refs, now):
     return "eligible"
 
 
-def protection(installation, candidate, images, report_metadata=False):
-    refs = release_refs(installation, report_metadata=report_metadata)
+def protection(installation, candidate, images, report_metadata=False, release_protection="all_retained"):
+    refs = release_refs(installation, report_metadata=report_metadata, release_protection=release_protection)
     if candidate:
         refs.add(candidate)
     ids = container_image_ids()
@@ -286,7 +348,7 @@ def protection(installation, candidate, images, report_metadata=False):
             raise MaintenanceError("invalid_protected_image")
         ids.update(value)
     for image in images:
-        if refs.intersection((image.get("RepoTags") or []) + (image.get("RepoDigests") or [])):
+        if refs.intersection(normalized_image_refs(image)):
             ids.add(image["Id"])
     return ids, refs
 
@@ -294,12 +356,12 @@ def protection(installation, candidate, images, report_metadata=False):
 def report_own_image(image, protected_ids, protected_refs, classification):
     """Public own refs only; never emit foreign tags, labels or raw fields."""
     source = ((image.get("Config") or {}).get("Labels") or {}).get("org.opencontainers.image.source")
-    if not isinstance(source, str) or source.lower() != SOURCE:
+    if not isinstance(source, str) or source.lower() not in (SOURCE, FRONTEND_SOURCE):
         return
+    frontend = source.lower() == FRONTEND_SOURCE
     tags = image.get("RepoTags") or []
     digests = image.get("RepoDigests") or []
-    refs = sorted(set(ref for ref in tags + digests if isinstance(ref, str) and
-                      (TAG_REF.fullmatch(ref) or DIGEST_REF.fullmatch(ref))))
+    refs = sorted(set().union(*(own_ref_expansion(ref, frontend=frontend) for ref in tags + digests)))
     if not refs:
         return
     if len(refs) > 64:
@@ -311,11 +373,25 @@ def report_own_image(image, protected_ids, protected_refs, classification):
     except (AttributeError, TypeError, ValueError):
         created = None
     size = image.get("Size")
+    shapes = {}
+    for ref in tags:
+        if not isinstance(ref, str):
+            kind = "foreign_or_invalid"
+        elif own_ref_expansion(ref, frontend=frontend):
+            kind = "own_tagged_digest" if "@" in ref and ":" in ref.split("@")[0] else "own_digest" if "@" in ref else "own_tag"
+        elif ref == "<none>:<none>":
+            kind = "docker_placeholder"
+        else:
+            kind = "foreign_or_invalid"
+        shapes[kind] = shapes.get(kind, 0) + 1
     emit("own_image_metadata", image_id=image["Id"], own_image_refs=refs,
          size_bytes=size if type(size) is int and size >= 0 else None, created=created,
-         source=SOURCE, protected=image["Id"] in protected_ids or bool(protected_refs.intersection(refs)),
-         classification=classification, foreign_tag_count=sum(not TAG_REF.fullmatch(ref) for ref in tags),
-         foreign_digest_count=sum(not DIGEST_REF.fullmatch(ref) for ref in digests))
+         source=FRONTEND_SOURCE if frontend else SOURCE, repository_scope="frontend" if frontend else "backend",
+         cleanup_supported=not frontend, protected=image["Id"] in protected_ids or bool(protected_refs.intersection(refs)),
+         classification=classification, tag_shape_counts=shapes,
+         foreign_tag_count=sum(not own_ref_expansion(ref, frontend=frontend) for ref in tags),
+         foreign_digest_count=sum(not (FRONTEND_DIGEST_REF.fullmatch(ref) or FRONTEND_TAGGED_DIGEST_REF.fullmatch(ref))
+                                  if frontend else canonical_digest(ref) is None for ref in digests))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -325,7 +401,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def public_digest_exists(ref):
     """Anonymous HTTPS proves the exact retained registry digest is public."""
-    if not DIGEST_REF.fullmatch(ref):
+    ref = canonical_digest(ref)
+    if ref is None:
         return False
     repository, digest = ref.removeprefix("ghcr.io/").split("@")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -378,6 +455,7 @@ def main(argv=None):
     parser.add_argument("mode", choices=("inspect", "cleanup_unused_images"), nargs="?", default="inspect")
     parser.add_argument("candidate_backend_image", nargs="?", default="")
     parser.add_argument("approved_image_ids", nargs="?", default="")
+    parser.add_argument("release_protection", choices=RELEASE_PROTECTIONS, nargs="?", default="all_retained")
     args = parser.parse_args(argv)
     if not re.fullmatch(r"(/[A-Za-z0-9_-]+)+", args.installation):
         raise MaintenanceError("invalid_installation")
@@ -399,7 +477,8 @@ def main(argv=None):
         fcntl.flock(descriptor, (fcntl.LOCK_EX if cleanup else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         report_storage(installation)
         images = [inspect_image(value) for value in image_ids()]
-        protected_ids, protected_refs = protection(installation, args.candidate_backend_image, images, report_metadata=not cleanup)
+        protected_ids, protected_refs = protection(installation, args.candidate_backend_image, images,
+                                                  report_metadata=not cleanup, release_protection=args.release_protection)
         now = datetime.datetime.now(datetime.timezone.utc)
         eligible = {}
         counts = {}
@@ -411,7 +490,7 @@ def main(argv=None):
             if reason == "eligible":
                 if all(public_digest_exists(ref) for ref in image["RepoDigests"]):
                     eligible[image["Id"]] = image
-                    emit("unused_image", image_id=image["Id"], public_refs=sorted((image.get("RepoTags") or []) + image["RepoDigests"]), size_bytes=image.get("Size", 0))
+                    emit("unused_image", image_id=image["Id"], public_refs=sorted(normalized_image_refs(image)), size_bytes=image.get("Size", 0))
                 else:
                     counts["public_digest_unverified"] = counts.get("public_digest_unverified", 0) + 1
         emit("inventory", images=len(images), protected_image_ids=len(protected_ids), eligible=len(eligible), classifications=counts)
@@ -424,7 +503,7 @@ def main(argv=None):
                 # before removal. Docker's no-force removal is the final race
                 # protection if a container is created after this snapshot.
                 image = inspect_image(image_id)
-                ids, refs = protection(installation, args.candidate_backend_image, [image])
+                ids, refs = protection(installation, args.candidate_backend_image, [image], release_protection=args.release_protection)
                 if classify_image(image, ids, refs, datetime.datetime.now(datetime.timezone.utc)) != "eligible" or not all(public_digest_exists(ref) for ref in image["RepoDigests"]):
                     raise MaintenanceError("image_protection_changed")
                 try:
