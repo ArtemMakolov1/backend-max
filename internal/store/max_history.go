@@ -561,6 +561,20 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,'',$15,$15)`,
 			return 0, fmt.Errorf("create MAX history attachment: %w", err)
 		}
 	}
+	if item.RoundTrip {
+		imported, err := scanPost(tx.QueryRowContext(ctx, `SELECT `+postColumns+` FROM posts WHERE workspace_id=$1 AND id=$2`, workspaceID, postID))
+		if err != nil {
+			return 0, fmt.Errorf("read imported publication snapshot: %w", err)
+		}
+		imported.Attachments, err = queryPostAttachments(ctx, tx, "WHERE post_id=? ORDER BY position,id", postID)
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE posts SET max_published_fingerprint=$1 WHERE workspace_id=$2 AND id=$3`,
+			publicationFingerprint(imported), workspaceID, postID); err != nil {
+			return 0, fmt.Errorf("record imported publication fingerprint: %w", err)
+		}
+	}
 	if _, err := createPostRevisionTx(ctx, tx, actorUserID, workspaceID, postID, now); err != nil {
 		return 0, err
 	}

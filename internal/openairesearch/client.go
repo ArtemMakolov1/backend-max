@@ -37,26 +37,33 @@ const (
 var opaqueCitationPattern = regexp.MustCompile(`cite[^]*`)
 var sourceDNSLabelPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 var sourceTLDSyntaxPattern = regexp.MustCompile(`^[a-z]{2,63}$`)
+var safeRequestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]*$`)
+var errDraftContentTooLong = errors.New("structured post draft content exceeds 4000 characters")
 
 type Client struct {
 	baseURL       string
 	apiKey        string
 	model         string
+	provider      string
+	responsePath  string
 	httpClient    *http.Client
 	contentSearch ContentSearcher
+	audioAnalysis *Client
 }
 
 type Request struct {
-	Topic          string   `json:"topic"`
-	Angle          string   `json:"angle,omitempty"`
-	Audience       string   `json:"audience,omitempty"`
-	Tone           string   `json:"tone"`
-	CTA            string   `json:"cta,omitempty"`
-	ForbiddenWords []string `json:"forbidden_words,omitempty"`
-	ExamplePosts   []string `json:"example_posts,omitempty"`
-	VisualStyle    string   `json:"visual_style,omitempty"`
-	Format         string   `json:"format"`
-	IncludeSources bool     `json:"include_sources"`
+	ChannelPosts         []ChannelPostStyle `json:"-"`
+	ExamplePostsOverride bool               `json:"-"`
+	Topic                string             `json:"topic"`
+	Angle                string             `json:"angle,omitempty"`
+	Audience             string             `json:"audience,omitempty"`
+	Tone                 string             `json:"tone"`
+	CTA                  string             `json:"cta,omitempty"`
+	ForbiddenWords       []string           `json:"forbidden_words,omitempty"`
+	ExamplePosts         []string           `json:"example_posts,omitempty"`
+	VisualStyle          string             `json:"visual_style,omitempty"`
+	Format               string             `json:"format"`
+	IncludeSources       bool               `json:"include_sources"`
 }
 
 type Source struct {
@@ -79,6 +86,7 @@ type Result struct {
 }
 
 type Error struct {
+	Provider          string
 	StatusCode        int
 	Code              string
 	Message           string
@@ -88,29 +96,55 @@ type Error struct {
 
 func (e *Error) Error() string {
 	if e.Code != "" {
-		return fmt.Sprintf("OpenAI Responses API error (%s): %s", e.Code, e.Message)
+		return fmt.Sprintf("%s Responses API error (%s): %s", providerName(e.Provider), e.Code, e.Message)
 	}
-	return fmt.Sprintf("OpenAI Responses API error (status %d): %s", e.StatusCode, e.Message)
+	return fmt.Sprintf("%s Responses API error (status %d): %s", providerName(e.Provider), e.StatusCode, e.Message)
 }
 
 func New(baseURL, apiKey, model string, httpClient *http.Client) (*Client, error) {
+	return newClient("openai", "/v1/responses", baseURL, apiKey, model, httpClient)
+}
+
+// NewDeepSeek uses the official Responses-compatible endpoint. MAX format
+// validation and the application's public request/result types are shared.
+func NewDeepSeek(baseURL, apiKey, model string, httpClient *http.Client) (*Client, error) {
+	return newClient("deepseek", "/responses", baseURL, apiKey, model, httpClient)
+}
+
+func newClient(provider, responsePath, baseURL, apiKey, model string, httpClient *http.Client) (*Client, error) {
+	name := providerName(provider)
 	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(baseURL), "/"))
 	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
-		return nil, errors.New("OpenAI API base URL must be absolute")
+		return nil, fmt.Errorf("%s API base URL must be absolute", name)
 	}
 	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return nil, errors.New("OpenAI API base URL must use http or https")
+		return nil, fmt.Errorf("%s API base URL must use http or https", name)
 	}
 	if strings.TrimSpace(apiKey) == "" || strings.TrimSpace(model) == "" || httpClient == nil {
-		return nil, errors.New("OpenAI API key, research model and HTTP client are required")
+		return nil, fmt.Errorf("%s API key, research model and HTTP client are required", name)
 	}
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		apiKey:  strings.TrimSpace(apiKey), model: strings.TrimSpace(model), httpClient: httpClient,
+		provider: provider, responsePath: responsePath,
 	}, nil
 }
 
+func providerName(provider string) string {
+	if provider == "deepseek" {
+		return "DeepSeek"
+	}
+	return "OpenAI"
+}
+
+func (c *Client) TextAIProvider() string {
+	return c.provider
+}
+
 func ValidateRequest(request Request) error {
+	if err := validateChannelStyle(request.ChannelPosts); err != nil {
+		return err
+	}
 	request.Topic = strings.TrimSpace(request.Topic)
 	request.Angle = strings.TrimSpace(request.Angle)
 	request.Audience = strings.TrimSpace(request.Audience)
@@ -163,32 +197,97 @@ func (c *Client) Generate(ctx context.Context, request Request) (Result, error) 
 		return Result{}, err
 	}
 
-	researchResponse, err := c.call(ctx, researchPayload(c.model, request))
-	if err != nil {
-		return Result{}, err
-	}
-	report, sources, err := extractResearch(researchResponse)
+	report, sources, err := c.research(ctx, request)
 	if err != nil {
 		return Result{}, err
 	}
 
-	draftResponse, err := c.call(ctx, draftPayload(c.model, request, report, sources))
+	draft, err := c.generatePostDraft(ctx, request, report, sources)
 	if err != nil {
 		return Result{}, err
-	}
-	draftText, err := extractOutputText(draftResponse)
-	if err != nil {
-		return Result{}, err
-	}
-	draft, err := decodeDraft(draftText, request.Format)
-	if err != nil {
-		return Result{}, responseError(draftResponse, "invalid_structured_output", err.Error())
-	}
-	if err := validateDraftForbiddenWords(draft, request.ForbiddenWords); err != nil {
-		return Result{}, responseError(draftResponse, "invalid_structured_output", err.Error())
 	}
 
 	return Result{Topic: request.Topic, Report: report, Sources: sources, Draft: draft}, nil
+}
+
+func (c *Client) generatePostDraft(ctx context.Context, request Request, report string, sources []Source) (Draft, error) {
+	draftSources := sources
+	styleTarget := styleLengthTarget(request.ChannelPosts, request.ExamplePosts, request.ExamplePostsOverride, 2400)
+	hasStyleLength := styleLengthTarget(request.ChannelPosts, request.ExamplePosts, request.ExamplePostsOverride, 0) > 0
+	modelReport := report
+	var modelSources any = sources
+	sourceLimit := 0
+	if c.provider == "deepseek" {
+		if request.IncludeSources {
+			sourceLimit = min(len(sources), draftSourceCount(styleTarget))
+			if sourceLimit == 0 {
+				return Draft{}, &Error{Provider: c.provider, Code: "invalid_structured_output", Message: "Post draft attribution requires a verified research source"}
+			}
+		}
+		draftSources = longestAttributionSources(sources, sourceLimit)
+		// Citation targets are server-owned. The drafting model gets verified
+		// prose and source IDs, then the server appends exact selected URLs.
+		modelReport = reportWithSourceIDs(report, sources)
+		modelSources = draftSourceEvidence(sources)
+	}
+	payload := draftPayload(c.model, request, modelReport, modelSources)
+	if c.provider == "deepseek" {
+		instruction := payload.Input[0].Content.(string)
+		instruction = strings.Replace(instruction, "Цель — около 3600 символов;", "Следуй характерной длине и манере канала по образцам;", 1)
+		instruction = strings.Replace(instruction, "Если include_sources=true, добавь в content компактный блок источников с кликабельными ссылками; если false, не добавляй блок источников.", "Если include_sources=true, верни в source_ids идентификаторы только тех источников, факты из которых использованы в content; если false, верни source_ids:[].", 1)
+		citationInstruction := " Не создавай ссылки на источники и не переноси их идентификаторы в готовый текст content."
+		if request.IncludeSources {
+			citationInstruction += fmt.Sprintf(" Выбирай не более %d проверенных источников и только факты, подтвержденные выбранными source_ids. Сервер сам добавит выбранные проверенные ссылки после твоего основного текста, если это требуется пользователю.", sourceLimit)
+		} else {
+			citationInstruction += " Пользователь отключил ссылки: source_ids должен быть пустым массивом, но содержание по-прежнему должно опираться только на факты проверенного отчета. Сервер сам добавит ссылки только при их включении пользователем."
+		}
+		payload.Input[0].Content = instruction + citationInstruction +
+			styleLengthInstruction(styleTarget, draftSourceReserve(draftSources, request.IncludeSources), false)
+		addGroundedDraftSchema(payload.Text.Format.Schema, sources, sourceLimit)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		response, err := c.call(ctx, payload)
+		if err != nil {
+			return Draft{}, err
+		}
+		text, err := extractOutputText(response)
+		if err != nil {
+			return Draft{}, err
+		}
+		var draft Draft
+		var selectedSources []Source
+		if c.provider == "deepseek" {
+			draft, selectedSources, err = decodeGroundedDraft(text, request.Format, sources, sourceLimit)
+		} else {
+			draft, err = decodeDraft(text, request.Format)
+		}
+		if err == nil && c.provider == "deepseek" && hasStyleLength && utf8.RuneCountInString(draft.Content) > styleTarget*3/2 {
+			// Check authored prose before server attribution. Channel examples
+			// establish a useful upper length bound, but never force extra facts.
+			err = errDraftStyleTooLong
+		}
+		if err == nil && c.provider == "deepseek" && request.IncludeSources {
+			draft, err = appendResearchSources(draft, selectedSources)
+		}
+		if err != nil {
+			if c.provider == "deepseek" && attempt == 0 && (errors.Is(err, errDraftContentTooLong) || errors.Is(err, errDraftStyleTooLong)) {
+				// Retry the drafting step once from the verified report, never
+				// truncating markup or feeding invalid generated text back in.
+				payload.Input[0].Content = payload.Input[0].Content.(string) + " Предыдущая попытка превысила предел длины. Создай новый черновик по тому же проверенному отчету, сохрани стиль и все бренд-правила." +
+					styleLengthInstruction(styleTarget, draftSourceReserve(draftSources, request.IncludeSources), true)
+				if hasStyleLength {
+					payload.Input[0].Content = payload.Input[0].Content.(string) + fmt.Sprintf(" Сервер отклонит основной текст длиннее %d символов Unicode: это слишком длинно для образцов этого канала. Выбери меньше подтвержденных деталей и уложись в указанную длину, не выдумывая факты.", styleTarget*3/2)
+				}
+				continue
+			}
+			return Draft{}, responseError(response, "invalid_structured_output", err.Error())
+		}
+		if err := validateDraftForbiddenWords(draft, request.ForbiddenWords); err != nil {
+			return Draft{}, responseError(response, "invalid_structured_output", err.Error())
+		}
+		return draft, nil
+	}
+	return Draft{}, errors.New("post draft was not generated")
 }
 
 func validateDraftForbiddenWords(draft Draft, forbiddenWords []string) error {
@@ -257,6 +356,7 @@ func normalizeEditorialList(values []string) []string {
 type responsePayload struct {
 	Model           string            `json:"model"`
 	Reasoning       *reasoningOptions `json:"reasoning,omitempty"`
+	Temperature     *float64          `json:"temperature,omitempty"`
 	Input           []inputMessage    `json:"input"`
 	Tools           []webSearchTool   `json:"tools,omitempty"`
 	ToolChoice      string            `json:"tool_choice,omitempty"`
@@ -310,6 +410,7 @@ type jsonSchemaFormat struct {
 
 func researchPayload(model string, request Request) responsePayload {
 	requestJSON, _ := json.Marshal(editorialContext{
+		ChannelPosts: request.ChannelPosts, ExamplePostsOverride: request.ExamplePostsOverride,
 		Topic: request.Topic, Angle: request.Angle, Audience: request.Audience, Tone: request.Tone,
 		CTA: request.CTA, ForbiddenWords: request.ForbiddenWords, ExamplePosts: request.ExamplePosts,
 		VisualStyle: request.VisualStyle,
@@ -336,31 +437,36 @@ func researchPayload(model string, request Request) responsePayload {
 }
 
 type editorialContext struct {
-	Topic          string   `json:"topic"`
-	Angle          string   `json:"angle"`
-	Audience       string   `json:"audience"`
-	Tone           string   `json:"tone"`
-	CTA            string   `json:"cta"`
-	ForbiddenWords []string `json:"forbidden_words"`
-	ExamplePosts   []string `json:"example_posts"`
-	VisualStyle    string   `json:"visual_style"`
+	ChannelPosts         []ChannelPostStyle `json:"channel_posts"`
+	ExamplePostsOverride bool               `json:"style_examples_override"`
+	Topic                string             `json:"topic"`
+	Angle                string             `json:"angle"`
+	Audience             string             `json:"audience"`
+	Tone                 string             `json:"tone"`
+	CTA                  string             `json:"cta"`
+	ForbiddenWords       []string           `json:"forbidden_words"`
+	ExamplePosts         []string           `json:"example_posts"`
+	VisualStyle          string             `json:"visual_style"`
 }
 
-func draftPayload(model string, request Request, report string, sources []Source) responsePayload {
+func draftPayload(model string, request Request, report string, sources any) responsePayload {
 	contextJSON, _ := json.Marshal(struct {
-		Topic          string   `json:"topic"`
-		Angle          string   `json:"angle"`
-		Audience       string   `json:"audience"`
-		Tone           string   `json:"tone"`
-		CTA            string   `json:"cta"`
-		ForbiddenWords []string `json:"forbidden_words"`
-		ExamplePosts   []string `json:"example_posts"`
-		VisualStyle    string   `json:"visual_style"`
-		Format         string   `json:"format"`
-		IncludeSources bool     `json:"include_sources"`
-		Report         string   `json:"report"`
-		Sources        []Source `json:"sources"`
+		ChannelPosts         []ChannelPostStyle `json:"channel_posts"`
+		ExamplePostsOverride bool               `json:"style_examples_override"`
+		Topic                string             `json:"topic"`
+		Angle                string             `json:"angle"`
+		Audience             string             `json:"audience"`
+		Tone                 string             `json:"tone"`
+		CTA                  string             `json:"cta"`
+		ForbiddenWords       []string           `json:"forbidden_words"`
+		ExamplePosts         []string           `json:"example_posts"`
+		VisualStyle          string             `json:"visual_style"`
+		Format               string             `json:"format"`
+		IncludeSources       bool               `json:"include_sources"`
+		Report               string             `json:"report"`
+		Sources              any                `json:"sources"`
 	}{
+		ChannelPosts: request.ChannelPosts, ExamplePostsOverride: request.ExamplePostsOverride,
 		Topic: request.Topic, Angle: request.Angle, Audience: request.Audience, Tone: request.Tone,
 		CTA: request.CTA, ForbiddenWords: request.ForbiddenWords, ExamplePosts: request.ExamplePosts,
 		VisualStyle: request.VisualStyle,
@@ -406,6 +512,8 @@ func draftPayload(model string, request Request, report string, sources []Source
 }
 
 type responseEnvelope struct {
+	provider          string
+	structuredJSON    bool
 	ID                string `json:"id"`
 	Status            string `json:"status"`
 	IncompleteDetails *struct {
@@ -467,18 +575,50 @@ type annotation struct {
 }
 
 func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnvelope, error) {
+	name := providerName(c.provider)
+	// DeepSeek ignores built-in web_search tools. Never submit a request that
+	// appears grounded but can only produce unsupported model assertions.
+	if c.provider == "deepseek" && len(payload.Tools) != 0 {
+		return responseEnvelope{}, c.contentSearchNotConfigured()
+	}
+	if c.provider == "deepseek" && payload.Text != nil && payload.Text.Format.Type == "json_schema" {
+		// Some DeepSeek Responses deployments accept text.format but still
+		// return Markdown fences. State the schema explicitly as an instruction;
+		// the application's strict decoders remain the final authority.
+		schema, err := json.Marshal(payload.Text.Format.Schema)
+		if err != nil {
+			return responseEnvelope{}, fmt.Errorf("encode %s Responses request: %w", name, err)
+		}
+		instruction := "\nВерни ровно один объект JSON, строго по схеме ниже. Не добавляй Markdown, блоки кода, пояснения или текст до/после JSON. JSON Schema:\n" + string(schema)
+		payload.Input = append([]inputMessage(nil), payload.Input...)
+		if len(payload.Input) != 0 && payload.Input[0].Role == "system" {
+			if text, ok := payload.Input[0].Content.(string); ok {
+				payload.Input[0].Content = text + instruction
+			} else {
+				payload.Input = append([]inputMessage{{Role: "system", Content: instruction}}, payload.Input...)
+			}
+		} else {
+			payload.Input = append([]inputMessage{{Role: "system", Content: instruction}}, payload.Input...)
+		}
+	}
 	// Luna defaults to medium. Keep the previous Mini workload's effective
 	// none effort across every text feature, including both research steps.
-	if c.model == "gpt-6-luna" || strings.HasPrefix(c.model, "gpt-6-luna-") {
+	if c.provider == "deepseek" || c.model == "gpt-6-luna" || strings.HasPrefix(c.model, "gpt-6-luna-") {
 		payload.Reasoning = &reasoningOptions{Effort: "none"}
+	}
+	if c.provider == "deepseek" {
+		// The Responses API accepts temperature with none reasoning. A focused
+		// default improves structured grounding without changing channel style.
+		temperature := 0.2
+		payload.Temperature = &temperature
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return responseEnvelope{}, fmt.Errorf("encode OpenAI Responses request: %w", err)
+		return responseEnvelope{}, fmt.Errorf("encode %s Responses request: %w", name, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/responses", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.responsePath, bytes.NewReader(body))
 	if err != nil {
-		return responseEnvelope{}, fmt.Errorf("create OpenAI Responses request: %w", err)
+		return responseEnvelope{}, fmt.Errorf("create %s Responses request: %w", name, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
@@ -491,19 +631,22 @@ func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnv
 	// #nosec G704 -- baseURL is deployment-owned configuration validated as an absolute HTTP(S) URL in New, never HTTP request input; redirects are disabled above.
 	resp, err := requestClient.Do(req)
 	if err != nil {
-		return responseEnvelope{}, fmt.Errorf("call OpenAI Responses API: %w", err)
+		return responseEnvelope{}, fmt.Errorf("call %s Responses API: %w", name, err)
 	}
 	defer func() {
 		_ = resp.Body.Close()
 	}()
 	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return responseEnvelope{}, fmt.Errorf("read OpenAI Responses response: %w", err)
+		return responseEnvelope{}, fmt.Errorf("read %s Responses response: %w", name, err)
 	}
 	if len(responseBody) > maxResponseBytes {
-		return responseEnvelope{}, errors.New("OpenAI Responses response is too large")
+		return responseEnvelope{}, fmt.Errorf("%s Responses response is too large", name)
 	}
 	requestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
+	if c.provider == "deepseek" && (len(requestID) > 128 || !safeRequestIDPattern.MatchString(requestID) || strings.Contains(requestID, c.apiKey)) {
+		requestID = ""
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var errorEnvelope struct {
 			Error struct {
@@ -521,13 +664,21 @@ func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnv
 		if message == "" {
 			message = http.StatusText(resp.StatusCode)
 		}
-		return responseEnvelope{}, &Error{StatusCode: resp.StatusCode, Code: code, Message: message, RequestID: requestID}
+		if c.provider == "deepseek" {
+			// Provider error bodies may echo request content. Retain the status,
+			// but do not expose raw DeepSeek bodies through application logs.
+			code = "provider_http_error"
+			message = http.StatusText(resp.StatusCode)
+		}
+		return responseEnvelope{}, &Error{Provider: c.provider, StatusCode: resp.StatusCode, Code: code, Message: message, RequestID: requestID}
 	}
 
 	var envelope responseEnvelope
 	if err := json.Unmarshal(responseBody, &envelope); err != nil {
-		return responseEnvelope{}, fmt.Errorf("decode OpenAI Responses response: %w", err)
+		return responseEnvelope{}, fmt.Errorf("decode %s Responses response: %w", name, err)
 	}
+	envelope.provider = c.provider
+	envelope.structuredJSON = payload.Text != nil && payload.Text.Format.Type == "json_schema"
 	envelope.RequestID = requestID
 	if envelope.Error != nil {
 		code := envelope.Error.Code
@@ -536,21 +687,27 @@ func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnv
 		}
 		message := envelope.Error.Message
 		if message == "" {
-			message = "OpenAI could not complete the response"
+			message = name + " could not complete the response"
 		}
-		return responseEnvelope{}, &Error{Code: code, Message: message, RequestID: requestID}
+		if c.provider == "deepseek" {
+			code, message = "response_failed", name+" could not complete the response"
+		}
+		return responseEnvelope{}, &Error{Provider: c.provider, Code: code, Message: message, RequestID: requestID}
 	}
 	if envelope.Status != "completed" {
-		code, message := "response_not_completed", "OpenAI response was not completed"
+		code, message := "response_not_completed", name+" response was not completed"
 		if envelope.Status == "incomplete" {
 			code = "response_incomplete"
 			if envelope.IncompleteDetails != nil && envelope.IncompleteDetails.Reason != "" {
-				message += ": " + envelope.IncompleteDetails.Reason
+				reason := envelope.IncompleteDetails.Reason
+				if c.provider != "deepseek" || reason == "max_output_tokens" || reason == "content_filter" {
+					message += ": " + reason
+				}
 			}
-		} else if envelope.Status != "" {
+		} else if envelope.Status != "" && (c.provider != "deepseek" || envelope.Status == "failed" || envelope.Status == "in_progress") {
 			message += ": " + envelope.Status
 		}
-		return responseEnvelope{}, &Error{Code: code, Message: message, RequestID: requestID}
+		return responseEnvelope{}, &Error{Provider: c.provider, Code: code, Message: message, RequestID: requestID}
 	}
 	return envelope, nil
 }
@@ -566,8 +723,8 @@ func extractResearch(envelope responseEnvelope) (string, []Source, error) {
 			switch content.Type {
 			case "refusal":
 				message := strings.TrimSpace(content.Refusal)
-				if message == "" {
-					message = "OpenAI refused the research request"
+				if message == "" || envelope.provider == "deepseek" {
+					message = providerName(envelope.provider) + " refused the research request"
 				}
 				return "", nil, responseError(envelope, "response_refused", message)
 			case "output_text":
@@ -583,11 +740,11 @@ func extractResearch(envelope responseEnvelope) (string, []Source, error) {
 		parts = append(parts, strings.TrimSpace(envelope.OutputText))
 	}
 	if len(parts) == 0 {
-		return "", nil, responseError(envelope, "missing_output_text", "OpenAI research response does not contain text")
+		return "", nil, responseError(envelope, "missing_output_text", providerName(envelope.provider)+" research response does not contain text")
 	}
 	sources = limitSources(deduplicateSources(sources), maxReturnedSources)
 	if len(sources) == 0 {
-		return "", nil, responseError(envelope, "missing_citations", "OpenAI research response does not contain valid URL citations")
+		return "", nil, responseError(envelope, "missing_citations", providerName(envelope.provider)+" research response does not contain valid URL citations")
 	}
 	return strings.Join(parts, "\n\n"), sources, nil
 }
@@ -602,8 +759,8 @@ func extractOutputText(envelope responseEnvelope) (string, error) {
 			switch content.Type {
 			case "refusal":
 				message := strings.TrimSpace(content.Refusal)
-				if message == "" {
-					message = "OpenAI refused the post drafting request"
+				if message == "" || envelope.provider == "deepseek" {
+					message = providerName(envelope.provider) + " refused the post drafting request"
 				}
 				return "", responseError(envelope, "response_refused", message)
 			case "output_text":
@@ -614,12 +771,37 @@ func extractOutputText(envelope responseEnvelope) (string, error) {
 		}
 	}
 	if len(parts) == 0 && strings.TrimSpace(envelope.OutputText) != "" {
-		return envelope.OutputText, nil
+		return normalizeStructuredText(envelope, envelope.OutputText), nil
 	}
 	if len(parts) == 0 {
-		return "", responseError(envelope, "missing_output_text", "OpenAI draft response does not contain text")
+		return "", responseError(envelope, "missing_output_text", providerName(envelope.provider)+" draft response does not contain text")
 	}
-	return strings.Join(parts, ""), nil
+	return normalizeStructuredText(envelope, strings.Join(parts, "")), nil
+}
+
+func normalizeStructuredText(envelope responseEnvelope, value string) string {
+	if envelope.provider != "deepseek" || !envelope.structuredJSON {
+		return value
+	}
+	trimmed := strings.TrimSpace(value)
+	lineEnd := strings.IndexByte(trimmed, '\n')
+	if lineEnd < 0 {
+		return value
+	}
+	opening := strings.TrimSuffix(trimmed[:lineEnd], "\r")
+	if opening != "```" && !strings.EqualFold(opening, "```json") {
+		return value
+	}
+	if !strings.HasSuffix(trimmed, "\n```") {
+		return value
+	}
+	content := trimmed[lineEnd+1 : len(trimmed)-3]
+	if strings.Contains(content, "```") {
+		return value
+	}
+	// Only one complete enclosing fence is removed. JSON parsers still reject
+	// prose, additional values, unknown fields and invalid content inside it.
+	return strings.TrimSpace(content)
 }
 
 func renderCitations(text string, annotations []annotation) (string, []Source) {
@@ -776,7 +958,7 @@ func decodeDraft(value, expectedFormat string) (Draft, error) {
 		return Draft{}, fmt.Errorf("structured post draft title exceeds %d characters", maxTitleRunes)
 	}
 	if utf8.RuneCountInString(draft.Content) > maxPostContentRunes {
-		return Draft{}, fmt.Errorf("structured post draft content exceeds %d characters", maxPostContentRunes)
+		return Draft{}, errDraftContentTooLong
 	}
 	switch draft.Format {
 	case "markdown":
@@ -806,5 +988,5 @@ func truncateRunes(value string, limit int) string {
 }
 
 func responseError(envelope responseEnvelope, code, message string) *Error {
-	return &Error{Code: code, Message: message, RequestID: envelope.RequestID}
+	return &Error{Provider: envelope.provider, Code: code, Message: message, RequestID: envelope.RequestID}
 }

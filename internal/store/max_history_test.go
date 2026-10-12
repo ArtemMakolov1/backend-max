@@ -88,6 +88,10 @@ func TestMAXHistoryImportPagesRemoteMediaIncrementalOverlapAndCopy(t *testing.T)
 		imported.MAXSenderIsBot == nil || !*imported.MAXSenderIsBot || imported.Status != PostStatusPublished {
 		t.Fatalf("supported imported post = %#v", imported)
 	}
+	if imported.MAXPublishedFingerprint == "" || imported.MAXPublishedFingerprint != publicationFingerprint(imported) ||
+		!imported.PublicationVersionKnown || imported.PublicationHasChanges {
+		t.Fatal("round-trippable imported text, buttons and media did not retain their original delivered fingerprint")
+	}
 	if !imported.CreatedAt.Equal(supportedAt) || imported.PublishedAt == nil || !imported.PublishedAt.Equal(supportedAt) {
 		t.Fatalf("imported source timestamps: created=%v published=%v want=%v",
 			imported.CreatedAt, imported.PublishedAt, supportedAt)

@@ -24,6 +24,7 @@ import (
 	"maxpilot/backend/internal/observability"
 	"maxpilot/backend/internal/openaiimg"
 	"maxpilot/backend/internal/openairesearch"
+	"maxpilot/backend/internal/qwenimg"
 	"maxpilot/backend/internal/store"
 	"maxpilot/backend/internal/yandexauth"
 )
@@ -358,6 +359,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok", "max_configured": s.app.MAXConfigured(), "openai_configured": s.app.OpenAIConfigured(),
 		"research_configured": s.app.ResearchConfigured(), "content_formatting_configured": s.app.ContentFormattingConfigured(),
+		"text_ai_provider":             s.app.TextAIProvider(),
+		"image_generation_configured":  s.app.ImageGenerationConfigured(),
+		"image_ai_provider":            s.app.ImageAIProvider(),
 		"content_discovery_configured": s.app.ContentDiscoveryConfigured(),
 		"content_search_configured":    s.app.ContentSearchConfigured(),
 		"max_comments_configured":      s.app.MAXCommentsConfigured(),
@@ -927,6 +931,7 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 	default:
 		var maxErr *maxclient.Error
 		var openAIErr *openaiimg.Error
+		var qwenErr *qwenimg.Error
 		var researchErr *openairesearch.Error
 		var channelErr *app.ChannelAccessError
 		if errors.As(err, &channelErr) {
@@ -957,7 +962,24 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 				"Функция с ИИ сейчас недоступна. Попробуйте позже.", nil)
 			return
 		}
+		if errors.As(err, &qwenErr) {
+			s.logger.Warn("Qwen image request failed", "status", qwenErr.StatusCode,
+				"code", qwenErr.Code, "request_id", qwenErr.RequestID, "error", qwenErr.Message)
+			s.problem(w, http.StatusBadGateway, "qwen_api_error",
+				"Не удалось создать изображение. Попробуйте ещё раз позже.", nil)
+			return
+		}
 		if errors.As(err, &researchErr) {
+			if researchErr.Code == "content_search_not_configured" {
+				s.problem(w, http.StatusServiceUnavailable, "content_search_not_configured",
+					"Поиск источников пока не подключён. Оформление текста и другие функции ИИ доступны.", nil)
+				return
+			}
+			if researchErr.Code == "content_search_no_sources" {
+				s.problem(w, http.StatusUnprocessableEntity, "content_search_no_sources",
+					"По этой теме не удалось найти подходящие источники. Уточните тему и попробуйте ещё раз.", nil)
+				return
+			}
 			if researchErr.Code == "content_search_failed" {
 				diagnostic := researchErr.SearchDiagnostics.Safe()
 				s.logger.Warn("content source retrieval failed", "provider", diagnostic.Provider,
@@ -966,7 +988,11 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 					"Не удалось получить материалы. Попробуйте ещё раз немного позже.", nil)
 				return
 			}
-			s.logger.Warn("OpenAI research request failed", "status", researchErr.StatusCode,
+			logMessage := "OpenAI research request failed"
+			if researchErr.Provider == "deepseek" {
+				logMessage = "DeepSeek text request failed"
+			}
+			s.logger.Warn(logMessage, "status", researchErr.StatusCode,
 				"request_id", researchErr.RequestID, "error", researchErr.Message)
 			s.problem(w, http.StatusBadGateway, "openai_research_error",
 				"Исследование с ИИ сейчас недоступно. Попробуйте позже.", nil)

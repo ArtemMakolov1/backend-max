@@ -26,6 +26,10 @@ func (s *Server) generateResearch(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, app.ErrResearchNotConfigured)
 		return
 	}
+	if err := s.app.ValidateResearchSources(); err != nil {
+		s.writeError(w, err)
+		return
+	}
 	release, err := s.aiLimiter.acquire(r.Context(), userID, store.AIOperationResearch, s.now().UTC())
 	if err != nil {
 		s.writeError(w, err)

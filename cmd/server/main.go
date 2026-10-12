@@ -15,13 +15,10 @@ import (
 	"maxpilot/backend/internal/api"
 	"maxpilot/backend/internal/app"
 	"maxpilot/backend/internal/config"
-	"maxpilot/backend/internal/contentsearch"
 	"maxpilot/backend/internal/email"
 	"maxpilot/backend/internal/maxclient"
 	"maxpilot/backend/internal/media"
 	"maxpilot/backend/internal/observability"
-	"maxpilot/backend/internal/openaiimg"
-	"maxpilot/backend/internal/openairesearch"
 	"maxpilot/backend/internal/store"
 	"maxpilot/backend/internal/yandexauth"
 	"maxpilot/backend/internal/yandexdirect"
@@ -95,29 +92,10 @@ func main() {
 		maxAPI = client
 	}
 
-	var openAI app.ImageClient
-	var research app.ResearchClient
-	if cfg.OpenAIAPIKey != "" {
-		client, err := openaiimg.New(cfg.OpenAIAPIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIImageModel, &http.Client{Timeout: 3 * time.Minute})
-		if err != nil {
-			logger.Error("could not initialize OpenAI client", "error", err)
-			os.Exit(1)
-		}
-		openAI = client
-		researchClient, err := openairesearch.New(cfg.OpenAIAPIBaseURL, cfg.OpenAIAPIKey, cfg.OpenAIResearchModel, &http.Client{Timeout: 90 * time.Second})
-		if err != nil {
-			logger.Error("could not initialize OpenAI research client", "error", err)
-			os.Exit(1)
-		}
-		searchClient, err := contentsearch.NewClient(contentsearch.Config{ExaAPIKey: cfg.ExaAPIKey, TavilyAPIKey: cfg.TavilyAPIKey})
-		if err != nil {
-			logger.Error("could not initialize content search", "error", err)
-			os.Exit(1)
-		}
-		if searchClient.Configured() {
-			researchClient = researchClient.WithContentSearch(searchClient)
-		}
-		research = researchClient
+	openAI, research, err := newAIClients(cfg, &http.Client{Timeout: 3 * time.Minute}, &http.Client{Timeout: 90 * time.Second})
+	if err != nil {
+		logger.Error("could not initialize AI clients", "error", err)
+		os.Exit(1)
 	}
 
 	application := app.NewWithMetrics(storage, mediaStore, maxAPI, openAI, research, logger, metrics)

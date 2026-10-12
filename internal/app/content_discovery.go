@@ -15,7 +15,7 @@ type ContentDiscoverer interface {
 
 func (a *App) ContentDiscoveryConfigured() bool {
 	_, ok := a.research.(ContentDiscoverer)
-	return a.research != nil && ok
+	return a.research != nil && ok && a.ValidateResearchSources() == nil
 }
 
 func (a *App) ContentSearchConfigured() bool {
@@ -46,6 +46,9 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 	// Never retain injected context, even for internal callers.
 	request.ChannelTitle, request.ChannelDescription = "", ""
 	request.RecentPosts, request.ForbiddenWords = nil, nil
+	request.ChannelPosts, request.ExamplePosts = nil, nil
+	request.ExamplePostsOverride = false
+	request.CTA, request.VisualStyle = "", ""
 	request.Audience, request.Tone = "", ""
 	request.MediaContext = ""
 	if channelID != nil {
@@ -70,7 +73,7 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 			return openairesearch.DiscoverContentResult{}, err
 		}
 		for _, sample := range samples {
-			post := openairesearch.DiscoveryPublishedPost{Text: boundDiscoveryText(sample.Text, openairesearch.MaxDiscoverySampleRunes), Media: []openairesearch.DiscoveryMedia{}}
+			post := openairesearch.DiscoveryPublishedPost{Text: boundDiscoveryText(sample.Text, openairesearch.MaxDiscoverySampleRunes), Media: []openairesearch.DiscoveryMedia{}, Format: sample.Format, CharacterCount: sample.CharacterCount}
 			if sample.ImageCount > 0 {
 				post.Media = append(post.Media, openairesearch.DiscoveryMedia{Type: "image", Count: sample.ImageCount})
 			}
@@ -81,6 +84,13 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 			if len(request.RecentPosts) == openairesearch.MaxDiscoverySamples {
 				break
 			}
+		}
+		styleSamples, err := a.store.ListChannelStyleSamplesForWorkspace(ctx, actorUserID, workspaceID, *channelID)
+		if err != nil {
+			return openairesearch.DiscoverContentResult{}, err
+		}
+		for _, sample := range styleSamples {
+			request.ChannelPosts = append(request.ChannelPosts, openairesearch.ChannelPostStyle{Text: boundDiscoveryText(sample.Text, openairesearch.MaxChannelStyleSampleRunes), Format: sample.Format, CharacterCount: sample.CharacterCount})
 		}
 	}
 	brand, err := a.store.ResolveWorkspaceBrandContext(ctx, actorUserID, workspaceID, nil, channelID)
@@ -99,10 +109,23 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 		if len(template.ForbiddenWords) != 0 {
 			profile.ForbiddenWords = template.ForbiddenWords
 		}
+		if strings.TrimSpace(template.CTA) != "" {
+			profile.CTA = template.CTA
+		}
+		if strings.TrimSpace(template.VisualStyle) != "" {
+			profile.VisualStyle = template.VisualStyle
+		}
+		if len(template.ExamplePosts) != 0 {
+			profile.ExamplePosts = template.ExamplePosts
+			request.ExamplePostsOverride = true
+		}
 	}
 	request.Audience = boundDiscoveryText(profile.Audience, 500)
 	request.Tone = boundDiscoveryText(profile.Tone, 100)
 	request.ForbiddenWords = append([]string(nil), profile.ForbiddenWords...)
+	request.CTA = boundDiscoveryText(profile.CTA, 500)
+	request.VisualStyle = boundDiscoveryText(profile.VisualStyle, 1000)
+	request.ExamplePosts = append([]string(nil), profile.ExamplePosts...)
 	if request.Tone == "" {
 		request.Tone = "Естественный и понятный"
 	}
@@ -110,6 +133,9 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 		return openairesearch.DiscoverContentResult{}, errors.New("selected channel has no topic context")
 	}
 	if err := openairesearch.ValidateDiscoverContentRequest(request); err != nil {
+		return openairesearch.DiscoverContentResult{}, err
+	}
+	if err := a.ValidateResearchSources(); err != nil {
 		return openairesearch.DiscoverContentResult{}, err
 	}
 	if beforeGenerate != nil {

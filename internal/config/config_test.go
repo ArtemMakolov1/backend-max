@@ -783,7 +783,9 @@ func clearAuthEnv(t *testing.T) {
 		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
-		"OPENAI_API_KEY", "OPENAI_API_BASE_URL", "EXA_API_KEY", "TAVILY_API_KEY",
+		"OPENAI_API_KEY", "OPENAI_API_BASE_URL", "OPENAI_IMAGE_MODEL", "OPENAI_RESEARCH_MODEL", "EXA_API_KEY", "TAVILY_API_KEY",
+		"TEXT_AI_PROVIDER", "DEEPSEEK_API_KEY", "DEEPSEEK_API_BASE_URL", "DEEPSEEK_TEXT_MODEL",
+		"IMAGE_AI_PROVIDER", "QWEN_API_KEY", "QWEN_API_BASE_URL", "QWEN_IMAGE_MODEL",
 		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
 		"MEDIA_USER_MAX_FILES", "MEDIA_USER_MAX_BYTES", "MEDIA_ORPHAN_GRACE_PERIOD", "MEDIA_CLEANUP_INTERVAL", "MEDIA_CLEANUP_BATCH_SIZE",
 		"BILLING_ENFORCEMENT_ENABLED", "BILLING_LIVE_ENABLED", "YOOKASSA_RECEIPTS_CONFIRMED",
@@ -800,6 +802,64 @@ func setValidLocalYandexAuth(t *testing.T) {
 	t.Setenv("YANDEX_REDIRECT_URI", "http://localhost:8080/api/v1/auth/yandex/callback")
 }
 
+func TestLoadDefaultsToIndependentQwenImagesWithoutOpenAIFallback(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("OPENAI_API_KEY", "synthetic-openai-key")
+	cfg, err := Load()
+	if err != nil || cfg.ImageAIProvider != "qwen" || cfg.QwenAPIBaseURL != "https://dashscope-intl.aliyuncs.com" || cfg.QwenImageModel != "qwen-image-3.0-pro" || cfg.ImageAIConfigured() {
+		t.Fatalf("Qwen defaults or provider isolation failed: %v", err)
+	}
+	t.Setenv("QWEN_API_KEY", "synthetic-qwen-key")
+	cfg, err = Load()
+	if err != nil || !cfg.ImageAIConfigured() {
+		t.Fatalf("Qwen credential did not enable images: %v", err)
+	}
+	t.Setenv("IMAGE_AI_PROVIDER", "openai")
+	cfg, err = Load()
+	if err != nil || !cfg.ImageAIConfigured() {
+		t.Fatalf("explicit OpenAI image selection failed: %v", err)
+	}
+}
+
+func TestLoadPinsQwenToOfficialRegionalAndWorkspaceOrigins(t *testing.T) {
+	for _, origin := range []string{"https://dashscope-intl.aliyuncs.com", "https://dashscope.aliyuncs.com/", "https://workspace-1.ap-southeast-1.maas.aliyuncs.com", "https://workspace.cn-beijing.maas.aliyuncs.com", "https://workspace.eu-central-1.maas.aliyuncs.com"} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("QWEN_API_BASE_URL", origin)
+		if _, err := Load(); err != nil {
+			t.Fatalf("official Qwen origin rejected: %v", err)
+		}
+	}
+	for _, origin := range []string{"http://dashscope-intl.aliyuncs.com", "https://dashscope-intl.aliyuncs.com.evil.example", "https://secret@dashscope-intl.aliyuncs.com", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "https://127.0.0.1", "https://workspace.unknown-region.maas.aliyuncs.com", "https://a.b.ap-southeast-1.maas.aliyuncs.com"} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("QWEN_API_BASE_URL", origin)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QWEN_API_BASE_URL") || strings.Contains(err.Error(), "secret") {
+			t.Fatal("unofficial Qwen origin accepted or echoed")
+		}
+	}
+}
+
+func TestLoadRejectsUnsafeQwenSecretsAndBootstrapCredentials(t *testing.T) {
+	for _, value := range []string{"synthetic-private\ninjection", "synthetic-private key", strings.Repeat("s", 4097)} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("QWEN_API_KEY", value)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QWEN_API_KEY") || strings.Contains(err.Error(), "synthetic-private") {
+			t.Fatal("unsafe Qwen key was accepted or echoed")
+		}
+	}
+	clearAuthEnv(t)
+	t.Setenv("PUBLIC_BASE_URL", "http://178.159.94.83")
+	t.Setenv("FRONTEND_ORIGIN", "http://178.159.94.83")
+	t.Setenv("AUTH_BOOTSTRAP_MODE", "true")
+	t.Setenv("QWEN_API_KEY", "synthetic-private-key")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "AUTH_BOOTSTRAP_MODE") || strings.Contains(err.Error(), "synthetic-private") {
+		t.Fatal("bootstrap accepted or echoed a Qwen key")
+	}
+}
+
 func TestLoadSearchProvidersAreOptionalAndTrimmed(t *testing.T) {
 	for _, test := range []struct {
 		name, exa, tavily string
@@ -813,7 +873,7 @@ func TestLoadSearchProvidersAreOptionalAndTrimmed(t *testing.T) {
 			clearAuthEnv(t)
 			setValidLocalYandexAuth(t)
 			if test.exa != "" || test.tavily != "" {
-				t.Setenv("OPENAI_API_KEY", "synthetic-openai-key")
+				t.Setenv("DEEPSEEK_API_KEY", "synthetic-deepseek-key")
 			}
 			t.Setenv("EXA_API_KEY", "  "+test.exa+"  ")
 			t.Setenv("TAVILY_API_KEY", "  "+test.tavily+"  ")
@@ -828,17 +888,116 @@ func TestLoadSearchProvidersAreOptionalAndTrimmed(t *testing.T) {
 	}
 }
 
-func TestLoadSearchProvidersRequireOpenAIWithoutLeakingKeys(t *testing.T) {
+func TestLoadSearchProvidersRequireSelectedTextProviderWithoutLeakingKeys(t *testing.T) {
 	for _, name := range []string{"EXA_API_KEY", "TAVILY_API_KEY"} {
 		t.Run(name, func(t *testing.T) {
 			clearAuthEnv(t)
 			setValidLocalYandexAuth(t)
 			t.Setenv(name, "synthetic-secret-must-not-appear")
 			_, err := Load()
-			if err == nil || !strings.Contains(err.Error(), "requires OPENAI_API_KEY") || strings.Contains(err.Error(), "synthetic-secret") {
+			if err == nil || !strings.Contains(err.Error(), "selected TEXT_AI_PROVIDER API key") || strings.Contains(err.Error(), "synthetic-secret") {
 				t.Fatal("missing synthesis credentials were not rejected safely")
 			}
 		})
+	}
+}
+
+func TestLoadDefaultsTextToDeepSeekIndependentlyOfOpenAI(t *testing.T) {
+	clearAuthEnv(t)
+	setValidLocalYandexAuth(t)
+	t.Setenv("OPENAI_API_KEY", "synthetic-image-key")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TextAIProvider != "deepseek" || cfg.DeepSeekAPIBaseURL != "https://api.deepseek.com" || cfg.DeepSeekTextModel != "deepseek-flash" || cfg.TextAIConfigured() {
+		t.Fatal("DeepSeek defaults or independent text configuration were not preserved")
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "  synthetic-deepseek-key  ")
+	cfg, err = Load()
+	if err != nil || !cfg.TextAIConfigured() || cfg.DeepSeekAPIKey != "synthetic-deepseek-key" {
+		t.Fatalf("DeepSeek-only text key was not enabled: %v", err)
+	}
+}
+
+func TestLoadSearchUsesOnlySelectedProviderCredentials(t *testing.T) {
+	for _, provider := range []string{"deepseek", "openai"} {
+		t.Run(provider, func(t *testing.T) {
+			clearAuthEnv(t)
+			setValidLocalYandexAuth(t)
+			t.Setenv("TEXT_AI_PROVIDER", provider)
+			t.Setenv("EXA_API_KEY", "synthetic-exa-key")
+			selectedKey, otherKey := "DEEPSEEK_API_KEY", "OPENAI_API_KEY"
+			if provider == "openai" {
+				selectedKey, otherKey = otherKey, selectedKey
+			}
+			t.Setenv(otherKey, "synthetic-other-provider-key")
+			if _, err := Load(); err == nil {
+				t.Fatal("unselected provider key unexpectedly enabled grounded text")
+			}
+			t.Setenv(selectedKey, "synthetic-selected-provider-key")
+			cfg, err := Load()
+			if err != nil || !cfg.TextAIConfigured() {
+				t.Fatalf("selected provider rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadPinsDeepSeekAPIToOfficialHTTPSOrigin(t *testing.T) {
+	for _, accepted := range []string{"https://api.deepseek.com", "https://api.deepseek.com/"} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("DEEPSEEK_API_BASE_URL", accepted)
+		cfg, err := Load()
+		if err != nil || cfg.DeepSeekAPIBaseURL != "https://api.deepseek.com" {
+			t.Fatalf("official DeepSeek URL rejected: %v", err)
+		}
+	}
+	for _, rejected := range []string{
+		"http://api.deepseek.com", "https://deepseek.example.com", "https://api.deepseek.com:443",
+		"https://api.deepseek.com/v1", "https://user@api.deepseek.com", "https://api.deepseek.com?x=1", "https://api.deepseek.com//",
+	} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("DEEPSEEK_API_BASE_URL", rejected)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DEEPSEEK_API_BASE_URL") {
+			t.Fatalf("unsafe DeepSeek URL accepted: %v", err)
+		}
+	}
+}
+
+func TestLoadRejectsInvalidDeepSeekConfigurationWithoutLeakingKeys(t *testing.T) {
+	for _, test := range []struct{ name, value string }{
+		{"TEXT_AI_PROVIDER", "unsupported"},
+		{"DEEPSEEK_TEXT_MODEL", "deepseek-flash\ninjection"},
+		{"DEEPSEEK_TEXT_MODEL", strings.Repeat("m", 129)},
+		{"DEEPSEEK_API_KEY", "synthetic-secret\ninjection"},
+		{"DEEPSEEK_API_KEY", "\nsynthetic-secret"},
+		{"DEEPSEEK_API_KEY", "synthetic-secret\r"},
+		{"DEEPSEEK_API_KEY", "synthetic-secret with space"},
+		{"DEEPSEEK_API_KEY", "synthetic-secret$unsafe"},
+		{"DEEPSEEK_API_KEY", strings.Repeat("s", 4097)},
+	} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv(test.name, test.value)
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), test.name) || strings.Contains(err.Error(), "synthetic-secret") {
+			t.Fatalf("invalid %s was not safely rejected", test.name)
+		}
+	}
+}
+
+func TestLoadRejectsDeepSeekKeyInBootstrap(t *testing.T) {
+	clearAuthEnv(t)
+	t.Setenv("PUBLIC_BASE_URL", "http://178.159.94.83")
+	t.Setenv("FRONTEND_ORIGIN", "http://178.159.94.83")
+	t.Setenv("AUTH_BOOTSTRAP_MODE", "true")
+	t.Setenv("DEEPSEEK_API_KEY", "synthetic-secret")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "AUTH_BOOTSTRAP_MODE") || strings.Contains(err.Error(), "synthetic-secret") {
+		t.Fatal("bootstrap DeepSeek integration was not safely rejected")
 	}
 }
 

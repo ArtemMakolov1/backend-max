@@ -8,8 +8,8 @@ backend-контейнер до и после сбора данных; при с
 Production-секреты и env-файлы диагностический Python не читает, сырые логи,
 тексты ответов, заголовки, IP-адреса и маршруты не передаёт.
 
-Вывод включает ограниченную историю ошибок, счётчики двух точных WARN-сообщений
-о получении материалов и OpenAI research, а также только безопасные HTTP-статусы
+Вывод включает ограниченную историю ошибок, счётчики точных WARN-сообщений
+о получении материалов и ответах текстового ИИ, а также только безопасные HTTP-статусы
 и ранее проверенные enum-коды. Для контейнера выводятся `edge_attached`,
 `edge_internal`, `default_route_is_edge` и `default_routes_count`; `null` означает,
 что значение не удалось надёжно определить. Несколько default routes считаются
@@ -78,7 +78,7 @@ production-домен — `https://maxposty.ru`. Frontend-репозиторий
 
 До настройки DNS workflow по умолчанию использует `DEPLOY_STAGE=bootstrap` и
 показывает публичную часть через `http://178.159.94.83`. Это строго
-fail-closed режим: Яндекс OAuth, MAX и OpenAI обязаны быть пустыми, метод входа
+fail-closed режим: Яндекс OAuth, MAX, DeepSeek, Qwen и OpenAI обязаны быть пустыми, метод входа
 недоступен, а все кабинеты и приватные API по-прежнему требуют серверную сессию
 и отвечают `401`. Bootstrap не является production и не подходит для реальных
 пользователей или данных.
@@ -162,7 +162,7 @@ timer: тесты и security-gates остаются обязательными 
   `GRAFANA_SECRET_KEY` — ещё три независимых значения из
   `openssl rand -hex 32`.
 
-В `bootstrap` не должно быть Yandex, MAX или OpenAI secrets. В Environment
+В `bootstrap` не должно быть Yandex, MAX, DeepSeek, Qwen или OpenAI secrets. В Environment
 `production` добавьте те же SSH/DB secrets с теми же значениями и дополнительно:
 
 - `YANDEX_CLIENT_ID` и `YANDEX_CLIENT_SECRET`;
@@ -220,26 +220,49 @@ release не входят: штатный attachment API должен откло
 оба Environment используются для одного PostgreSQL volume. Подробная схема
 доступа и список дашбордов описаны в `monitoring/README.md`.
 
-`OPENAI_API_KEY` можно добавить в тот же Environment позже. Без него production
-безопасно запускает Яндекс-вход и интеграцию MAX, но не создаёт OpenAI-клиенты:
-health endpoint показывает `openai_configured=false` и
-`research_configured=false`, а AI-маршруты явно отвечают `503` с кодами
-`openai_not_configured` или `openai_research_not_configured`. После добавления
-ключа достаточно повторного deployment; хранить пустой secret в GitHub не
-требуется.
+Текстовые операции по умолчанию используют DeepSeek. Добавьте protected secret
+`DEEPSEEK_API_KEY` в Environment `production`; переменные `TEXT_AI_PROVIDER=deepseek`
+и `DEEPSEEK_TEXT_MODEL=deepseek-flash` имеют эти значения по умолчанию.
+Origin закреплён на `https://api.deepseek.com`.
+Для возврата текстовых операций на OpenAI задайте `TEXT_AI_PROVIDER=openai`
+и secret `OPENAI_API_KEY`; `OPENAI_RESEARCH_MODEL` управляет его текстовой моделью.
+Оба workflow, обычный deploy и восстановление S3, передают выбор провайдера,
+ключ DeepSeek и модель через renderer в backend.
+
+Генерация изображений по умолчанию использует Qwen Image 3.0 Pro. Добавьте
+protected secret `QWEN_API_KEY`; defaults: `IMAGE_AI_PROVIDER=qwen`,
+`QWEN_IMAGE_MODEL=qwen-image-3.0-pro`,
+`QWEN_API_BASE_URL=https://dashscope-intl.aliyuncs.com` (Singapore). Ключ,
+origin и доступность модели должны относиться к одному региону. Клиент использует
+синхронный native endpoint `/api/v1/services/aigc/multimodal-generation/generation`.
+Допустимы
+официальные Singapore/Beijing origins и workspace origins в документированных
+регионах. При явном `IMAGE_AI_PROVIDER=openai` применяется `OPENAI_API_KEY`;
+тот же ключ независимо подключает OpenAI-анализ звука. Отсутствие выбранного
+ключа не включает другой платный провайдер автоматически. Health сообщает
+`image_generation_configured`, `image_ai_provider`, `research_configured` и
+`text_ai_provider`; `openai_configured` относится только к OpenAI-клиентам.
+Все ключи необязательны для запуска Яндекс-входа и MAX; отключённые маршруты
+отвечают `503` с прежними кодами `openai_not_configured` или
+`openai_research_not_configured`. Пустые secrets хранить не требуется.
 
 Для внешнего поиска материалов можно добавить optional protected secrets
 `EXA_API_KEY` и/или `TAVILY_API_KEY` в Environment `production`. Они передаются
 через renderer в backend, не являются repository variables и не выводятся в логи.
-Для синтеза карточек обязательно нужен `OPENAI_API_KEY`; отдельный поисковый ключ
-без него отклоняется валидатором. Без обоих поисковых ключей сохраняется поиск
-через OpenAI. В `bootstrap` renderer всегда очищает эти значения, а runtime и
+Для синтеза карточек нужен ключ выбранного `TEXT_AI_PROVIDER`; отдельный поисковый
+ключ без него отклоняется валидатором. DeepSeek не поддерживает встроенный
+веб-поиск: без Exa/Tavily исследования и поиск материалов отвечают
+`content_search_not_configured`. Остальные текстовые операции продолжают работать.
+При явном выборе OpenAI сохраняется его встроенный веб-поиск.
+В `bootstrap` renderer всегда очищает AI- и поисковые ключи, а runtime и
 env validator запрещают их включение. Старые env-файлы без новых optional полей
 остаются допустимыми. Провайдеры используют фиксированные HTTPS endpoints
 `api.exa.ai` и `api.tavily.com`; custom base URL не настраивается. В Compose нет
 общего ограничения исходящего трафика: backend использует сеть `edge`. Если на
 VPS настроен отдельный firewall, проверьте исходящий HTTPS к этим двум доменам
-и `api.openai.com`. Все три адреса используют обычное DNS-разрешение и HTTPS
+и `api.deepseek.com`, для Qwen — выбранный Model Studio origin и result buckets
+`dashscope*.oss-*.aliyuncs.com`, а для отдельного OpenAI-звука — `api.openai.com`.
+Все адреса используют обычное DNS-разрешение и HTTPS
 с проверкой сертификатов; статическая запись для OpenAI на внутренний IP не нужна.
 
 Добавьте repository variables:
