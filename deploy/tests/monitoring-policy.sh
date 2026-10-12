@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 production_compose="$repo_root/deploy/compose.production.yaml"
 local_compose="$repo_root/compose.yaml"
-prometheus_image='prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e'
+prometheus_image='ghcr.io/artemmakolov1/maxposty-prometheus:v3.15.0-go1.27.2.1@sha256:c66333fad371671d2cc959cb9797c63fb4de410b25b3cf5fb5f83d867d0d8840'
 security_workflow="$repo_root/.github/workflows/security.yml"
 monitoring_trivy_ignore="$repo_root/.github/trivy/monitoring-images.yaml"
 
@@ -15,12 +15,12 @@ if [[ $(grep -c '^    ports:$' "$production_compose") -ne 1 ]] ||
 fi
 
 for image in \
-  'prom/prometheus:v3.15.0@sha256:' \
-  'ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.8.2@sha256:' \
-  'ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261004-prometheus.2@sha256:' \
-  'ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.8.3@sha256:' \
-  'ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.8.3@sha256:' \
-  'ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.8.1@sha256:'; do
+  'ghcr.io/artemmakolov1/maxposty-prometheus:v3.15.0-go1.27.2.1@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-alertmanager:v0.34.1-go1.26.9.1@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-grafana:nightly-20261010-prometheus.1@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-postgres-exporter:v0.20.1-go1.26.9.1@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-pgbouncer-exporter:v0.12.1-go1.26.9.1@sha256:' \
+  'ghcr.io/artemmakolov1/maxposty-node-exporter:v1.12.1-go1.26.9.1@sha256:'; do
   grep -F "$image" "$production_compose" >/dev/null || {
     echo "Monitoring image is not pinned by digest: $image" >&2
     exit 1
