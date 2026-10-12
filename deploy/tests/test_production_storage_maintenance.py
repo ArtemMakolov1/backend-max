@@ -2,12 +2,16 @@
 import contextlib
 import copy
 import datetime
+import http.server
 import importlib.util
 import io
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -102,6 +106,61 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "command_failed")
         self.assertEqual(caught.exception.operation, "image_inventory")
         self.assertNotIn("PRIVATE_FIXTURE_ERROR", str(caught.exception))
+
+    def test_bounded_stderr_categories_never_expose_private_detail_or_field(self):
+        cases = (
+            (b'template parsing error: map has no entry for key "Created" PRIVATE_DETAIL', "field_missing", "Created"),
+            (b'template parsing error: cannot evaluate field PRIVATE_PASSWORD', "template_error", None),
+            (b'Error: No such image: PRIVATE_DETAIL', "no_such_image", None),
+            (b'permission denied while connecting PRIVATE_DETAIL', "daemon_permission", None),
+            (b'no space left on device PRIVATE_DETAIL', "no_space", None),
+            (b'unknown PRIVATE_DETAIL', "other", None),
+        )
+        for raw, reason, field in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(maintenance.classify_stderr(raw), (reason, field))
+
+    @unittest.skipUnless(shutil.which("docker"), "Docker CLI not installed; daemon not required")
+    def test_actual_docker_cli_typed_context_handles_omitted_created_and_config(self):
+        # Exercise the real CLI formatter against a local mock Engine, without
+        # contacting a real Docker context or reading the user's Docker config.
+        fixture = {"Id": OLD_ID, "RepoTags": [], "RepoDigests": [], "Size": 1}
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header("API-Version", "1.49")
+                self.end_headers()
+            def do_GET(self):
+                payload = json.dumps(fixture).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            def log_message(self, *_):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory(prefix="maxpostydockercli") as clean_home:
+                environment = {"HOME": clean_home, "PATH": "/usr/bin:/bin", "DOCKER_API_VERSION": "1.49"}
+                def actual_cli(argv, limit=maintenance.MAX_OUTPUT, **_):
+                    command = [shutil.which("docker"), "--host", "tcp://127.0.0.1:" + str(server.server_port)] + argv[1:]
+                    result = subprocess.run(command, capture_output=True, text=True, env=environment, timeout=10)
+                    self.assertEqual(result.returncode, 0)
+                    return result.stdout
+                with patch.object(maintenance, "run", side_effect=actual_cli):
+                    for config in (None, {}, {"Labels": None}, {"Labels": {}, "Env": ["PRIVATE_FIXTURE_DO_NOT_PRINT"]}):
+                        fixture["Config"] = config
+                        inspected = maintenance.inspect_image(OLD_ID)
+                        self.assertEqual(inspected["Created"], "")
+                        self.assertEqual(inspected["Config"]["Labels"]["org.opencontainers.image.source"], None)
+                        self.assertNotIn("PRIVATE_FIXTURE_DO_NOT_PRINT", json.dumps(inspected))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
 
 class ProtectionTests(unittest.TestCase):

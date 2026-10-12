@@ -34,13 +34,37 @@ MAX_OUTPUT = 4 * 1024 * 1024
 COMMAND_TIMEOUT = 30
 OPERATIONS = frozenset(("docker_command", "image_inspect", "image_inventory", "container_inventory",
                         "container_image", "release_image", "docker_root", "docker_usage", "image_remove"))
+FAILURE_REASONS = frozenset(("template_error", "field_missing", "no_such_image", "daemon_permission", "no_space", "other"))
+PUBLIC_TEMPLATE_FIELDS = frozenset(("Id", "ID", "Created", "Config", "Labels", "Size", "RepoTags", "RepoDigests", "Image"))
 
 
 class MaintenanceError(Exception):
     """Only fixed, local diagnostic codes may cross the output boundary."""
-    def __init__(self, code, operation="docker_command"):
+    def __init__(self, code, operation="docker_command", reason="other", field=None):
         super().__init__(code)
         self.operation = operation if operation in OPERATIONS else "docker_command"
+        self.reason = reason if reason in FAILURE_REASONS else "other"
+        self.field = field if field in PUBLIC_TEMPLATE_FIELDS else None
+
+
+def classify_stderr(raw):
+    """Discard Docker stderr; return fixed categories and public field names."""
+    value = raw[:65536].decode("utf-8", errors="replace")
+    lower = value.lower()
+    if "no space left on device" in lower:
+        return "no_space", None
+    if "permission denied" in lower or "access is denied" in lower:
+        return "daemon_permission", None
+    if "no such image" in lower:
+        return "no_such_image", None
+    if "template" in lower:
+        missing = re.search(r'map has no entry for key "([A-Za-z]+)"|can.t evaluate field ([A-Za-z]+) in type', value)
+        if missing:
+            field = missing.group(1) or missing.group(2)
+            if field in PUBLIC_TEMPLATE_FIELDS:
+                return "field_missing", field
+        return "template_error", None
+    return "other", None
 
 
 def emit(event, **fields):
@@ -84,7 +108,8 @@ def run(argv, limit=MAX_OUTPUT, missing_ok=False, operation="docker_command"):
                     b"Error response from daemon: No such image: " + expected,
                     b"Error: No such image: " + expected):
                 return None
-            raise MaintenanceError("command_failed", operation)
+            reason, field = classify_stderr(error_output)
+            raise MaintenanceError("command_failed", operation, reason, field)
         return result.decode("utf-8", errors="strict")
     finally:
         selector.close()
@@ -100,7 +125,10 @@ def inspect_image(image_id):
         raise MaintenanceError("invalid_image_id")
     # Select fields inside Docker: Config.Env and other private fields never
     # leave the daemon, even temporarily in this process.
-    template = ('{"Id":{{json .Id}},"RepoTags":{{json .RepoTags}},'
+    # ID is the typed InspectResponse field; its JSON name is Id. Using .Id
+    # forces Docker's raw-map fallback with missingkey=error, which fails on
+    # valid omitted Created/Config fields (for example image attestations).
+    template = ('{"Id":{{json .ID}},"RepoTags":{{json .RepoTags}},'
                 '"RepoDigests":{{json .RepoDigests}},"Created":{{json .Created}},'
                 '"Size":{{json .Size}},"Config":{"Labels":{'
                 '"org.opencontainers.image.source":{{if .Config}}{{if .Config.Labels}}'
@@ -236,7 +264,7 @@ def protection(installation, candidate, images):
     # A release's OCI index digest and a local platform digest need not be
     # identical. Resolve every retained ref through Docker without pulling.
     for ref in sorted(refs):
-        resolved = run(["docker", "image", "inspect", "--format", "{{.Id}}", ref], 256, missing_ok=True, operation="release_image")
+        resolved = run(["docker", "image", "inspect", "--format", "{{.ID}}", ref], 256, missing_ok=True, operation="release_image")
         if resolved is None and ref == candidate:
             raise MaintenanceError("candidate_image_not_available")
         value = resolved.splitlines() if resolved is not None else []
@@ -373,7 +401,7 @@ if __name__ == "__main__":
     try:
         main()
     except MaintenanceError as error:
-        emit("maintenance_failed", code=str(error), operation=error.operation)
+        emit("maintenance_failed", code=str(error), operation=error.operation, reason=error.reason, field=error.field)
         sys.exit(1)
     except Exception:
         emit("maintenance_failed", code="inspection_failed")
