@@ -1,0 +1,109 @@
+name: Inspect or maintain production image storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Inspect first; cleanup removes only explicitly reviewed unused own images
+        type: choice
+        options: [inspect, cleanup_unused_images]
+        default: inspect
+        required: true
+      candidate_backend_image:
+        description: Exact immutable backend candidate to preserve (required for cleanup)
+        type: string
+        default: ''
+        required: false
+      approved_image_ids:
+        description: Comma-separated full sha256 image IDs from inspect (required for cleanup)
+        type: string
+        default: ''
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maxposty-backend-production-storage-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintain:
+    if: github.ref == 'refs/heads/main' && github.repository == 'ArtemMakolov1/backend-max'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: https://maxposty.ru
+    env:
+      VPS_HOST: ${{ vars.VPS_HOST || '178.159.94.83' }}
+      VPS_PORT: ${{ vars.VPS_PORT || '22' }}
+      VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}
+      VPS_DEPLOY_DIR: ${{ vars.VPS_DEPLOY_DIR || '/opt/maxposty/backend' }}
+      MODE: ${{ inputs.mode }}
+      CANDIDATE_BACKEND_IMAGE: ${{ inputs.candidate_backend_image }}
+      APPROVED_IMAGE_IDS: ${{ inputs.approved_image_ids }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate maintenance inputs and offline protection tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VPS_HOST" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          [[ "$VPS_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          (( VPS_PORT <= 65535 )) || { echo "Invalid production target" >&2; exit 1; }
+          [[ "$VPS_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || { echo "Invalid production target" >&2; exit 1; }
+          [[ "$VPS_DEPLOY_DIR" =~ ^(/[A-Za-z0-9_-]+)+$ ]] || { echo "Invalid deployment directory" >&2; exit 1; }
+          [[ "$MODE" == inspect || "$MODE" == cleanup_unused_images ]] || { echo "Invalid maintenance mode" >&2; exit 1; }
+          [[ -z "$CANDIDATE_BACKEND_IMAGE" || "$CANDIDATE_BACKEND_IMAGE" =~ ^ghcr\.io/artemmakolov1/backend-max@sha256:[0-9a-f]{64}$ ]] || { echo "Invalid candidate image" >&2; exit 1; }
+          [[ -z "$APPROVED_IMAGE_IDS" || "$APPROVED_IMAGE_IDS" =~ ^sha256:[0-9a-f]{64}(,sha256:[0-9a-f]{64})*$ ]] || { echo "Invalid approved image IDs" >&2; exit 1; }
+          if [[ "$MODE" == cleanup_unused_images ]]; then
+            [[ -n "$CANDIDATE_BACKEND_IMAGE" && -n "$APPROVED_IMAGE_IDS" ]] || { echo "Cleanup requires preserved candidate and reviewed IDs" >&2; exit 1; }
+          else
+            [[ -z "$APPROVED_IMAGE_IDS" ]] || { echo "Inspect cannot approve image removal" >&2; exit 1; }
+          fi
+          [[ -f deploy/maintain-production-storage.py && ! -L deploy/maintain-production-storage.py ]] || { echo "Reviewed script is missing" >&2; exit 1; }
+          python3 -m unittest discover -s deploy/tests -p 'test_production_storage_maintenance.py'
+      - name: Configure pinned SSH host identity
+        shell: bash
+        env:
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ -n "$VPS_SSH_PRIVATE_KEY" && -n "$VPS_SSH_KNOWN_HOSTS" ]] || { echo "Pinned deployment SSH credentials are required" >&2; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" >"$HOME/.ssh/id_deploy"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" >"$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
+      - name: Run reviewed storage maintenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${VPS_USER}@${VPS_HOST}"
+          ssh_options=(
+            -i "$HOME/.ssh/id_deploy"
+            -p "$VPS_PORT"
+            -o BatchMode=yes
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$HOME/.ssh/known_hosts"
+            -o ConnectTimeout=10
+            -o ServerAliveInterval=10
+            -o ServerAliveCountMax=2
+          )
+          # Inputs contain only the validated fixed path, choices and public
+          # digests/IDs. The reviewed script runs from stdin without artifacts.
+          # shellcheck disable=SC2029
+          if ! ssh "${ssh_options[@]}" "$target" "python3 - '$VPS_DEPLOY_DIR' '$MODE' '$CANDIDATE_BACKEND_IMAGE' '$APPROVED_IMAGE_IDS'" \
+              <deploy/maintain-production-storage.py 2>/dev/null; then
+            echo "Production storage maintenance did not complete" >&2
+            exit 1
+          fi
+      - name: Remove runner SSH credentials
+        if: ${{ always() }}
+        shell: bash
+        run: rm -f "$HOME/.ssh/id_deploy" "$HOME/.ssh/known_hosts"
