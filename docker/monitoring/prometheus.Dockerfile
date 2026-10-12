@@ -19,12 +19,17 @@ RUN wget -q "https://github.com/prometheus/prometheus/releases/download/v3.15.0/
     && tar -xzf /tmp/ui.tar.gz -C web/ui \
     && rm /tmp/ui.tar.gz \
     && bash scripts/compress_assets.sh
+# BuildKit injects its Unix OTLP endpoint into RUN. The upstream tracing tests
+# configure their own secure HTTP client, so isolate only the test process from
+# inherited builder OTEL options. Run every upstream test without source edits.
 RUN go get golang.org/x/net@v0.60.0 \
     && go mod tidy \
     && go mod download \
     && go mod verify \
     && go build -tags netgo,builtinassets -trimpath -o ./ ./cmd/prometheus ./cmd/promtool \
-    && go test -tags netgo,builtinassets ./...
+    && env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_TRACES_ENDPOINT \
+      -u OTEL_EXPORTER_OTLP_TRACES_PROTOCOL -u OTEL_TRACES_EXPORTER \
+      go test -tags netgo,builtinassets ./...
 
 ARG TARGETARCH
 ARG TARGETOS

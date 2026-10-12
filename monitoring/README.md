@@ -57,6 +57,12 @@ Workflow `Build patched monitoring images` собирает отдельный �
 проверяемые ссылки `repository:tag@sha256:...` для последующего обновления
 Compose и security matrix. Новые deployment pins устанавливаются только
 после успешной сборки и проверок, без исключений для уязвимостей.
+При отдельной сборке Grafana параметр `prometheus_image` обязателен: это
+`ghcr.io/<owner>/maxposty-prometheus@sha256:...` проверенного пересобранного
+Prometheus. Runtime-проверка выполняется на той же паре образов, что deployment.
+Полный набор upstream-тестов Prometheus запускается без унаследованных OTEL
+настроек BuildKit: его Unix tracing endpoint конфликтует с собственным TLS
+HTTP fixture. Production-код и проверки upstream-тестов не изменяются.
 
 `OBSERVABILITY_ADMIN_USERS` — comma-separated allowlist идентификаторов
 операторов. Backend endpoint `/api/v1/observability/auth` разрешает доступ

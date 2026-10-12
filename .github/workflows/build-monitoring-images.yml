@@ -16,6 +16,11 @@ on:
           - alertmanager
           - grafana
           - prometheus
+      prometheus_image:
+        description: Required ghcr Prometheus repository@sha256 digest for Grafana-only builds
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -56,16 +61,22 @@ jobs:
         shell: bash
         env:
           REQUESTED_COMPONENT: ${{ inputs.component || 'all' }}
+          GRAFANA_PROMETHEUS_IMAGE: ${{ inputs.prometheus_image }}
         run: |
           set -euo pipefail
+          owner=${GITHUB_REPOSITORY_OWNER,,}
           case "$REQUESTED_COMPONENT" in
             all|postgres-exporter|pgbouncer-exporter|node-exporter|alertmanager|grafana|prometheus) ;;
             *) echo 'Unsupported monitoring component' >&2; exit 1 ;;
           esac
+          if [[ "$REQUESTED_COMPONENT" == grafana ]] &&
+            [[ ! "$GRAFANA_PROMETHEUS_IMAGE" =~ ^ghcr[.]io/${owner}/maxposty-prometheus@sha256:[0-9a-f]{64}$ ]]; then
+            echo 'Grafana-only builds require the immutable patched Prometheus digest' >&2
+            exit 1
+          fi
           components=$(jq -cn --arg component "$REQUESTED_COMPONENT" \
             'if $component == "all" then ["postgres-exporter", "pgbouncer-exporter", "node-exporter", "alertmanager", "grafana", "prometheus"] else [$component] end')
           printf 'components=%s\n' "$components" >>"$GITHUB_OUTPUT"
-          owner=${GITHUB_REPOSITORY_OWNER,,}
           docker buildx create --name maxposty-monitoring-builder --driver docker-container --use
           docker buildx inspect --bootstrap
 
@@ -108,9 +119,9 @@ jobs:
         shell: bash
         env:
           GRAFANA_IMAGE: ${{ steps.build.outputs.grafana }}
-          # A single-component Grafana build uses an immutable upstream test
-          # fixture. Full builds validate both newly produced image digests.
-          PROMETHEUS_IMAGE: ${{ steps.build.outputs.prometheus || 'prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e' }}
+          # Both full and single-component builds validate the exact patched
+          # Prometheus digest that will be deployed with Grafana.
+          PROMETHEUS_IMAGE: ${{ steps.build.outputs.prometheus || inputs.prometheus_image }}
         run: bash docker/monitoring/test-grafana.sh
       - name: Upload immutable monitoring image references
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
