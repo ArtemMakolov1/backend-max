@@ -21,6 +21,11 @@ on:
         type: string
         required: false
         default: ""
+      grafana_image:
+        description: Optional existing Grafana repository@sha256 digest to verify without rebuilding
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -62,6 +67,7 @@ jobs:
         env:
           REQUESTED_COMPONENT: ${{ inputs.component || 'all' }}
           GRAFANA_PROMETHEUS_IMAGE: ${{ inputs.prometheus_image }}
+          REUSE_GRAFANA_IMAGE: ${{ inputs.grafana_image }}
         run: |
           set -euo pipefail
           owner=${GITHUB_REPOSITORY_OWNER,,}
@@ -74,11 +80,19 @@ jobs:
             echo 'Grafana-only builds require the immutable patched Prometheus digest' >&2
             exit 1
           fi
+          if [[ -n "$REUSE_GRAFANA_IMAGE" ]] &&
+            { [[ "$REQUESTED_COMPONENT" != grafana ]] ||
+              [[ ! "$REUSE_GRAFANA_IMAGE" =~ ^ghcr[.]io/${owner}/maxposty-grafana@sha256:[0-9a-f]{64}$ ]]; }; then
+            echo 'Only a Grafana-only run may reuse its immutable repository digest' >&2
+            exit 1
+          fi
           components=$(jq -cn --arg component "$REQUESTED_COMPONENT" \
             'if $component == "all" then ["postgres-exporter", "pgbouncer-exporter", "node-exporter", "alertmanager", "grafana", "prometheus"] else [$component] end')
           printf 'components=%s\n' "$components" >>"$GITHUB_OUTPUT"
-          docker buildx create --name maxposty-monitoring-builder --driver docker-container --use
-          docker buildx inspect --bootstrap
+          if [[ -z "$REUSE_GRAFANA_IMAGE" ]]; then
+            docker buildx create --name maxposty-monitoring-builder --driver docker-container --use
+            docker buildx inspect --bootstrap
+          fi
 
           build_image() {
             local component=$1
@@ -89,19 +103,36 @@ jobs:
             fi
             local repository="ghcr.io/${owner}/maxposty-${component}"
             local metadata="$RUNNER_TEMP/${component}.json"
-            docker buildx build \
-              --platform linux/amd64,linux/arm64 \
-              --file "$dockerfile" \
-              --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
-              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-              --tag "${repository}:${version}" \
-              --provenance=mode=max \
-              --sbom=true \
-              --metadata-file "$metadata" \
-              --push \
-              .
             local digest
-            digest=$(jq -er '."containerimage.digest"' "$metadata")
+            if [[ "$component" == grafana && -n "$REUSE_GRAFANA_IMAGE" ]]; then
+              digest=${REUSE_GRAFANA_IMAGE##*@}
+              docker buildx imagetools inspect "${repository}:${version}" \
+                --format '{{json .Manifest}}' >"$metadata"
+              # Reuse only this exact published tag/digest with both runtime
+              # architectures and their original attestation manifests.
+              jq -e --arg digest "$digest" '
+                .digest == $digest and
+                any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "amd64") and
+                any(.manifests[]?; .platform.os == "linux" and .platform.architecture == "arm64") and
+                (.manifests as $manifests | all($manifests[] | select(.platform.os == "linux");
+                  .digest as $platform | any($manifests[];
+                    .annotations["vnd.docker.reference.type"] == "attestation-manifest" and
+                    .annotations["vnd.docker.reference.digest"] == $platform)))
+              ' "$metadata" >/dev/null
+            else
+              docker buildx build \
+                --platform linux/amd64,linux/arm64 \
+                --file "$dockerfile" \
+                --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+                --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+                --tag "${repository}:${version}" \
+                --provenance=mode=max \
+                --sbom=true \
+                --metadata-file "$metadata" \
+                --push \
+                .
+              digest=$(jq -er '."containerimage.digest"' "$metadata")
+            fi
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
             printf '%s=%s@%s\n' "${component//-/_}" "$repository" "$digest" >>"$GITHUB_OUTPUT"
             printf '%s=%s:%s@%s\n' "$component" "$repository" "$version" "$digest" >>"$RUNNER_TEMP/monitoring-images.txt"

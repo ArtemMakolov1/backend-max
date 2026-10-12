@@ -60,6 +60,10 @@ Compose и security matrix. Новые deployment pins устанавливаю�
 При отдельной сборке Grafana параметр `prometheus_image` обязателен: это
 `ghcr.io/<owner>/maxposty-prometheus@sha256:...` проверенного пересобранного
 Prometheus. Runtime-проверка выполняется на той же паре образов, что deployment.
+Если образ Grafana уже собран, параметр `grafana_image` позволяет повторить
+runtime-проверку и оба Trivy-сканирования того же digest без пересборки.
+Workflow сверяет опубликованный tag, обе архитектуры и attestation manifests;
+обычная сборка из закреплённых исходников остаётся вариантом по умолчанию.
 Полный набор upstream-тестов Prometheus запускается без унаследованных OTEL
 настроек BuildKit: его Unix tracing endpoint конфликтует с собственным TLS
 HTTP fixture. Production-код и проверки upstream-тестов не изменяются.

@@ -67,7 +67,6 @@ docker run -d --name "$prometheus" --platform linux/amd64 \
   "$PROMETHEUS_IMAGE" >/dev/null
 docker run -d --name "$grafana" --platform linux/amd64 \
   --network "$network" --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --publish 127.0.0.1::3000 \
   --tmpfs /var/lib/grafana:rw,nosuid,nodev,uid=472,gid=0 \
   --tmpfs /tmp:rw,nosuid,nodev,uid=472,gid=0 \
   --mount "type=bind,src=$fixture/provisioning,dst=/etc/grafana/provisioning,readonly" \
@@ -78,11 +77,13 @@ docker run -d --name "$grafana" --platform linux/amd64 \
   --env GF_ANALYTICS_CHECK_FOR_UPDATES=false \
   --env GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false \
   "$GRAFANA_IMAGE" >/dev/null
-port=$(docker inspect "$grafana" | jq -er '.[0].NetworkSettings.Ports["3000/tcp"][0].HostPort')
-base="http://127.0.0.1:${port}"
+# Internal Docker networks do not provide host port mappings on every engine.
+# Curl is part of the pinned Grafana base; query its real HTTP listener inside
+# the same hardened container without exposing either fixture to the host.
+base='http://127.0.0.1:3000'
 ready=false
 for (( attempt=0; attempt<60; attempt++ )); do
-  if curl --silent --fail --max-time 3 "$base/api/health" >"$fixture/health.json" &&
+  if docker exec "$grafana" curl --silent --fail --max-time 3 "$base/api/health" >"$fixture/health.json" &&
     jq -e '.database == "ok"' "$fixture/health.json" >/dev/null; then
     ready=true
     break
@@ -92,7 +93,7 @@ done
 [[ "$ready" == true ]] || { echo 'Grafana did not become healthy' >&2; exit 1; }
 
 api() {
-  curl --silent --show-error --fail --max-time 30 \
+  docker exec "$grafana" curl --silent --show-error --fail --max-time 30 \
     --user smoke-admin:monitoring-isolated-fixture-password "$@"
 }
 api "$base/api/plugins/prometheus/settings" >"$fixture/plugin.json"
@@ -101,8 +102,9 @@ jq -e '.id == "prometheus" and .signature == "internal" and
 api "$base/api/plugins?type=datasource&core=1" >"$fixture/core-plugins.json"
 jq -e 'any(.[]; .id == "prometheus" and .signature == "internal")' \
   "$fixture/core-plugins.json" >/dev/null
-api --dump-header "$fixture/module.headers" "$base/public/plugins/prometheus/module.js" \
+api --dump-header /tmp/maxposty-module.headers "$base/public/plugins/prometheus/module.js" \
   >"$fixture/module.js"
+docker exec "$grafana" cat /tmp/maxposty-module.headers >"$fixture/module.headers"
 test -s "$fixture/module.js"
 grep -Eiq '^content-type: (application|text)/(javascript|x-javascript)' "$fixture/module.headers"
 api "$base/api/datasources/uid/maxposty-prometheus/health" >"$fixture/datasource-health.json"
