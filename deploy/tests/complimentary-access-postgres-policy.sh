@@ -160,9 +160,9 @@ done
 
 bad_checksum=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 if call revoke fixture.owner@example.test "$bad_checksum" >"$fixture/result" 2>&1; then echo "Mismatched schema was accepted" >&2; exit 1; fi
-psql_owner "$test_database" -c "INSERT INTO schema_migrations(version,checksum_sha256) VALUES ('043_fixture.sql',repeat('a',64));" >/dev/null
+psql_owner "$test_database" -c "INSERT INTO schema_migrations(version,checksum_sha256) VALUES ('044_fixture.sql',repeat('a',64));" >/dev/null
 if call revoke >"$fixture/result" 2>&1; then echo "Future schema was accepted" >&2; exit 1; fi
-psql_owner "$test_database" -c "DELETE FROM schema_migrations WHERE version='043_fixture.sql';" >/dev/null
+psql_owner "$test_database" -c "DELETE FROM schema_migrations WHERE version='044_fixture.sql';" >/dev/null
 if call grant absent.fixture@example.test >"$fixture/result" 2>&1; then echo "Absent identity was accepted" >&2; exit 1; fi
 psql_owner "$test_database" <<'SQL' >/dev/null
 UPDATE users SET email='fixture.owner@example.test' WHERE id='fixture-other';

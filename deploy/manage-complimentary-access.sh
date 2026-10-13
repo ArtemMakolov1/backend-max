@@ -44,9 +44,9 @@ SET LOCAL search_path=pg_catalog,public;
 SELECT 'schema_verified=' || (1/COUNT(*)::int)
 FROM public.schema_migrations
 WHERE version='039_account_complimentary_access.sql' AND checksum_sha256=:'schema_checksum'
-  AND EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='042_content_analysis_cache.sql'
-    AND checksum_sha256='8b0518aef3e41c0925d55b2f400cad50c3cd476566caea6d0c1e602a5b2c6331')
-  AND NOT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version>'042_content_analysis_cache.sql');
+  AND EXISTS(SELECT 1 FROM public.schema_migrations WHERE version='043_published_content_index.sql'
+    AND checksum_sha256='50f4af5e5c66dba0d9ef4c3ee992a9e49154382bdd56a4be7a9127fbe2727871')
+  AND NOT EXISTS(SELECT 1 FROM public.schema_migrations WHERE version>'043_published_content_index.sql');
 -- Keep the account identifier private. A separate statement lets STABLE
 -- entitlement helpers observe this transaction's completed grant/revoke.
 SELECT user_id,active::text AS active,owned_workspaces::text AS owned_workspaces,changed::text AS changed
