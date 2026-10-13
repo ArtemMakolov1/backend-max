@@ -41,6 +41,7 @@ var (
 type Config struct {
 	ExaAPIKey    string
 	TavilyAPIKey string
+	ExaProxyURL  string
 }
 
 type Request struct {
@@ -94,6 +95,10 @@ type Client struct {
 }
 
 func NewClient(config Config) (*Client, error) {
+	proxy, err := parseExaProxyURL(config.ExaProxyURL)
+	if err != nil {
+		return nil, err
+	}
 	transport := &http.Transport{
 		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:   true,
@@ -103,8 +108,9 @@ func NewClient(config Config) (*Client, error) {
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 4,
 	}
-	// Do not disclose provider credentials through an environment-selected proxy.
-	transport.Proxy = nil
+	// Only Exa may use the explicit deployment route. Global proxy environment
+	// variables never select a route for Exa or Tavily.
+	configureExaRoute(transport, proxy)
 	transport.ResponseHeaderTimeout = providerTimeout
 	return newClient(config, &http.Client{Transport: transport})
 }
@@ -245,7 +251,8 @@ func (c *Client) searchProvider(ctx context.Context, provider string, request Re
 }
 
 func (c *Client) post(ctx context.Context, provider, endpoint string, payload, target any) error {
-	// The injection hook must not become a configurable proxy or endpoint surface.
+	// Provider endpoints stay fixed even with a deployment-owned Exa proxy;
+	// a request or test injection must not redirect provider credentials elsewhere.
 	if (provider != "exa" || endpoint != exaEndpoint) && (provider != "tavily" || endpoint != tavilyEndpoint) {
 		return &Error{Provider: provider, Code: "invalid_endpoint"}
 	}

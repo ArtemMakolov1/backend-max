@@ -52,7 +52,7 @@ func newAIClients(cfg config.Config, imageHTTP, textHTTP *http.Client) (app.Imag
 	case "openai":
 		research = openAIText
 	}
-	searchClient, err := contentsearch.NewClient(contentsearch.Config{ExaAPIKey: cfg.ExaAPIKey, TavilyAPIKey: cfg.TavilyAPIKey})
+	searchClient, err := contentsearch.NewClient(contentsearch.Config{ExaAPIKey: cfg.ExaAPIKey, TavilyAPIKey: cfg.TavilyAPIKey, ExaProxyURL: cfg.ExaProxyURL})
 	if err != nil {
 		return nil, nil, fmt.Errorf("initialize content search: %w", err)
 	}

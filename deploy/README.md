@@ -44,15 +44,15 @@ read-only Docker-запрос — восемью секундами и 16 KiB. �
 ### Однократная проверка авторизованного POST с хоста
 
 `validate-provider-host-post.yml` запускается вручную только для точного SHA
-`main` в защищённом Environment `production`. Получатель SSH закреплён как
-`maxposty-deploy@77.91.94.235:22` и проверяется по сохранённому host key.
-Runner передаёт только designated `EXA_API_KEY` и `TAVILY_API_KEY` через
+`main` в защищённом Environment `production`. Получатель задаётся теми же
+`VPS_HOST`, `VPS_PORT`, `VPS_USER`, что и backend deployment, и проверяется
+по сохранённому host key. Runner передаёт только ключ выбранного провайдера через
 зашифрованный stdin SSH; ключи не попадают в аргументы команд, файлы или вывод.
 Серверный helper получает чистое окружение и не читает production-конфигурацию.
 
-Каждый запуск выполняет ровно один POST на `https://api.exa.ai/search`
-(`type: auto`, `numResults: 1`, `contents.highlights: true`) и один на
-`https://api.tavily.com/search` (`search_depth: basic`, `max_results: 1`).
+Каждый запуск выполняет один POST к провайдеру из input `provider`:
+`https://api.exa.ai/search` (`type: auto`, `numResults: 1`, `contents.highlights: true`)
+или `https://api.tavily.com/search` (`search_depth: basic`, `max_results: 1`).
 Запрос фиксирован: `public information about the solar system`.
 Форматы сверены с [Exa Search](https://exa.ai/docs/reference/search) и
 [Tavily Search](https://docs.tavily.com/documentation/api-reference/endpoint/search).
@@ -66,10 +66,38 @@ enum `result`; response body, request ID, заголовки и причины �
 runner ограничен 70 секундами и 4 KiB вывода; на сервере нужен `/usr/bin/timeout`.
 Временная SSH identity на runner удаляется в `always()` cleanup.
 
-Успешный workflow означает завершение диагностики: например, `401` и `403`
-также штатно выводятся как результат. Пригодность ключа оценивается по HTTP-статусу.
+Workflow принимает выбранного провайдера только при HTTP 200. Ответы 401, 403
+или транспортная ошибка завершают проверку с failure; значение статуса сохраняется.
 Хостовый `200` не подтверждает container TLS/POST, равенство runtime-ключа
 переданному GitHub secret, получение материалов, работу Luna или полный UX.
+
+## Явный прокси для Exa
+
+`EXA_PROXY_URL` — необязательный секрет Environment `production` с полным
+authority URL HTTP(S) CONNECT-прокси или TLS relay. Значение применяется только к
+`https://api.exa.ai/search`; Tavily и остальные интеграции сохраняют прямой маршрут.
+Оба deployment workflow передают значение через закрытый env-файл. Bootstrap
+очищает его вместе с ключами провайдеров. Старые env-файлы без поля остаются валидны.
+
+Username/password в URL должны быть URI-encoded, включая `$`, кавычки и `\`.
+Пример формы: `https://proxy-user:encoded-password@proxy.example:8443`.
+Для существующего ретранслятора TLS используйте `tls://relay.example:443`:
+порт обязателен, userinfo запрещён. Backend подключается к адресу relay,
+а SNI, HTTP Host и проверка сертификата сохраняют origin `api.exa.ai`.
+На relay разрешите точный Exa SNI только с backend-адреса; ключ Exa остаётся
+в зашифрованном потоке между backend и Exa.
+
+Неверная схема, host/port, path/query/fragment и переводы строк отклоняются без
+вывода URL или credentials. Сертификат Exa, SNI, ограничения ответа и redirects
+проверяются и при проксировании; ошибка прокси не вызывает прямой повтор Exa.
+
+На forward proxy разрешите только backend-адрес, отдельную аутентификацию и
+CONNECT к `api.exa.ai:443`. Для Basic proxy auth нужен HTTPS-прокси или
+зашифрованный туннель: этот заголовок передаётся до origin TLS.
+`validate-provider-host-post.yml` использует явно заданный TLS relay при
+выбранном Exa и `EXA_PROXY_URL`. Без поля выполняется прямой запрос.
+Диагностическая Python-проба не поддерживает HTTP(S) CONNECT и отклоняет
+такой режим до сетевого запроса; приложение поддерживает все три схемы.
 
 Backend разворачивается из GitHub Actions в GHCR и затем на один VPS. Основной
 production-домен — `https://maxposty.ru`. Frontend-репозиторий владеет Caddy,

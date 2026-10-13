@@ -9,7 +9,7 @@ for smtp_key in SMTP_HOST SMTP_PORT SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL 
   grep -F "          $smtp_key: \${{ secrets.$smtp_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "      $smtp_key: \${$smtp_key}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
-for search_key in EXA_API_KEY TAVILY_API_KEY DEEPSEEK_API_KEY; do
+for search_key in EXA_API_KEY EXA_PROXY_URL TAVILY_API_KEY DEEPSEEK_API_KEY; do
   grep -F "          $search_key: \${{ secrets.$search_key }}" "$repo_root/.github/workflows/deploy.yml" >/dev/null
   grep -F "          $search_key: \${{ secrets.$search_key }}" "$repo_root/.github/workflows/recover-s3-production.yml" >/dev/null
   grep -F "      $search_key: \${$search_key:-}" "$repo_root/deploy/compose.production.yaml" >/dev/null
@@ -85,6 +85,7 @@ render_production() {
     DEEPSEEK_API_KEY= \
     DEEPSEEK_TEXT_MODEL=deepseek-flash \
     EXA_API_KEY= \
+    EXA_PROXY_URL= \
     TAVILY_API_KEY= \
     "$@" \
     "$repo_root/deploy/render-production-env.sh" "$output"
@@ -99,6 +100,7 @@ grep -Fx 'DEEPSEEK_API_KEY=' "$production_env" >/dev/null
 grep -Fx 'DEEPSEEK_API_BASE_URL=https://api.deepseek.com' "$production_env" >/dev/null
 grep -Fx 'DEEPSEEK_TEXT_MODEL=deepseek-flash' "$production_env" >/dev/null
 grep -Fx 'EXA_API_KEY=' "$production_env" >/dev/null
+grep -Fx 'EXA_PROXY_URL=' "$production_env" >/dev/null
 grep -Fx 'TAVILY_API_KEY=' "$production_env" >/dev/null
 grep -Fx 'OPENAI_RESEARCH_MODEL=gpt-6-luna' "$production_env" >/dev/null
 grep -Fx 'OPENAI_IMAGE_MODEL=gpt-image-2' "$production_env" >/dev/null
@@ -164,6 +166,34 @@ for search_mode in exa tavily both; do
 done
 
 # Old env files remain valid when optional provider keys are entirely absent.
+# Proxy credentials remain server-owned, isolated and encoded in rendered env.
+proxy_url='http://synthetic-proxy-user:synthetic%24proxy%27password@proxy.example.test:3128'
+render_production "$sandbox/exa-proxy.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+  EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$proxy_url"
+grep -Fx "EXA_PROXY_URL=$proxy_url" "$sandbox/exa-proxy.env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$sandbox/exa-proxy.env"
+relay_url='tls://relay.example.test:443'
+render_production "$sandbox/exa-relay.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+  EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$relay_url"
+grep -Fx "EXA_PROXY_URL=$relay_url" "$sandbox/exa-relay.env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$sandbox/exa-relay.env"
+for bad_proxy in 'socks5://proxy.example.test:1080' 'http://proxy.example.test:0' \
+  'http://proxy.example.test:3128/path' 'http://user:synthetic$proxy-password@proxy.example.test:3128' \
+  $'http://synthetic-proxy-user:synthetic-proxy-password@proxy.example.test:3128\nINJECTED=secret'; do
+  if render_production "$sandbox/invalid-proxy.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+    EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$bad_proxy" >"$sandbox/proxy-error.log" 2>&1; then
+    echo "Production render accepted an invalid Exa proxy" >&2
+    exit 1
+  fi
+  if grep -F 'synthetic-proxy' "$sandbox/proxy-error.log" >/dev/null; then
+    echo "Proxy validation disclosed credentials" >&2
+    exit 1
+  fi
+done
+if render_production "$sandbox/proxy-without-exa.env" EXA_PROXY_URL="$proxy_url" >"$sandbox/proxy-error.log" 2>&1; then
+  echo "Production render accepted a proxy without Exa credentials" >&2
+  exit 1
+fi
 awk -F= '$1 != "EXA_API_KEY" && $1 != "TAVILY_API_KEY" && $1 != "TEXT_AI_PROVIDER" && $1 !~ /^DEEPSEEK_/ { print }' \
   "$production_env" >"$sandbox/legacy-search.env"
 "$repo_root/deploy/validate-production-env.sh" "$sandbox/legacy-search.env"
@@ -518,6 +548,7 @@ env \
   DEEPSEEK_API_KEY=must-not-leak \
   QWEN_API_KEY=must-not-leak \
   EXA_API_KEY=must-not-leak \
+  EXA_PROXY_URL=must-not-leak \
   TAVILY_API_KEY=must-not-leak \
   SMTP_HOST=must-not-leak \
   SMTP_USERNAME=must-not-leak \
@@ -525,7 +556,7 @@ env \
   SMTP_FROM_EMAIL=must-not-leak \
   "$repo_root/deploy/render-production-env.sh" "$bootstrap_env"
 
-for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY DEEPSEEK_API_KEY QWEN_API_KEY EXA_API_KEY TAVILY_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
+for integration_key in ALERTMANAGER_WEBHOOK_URL YANDEX_CLIENT_ID OBSERVABILITY_ADMIN_USERS DIRECT_OAUTH_CLIENT_ID DIRECT_OAUTH_CLIENT_SECRET DIRECT_OAUTH_REDIRECT_URI DIRECT_TOKEN_DATA_KEY YANDEX_WORDSTAT_API_KEY YANDEX_WORDSTAT_FOLDER_ID MAX_BOT_TOKEN S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_BUCKET S3_REGION OPENAI_API_KEY DEEPSEEK_API_KEY QWEN_API_KEY EXA_API_KEY EXA_PROXY_URL TAVILY_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD SMTP_FROM_EMAIL; do
   grep -Fx "$integration_key=" "$bootstrap_env" >/dev/null
   awk -F= -v key="$integration_key" \
     '$1 == key { print key "=must-not-be-present"; next } { print }' \

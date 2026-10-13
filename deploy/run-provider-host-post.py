@@ -87,10 +87,12 @@ def main():
         if len(sys.argv) != 1 or not SOURCE.is_file() or SOURCE.is_symlink():
             raise ValueError()
         ssh_target()
-        # Only these two designated runner secrets are consulted. No server env,
-        # runtime configuration, or other provider credentials are read.
-        payload = json.dumps({"exa": os.environ.get("EXA_API_KEY"),
-                              "tavily": os.environ.get("TAVILY_API_KEY")}).encode("ascii")
+        # Only selected provider secrets are consulted. The optional Exa route
+        # also travels inside SSH stdin; no server env or runtime files are read.
+        selected = {"exa": os.environ.get("EXA_API_KEY"), "tavily": os.environ.get("TAVILY_API_KEY")}
+        if selected['exa'] and os.environ.get('EXA_PROXY_URL'):
+            selected['exa_proxy_url'] = os.environ['EXA_PROXY_URL']
+        payload = json.dumps(selected).encode("ascii")
         keys = validation.credentials(payload)
         source = SOURCE.read_text(encoding="utf-8")
         records, code = invoke(source, payload)
@@ -99,6 +101,9 @@ def main():
                        if keys[record["provider"]] else record["result"] == "credential_missing"
                        for record in records)
         return 0 if code == 0 and accepted else 1
+    except validation.UnsupportedProxy:
+        validation.emit(validation.unsupported_proxy_records())
+        return 1
     except Exception:
         validation.emit([validation.result(provider, "ssh_failed") for provider in validation.PROVIDERS])
         return 1

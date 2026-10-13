@@ -169,6 +169,7 @@ services:
       QWEN_API_BASE_URL: ${QWEN_API_BASE_URL:-https://dashscope-intl.aliyuncs.com}
       QWEN_IMAGE_MODEL: ${QWEN_IMAGE_MODEL:-qwen-image-3.0-pro}
       EXA_API_KEY: ${EXA_API_KEY:-}
+      EXA_PROXY_URL: ${EXA_PROXY_URL:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       OPENAI_RESEARCH_MODEL: ${OPENAI_RESEARCH_MODEL:-gpt-6-luna}
       OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}

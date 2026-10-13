@@ -8,8 +8,10 @@ import json
 import os
 from pathlib import Path
 import shlex
+import select
 import shutil
 import socket
+import socketserver
 import ssl
 import subprocess
 import sys
@@ -37,6 +39,84 @@ KEYS = {"exa": "SYNTHETIC-EXA-PRIVATE", "tavily": "SYNTHETIC-TAVILY-PRIVATE"}
 PRIVATE = "PRIVATE-RESPONSE-REQUEST-ID-URL"
 
 
+@contextlib.contextmanager
+def tls_relay_fixture(names=('api.exa.ai', 'api.tavily.com'), status=200):
+    """A trusted synthetic origin behind an opaque, loopback-only TCP relay."""
+    with tempfile.TemporaryDirectory(prefix='provider-relay-tls-') as directory:
+        root = Path(directory)
+        def openssl(*args):
+            subprocess.run(['openssl', *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           check=True, timeout=10)
+        openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=Synthetic Provider CA',
+                '-keyout', str(root / 'ca.key'), '-out', str(root / 'ca.pem'),
+                '-addext', 'basicConstraints=critical,CA:TRUE')
+        openssl('req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=Synthetic Origin',
+                '-keyout', str(root / 'origin.key'), '-out', str(root / 'origin.csr'))
+        (root / 'extensions').write_text('subjectAltName=' + ','.join('DNS:' + name for name in names))
+        openssl('x509', '-req', '-in', str(root / 'origin.csr'), '-CA', str(root / 'ca.pem'),
+                '-CAkey', str(root / 'ca.key'), '-CAcreateserial', '-days', '1',
+                '-extfile', str(root / 'extensions'), '-out', str(root / 'origin.pem'))
+        requests, server_names, tls_prefixes = [], [], []
+        class Origin(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                requests.append({'path': self.path, 'host': self.headers.get('Host'),
+                                 'exa_key': self.headers.get('x-api-key'), 'bearer': self.headers.get('Authorization'),
+                                 'proxy_auth': self.headers.get('Proxy-Authorization'), 'body': json.loads(body)})
+                self.send_response(status)
+                if status == 302:
+                    self.send_header('Location', 'https://credential-trap.invalid/' + PRIVATE)
+                # No body is sent. A body read would wait until timeout instead
+                # of returning immediately after the verified response headers.
+                self.send_header('Content-Length', '1048576')
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        origin = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Origin)
+        server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server_context.load_cert_chain(root / 'origin.pem', root / 'origin.key')
+        server_context.set_servername_callback(lambda _socket, name, _context: server_names.append(name))
+        origin.socket = server_context.wrap_socket(origin.socket, server_side=True)
+        original_dial = socket.create_connection
+        class Relay(socketserver.BaseRequestHandler):
+            def handle(self):
+                with original_dial(origin.server_address, timeout=3) as upstream:
+                    peers = (self.request, upstream)
+                    first = True
+                    while True:
+                        ready, _, _ = select.select(peers, [], [], 3)
+                        if not ready:
+                            return
+                        for source in ready:
+                            try:
+                                data = source.recv(16384)
+                            except ConnectionResetError:
+                                return
+                            if not data:
+                                return
+                            if first and source is self.request:
+                                tls_prefixes.append(data[:5]); first = False
+                            try:
+                                (upstream if source is self.request else self.request).sendall(data)
+                            except (BrokenPipeError, ConnectionResetError):
+                                return
+        relay = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Relay)
+        relay.daemon_threads = True
+        threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in (origin, relay)]
+        for thread in threads:
+            thread.start()
+        context = ssl.create_default_context(cafile=str(root / 'ca.pem'))
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            yield {'origin': origin.server_address, 'relay': relay.server_address, 'context': context,
+                   'requests': requests, 'sni': server_names, 'tls_prefixes': tls_prefixes, 'dial': original_dial}
+        finally:
+            for server in (relay, origin):
+                server.shutdown(); server.server_close()
+            for thread in threads:
+                thread.join(timeout=2)
+
+
 class Response:
     def __init__(self, status):
         self.status, self.closed = status, False
@@ -51,6 +131,103 @@ class Response:
 
 
 class ProviderTests(unittest.TestCase):
+    def test_legacy_payload_and_tls_relay_authorities_are_validated_before_network(self):
+        self.assertEqual(remote.credentials(json.dumps(KEYS).encode()), KEYS)
+        for url, expected in [('tls://relay.example:443', ('relay.example', 443)),
+                              ('tls://127.0.0.1:8443', ('127.0.0.1', 8443)),
+                              ('tls://[2001:db8::1]:443', ('2001:db8::1', 443))]:
+            with self.subTest(url=url):
+                payload = {**KEYS, 'exa_proxy_url': url}
+                self.assertEqual(remote.credentials(json.dumps(payload).encode()), payload)
+                self.assertEqual(remote.relay_address(url), expected)
+        invalid = [None, False, 'tls://relay.example', 'tls://relay.example:0', 'tls://relay.example:65536',
+                   'tls://relay.example:443/', 'tls://relay.example:443?', 'tls://relay.example:443#',
+                   'tls://user:SYNTHETIC-PROXY-PRIVATE@relay.example:443', 'tls://@relay.example:443',
+                   'tls://[::1]suffix:443', 'tls://[::1]:443\nINJECTED=private']
+        for url in invalid:
+            data = json.dumps({**KEYS, 'exa_proxy_url': url}).encode()
+            output = io.StringIO()
+            with self.subTest(url=url), patch.object(sys, 'argv', ['validation']), \
+                    patch.object(sys, 'stdin', type('Input', (), {'buffer': io.BytesIO(data)})()), \
+                    patch.object(remote.urllib.request, 'build_opener') as opener, contextlib.redirect_stdout(output):
+                self.assertEqual(remote.main(), 1)
+                opener.assert_not_called()
+            self.assertEqual([json.loads(line)['result'] for line in output.getvalue().splitlines()], ['invalid_input'] * 2)
+            self.assertNotIn('SYNTHETIC-PROXY-PRIVATE', output.getvalue())
+        with self.assertRaises(ValueError):
+            remote.credentials(json.dumps({'exa': None, 'tavily': KEYS['tavily'],
+                                           'exa_proxy_url': 'tls://relay.example:443'}).encode())
+
+    def test_connect_proxy_probe_is_explicitly_unsupported_without_network_or_secret_echo(self):
+        for url in ['http://relay.example:3128', 'https://user:SYNTHETIC-PROXY-PRIVATE@relay.example:443']:
+            output = io.StringIO()
+            with patch.object(sys, 'argv', ['validation']), \
+                    patch.object(sys, 'stdin', type('Input', (), {'buffer': io.BytesIO(
+                        json.dumps({**KEYS, 'exa_proxy_url': url}).encode())})()), \
+                    patch.object(remote.urllib.request, 'build_opener') as opener, contextlib.redirect_stdout(output):
+                self.assertEqual(remote.main(), 1)
+                opener.assert_not_called()
+            self.assertEqual([json.loads(line) for line in output.getvalue().splitlines()], remote.unsupported_proxy_records())
+            self.assertNotIn('SYNTHETIC-PROXY-PRIVATE', output.getvalue())
+
+    @unittest.skipUnless(shutil.which('openssl'), 'local synthetic TLS fixture requires OpenSSL')
+    def test_tls_relay_retains_origin_sni_certificate_and_headers_with_tavily_direct(self):
+        with tls_relay_fixture() as fixture:
+            addresses = []
+            def dial(address, timeout, source_address):
+                addresses.append(address)
+                target = fixture['origin'] if address == ('api.tavily.com', 443) else address
+                self.assertIn(address, [fixture['relay'], ('api.tavily.com', 443)])
+                return fixture['dial'](target, timeout, source_address)
+            url = 'tls://%s:%s' % fixture['relay']
+            with patch.dict(os.environ, {'HTTPS_PROXY': 'http://127.0.0.1:1'}, clear=True), \
+                    patch.object(remote.ssl, 'create_default_context', return_value=fixture['context']), \
+                    patch.object(remote.socket, 'create_connection', side_effect=dial):
+                self.assertEqual(remote.probe('exa', KEYS['exa'], url), remote.result('exa', status=200))
+                self.assertEqual(remote.probe('tavily', KEYS['tavily'], url), remote.result('tavily', status=200))
+            self.assertEqual(addresses, [fixture['relay'], ('api.tavily.com', 443)])
+            self.assertEqual(fixture['sni'], ['api.exa.ai', 'api.tavily.com'])
+            self.assertEqual([item['host'] for item in fixture['requests']], ['api.exa.ai', 'api.tavily.com'])
+            exa, tavily = fixture['requests']
+            self.assertEqual(exa['exa_key'], KEYS['exa']); self.assertIsNone(exa['bearer'])
+            self.assertEqual(tavily['bearer'], 'Bearer ' + KEYS['tavily']); self.assertIsNone(tavily['exa_key'])
+            self.assertTrue(all(item['proxy_auth'] is None for item in fixture['requests']))
+            self.assertEqual([item['path'] for item in fixture['requests']], ['/search', '/search'])
+            self.assertTrue(fixture['tls_prefixes'][0].startswith(b'\x16\x03'))
+
+    @unittest.skipUnless(shutil.which('openssl'), 'local synthetic TLS fixture requires OpenSSL')
+    def test_tls_relay_rejects_trusted_wrong_origin_hostname_without_direct_fallback(self):
+        with tls_relay_fixture(names=('relay.example',)) as fixture:
+            addresses = []
+            def dial(address, timeout, source_address):
+                addresses.append(address)
+                return fixture['dial'](address, timeout, source_address)
+            with patch.object(remote.ssl, 'create_default_context', return_value=fixture['context']), \
+                    patch.object(remote.socket, 'create_connection', side_effect=dial):
+                value = remote.probe('exa', KEYS['exa'], 'tls://%s:%s' % fixture['relay'])
+            self.assertEqual(value, remote.result('exa', 'tls'))
+            self.assertEqual(fixture['sni'], ['api.exa.ai'])
+            self.assertEqual(fixture['requests'], [])
+            self.assertEqual(addresses, [fixture['relay']])
+
+    @unittest.skipUnless(shutil.which('openssl'), 'local synthetic TLS fixture requires OpenSSL')
+    def test_tls_relay_redirect_is_not_followed_and_http_status_remains_typed(self):
+        with tls_relay_fixture(status=302) as fixture:
+            with patch.object(remote.ssl, 'create_default_context', return_value=fixture['context']):
+                value = remote.probe('exa', KEYS['exa'], 'tls://%s:%s' % fixture['relay'])
+            self.assertEqual(value, remote.result('exa', status=302))
+            self.assertEqual(len(fixture['requests']), 1)
+            self.assertNotIn(PRIVATE, json.dumps(value))
+
+    def test_tls_relay_refusal_does_not_retry_direct_origin(self):
+        address = ('relay.example', 443)
+        with patch.object(remote.socket, 'create_connection', side_effect=ConnectionRefusedError(
+                errno.ECONNREFUSED, PRIVATE)) as dial:
+            value = remote.probe('exa', KEYS['exa'], 'tls://%s:%s' % address)
+        self.assertEqual(value, remote.result('exa', 'connection_refused'))
+        self.assertEqual([call.args[0] for call in dial.call_args_list], [address])
+        self.assertNotIn(PRIVATE, json.dumps(value))
+
     def test_deadline_interrupts_blocked_input_and_restores_signal_handler(self):
         import signal
         reader, writer = os.pipe()
@@ -215,6 +392,38 @@ class ProviderTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_proxy_is_selected_exa_only_encrypted_stdin_and_never_remote_argv_or_output(self):
+        proxy = 'tls://relay.example:443'
+        for selected in ('exa', 'tavily'):
+            environment = {selected.upper() + '_API_KEY': KEYS[selected], 'EXA_PROXY_URL': proxy}
+            records = [remote.result(provider, status=200) if provider == selected else remote.result(provider, 'credential_missing')
+                       for provider in remote.PROVIDERS]
+            output = io.StringIO()
+            with patch.dict(os.environ, environment, clear=True), patch.object(sys, 'argv', ['runner']), \
+                    patch.object(runner, 'invoke', return_value=(records, 0)) as invoke, contextlib.redirect_stdout(output):
+                self.assertEqual(runner.main(), 0)
+            source, payload = invoke.call_args.args
+            decoded = json.loads(payload)
+            self.assertEqual(decoded, {'exa': KEYS['exa'] if selected == 'exa' else None,
+                                       'tavily': KEYS['tavily'] if selected == 'tavily' else None,
+                                       **({'exa_proxy_url': proxy} if selected == 'exa' else {})})
+            self.assertNotIn(proxy, source); self.assertNotIn(proxy, runner.remote_command(source))
+            for secret in (*KEYS.values(), proxy):
+                self.assertNotIn(secret, output.getvalue())
+
+    def test_malformed_or_unsupported_proxy_fails_before_ssh(self):
+        for proxy, expected in [('tls://user:SYNTHETIC-PROXY-PRIVATE@relay.example:443', 'ssh_failed'),
+                                ('tls://relay.example:443/path', 'ssh_failed'),
+                                ('https://relay.example:443', 'unsupported_proxy')]:
+            output = io.StringIO()
+            with patch.dict(os.environ, {'EXA_API_KEY': KEYS['exa'], 'EXA_PROXY_URL': proxy}, clear=True), \
+                    patch.object(sys, 'argv', ['runner']), patch.object(runner, 'invoke') as invoke, \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(runner.main(), 1); invoke.assert_not_called()
+            self.assertEqual(json.loads(output.getvalue().splitlines()[0])['result'], expected)
+            self.assertNotIn('SYNTHETIC-PROXY-PRIVATE', output.getvalue())
+            self.assertNotIn(KEYS['exa'], output.getvalue())
+
     def test_source_shell_quoting_keeps_script_one_argument_without_interpolation(self):
         source = "print(\"literal ' $() `command` \\\"\")\n"
         words = shlex.split(runner.remote_command(source))
@@ -354,6 +563,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("VPS_PORT: ${{ vars.VPS_PORT || '22' }}", workflow)
         self.assertIn("VPS_USER: ${{ vars.VPS_USER || 'maxposty-deploy' }}", workflow)
         self.assertIn("EXA_API_KEY: ${{ inputs.provider == 'exa' && secrets.EXA_API_KEY || '' }}", workflow)
+        self.assertIn("EXA_PROXY_URL: ${{ inputs.provider == 'exa' && secrets.EXA_PROXY_URL || '' }}", workflow)
         self.assertIn("TAVILY_API_KEY: ${{ inputs.provider == 'tavily' && secrets.TAVILY_API_KEY || '' }}", workflow)
         for forbidden in ('  push:', '  schedule:', 'OPENAI_API_KEY', 'upload-artifact',
                           'ssh-keyscan', '.env.production', 'scp ', 'contents: write', 'packages: write'):

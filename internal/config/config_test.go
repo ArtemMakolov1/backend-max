@@ -783,7 +783,7 @@ func clearAuthEnv(t *testing.T) {
 		"WORKSPACE_MAX_OWNED_TEAM_WORKSPACES",
 		"AI_IMAGE_PER_MINUTE", "AI_IMAGE_PER_DAY", "AI_RESEARCH_PER_MINUTE", "AI_RESEARCH_PER_DAY", "AI_LEASE_TTL",
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
-		"OPENAI_API_KEY", "OPENAI_API_BASE_URL", "OPENAI_IMAGE_MODEL", "OPENAI_RESEARCH_MODEL", "EXA_API_KEY", "TAVILY_API_KEY",
+		"OPENAI_API_KEY", "OPENAI_API_BASE_URL", "OPENAI_IMAGE_MODEL", "OPENAI_RESEARCH_MODEL", "EXA_API_KEY", "TAVILY_API_KEY", "EXA_PROXY_URL",
 		"TEXT_AI_PROVIDER", "DEEPSEEK_API_KEY", "DEEPSEEK_API_BASE_URL", "DEEPSEEK_TEXT_MODEL",
 		"IMAGE_AI_PROVIDER", "QWEN_API_KEY", "QWEN_API_BASE_URL", "QWEN_IMAGE_MODEL",
 		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
@@ -885,6 +885,49 @@ func TestLoadSearchProvidersAreOptionalAndTrimmed(t *testing.T) {
 				t.Fatal("optional search credentials were not normalized")
 			}
 		})
+	}
+}
+
+func TestLoadExaProxyIsOptionalExplicitAndSanitized(t *testing.T) {
+	for _, value := range []string{"", "http://proxy.example:3128", "https://synthetic-user:synthetic-password@proxy.example:8443", "tls://relay.example:443"} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("EXA_PROXY_URL", "  "+value+"  ")
+		t.Setenv("HTTPS_PROXY", "http://unexpected-environment-proxy.invalid:9999")
+		cfg, err := Load()
+		if err != nil || cfg.ExaProxyURL != value {
+			t.Fatal("explicit Exa proxy was not loaded independently of global proxy environment")
+		}
+	}
+	for _, value := range []string{
+		"http://synthetic-user:synthetic-password@proxy.example/path",
+		"https://synthetic-user:synthetic-password@proxy.example?key=private",
+		"https://synthetic-user:synthetic-password@proxy.example#private",
+		"socks5://synthetic-user:synthetic-password@proxy.example:1080",
+		"https://synthetic-user:synthetic-password@proxy.example:65536",
+		"https://synthetic-user:synthetic-password@proxy.example\n",
+		"tls://synthetic-user:synthetic-password@proxy.example:443",
+		"tls://proxy.example",
+	} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("EXA_PROXY_URL", value)
+		_, err := Load()
+		if err == nil || !strings.Contains(err.Error(), "EXA_PROXY_URL") || strings.Contains(err.Error(), "synthetic-") || strings.Contains(err.Error(), "proxy.example") {
+			t.Fatal("invalid Exa proxy was not rejected with a sanitized static error")
+		}
+	}
+}
+
+func TestLoadRejectsExaProxyInBootstrap(t *testing.T) {
+	clearAuthEnv(t)
+	t.Setenv("PUBLIC_BASE_URL", "http://178.159.94.83")
+	t.Setenv("FRONTEND_ORIGIN", "http://178.159.94.83")
+	t.Setenv("AUTH_BOOTSTRAP_MODE", "true")
+	t.Setenv("EXA_PROXY_URL", "http://synthetic-user:synthetic-password@proxy.example:3128")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "integrations to be disabled") || strings.Contains(err.Error(), "synthetic-") || strings.Contains(err.Error(), "proxy.example") {
+		t.Fatal("bootstrap accepted or echoed an Exa proxy")
 	}
 }
 
