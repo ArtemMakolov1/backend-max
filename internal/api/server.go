@@ -996,8 +996,12 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 				logMessage = "Qwen text request failed"
 			}
 			failureCode := safeResearchFailureCode(researchErr.Code)
-			s.logger.Warn(logMessage, "status", researchErr.StatusCode, "code", failureCode,
-				"request_id", researchErr.RequestID, "error", researchErr.Message)
+			logValues := []any{"status", researchErr.StatusCode, "code", failureCode,
+				"request_id", researchErr.RequestID, "error", researchErr.Message}
+			if diagnostic := researchErr.DiscoveryFailureDiagnostics(); diagnostic.Stage != "" {
+				logValues = append(logValues, "discovery_stage", diagnostic.Stage, "validation_reason", diagnostic.ValidationReason)
+			}
+			s.logger.Warn(logMessage, logValues...)
 			if researchErr.StatusCode == 0 && failureCode == "invalid_structured_output" {
 				s.problem(w, http.StatusBadGateway, "ai_invalid_result",
 					"ИИ вернул некорректный результат. Попробуйте ещё раз.", nil)

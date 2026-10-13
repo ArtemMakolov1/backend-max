@@ -161,6 +161,18 @@ PROVIDER_CODES = {
         "provider_transport_error", "provider_http_error", "invalid_provider_response",
     )
 }
+DISCOVERY_FAILURE_STAGES = frozenset((
+    "discovery_precheck", "discovery_synthesis", "discovery_synthesis_retry", "discovery_postcheck",
+))
+DISCOVERY_VALIDATION_REASONS = frozenset((
+    "invalid_pair_decisions", "discovery_json_invalid", "discovery_shape_invalid",
+    "discovery_kind_invalid", "discovery_kind_mismatch", "discovery_source_unsafe",
+    "discovery_source_unverified", "discovery_card_bounds", "discovery_draft_bounds",
+    "discovery_format_unsupported", "discovery_external_links", "discovery_attribution_size",
+    "discovery_source_format", "discovery_forbidden_words", "unknown",
+    "card_title_bounds", "card_summary_bounds", "draft_title_bounds", "draft_content_bounds",
+    "draft_format_mismatch", "draft_image_prompt_bounds",
+))
 
 # Exact messages produced by our text response/discovery validators only.
 # This also classifies older records whose logger did not include a code. No
@@ -286,6 +298,14 @@ def sanitize_record(record):
         ) else None
         if record.get("msg") in ("DeepSeek text request failed", "Qwen text request failed") and type(status) is int and status == 0:
             reason = SOURCE_OWNED_RESULT_REASONS.get(error) if isinstance(error, str) else None
+        discovery_stage = record.get("discovery_stage")
+        if not isinstance(discovery_stage, str) or discovery_stage not in DISCOVERY_FAILURE_STAGES:
+            discovery_stage = None
+        validation_reason = None
+        if discovery_stage is not None:
+            supplied_reason = record.get("validation_reason")
+            validation_reason = (supplied_reason if isinstance(supplied_reason, str)
+                                 and supplied_reason in DISCOVERY_VALIDATION_REASONS else "unknown")
         return {
             "time": safe_time(record.get("time")),
             "category": "provider_result" if type(status) is int and status == 0 else "provider_http",
@@ -293,6 +313,7 @@ def sanitize_record(record):
             "prefix_chain": [], "transport_kind": None,
             "provider_status": http_status, "provider_reason": reason,
             "provider_code": PROVIDER_CODES.get(code) if isinstance(code, str) else None,
+            "discovery_stage": discovery_stage, "validation_reason": validation_reason,
         }
     if record.get("msg") != "request failed":
         return None

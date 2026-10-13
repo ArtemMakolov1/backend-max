@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"maxpilot/backend/internal/contentsearch"
 	"maxpilot/backend/internal/openairesearch"
 )
 
@@ -31,14 +33,16 @@ func TestResearchInvalidResultIsDistinctFromProviderFailure(t *testing.T) {
 				server := &Server{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
 				response := httptest.NewRecorder()
 				server.writeError(response, &openairesearch.Error{Provider: provider, Code: test.providerCode,
-					StatusCode: test.status, Message: "private-provider-content", RequestID: "private-request-id"})
+					StatusCode: test.status, Message: "private-provider-content discovery_precheck invalid_pair_decisions", RequestID: "private-request-id"})
 				assertProblemCode(t, response, http.StatusBadGateway, test.publicCode)
 				if strings.Contains(response.Body.String(), "private-") {
 					t.Fatal("public error exposed upstream details")
 				}
 				var logged struct {
-					Code    string `json:"code"`
-					Message string `json:"msg"`
+					Code             string `json:"code"`
+					Message          string `json:"msg"`
+					DiscoveryStage   string `json:"discovery_stage"`
+					ValidationReason string `json:"validation_reason"`
 				}
 				if json.Unmarshal(logs.Bytes(), &logged) != nil || logged.Code != test.loggedCode {
 					t.Fatal("failure code was not safely classified")
@@ -46,7 +50,57 @@ func TestResearchInvalidResultIsDistinctFromProviderFailure(t *testing.T) {
 				if provider == "qwen" && logged.Message != "Qwen text request failed" {
 					t.Fatal("Qwen failure was logged as another provider")
 				}
+				if logged.DiscoveryStage != "" || logged.ValidationReason != "" {
+					t.Fatal("untyped private provider text acquired discovery diagnostic authority")
+				}
 			})
 		}
+	}
+}
+
+type researchFailureDiagnosticSearcher struct{}
+
+func (researchFailureDiagnosticSearcher) Search(context.Context, contentsearch.Request) (contentsearch.Result, error) {
+	return contentsearch.Result{Provider: "fixture", Sources: []contentsearch.Source{
+		{Title: "Проверенный источник", URL: "https://example.com/source", Content: "Подробности нового научного события."},
+	}}, nil
+}
+
+func TestResearchDiscoveryFailureLogsTypedClosedStageWithoutPublicMetadata(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{
+			"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "private-invalid-provider-payload"},
+		}}})
+	}))
+	defer provider.Close()
+	client, err := openairesearch.NewQwen(provider.URL, "local-fixture-key", "qwen3.6-plus", provider.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.WithContentSearch(researchFailureDiagnosticSearcher{}).DiscoverContent(t.Context(),
+		openairesearch.DiscoverContentRequest{Topic: "Научные события", ContentKind: "idea", Format: "markdown"})
+	if err == nil {
+		t.Fatal("fixture did not produce a typed discovery validation failure")
+	}
+	var logs bytes.Buffer
+	server := &Server{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+	response := httptest.NewRecorder()
+	server.writeError(response, err)
+	assertProblemCode(t, response, http.StatusBadGateway, "ai_invalid_result")
+	if strings.Contains(response.Body.String(), "discovery_stage") || strings.Contains(response.Body.String(), "validation_reason") || strings.Contains(response.Body.String(), "private-") {
+		t.Fatal("diagnostic fields or provider data entered the public problem")
+	}
+	var logged struct {
+		Code             string `json:"code"`
+		DiscoveryStage   string `json:"discovery_stage"`
+		ValidationReason string `json:"validation_reason"`
+	}
+	if json.Unmarshal(logs.Bytes(), &logged) != nil || logged.Code != "invalid_structured_output" ||
+		logged.DiscoveryStage != "discovery_synthesis" || logged.ValidationReason != "discovery_json_invalid" {
+		t.Fatal("typed discovery failure did not emit its closed synthesis diagnostic")
+	}
+	if strings.Contains(logs.String(), "private-invalid-provider-payload") {
+		t.Fatal("upstream provider payload escaped the source-owned validation boundary")
 	}
 }

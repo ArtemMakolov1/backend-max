@@ -112,7 +112,9 @@ func (c *Client) matchPublishedReferences(ctx context.Context, request DiscoverC
 	}
 	decisions, err := decodeSemanticPublicationDecisions(text, pairs)
 	if err != nil {
-		return publicationMatchResult{}, responseError(envelope, "invalid_structured_output", "Publication identity classification returned invalid structured output")
+		failure := responseError(envelope, "invalid_structured_output", "Publication identity classification returned invalid structured output")
+		failure.discoveryDiagnostics.ValidationReason = discoveryValidationReason(err)
+		return publicationMatchResult{}, failure
 	}
 	for _, pair := range pairs {
 		if decisions[pair.PairID] {

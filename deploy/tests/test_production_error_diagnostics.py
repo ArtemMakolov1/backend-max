@@ -41,6 +41,46 @@ def provider_record(**extra):
 
 
 class SanitizerTests(unittest.TestCase):
+    def test_discovery_failure_fields_export_only_exact_source_owned_enums(self):
+        for stage in diagnostic.DISCOVERY_FAILURE_STAGES:
+            for reason in diagnostic.DISCOVERY_VALIDATION_REASONS:
+                safe = diagnostic.sanitize_record(record(
+                    "; ".join(SECRETS), msg="Qwen text request failed", status=0,
+                    code="invalid_structured_output", discovery_stage=stage, validation_reason=reason))
+                self.assertEqual((safe["discovery_stage"], safe["validation_reason"]), (stage, reason))
+                self.assert_safe(safe)
+
+    def test_discovery_failure_fields_never_infer_private_or_noncanonical_metadata(self):
+        values = (None, True, 1, [], {}, *SECRETS,
+                  " discovery_precheck", "discovery_precheck ", "DISCOVERY_PRECHECK",
+                  "discovery_precheck\n" + SECRETS[0])
+        for stage in values:
+            safe = diagnostic.sanitize_record(record(
+                "; ".join(SECRETS), msg="Qwen text request failed", status=0,
+                discovery_stage=stage, validation_reason="invalid_pair_decisions"))
+            self.assertIsNone(safe["discovery_stage"])
+            self.assertIsNone(safe["validation_reason"])
+            self.assert_safe(safe)
+        for reason in (None, True, 1, [], {}, *SECRETS,
+                       " invalid_pair_decisions", "invalid_pair_decisions ", "INVALID_PAIR_DECISIONS",
+                       "invalid_pair_decisions\n" + SECRETS[0]):
+            safe = diagnostic.sanitize_record(record(
+                "; ".join(SECRETS), msg="Qwen text request failed", status=0,
+                discovery_stage="discovery_postcheck", validation_reason=reason))
+            self.assertEqual(safe["discovery_stage"], "discovery_postcheck")
+            self.assertEqual(safe["validation_reason"], "unknown")
+            self.assert_safe(safe)
+        safe = diagnostic.sanitize_record(record(
+            "discovery_precheck invalid_pair_decisions " + SECRETS[0], msg="Qwen text request failed", status=0))
+        self.assertIsNone(safe["discovery_stage"])
+        self.assertIsNone(safe["validation_reason"])
+        self.assert_safe(safe)
+        generic = diagnostic.sanitize_record(record(
+            SECRETS[0], discovery_stage="discovery_precheck", validation_reason="invalid_pair_decisions"))
+        self.assertNotIn("discovery_stage", generic)
+        self.assertNotIn("validation_reason", generic)
+        self.assert_safe(generic)
+
     def test_deepseek_failures_keep_existing_secret_safe_diagnostic_contract(self):
         safe = diagnostic.sanitize_record(record("; ".join(SECRETS), msg="DeepSeek text request failed", status=401))
         self.assertEqual(safe["category"], "provider_http")
@@ -73,11 +113,15 @@ class SanitizerTests(unittest.TestCase):
             self.assertNotIn(secret, rendered)
         keys = {"time", "category", "sqlstate", "table", "constraint", "prefix_chain", "transport_kind"}
         if value["category"] in ("provider_http", "provider_result"):
-            keys |= {"provider_status", "provider_code", "provider_reason"}
+            keys |= {"provider_status", "provider_code", "provider_reason", "discovery_stage", "validation_reason"}
             self.assertTrue(value["provider_status"] is None or (
                 type(value["provider_status"]) is int and value["provider_status"] in diagnostic.PROVIDER_HTTP_STATUSES))
             self.assertTrue(value["provider_code"] is None or value["provider_code"] in diagnostic.PROVIDER_CODES)
             self.assertIn(value["provider_reason"], (None, "unsupported_region", *diagnostic.SOURCE_OWNED_RESULT_REASONS.values()))
+            self.assertTrue(value["discovery_stage"] is None or value["discovery_stage"] in diagnostic.DISCOVERY_FAILURE_STAGES)
+            self.assertTrue(value["validation_reason"] is None or value["validation_reason"] in diagnostic.DISCOVERY_VALIDATION_REASONS)
+            if value["discovery_stage"] is None:
+                self.assertIsNone(value["validation_reason"])
         self.assertEqual(set(value), keys)
         self.assertTrue(value["sqlstate"] is None or value["sqlstate"] in diagnostic.SQLSTATES)
         self.assertTrue(value["table"] is None or value["table"] in diagnostic.TABLES)

@@ -62,7 +62,7 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	}
 	publicationMatches, err := c.matchPublishedCandidatesDetailed(ctx, request, candidates)
 	if err != nil {
-		return DiscoverContentResult{}, err
+		return DiscoverContentResult{}, annotateDiscoveryFailure(err, discoveryPrecheck, nil)
 	}
 	unpublished := make([]contentsearch.Source, 0, len(candidates))
 	publishedRejected := false
@@ -86,13 +86,14 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 		return result, nil
 	}
 	payload := externalDiscoveryPayload(c.model, request, evidence)
+	stage := discoverySynthesis
 	envelope, err := c.call(ctx, payload)
 	if err != nil {
-		return DiscoverContentResult{}, err
+		return DiscoverContentResult{}, annotateDiscoveryFailure(err, stage, nil)
 	}
 	text, err := extractOutputText(envelope)
 	if err != nil {
-		return DiscoverContentResult{}, err
+		return DiscoverContentResult{}, annotateDiscoveryFailure(err, stage, nil)
 	}
 	// Crucially, neither message annotations nor hallucinated web-search output
 	// from this synthesis response can expand the retrieval authority map.
@@ -105,18 +106,19 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 		// model output never becomes context, and retrieval is not repeated.
 		payload.Input = append([]inputMessage(nil), payload.Input...)
 		payload.Input[0].Content = payload.Input[0].Content.(string) + discoveryNoLinksRetryInstruction
+		stage = discoverySynthesisRetry
 		envelope, err = c.call(ctx, payload)
 		if err != nil {
-			return DiscoverContentResult{}, err
+			return DiscoverContentResult{}, annotateDiscoveryFailure(err, stage, nil)
 		}
 		text, err = extractOutputText(envelope)
 		if err != nil {
-			return DiscoverContentResult{}, err
+			return DiscoverContentResult{}, annotateDiscoveryFailure(err, stage, nil)
 		}
 		cards, err = decodeDiscoveryCardsFromSources(text, sources, previews, request)
 	}
 	if err != nil {
-		return DiscoverContentResult{}, responseError(envelope, "invalid_structured_output", err.Error())
+		return DiscoverContentResult{}, annotateDiscoveryFailure(responseError(envelope, "invalid_structured_output", err.Error()), stage, err)
 	}
 	for i := range cards {
 		if cards[i].ContentKind == "video" {
@@ -131,7 +133,7 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	}
 	cards, finalPublishedRejected, err := c.filterPublishedCards(ctx, request, cards)
 	if err != nil {
-		return DiscoverContentResult{}, err
+		return DiscoverContentResult{}, annotateDiscoveryFailure(err, discoveryPostcheck, nil)
 	}
 	result.Cards = cards
 	if len(cards) == 0 {

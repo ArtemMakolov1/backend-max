@@ -179,15 +179,15 @@ func (c *Client) DiscoverContent(ctx context.Context, request DiscoverContentReq
 	}
 	envelope, err := c.call(ctx, discoveryPayload(c.model, request))
 	if err != nil {
-		return DiscoverContentResult{}, err
+		return DiscoverContentResult{}, annotateDiscoveryFailure(err, discoverySynthesis, nil)
 	}
 	text, err := extractOutputText(envelope)
 	if err != nil {
-		return DiscoverContentResult{}, err
+		return DiscoverContentResult{}, annotateDiscoveryFailure(err, discoverySynthesis, nil)
 	}
 	cards, err := decodeDiscoveryCards(text, envelope, request)
 	if err != nil {
-		return DiscoverContentResult{}, responseError(envelope, "invalid_structured_output", err.Error())
+		return DiscoverContentResult{}, annotateDiscoveryFailure(responseError(envelope, "invalid_structured_output", err.Error()), discoverySynthesis, err)
 	}
 	media := discoveryMediaSources(envelope)
 	for i := range cards {
@@ -204,7 +204,7 @@ func (c *Client) DiscoverContent(ctx context.Context, request DiscoverContentReq
 	}
 	cards, publishedRejected, err := c.filterPublishedCards(ctx, request, cards)
 	if err != nil {
-		return DiscoverContentResult{}, err
+		return DiscoverContentResult{}, annotateDiscoveryFailure(err, discoveryPostcheck, nil)
 	}
 	result := DiscoverContentResult{Topic: request.Topic, ContentKind: request.ContentKind, Cards: cards}
 	if len(cards) == 0 && publishedRejected {
@@ -448,15 +448,27 @@ func decodeDiscoveryCardsFromSources(text string, sources map[string]Source, pre
 		}
 		candidate.Title = strings.TrimSpace(opaqueCitationPattern.ReplaceAllString(candidate.Title, ""))
 		candidate.Summary = strings.TrimSpace(opaqueCitationPattern.ReplaceAllString(candidate.Summary, ""))
-		if candidate.Title == "" || utf8.RuneCountInString(candidate.Title) > 120 || candidate.Summary == "" || utf8.RuneCountInString(candidate.Summary) > 350 {
-			return nil, errors.New("content discovery card exceeds its text bounds")
+		if candidate.Title == "" || utf8.RuneCountInString(candidate.Title) > 120 {
+			return nil, &discoveryValidationError{message: "content discovery card exceeds its text bounds", reason: "card_title_bounds"}
+		}
+		if candidate.Summary == "" || utf8.RuneCountInString(candidate.Summary) > 350 {
+			return nil, &discoveryValidationError{message: "content discovery card exceeds its text bounds", reason: "card_summary_bounds"}
 		}
 		draft := candidate.Draft
 		draft.Title = strings.TrimSpace(opaqueCitationPattern.ReplaceAllString(draft.Title, ""))
 		draft.Content = strings.TrimSpace(opaqueCitationPattern.ReplaceAllString(draft.Content, ""))
 		draft.ImagePrompt = strings.TrimSpace(draft.ImagePrompt)
-		if draft.Title == "" || utf8.RuneCountInString(draft.Title) > maxTitleRunes || draft.Content == "" || utf8.RuneCountInString(draft.Content) > maxDiscoveryDraftRunes || draft.Format != request.Format || utf8.RuneCountInString(draft.ImagePrompt) > 800 {
-			return nil, errors.New("content discovery draft exceeds its text bounds")
+		if draft.Title == "" || utf8.RuneCountInString(draft.Title) > maxTitleRunes {
+			return nil, &discoveryValidationError{message: "content discovery draft exceeds its text bounds", reason: "draft_title_bounds"}
+		}
+		if draft.Content == "" || utf8.RuneCountInString(draft.Content) > maxDiscoveryDraftRunes {
+			return nil, &discoveryValidationError{message: "content discovery draft exceeds its text bounds", reason: "draft_content_bounds"}
+		}
+		if draft.Format != request.Format {
+			return nil, &discoveryValidationError{message: "content discovery draft exceeds its text bounds", reason: "draft_format_mismatch"}
+		}
+		if utf8.RuneCountInString(draft.ImagePrompt) > 800 {
+			return nil, &discoveryValidationError{message: "content discovery draft exceeds its text bounds", reason: "draft_image_prompt_bounds"}
 		}
 		if candidate.ContentKind == "meme" || candidate.ContentKind == "video" {
 			draft.ImagePrompt = ""

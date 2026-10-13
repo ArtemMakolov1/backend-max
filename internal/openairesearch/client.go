@@ -86,12 +86,13 @@ type Result struct {
 }
 
 type Error struct {
-	Provider          string
-	StatusCode        int
-	Code              string
-	Message           string
-	RequestID         string
-	SearchDiagnostics contentsearch.Diagnostics `json:"-"`
+	Provider             string
+	StatusCode           int
+	Code                 string
+	Message              string
+	RequestID            string
+	SearchDiagnostics    contentsearch.Diagnostics `json:"-"`
+	discoveryDiagnostics DiscoveryDiagnostics
 }
 
 func (e *Error) Error() string {
