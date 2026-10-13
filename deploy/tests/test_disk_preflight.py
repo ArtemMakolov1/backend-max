@@ -7,12 +7,31 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy-production.sh"
 SOURCE = SCRIPT.read_text().split("<<'DISK_PREFLIGHT_PY'\n", 1)[1].split("\nDISK_PREFLIGHT_PY\n", 1)[0]
 REF = "ghcr.io/example/backend@sha256:" + "a" * 64
+INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
+MANIFEST_TYPE = "application/vnd.oci.image.manifest.v1+json"
+SCHEMA2_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
+AMD64_DIGEST = "sha256:" + "d" * 64
+ARM64_DIGEST = "sha256:" + "e" * 64
+
+
+def native_manifest(size=100000000, media_type=MANIFEST_TYPE):
+    return {"schemaVersion": 2, "mediaType": media_type, "layers": [{"size": size}]}
+
+
+def descriptor(architecture="amd64", digest=AMD64_DIGEST, os_name="linux"):
+    return {"digest": digest, "mediaType": MANIFEST_TYPE,
+            "platform": {"architecture": architecture, "os": os_name}}
+
+
+def image_index(entries):
+    return {"schemaVersion": 2, "mediaType": INDEX_TYPE, "manifests": entries}
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, sys, time
@@ -55,17 +74,40 @@ if a[:2] == ['image', 'inspect']:
         sys.exit(1)
     emit(c.get('local_image', 'sha256:' + 'c' * 64 + ' linux amd64'))
 if a[:2] == ['manifest', 'inspect']:
-    if c.get('oversized'):
+    parent_refs = c.get('refs', 'ghcr.io/example/backend@sha256:' + 'a' * 64).splitlines()
+    stage = 'single' if '--verbose' in a else ('index' if a[-1] in parent_refs else 'native')
+    if c.get('native_timeout') and stage == 'native':
+        time.sleep(30)
+    if c.get('native_error') and stage == 'native':
+        print('PRIVATE_SENTINEL private registry arguments: ' + a[-1], file=sys.stderr)
+        sys.exit(1)
+    if c.get('oversized') or c.get('oversized_stage') == stage:
         emit('X' * 300000)
     if c.get('bad_manifest'):
         emit('{invalid PRIVATE_SENTINEL')
-    if 'manifest' in c:
+    if 'manifest' in c and stage == 'index':
         emit(json.dumps(c['manifest']))
+    if 'native_manifest' in c and stage == 'native':
+        emit(json.dumps(c['native_manifest']))
+    index_type = 'application/vnd.oci.image.index.v1+json'
+    image_type = c.get('single_type', 'application/vnd.oci.image.manifest.v1+json')
+    def single(size):
+        return {'schemaVersion': 2, 'mediaType': image_type, 'layers': [{'size': size}]}
     def entry(arch, size, variant=None):
         platform = {'architecture': arch, 'os': 'linux'}
         if variant: platform['variant'] = variant
-        return {'Descriptor': {'platform': platform}, 'OCIManifest': {'layers': [{'size': size}]}}
-    emit(json.dumps([entry('amd64', 100000000), entry('arm64', 200000000, 'v8'), entry('unknown', 1000000000)]))
+        name = 'SchemaV2Manifest' if image_type.startswith('application/vnd.docker.') else 'OCIManifest'
+        return {'Descriptor': {'platform': platform}, name: single(size)}
+    if stage == 'single':
+        emit(json.dumps(c.get('single_verbose', entry('amd64', 100000000))))
+    if c.get('single_manifest') and stage == 'index':
+        emit(json.dumps(single(100000000)))
+    if stage == 'native':
+        emit(json.dumps(single(200000000 if a[-1].endswith('e' * 64) else 100000000)))
+    emit(json.dumps({'schemaVersion': 2, 'mediaType': index_type, 'manifests': [
+        {'digest': 'sha256:' + 'd' * 64, 'platform': {'architecture': 'amd64', 'os': 'linux'}},
+        {'digest': 'sha256:' + 'e' * 64, 'platform': {'architecture': 'arm64', 'os': 'linux', 'variant': 'v8'}},
+        {'digest': 'sha256:' + 'f' * 64, 'platform': {'architecture': 'unknown', 'os': 'unknown'}}]}))
 if a[0] == 'inspect':
     emit(c.get('running', 'true') if '.State.Running' in a[2] else c.get('mount', 'volume:maxposty-backend_postgres-data'))
 if a[0] == 'exec':
@@ -81,7 +123,7 @@ sys.exit(1)
 
 
 class DiskPreflightTests(unittest.TestCase):
-    def run_fixture(self, configuration=None, phase="before-pull", bootstrap=False, installation="/install"):
+    def run_fixture(self, configuration=None, phase="before-pull", bootstrap=False, installation="/install", timeout=10):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ("docker", "df", "stat"):
@@ -93,7 +135,7 @@ class DiskPreflightTests(unittest.TestCase):
                                PREFLIGHT_FIXTURE=json.dumps(configuration or {}), PREFLIGHT_LOG=str(log))
             result = subprocess.run([sys.executable, "-c", SOURCE, phase, installation, "/next", "/next/env", "/next/release",
                                      "" if bootstrap else "/old", "/old/env", "/old/release"],
-                                    env=environment, capture_output=True, text=True, timeout=10)
+                                    env=environment, capture_output=True, text=True, timeout=timeout)
             commands = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertNotIn("PRIVATE_SENTINEL", result.stdout + result.stderr)
         self.assertFalse(any("pull" in command or "rm" in command or "pg_dump" in command or "stop" in command for command in commands))
@@ -146,16 +188,73 @@ class DiskPreflightTests(unittest.TestCase):
             self.assert_blocked({}, "backup destination", installation=directory)
 
     def test_missing_image_budget_selects_native_not_attestation_layers(self):
-        result, _ = self.run_fixture({"missing": True})
+        result, commands = self.run_fixture({"missing": True})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("required_bytes=961870912", result.stdout)
         self.assertIn("required_inodes=12288", result.stdout)
+        manifests = [command for command in commands if command[:3] == ['docker', 'manifest', 'inspect']]
+        self.assertEqual(manifests, [['docker', 'manifest', 'inspect', REF],
+                                    ['docker', 'manifest', 'inspect', 'ghcr.io/example/backend@' + AMD64_DIGEST]])
         self.assert_blocked({"missing": True, "docker_kib": 800000}, "docker filesystem")
 
     def test_arm64_variant_is_supported_and_wrong_cached_arch_is_reserved(self):
-        result, _ = self.run_fixture({"architecture": "aarch64"})
+        result, commands = self.run_fixture({"architecture": "aarch64"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("required_bytes=1261870912", result.stdout)
+        self.assertIn(['docker', 'manifest', 'inspect', 'ghcr.io/example/backend@' + ARM64_DIGEST], commands)
+        self.assertFalse(any(AMD64_DIGEST in command for command in commands))
+
+    def test_native_child_ref_preserves_registry_port_and_removes_parent_tag(self):
+        parent = 'registry.example:5000/example/backend:release@sha256:' + 'a' * 64
+        result, commands = self.run_fixture({'missing': True, 'refs': parent})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(['docker', 'manifest', 'inspect', 'registry.example:5000/example/backend@' + AMD64_DIGEST], commands)
+
+    def test_single_oci_and_schema2_pins_keep_verified_verbose_platform_fallback(self):
+        for media_type in (MANIFEST_TYPE, SCHEMA2_TYPE):
+            with self.subTest(media_type=media_type):
+                result, commands = self.run_fixture({'missing': True, 'single_manifest': True, 'single_type': media_type})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('required_bytes=961870912', result.stdout)
+                self.assertEqual([command for command in commands if command[:3] == ['docker', 'manifest', 'inspect']],
+                                 [['docker', 'manifest', 'inspect', REF], ['docker', 'manifest', 'inspect', '--verbose', REF]])
+        for platform in ({}, {'architecture': 'arm64', 'os': 'linux'}, {'architecture': 'amd64', 'os': 'unknown'}):
+            verbose = {'Descriptor': {'platform': platform}, 'OCIManifest': native_manifest()}
+            self.assert_blocked({'missing': True, 'single_manifest': True, 'single_verbose': verbose}, 'native image manifest')
+
+    def test_index_platform_and_native_digest_must_be_unique_and_well_formed(self):
+        for entries in ([], {}, [None], [{'digest': AMD64_DIGEST}],
+                        [descriptor('arm64', ARM64_DIGEST)], [descriptor(), descriptor()],
+                        [descriptor(digest='sha256:PRIVATE_SENTINEL')], [descriptor(digest='sha512:' + 'd' * 64)],
+                        [descriptor(digest='sha256:' + 'D' * 64)]):
+            with self.subTest(entries=entries):
+                _, commands = self.assert_blocked({'missing': True, 'manifest': image_index(entries)})
+                self.assertEqual([command for command in commands if command[:3] == ['docker', 'manifest', 'inspect']],
+                                 [['docker', 'manifest', 'inspect', REF]])
+
+    def test_native_child_cannot_be_an_index_or_contain_unbounded_invalid_layers(self):
+        cases = [image_index([descriptor()]), {}, {**native_manifest(), 'layers': []},
+                 {**native_manifest(), 'layers': [{}]}, {**native_manifest(), 'layers': [None]},
+                 {**native_manifest(), 'layers': [{'size': 1}] * 129}]
+        cases.extend(native_manifest(size) for size in (-1, True, 2 ** 53 + 1, 'PRIVATE_SENTINEL'))
+        for manifest in cases:
+            with self.subTest(manifest=manifest):
+                self.assert_blocked({'missing': True, 'native_manifest': manifest})
+
+    def test_native_metadata_failures_are_named_without_echoing_private_args(self):
+        result, _ = self.assert_blocked({'missing': True, 'native_error': True}, 'native_image_manifest failed')
+        self.assertNotIn(REF, result.stdout + result.stderr)
+        self.assertNotIn(AMD64_DIGEST, result.stdout + result.stderr)
+        for stage, name in (('index', 'image_index'), ('native', 'native_image_manifest'), ('single', 'single_image_manifest')):
+            self.assert_blocked({'missing': True, 'single_manifest': stage == 'single', 'oversized_stage': stage},
+                                'metadata probe ' + name + ' exceeded output limit')
+
+    def test_native_metadata_probe_keeps_twenty_second_timeout_and_named_error(self):
+        started = time.monotonic()
+        self.assert_blocked({'missing': True, 'native_timeout': True}, 'native_image_manifest timed out', timeout=28)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 20)
+        self.assertLess(elapsed, 26)
 
     def test_after_pull_reserves_snapshot_but_no_duplicate_image_growth(self):
         result, commands = self.run_fixture(phase="after-pull")
@@ -173,9 +272,8 @@ class DiskPreflightTests(unittest.TestCase):
 
     def test_invalid_large_or_wrong_platform_manifests_fail_closed(self):
         for fixture in ({"bad_manifest": True}, {"oversized": True}, {"manifest": []},
-                        {"manifest": [{"Descriptor": {"platform": {"architecture": "arm64", "os": "linux"}}}]},
-                        {"manifest": [{"Descriptor": {"platform": {"architecture": "amd64", "os": "linux"}},
-                                       "OCIManifest": {"layers": [{"size": -1}]}}]}):
+                        {"manifest": {'schemaVersion': 2, 'mediaType': 'unknown', 'manifests': [descriptor()]}},
+                        {"native_manifest": native_manifest(-1)}):
             with self.subTest(fixture=fixture):
                 self.assert_blocked(dict(fixture, missing=True))
 

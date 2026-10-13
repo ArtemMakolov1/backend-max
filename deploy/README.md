@@ -418,14 +418,32 @@ Workflow `Backend production backup` работает отдельно от depl
 1. создаёт PostgreSQL custom dump;
 2. восстанавливает его в новую временную БД, выполняет контрольный запрос и
    удаляет временную БД;
-3. формирует manifest и публикует зашифрованный immutable off-host asset тем же
-   проверенным hook;
+3. формирует manifest локальных dump и media;
 4. принудительно переключает WAL и ждёт подтверждения точного сегмента через
    `pg_stat_archiver`;
 5. создаёт streaming `pg_basebackup`, проверяет `pg_verifybackup` и только затем
    делает каталог base backup видимым;
-6. удаляет локальные logical/base/WAL копии старше настроенной retention и
-   атомарно обновляет Prometheus textfile-метрики.
+6. публикует зашифрованный immutable off-host asset проверенным hook;
+7. выполняет ротацию локальных копий и атомарно обновляет Prometheus textfile-метрики.
+
+Локальная ротация также выполняется до создания новой плановой копии и при
+завершении неуспешной попытки, поэтому ошибка offsite не накапливает новые
+локальные поколения. Deployment очищает старые logical-копии до дисковой
+проверки и после публикации проверенного pre-migration dump.
+
+Сохраняются два последних standalone pre-migration dump и два последних
+полных scheduled-комплекта (dump, media и checksum). Текущее поколение защищено
+явно, включая изменение часов VPS. Для physical backups сохраняются две
+последние базы и опорная база перед границей `PITR_RETENTION_DAYS`; опорная база
+проверяется `pg_verifybackup`. WAL удаляется только из архивного volume, до
+минимального START WAL всех оставленных баз на той же timeline. History, неизвестные
+имена, symlinks и незавершённые файлы сохраняются.
+
+Workflow `Inspect or rotate production backups` позволяет сначала получить
+ограниченную инвентаризацию, затем выполнить `cleanup` или только
+`cleanup_logical` из `main`. Он использует тот же эксклюзивный deployment lock,
+accepted release и проверенную SSH identity; содержимое дампов и секреты
+не попадают в вывод.
 
 PostgreSQL запускается с `archive_mode=on`, `wal_level=replica` и архивирует WAL
 в отдельный Docker volume. Base backups и WAL хранятся раздельно от основного

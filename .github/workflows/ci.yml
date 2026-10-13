@@ -66,6 +66,7 @@ jobs:
           ./deploy/tests/monitoring-policy.sh
           bash ./deploy/tests/production-env-policy.sh
           python3 -m unittest discover -s deploy/tests -p 'test_exa_proxy_url.py'
+          python3 -m unittest discover -s deploy/tests -p 'test_backup_retention.py'
           ./deploy/tests/operations-policy.sh
           ./deploy/tests/backup-release-policy.sh
           ./deploy/tests/rollback-policy.sh

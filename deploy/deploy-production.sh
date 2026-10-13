@@ -180,6 +180,23 @@ compose() {
     "$@"
 }
 
+rotate_local_migration_backups() {
+  # Bootstrap has no accepted production release to authorize local cleanup.
+  [[ -n "$current_dir" ]] || return 0
+  [[ "$(env_value "$current_env" AUTH_BOOTSTRAP_MODE)" == false ]] || return 0
+  [[ "$(env_value "$next_env" AUTH_BOOTSTRAP_MODE)" == false ]] || return 0
+  local -a rotation_command=(
+    python3 "$release_dir/deploy/backup/rotate-production-backups.py"
+    "$installation_dir" cleanup_logical --lock-fd 9
+    --logical-retention-days "$(env_value "$next_env" BACKUP_RETENTION_DAYS)"
+    --pitr-retention-days "$(env_value "$next_env" PITR_RETENTION_DAYS)"
+  )
+  if [[ -n "${backup_timestamp:-}" ]]; then
+    rotation_command+=(--protect-generation "$backup_timestamp")
+  fi
+  "${rotation_command[@]}"
+}
+
 disk_preflight() {
   # Metadata only: no image/volume cleanup, dumps, environment-file output, or
   # service changes. Both calls run under .deploy.lock before writes are frozen.
@@ -194,25 +211,41 @@ import sys
 import time
 
 phase, install_dir, next_dir, next_env, next_release, old_dir, old_env, old_release = sys.argv[1:]
+PROBE_NAMES = frozenset((
+    "docker_root", "docker_architecture", "postgres_container", "postgres_running", "postgres_mount",
+    "postgres_database_size", "existing_postgres_volume", "compose_images", "local_image",
+    "image_index", "native_image_manifest", "single_image_manifest",
+    "docker_filesystem_bytes", "docker_filesystem_inodes", "docker_filesystem_device",
+    "backup_filesystem_bytes", "backup_filesystem_inodes", "backup_filesystem_device",
+    "postgres_filesystem_bytes", "postgres_filesystem_inodes", "postgres_filesystem_device"))
+INDEX_TYPES = frozenset(("application/vnd.oci.image.index.v1+json",
+                        "application/vnd.docker.distribution.manifest.list.v2+json"))
+MANIFEST_TYPES = frozenset(("application/vnd.oci.image.manifest.v1+json",
+                           "application/vnd.docker.distribution.manifest.v2+json"))
 
 def blocked(reason):
     raise SystemExit("Storage preflight (" + phase + ") blocked: " + reason)
 
-def probe(args, allow_missing=False):
+def probe(name, args, allow_missing=False):
     # Bound both duration and output; never forward Docker/psql diagnostics,
     # which may contain private connection information.
-    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               env=dict(os.environ, LC_ALL="C"))
+    if name not in PROBE_NAMES:
+        blocked("invalid metadata probe")
+    try:
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=dict(os.environ, LC_ALL="C"))
+    except OSError:
+        blocked("metadata probe " + name + " is unavailable")
     output = {"out": bytearray(), "err": bytearray()}
     selector = selectors.DefaultSelector()
-    for pipe, name in ((process.stdout, "out"), (process.stderr, "err")):
-        selector.register(pipe, selectors.EVENT_READ, name)
+    for pipe, stream_name in ((process.stdout, "out"), (process.stderr, "err")):
+        selector.register(pipe, selectors.EVENT_READ, stream_name)
     deadline = time.monotonic() + 20
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                blocked("metadata probe timed out")
+                blocked("metadata probe " + name + " timed out")
             for key, _ in selector.select(min(remaining, 1)):
                 data = os.read(key.fileobj.fileno(), 8192)
                 if not data:
@@ -220,14 +253,20 @@ def probe(args, allow_missing=False):
                     continue
                 output[key.data].extend(data)
                 if len(output[key.data]) > (262144 if key.data == "out" else 4096):
-                    blocked("metadata probe exceeded output limit")
-        code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                    blocked("metadata probe " + name + " exceeded output limit")
+        try:
+            code = process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            blocked("metadata probe " + name + " timed out")
         if code:
             error = output["err"].decode("utf-8", errors="replace").strip()
             if allow_missing and re.fullmatch(r"(?:Error response from daemon:|Error:) No such image: [^\r\n]+", error):
                 return None
-            blocked("metadata probe failed")
-        return output["out"].decode("utf-8").strip()
+            blocked("metadata probe " + name + " failed")
+        try:
+            return output["out"].decode("utf-8").strip()
+        except UnicodeError:
+            blocked("metadata probe " + name + " returned malformed output")
     finally:
         if process.poll() is None:
             process.kill()
@@ -248,10 +287,17 @@ def integer(value):
         blocked("numeric metadata is out of range")
     return result
 
-def filesystem(args):
+def manifest_probe(name, args):
+    try:
+        return json.loads(probe(name, args))
+    except (ValueError, TypeError):
+        blocked("metadata probe " + name + " returned malformed JSON")
+
+def filesystem(role, args):
     measurements = []
     for flag in ("-Pk", "-Pi"):
-        rows = probe(args[:-1] + [flag, args[-1]]).splitlines()
+        name = role + "_filesystem_" + ("bytes" if flag == "-Pk" else "inodes")
+        rows = probe(name, args[:-1] + [flag, args[-1]]).splitlines()
         if len(rows) != 2:
             blocked("filesystem metadata is unavailable")
         fields = rows[1].split()
@@ -262,13 +308,13 @@ def filesystem(args):
         blocked("filesystem changed during inspection")
     # st_dev is identical for host paths and the bind-mounted local PG volume;
     # df source labels can differ for two mounts of the same filesystem.
-    device = integer(probe(args[:-2] + ["stat", "-c", "%d", args[-1]]))
+    device = integer(probe(role + "_filesystem_device", args[:-2] + ["stat", "-c", "%d", args[-1]]))
     return device, measurements[0][1] * 1024, measurements[1][1]
 
 try:
     if phase not in ("before-pull", "after-pull"):
         blocked("invalid phase")
-    docker_root = probe(["docker", "info", "--format", "{{.DockerRootDir}}"])
+    docker_root = probe("docker_root", ["docker", "info", "--format", "{{.DockerRootDir}}"])
     if not docker_root.startswith("/") or "\n" in docker_root:
         blocked("Docker data root is unavailable")
     backup_path = install_dir + "/backups"
@@ -276,23 +322,23 @@ try:
         if os.path.lexists(backup_path):
             blocked("backup destination is not a directory")
         backup_path = install_dir
-    filesystems = {"docker": filesystem(["df", docker_root]),
-                   "backup": filesystem(["df", backup_path])}
+    filesystems = {"docker": filesystem("docker", ["df", docker_root]),
+                   "backup": filesystem("backup", ["df", backup_path])}
     # The physical database size includes indexes and unused space. Reserve an
     # additional 25% for growth, with a 64 MiB floor for a fresh bootstrap dump.
     snapshot = 64 * 1024 ** 2
     if old_dir:
-        pg_id = probe(compose_args(old_dir, old_env, old_release, "ps", "-aq", "postgres"))
+        pg_id = probe("postgres_container", compose_args(old_dir, old_env, old_release, "ps", "-aq", "postgres"))
         if not re.fullmatch(r"[0-9a-f]{64}", pg_id):
             blocked("current PostgreSQL container is unavailable")
-        if probe(["docker", "inspect", "--format", "{{.State.Running}}", pg_id]) != "true":
+        if probe("postgres_running", ["docker", "inspect", "--format", "{{.State.Running}}", pg_id]) != "true":
             blocked("current PostgreSQL is not running")
-        mount = probe(["docker", "inspect", "--format",
+        mount = probe("postgres_mount", ["docker", "inspect", "--format",
                        '{{range .Mounts}}{{if eq .Destination "/var/lib/postgresql"}}{{.Type}}:{{.Name}}{{end}}{{end}}', pg_id])
         if mount != "volume:maxposty-backend_postgres-data":
             blocked("PostgreSQL data volume does not match the production contract")
-        filesystems["postgres"] = filesystem(["docker", "exec", pg_id, "df", "/var/lib/postgresql"])
-        size = integer(probe(["docker", "exec", pg_id, "sh", "-ec",
+        filesystems["postgres"] = filesystem("postgres", ["docker", "exec", pg_id, "df", "/var/lib/postgresql"])
+        size = integer(probe("postgres_database_size", ["docker", "exec", pg_id, "sh", "-ec",
             'PGCONNECT_TIMEOUT=3 PGOPTIONS="-c statement_timeout=5000 -c default_transaction_read_only=on" '
             'PGPASSWORD="$POSTGRES_PASSWORD" psql --host=127.0.0.1 --no-password '
             '--username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --tuples-only --no-align '
@@ -300,21 +346,21 @@ try:
         if not size:
             blocked("database snapshot estimate is unavailable")
         snapshot = max(snapshot, (size * 5 + 3) // 4)
-    elif probe(["docker", "volume", "ls", "--filter", "name=^maxposty-backend_postgres-data$", "--format", "{{.Name}}"]):
+    elif probe("existing_postgres_volume", ["docker", "volume", "ls", "--filter", "name=^maxposty-backend_postgres-data$", "--format", "{{.Name}}"]):
         blocked("existing PostgreSQL data requires an accepted current release")
 
-    refs = set(probe(compose_args(next_dir, next_env, next_release, "config", "--images")).splitlines())
+    refs = set(probe("compose_images", compose_args(next_dir, next_env, next_release, "config", "--images")).splitlines())
     if not refs or len(refs) > 32:
         blocked("image metadata is unavailable")
     missing_bytes = missing_count = 0
-    raw_arch = probe(["docker", "info", "--format", "{{.Architecture}}"])
+    raw_arch = probe("docker_architecture", ["docker", "info", "--format", "{{.Architecture}}"])
     architecture = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(raw_arch)
     if architecture is None:
         blocked("Docker architecture is unsupported")
     for ref in sorted(refs):
         if not re.fullmatch(r"[a-z0-9][a-z0-9._/:-]*@sha256:[0-9a-f]{64}", ref):
             blocked("image is not pinned to an immutable digest")
-        local_image = probe(["docker", "image", "inspect", "--format", "{{.ID}} {{.Os}} {{.Architecture}}", ref], allow_missing=True)
+        local_image = probe("local_image", ["docker", "image", "inspect", "--format", "{{.ID}} {{.Os}} {{.Architecture}}", ref], allow_missing=True)
         if local_image is not None:
             if not re.fullmatch(r"sha256:[0-9a-f]{64} [a-z0-9]+ [a-z0-9]+", local_image):
                 blocked("local image metadata is malformed")
@@ -322,18 +368,45 @@ try:
                 continue
         if phase == "after-pull":
             blocked("required image is still missing after pull")
-        manifests = json.loads(probe(["docker", "manifest", "inspect", "--verbose", ref]))
-        if not isinstance(manifests, list):
-            manifests = [manifests]
-        matches = [entry for entry in manifests if
-                   entry.get("Descriptor", {}).get("platform", {}).get("architecture") == architecture and
-                   entry.get("Descriptor", {}).get("platform", {}).get("os") == "linux"]
-        if len(matches) != 1:
-            blocked("native image manifest is unavailable")
-        entry = matches[0]
-        manifest = entry.get("OCIManifest", entry.get("SchemaV2Manifest", {}))
+        parent = manifest_probe("image_index", ["docker", "manifest", "inspect", ref])
+        if not isinstance(parent, dict) or parent.get("schemaVersion") != 2:
+            blocked("image manifest metadata is malformed")
+        if "manifests" in parent:
+            descriptors = parent["manifests"]
+            if parent.get("mediaType") not in INDEX_TYPES or not isinstance(descriptors, list) or not descriptors or len(descriptors) > 128:
+                blocked("image index metadata is malformed")
+            if any(not isinstance(entry, dict) or not isinstance(entry.get("platform"), dict) for entry in descriptors):
+                blocked("image index platform metadata is malformed")
+            matches = [entry for entry in descriptors if entry["platform"].get("architecture") == architecture and
+                       entry["platform"].get("os") == "linux"]
+            if len(matches) != 1:
+                blocked("native image manifest is unavailable")
+            digest = matches[0].get("digest")
+            if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                blocked("native image digest is malformed")
+            repository = ref.rsplit("@", 1)[0]
+            if repository.rfind(":") > repository.rfind("/"):
+                repository = repository.rsplit(":", 1)[0]
+            manifest = manifest_probe("native_image_manifest", ["docker", "manifest", "inspect", repository + "@" + digest])
+        else:
+            if parent.get("mediaType") not in MANIFEST_TYPES:
+                blocked("image manifest metadata is malformed")
+            # A standalone manifest has no platform descriptor. Retain the
+            # legacy verbose/config check only for this one pinned image.
+            verbose = manifest_probe("single_image_manifest", ["docker", "manifest", "inspect", "--verbose", ref])
+            entries = verbose if isinstance(verbose, list) else [verbose]
+            matches = [entry for entry in entries if isinstance(entry, dict) and
+                       isinstance(entry.get("Descriptor"), dict) and
+                       isinstance(entry["Descriptor"].get("platform"), dict) and
+                       entry["Descriptor"]["platform"].get("architecture") == architecture and
+                       entry["Descriptor"]["platform"].get("os") == "linux"]
+            if len(matches) != 1:
+                blocked("native image manifest is unavailable")
+            manifest = matches[0].get("OCIManifest", matches[0].get("SchemaV2Manifest", {}))
+        if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 2 or manifest.get("mediaType") not in MANIFEST_TYPES or "manifests" in manifest:
+            blocked("native image manifest metadata is malformed")
         layers = manifest.get("layers", [])
-        if not layers or len(layers) > 128:
+        if not isinstance(layers, list) or not layers or len(layers) > 128 or any(not isinstance(layer, dict) for layer in layers):
             blocked("image layer metadata is unavailable")
         # Keep room for compressed downloads and unpacking. Cached images add
         # no pull reserve; shared missing layers are deliberately overestimated.
@@ -698,6 +771,7 @@ trap restore_previous_release EXIT
 install -d -m 755 "$installation_dir/runtime" "$installation_dir/runtime/metrics"
 "$alertmanager_renderer" "$next_env" "$alertmanager_config"
 compose "$release_dir" "$next_env" "$next_release" config >/dev/null
+rotate_local_migration_backups
 disk_preflight before-pull
 compose "$release_dir" "$next_env" "$next_release" pull \
   backend migrate runtime-storage-init postgres pgbouncer postgres-exporter pgbouncer-exporter node-exporter alertmanager prometheus grafana
@@ -762,9 +836,7 @@ chmod 600 "$backup_temporary"
 mv "$backup_temporary" "$backup_final"
 backup_temporary=''
 
-retention_days=$(env_value "$next_env" BACKUP_RETENTION_DAYS)
-find "$backup_dir" -type f -name 'postgres-*.dump' \
-  -mtime "+$retention_days" -delete
+rotate_local_migration_backups
 
 schema_advanced=true
 compose "$release_dir" "$next_env" "$next_release" run --rm --no-deps migrate

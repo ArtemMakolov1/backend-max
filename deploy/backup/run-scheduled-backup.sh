@@ -7,7 +7,7 @@ if [[ ! "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   exit 2
 fi
 
-for command_name in awk date docker find flock install mktemp openssl readlink sha256sum tar; do
+for command_name in awk date docker flock install mktemp openssl python3 readlink sha256sum tar; do
   command -v "$command_name" >/dev/null 2>&1 || {
     echo "Required backup command is missing: $command_name" >&2
     exit 1
@@ -96,6 +96,19 @@ METRICS
 }
 
 write_attempt_metric 0
+backup_retention_days=$(env_value "$environment_file" BACKUP_RETENTION_DAYS)
+pitr_retention_days=$(env_value "$environment_file" PITR_RETENTION_DAYS)
+rotate_local_backups() {
+  local command=(python3 "$release_dir/deploy/backup/rotate-production-backups.py" "$installation_dir" cleanup
+    --lock-fd 9 --logical-retention-days "$backup_retention_days" --pitr-retention-days "$pitr_retention_days")
+  if [[ -n "${timestamp:-}" ]]; then
+    command+=(--protect-generation "$timestamp")
+  fi
+  "${command[@]}"
+}
+# Local retention is independent from offsite availability. Reclaim obsolete
+# verified generations before allocating another complete physical snapshot.
+rotate_local_backups
 auth_dir=$(mktemp -d "$release_dir/.backup-auth.XXXXXX")
 chmod 700 "$auth_dir"
 curl_config="$auth_dir/github-curl.config"
@@ -129,6 +142,12 @@ cleanup() {
   compose exec -T postgres rm -rf "/var/lib/postgresql/base-backups/$base_temporary" >/dev/null 2>&1 || true
   rm -rf "$auth_dir"
   rm -f "$dump_temporary" "$media_temporary"
+  # A failed offsite upload must not accumulate completed logical/base copies.
+  # Keep its failure status, while also reporting a failed retention attempt.
+  if [[ "$completed" != true ]] && ! rotate_local_backups; then
+    echo "Local backup retention failed" >&2
+    (( status != 0 )) || status=1
+  fi
   if [[ "$completed" != true ]]; then
     write_attempt_metric 0 || true
   fi
@@ -209,13 +228,7 @@ export MAXPOSTY_BACKUP_SNAPSHOT_SOURCE_SHA=$source_sha
 export MAXPOSTY_BACKUP_RECIPIENT_CERT="$installation_dir/certs/backup-recipient.pem"
 "$backup_hook" "$dump_final" "$media_final" "$manifest_final" "$image"
 
-backup_retention_days=$(env_value "$environment_file" BACKUP_RETENTION_DAYS)
-pitr_retention_days=$(env_value "$environment_file" PITR_RETENTION_DAYS)
-find "$backup_dir" -type f \( -name 'postgres-*.dump' -o -name 'media-*.tar.gz' -o -name 'backup-*.sha256' \) \
-  -mtime "+$backup_retention_days" -delete
-compose exec -T postgres find /var/lib/postgresql/base-backups -mindepth 1 -maxdepth 1 -type d -name 'base-*' \
-  -mtime "+$pitr_retention_days" -exec rm -rf -- '{}' +
-compose exec -T postgres find /var/lib/postgresql/wal-archive -type f -mtime "+$pitr_retention_days" -delete
+rotate_local_backups
 
 wal_failed_count=$(compose exec -T postgres sh -ec \
   'PGPASSWORD="$POSTGRES_PASSWORD" psql --no-password --username="$POSTGRES_USER" --dbname="$POSTGRES_DB" --tuples-only --no-align --command="SELECT failed_count FROM pg_stat_archiver"' |
