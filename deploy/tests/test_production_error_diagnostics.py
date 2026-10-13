@@ -60,7 +60,7 @@ class SanitizerTests(unittest.TestCase):
             self.assertTrue(value["provider_status"] is None or (
                 type(value["provider_status"]) is int and value["provider_status"] in diagnostic.PROVIDER_HTTP_STATUSES))
             self.assertTrue(value["provider_code"] is None or value["provider_code"] in diagnostic.PROVIDER_CODES)
-            self.assertIn(value["provider_reason"], (None, "unsupported_region"))
+            self.assertIn(value["provider_reason"], (None, "unsupported_region", *diagnostic.SOURCE_OWNED_RESULT_REASONS.values()))
         self.assertEqual(set(value), keys)
         self.assertTrue(value["sqlstate"] is None or value["sqlstate"] in diagnostic.SQLSTATES)
         self.assertTrue(value["table"] is None or value["table"] in diagnostic.TABLES)
@@ -266,6 +266,56 @@ class SanitizerTests(unittest.TestCase):
             self.assertIsNone(safe["provider_status"])
             self.assertIsNone(safe["provider_code"])
             self.assert_safe(safe)
+
+    def test_deepseek_results_classify_only_complete_source_owned_messages(self):
+        for message, reason in diagnostic.SOURCE_OWNED_RESULT_REASONS.items():
+            with self.subTest(reason=reason, message=message):
+                safe = diagnostic.sanitize_record(record(message, msg="DeepSeek text request failed", status=0,
+                                                         request_id=SECRETS[5], body=SECRETS, url=SECRETS[2]))
+                self.assertEqual(safe["category"], "provider_result")
+                self.assertEqual(safe["provider_reason"], reason)
+                self.assertIsNone(safe["provider_status"])
+                self.assertIsNone(safe["provider_code"])
+                self.assert_safe(safe)
+
+    def test_deepseek_result_reasons_reject_private_fragments_and_unknown_values(self):
+        for message in diagnostic.SOURCE_OWNED_RESULT_REASONS:
+            for error in (message + " " + SECRETS[0], SECRETS[2] + " " + message,
+                          message + "\n" + SECRETS[4], " " + message, message + ".", message.upper()):
+                with self.subTest(error=error):
+                    safe = diagnostic.sanitize_record(record(error, msg="DeepSeek text request failed", status=0))
+                    self.assertIsNone(safe["provider_reason"])
+                    self.assert_safe(safe)
+        for error in (*SECRETS, "unknown response validation failure", "invalid_structured_output",
+                      None, {}, [], True, 0):
+            with self.subTest(error=error):
+                safe = diagnostic.sanitize_record(record(error, msg="DeepSeek text request failed", status=0))
+                self.assertIsNone(safe["provider_reason"])
+                self.assert_safe(safe)
+
+    def test_deepseek_result_reasons_require_the_exact_logger_and_integer_zero_status(self):
+        for message in diagnostic.SOURCE_OWNED_RESULT_REASONS:
+            for status in (None, {}, [], True, False, 0.0, "0", 200, 400, 402, 403, 429, 500):
+                with self.subTest(status=status, message=message):
+                    safe = diagnostic.sanitize_record(record(message, msg="DeepSeek text request failed", status=status))
+                    self.assertIsNone(safe["provider_reason"])
+                    self.assert_safe(safe)
+            safe = diagnostic.sanitize_record(record(message, msg="OpenAI research request failed", status=0))
+            self.assertIsNone(safe["provider_reason"])
+            self.assert_safe(safe)
+            for msg in ("DeepSeek text request failed ", "DeepSeek text request failed\n" + SECRETS[0],
+                        "DeepSeek image request failed", SECRETS[0]):
+                self.assertIsNone(diagnostic.sanitize_record(record(message, msg=msg, status=0)))
+            safe = diagnostic.sanitize_record(record(message, status=0))
+            self.assertEqual(safe["category"], "unknown")
+            self.assertNotIn("provider_reason", safe)
+            self.assert_safe(safe)
+
+    def test_provider_payment_required_is_preserved_without_inferring_private_reason(self):
+        safe = diagnostic.sanitize_record(record("; ".join(SECRETS), msg="DeepSeek text request failed", status=402))
+        self.assertEqual((safe["category"], safe["provider_status"]), ("provider_http", 402))
+        self.assertIsNone(safe["provider_reason"])
+        self.assert_safe(safe)
 
     def test_region_reason_requires_403_and_the_complete_canonical_message(self):
         canonical = "Country, region, or territory not supported"

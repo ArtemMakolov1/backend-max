@@ -145,7 +145,7 @@ TRANSPORT_KINDS = frozenset((
 # The API's exact research logger supplies status separately from the private
 # error message. Zero means a response-validation failure, not an HTTP status.
 PROVIDER_HTTP_STATUSES = frozenset((
-    400, 401, 403, 404, 408, 409, 413, 415, 422, 429, 500, 502, 503, 504,
+    400, 401, 402, 403, 404, 408, 409, 413, 415, 422, 429, 500, 502, 503, 504,
 ))
 # Only canonical known provider codes and source-owned Responses validation
 # codes may leave the server. Never infer a code from the private error text.
@@ -159,6 +159,35 @@ PROVIDER_CODES = {
         "response_incomplete", "response_failed", "response_refused",
         "missing_output_text", "content_changed",
     )
+}
+
+# Exact messages produced by our DeepSeek response/discovery validators only.
+# This also classifies older records whose logger did not include a code. No
+# substring, provider-body fragment or dynamically formatted value is accepted.
+SOURCE_OWNED_RESULT_REASONS = {
+    "DeepSeek could not complete the response": "response_failed",
+    "DeepSeek response was not completed": "response_not_completed",
+    "DeepSeek response was not completed: failed": "response_failed",
+    "DeepSeek response was not completed: in_progress": "response_in_progress",
+    "DeepSeek response was not completed: max_output_tokens": "response_token_limit",
+    "DeepSeek response was not completed: content_filter": "response_content_filter",
+    "DeepSeek refused the post drafting request": "response_refused",
+    "DeepSeek draft response does not contain text": "response_text_missing",
+    "invalid content discovery JSON": "discovery_json_invalid",
+    "content discovery must contain one JSON object and at most three cards": "discovery_shape_invalid",
+    "content discovery card kind is invalid": "discovery_kind_invalid",
+    "content discovery did not honor the requested kind": "discovery_kind_mismatch",
+    "content discovery contains an unsafe source": "discovery_source_unsafe",
+    "content discovery source was not returned by web search": "discovery_source_unverified",
+    "content discovery card exceeds its text bounds": "discovery_card_bounds",
+    "content discovery draft exceeds its text bounds": "discovery_draft_bounds",
+    "content discovery draft uses unsupported MAX formatting": "discovery_format_unsupported",
+    "content discovery draft must not invent external links": "discovery_external_links",
+    "content discovery draft with attribution exceeds the MAX post size bound": "discovery_attribution_size",
+    "content discovery source cannot be safely formatted for MAX": "discovery_source_format",
+    "draft title contains a forbidden word or phrase": "discovery_forbidden_words",
+    "draft content contains a forbidden word or phrase": "discovery_forbidden_words",
+    "draft image_prompt contains a forbidden word or phrase": "discovery_forbidden_words",
 }
 
 
@@ -250,6 +279,8 @@ def sanitize_record(record):
             http_status == 403 and isinstance(error, str)
             and error.strip().casefold() == "country, region, or territory not supported"
         ) else None
+        if record.get("msg") == "DeepSeek text request failed" and type(status) is int and status == 0:
+            reason = SOURCE_OWNED_RESULT_REASONS.get(error) if isinstance(error, str) else None
         return {
             "time": safe_time(record.get("time")),
             "category": "provider_result" if type(status) is int and status == 0 else "provider_http",
