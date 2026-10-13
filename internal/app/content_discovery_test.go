@@ -5,12 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"maxpilot/backend/internal/contentsearch"
 	"maxpilot/backend/internal/openairesearch"
 	"maxpilot/backend/internal/store"
 )
@@ -43,24 +47,32 @@ func TestContentDiscoveryPublishedMatcherIsServerOwnedAndSelectedChannelScoped(t
 	}
 	injectedCalls := 0
 	_, err = application.DiscoverContentForWorkspaceWithBeforeGenerate(t.Context(), "description-owner", workspace.ID, &channel.ID,
-		openairesearch.DiscoverContentRequest{PublishedMatcher: func(context.Context, []openairesearch.DiscoveryPublishedCandidate) ([]bool, error) {
-			injectedCalls++
-			return []bool{true, true, true}, nil
-		}}, nil)
-	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedMatcher == nil {
-		t.Fatalf("server publication matcher unavailable: %v", err)
+		openairesearch.DiscoverContentRequest{
+			PublishedMatcher: func(context.Context, []openairesearch.DiscoveryPublishedCandidate) ([]bool, error) {
+				injectedCalls++
+				return []bool{true, true, true}, nil
+			},
+			PublishedReferenceLookup: func(context.Context, []openairesearch.DiscoveryPublishedCandidate) ([][]openairesearch.DiscoveryPublishedReference, error) {
+				injectedCalls++
+				return [][]openairesearch.DiscoveryPublishedReference{{{Text: "Injected private publication"}}}, nil
+			},
+		}, nil)
+	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedMatcher != nil || fake.requests[0].PublishedReferenceLookup == nil {
+		t.Fatalf("server publication reference lookup unavailable: %v", err)
 	}
 	request := fake.requests[0]
-	matches, err := request.PublishedMatcher(t.Context(), []openairesearch.DiscoveryPublishedCandidate{
+	candidates := []openairesearch.DiscoveryPublishedCandidate{
 		{SourceURL: "https://example.com/engine?utm_campaign=another", Title: "Другая подача уже опубликованного двигателя"},
 		{SourceURL: "https://example.com/other-channel", Title: "Подводная лодка"},
 		{SourceURL: "https://example.com/draft", Title: "Черновик"},
-	})
+	}
+	references, err := request.PublishedReferenceLookup(t.Context(), candidates)
+	matches := discoveryReferencesMatchCandidates(candidates, references)
 	if err != nil || len(matches) != 3 || !matches[0] || matches[1] || matches[2] || injectedCalls != 0 {
 		t.Fatalf("matcher trusted caller, draft or foreign channel: matches=%v injected=%d err=%v", matches, injectedCalls, err)
 	}
 	encoded, err := json.Marshal(request)
-	if err != nil || strings.Contains(string(encoded), "PublishedMatcher") || strings.Contains(string(encoded), "секретный") {
+	if err != nil || strings.Contains(string(encoded), "PublishedMatcher") || strings.Contains(string(encoded), "PublishedReferenceLookup") || strings.Contains(string(encoded), "секретный") {
 		t.Fatal("local publication index leaked into serialized model/public request")
 	}
 }
@@ -89,12 +101,12 @@ func TestContentDiscoveryPublishedMatcherRecognizesShortCaptionAndLongSourceRewr
 		ChannelID: &channel.ID, Title: "Новая публикация", Content: fixture.Reference.Text, Format: store.FormatMarkdown})
 	_, err = application.DiscoverContentForWorkspaceWithBeforeGenerate(t.Context(), "description-owner", workspace.ID, &channel.ID,
 		openairesearch.DiscoverContentRequest{Topic: "Керосин из опилок и подсолнечной лузги"}, nil)
-	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedMatcher == nil {
-		t.Fatalf("server publication matcher unavailable: %v", err)
+	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedMatcher != nil || fake.requests[0].PublishedReferenceLookup == nil {
+		t.Fatalf("server publication reference lookup unavailable: %v", err)
 	}
 	article := fixture.Article
 	article.Text += strings.Repeat(" Научные исследования продолжаются, подробности описаны в публикации.", 80)
-	matched, err := fake.requests[0].PublishedMatcher(t.Context(), []openairesearch.DiscoveryPublishedCandidate{
+	candidates := []openairesearch.DiscoveryPublishedCandidate{
 		article,
 		fixture.Candidate,
 		{Title: "Керосиновый двигатель выдержал испытания на орбите",
@@ -103,9 +115,243 @@ func TestContentDiscoveryPublishedMatcherRecognizesShortCaptionAndLongSourceRewr
 		{Title: "Опилки и лузга стали основой строительных панелей",
 			Text:      "Древесные опилки и подсолнечную лузгу прессуют в прочные строительные панели. Полученный утеплитель сохраняет тепло в стенах жилых домов.",
 			SourceURL: "https://example.com/new-construction-panels"},
-	})
+	}
+	references, err := fake.requests[0].PublishedReferenceLookup(t.Context(), candidates)
+	matched := discoveryReferencesMatchCandidates(candidates, references)
 	if err != nil || len(matched) != 4 || !matched[0] || !matched[1] || matched[2] || matched[3] {
 		t.Fatalf("short published caption/rewrite event identity mismatch: matches=%v err=%v", matched, err)
+	}
+}
+
+func discoveryReferencesMatchCandidates(candidates []openairesearch.DiscoveryPublishedCandidate, references [][]openairesearch.DiscoveryPublishedReference) []bool {
+	if len(candidates) != len(references) {
+		return nil
+	}
+	matches := make([]bool, len(candidates))
+	for index, candidate := range candidates {
+		for _, reference := range references[index] {
+			if openairesearch.IsPublishedDiscoveryDuplicate(candidate, reference) {
+				matches[index] = true
+				break
+			}
+		}
+	}
+	return matches
+}
+
+func TestContentDiscoveryPublishedReferenceLookupBoundsComparisonsAndRechecksMembership(t *testing.T) {
+	fake := &discoveryTestClient{}
+	application, storage, _ := newChannelDescriptionFixture(t, fake)
+	workspace, err := storage.CreateWorkspace(t.Context(), "description-owner", store.Workspace{Name: "Shared editorial workspace"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activatePaidWorkspaceForTest(t, storage, "description-owner", workspace.ID)
+	channel, err := storage.CreateChannel(t.Context(), store.Channel{UserID: "description-owner", WorkspaceID: workspace.ID,
+		VerifiedMAXOwnerID: "100", MAXChatID: "-70004", Title: "Инженерные новости", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 6; index++ {
+		createDeliveredDiscoveryTestPost(t, storage, store.Post{UserID: "description-owner", WorkspaceID: workspace.ID,
+			ChannelID: &channel.ID, Title: "Private internal title", Format: store.FormatMarkdown,
+			Content: fmt.Sprintf("Ракетный двигатель. Отдельная публикация о конструктивном решении номер %d.", index)})
+	}
+	if err := storage.UpsertUser(t.Context(), store.User{ID: "projection-editor", DisplayName: "Editor"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.AddWorkspaceMember(t.Context(), "description-owner", store.WorkspaceMember{
+		WorkspaceID: workspace.ID, UserID: "projection-editor", Role: store.WorkspaceRoleEditor,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = application.DiscoverContentForWorkspaceWithBeforeGenerate(t.Context(), "projection-editor", workspace.ID, &channel.ID,
+		openairesearch.DiscoverContentRequest{Topic: "Ракетный двигатель"}, nil)
+	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedReferenceLookup == nil || fake.requests[0].PublishedMatcher != nil {
+		t.Fatalf("scoped reference projection unavailable: %v", err)
+	}
+	lookup := fake.requests[0].PublishedReferenceLookup
+	candidates := []openairesearch.DiscoveryPublishedCandidate{{Title: "Ракетный двигатель", Text: "Устройство нового поколения прошло испытания."}}
+	refs, err := lookup(t.Context(), candidates)
+	if err != nil || len(refs) != 1 || len(refs[0]) != 3 {
+		t.Fatalf("nearest reference projection is not bounded to three: groups=%d err=%v", len(refs), err)
+	}
+	for _, reference := range refs[0] {
+		if reference.Title != "Ракетный двигатель" || utf8.RuneCountInString(reference.Text) > 4000 || strings.Contains(reference.Text, "Private") {
+			t.Fatal("reference projection included an unproven internal title or unbounded body")
+		}
+	}
+	if refs, err := lookup(t.Context(), make([]openairesearch.DiscoveryPublishedCandidate, 21)); err == nil || refs != nil {
+		t.Fatal("an unbounded candidate list reached publication lookup")
+	}
+	if err := storage.RemoveWorkspaceMember(t.Context(), "description-owner", workspace.ID, "projection-editor"); err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := lookup(t.Context(), candidates); !errors.Is(err, store.ErrNotFound) || refs != nil {
+		t.Fatalf("revoked member retained publication comparisons: groups=%d err=%v", len(refs), err)
+	}
+}
+
+type discoverySemanticTestSearcher struct {
+	source contentsearch.Source
+}
+
+func TestContentDiscoveryPublishedReferenceLookupRetainsNewerMilestoneAlongsideOldBackground(t *testing.T) {
+	fake := &discoveryTestClient{}
+	application, storage, workspace := newChannelDescriptionFixture(t, fake)
+	activatePaidWorkspaceForTest(t, storage, "description-owner", workspace.ID)
+	channel, err := storage.CreateChannel(t.Context(), store.Channel{UserID: "description-owner", WorkspaceID: workspace.ID,
+		VerifiedMAXOwnerID: "100", MAXChatID: "-70006", Title: "Изобретено в России", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile("../contentdedup/testdata/published_aviation_rewrite.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Reference openairesearch.DiscoveryPublishedReference
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	newer := "Открыт промышленный завод авиационного биотоплива. Предприятие впервые выпустило коммерческую партию; далее приведён старый лабораторный контекст. " + fixture.Reference.Text
+	for _, content := range []string{fixture.Reference.Text, newer} {
+		createDeliveredDiscoveryTestPost(t, storage, store.Post{UserID: "description-owner", WorkspaceID: workspace.ID,
+			ChannelID: &channel.ID, Title: "Private internal label", Content: content, Format: store.FormatMarkdown})
+	}
+	_, err = application.DiscoverContentForWorkspaceWithBeforeGenerate(t.Context(), "description-owner", workspace.ID, &channel.ID,
+		openairesearch.DiscoverContentRequest{Topic: "Авиационное биотопливо"}, nil)
+	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedReferenceLookup == nil {
+		t.Fatalf("milestone reference lookup unavailable: %v", err)
+	}
+	candidate := openairesearch.DiscoveryPublishedCandidate{Title: "Завод запустил промышленное производство авиационного биотоплива",
+		Text:      "Коммерческий выпуск начался на промышленном заводе авиационного биотоплива. В качестве справки сообщаются прежние показатели топлива. " + fixture.Reference.Text,
+		SourceURL: "https://example.com/another-publisher-new-plant"}
+	refs, err := fake.requests[0].PublishedReferenceLookup(t.Context(), []openairesearch.DiscoveryPublishedCandidate{candidate})
+	if err != nil || len(refs) != 1 || len(refs[0]) != 2 {
+		t.Fatalf("old background relevance crowded out a confirmed newer milestone: groups=%d err=%v", len(refs), err)
+	}
+	seen := make(map[string]bool)
+	for _, reference := range refs[0] {
+		seen[reference.Text] = true
+		if openairesearch.IsDefinitivePublishedDiscoveryDuplicate(candidate, reference) {
+			t.Fatal("paraphrased milestone fixture unexpectedly established exact identity")
+		}
+	}
+	if !seen[fixture.Reference.Text] || !seen[newer] {
+		t.Fatal("semantic comparison omitted old background or the actual newer publication")
+	}
+}
+
+func (f discoverySemanticTestSearcher) Search(context.Context, contentsearch.Request) (contentsearch.Result, error) {
+	return contentsearch.Result{Provider: "fixture", Sources: []contentsearch.Source{f.source}}, nil
+}
+
+func TestContentDiscoveryUsesScopedPublishedIndexForSemanticAlternatePublisherAndNewEvents(t *testing.T) {
+	data, err := os.ReadFile("../contentdedup/testdata/published_aviation_rewrite.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Reference        openairesearch.DiscoveryPublishedReference
+		SecondaryArticle openairesearch.DiscoveryPublishedCandidate `json:"secondary_article"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name      string
+		candidate openairesearch.DiscoveryPublishedCandidate
+		duplicate bool
+	}{
+		{"same event at alternate publisher without measurements", fixture.SecondaryArticle, true},
+		{"new industrial milestone with copied old fuel background", openairesearch.DiscoveryPublishedCandidate{
+			Title:     "Открыт первый промышленный завод авиационного биотоплива",
+			Text:      "Новое событие: впервые запущен промышленный завод авиационного биотоплива, который выпускает коммерческую партию. Ниже приведены прежние лабораторные результаты для контекста. " + fixture.Reference.Text,
+			SourceURL: "https://example.com/new-industrial-plant"}, false},
+		{"new aviation milestone", openairesearch.DiscoveryPublishedCandidate{Title: "Самолет выполнил первый перелет на топливе из опилок",
+			Text:      "Новый этап разработки авиационного топлива: самолет впервые совершил испытательный перелет на горючем из древесных опилок и подсолнечной лузги. В отличие от лабораторной оценки топлива, эта публикация сообщает о первом летном испытании.",
+			SourceURL: "https://example.com/first-flight"}, false},
+		{"same biomass new construction result", openairesearch.DiscoveryPublishedCandidate{Title: "Строительные панели из опилок и подсолнечной лузги",
+			Text:      "Из древесных опилок и подсолнечной лузги изготовили новые строительные панели. Эксперимент подтвердил теплоизоляцию стен; это самостоятельный результат материаловедения, без разработки авиационного топлива.",
+			SourceURL: "https://example.com/construction-panels"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				var payload struct {
+					MaxTokens int `json:"max_tokens"`
+					Messages  []struct {
+						Role, Content string
+					} `json:"messages"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Error("invalid classifier/synthesis transport payload")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				content := `{"cards":[]}`
+				for _, message := range payload.Messages {
+					const prefix = "Пары редакционных материалов JSON:\n"
+					if message.Role != "user" || !strings.HasPrefix(message.Content, prefix) {
+						continue
+					}
+					var pairs []struct {
+						PairID    string `json:"pair_id"`
+						Candidate struct{ Title, Text string }
+						Published struct{ Title, Text string }
+					}
+					if err := json.Unmarshal([]byte(strings.TrimPrefix(message.Content, prefix)), &pairs); err != nil || len(pairs) != 1 || pairs[0].PairID != "p1" || payload.MaxTokens != 600 {
+						t.Error("semantic classifier did not receive one bounded authorized pair")
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if utf8.RuneCountInString(pairs[0].Candidate.Text) > 1000 || utf8.RuneCountInString(pairs[0].Published.Text) > 1000 ||
+						utf8.RuneCountInString(pairs[0].Candidate.Title) > 200 || utf8.RuneCountInString(pairs[0].Published.Title) > 200 ||
+						strings.Contains(message.Content, "PRIVATE_INTERNAL_LABEL") || strings.Contains(message.Content, "private-media.example") ||
+						strings.Contains(message.Content, "https://") || strings.Contains(message.Content, "description-owner") {
+						t.Error("semantic projection exposed private fields, URLs or unbounded publication text")
+					}
+					content = fmt.Sprintf(`{"pairs":[{"pair_id":"p1","duplicate":%t}]}`, test.duplicate)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{
+					"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": content},
+				}}})
+			}))
+			defer server.Close()
+			client, err := openairesearch.NewQwen(server.URL, "local-fixture-key", "qwen3.6-plus", server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			client = client.WithContentSearch(discoverySemanticTestSearcher{source: contentsearch.Source{
+				Title: test.candidate.Title, Content: test.candidate.Text, URL: test.candidate.SourceURL,
+			}})
+			application, storage, workspace := newChannelDescriptionFixture(t, client)
+			activatePaidWorkspaceForTest(t, storage, "description-owner", workspace.ID)
+			channel, err := storage.CreateChannel(t.Context(), store.Channel{UserID: "description-owner", WorkspaceID: workspace.ID,
+				VerifiedMAXOwnerID: "100", MAXChatID: "-70005", Title: "Изобретено в России", IsChannel: true, Active: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			createDeliveredDiscoveryTestPost(t, storage, store.Post{UserID: "description-owner", WorkspaceID: workspace.ID,
+				ChannelID: &channel.ID, Title: "PRIVATE_INTERNAL_LABEL", Format: store.FormatMarkdown,
+				Content: fixture.Reference.Text + "\n\nhttps://private-media.example/attachment?token=fixture-only"})
+			result, err := application.DiscoverContentForWorkspaceWithBeforeGenerate(t.Context(), "description-owner", workspace.ID, &channel.ID,
+				openairesearch.DiscoverContentRequest{Topic: "Авиационное топливо"}, nil)
+			if err != nil {
+				t.Fatalf("authorized semantic discovery failed: %v", err)
+			}
+			if test.duplicate {
+				if result.EmptyReason != "already_published" || len(result.Cards) != 0 || calls.Load() != 1 {
+					t.Fatalf("alternate publisher survived prior publication: calls=%d empty=%s", calls.Load(), result.EmptyReason)
+				}
+			} else if calls.Load() != 2 || result.EmptyReason == "already_published" {
+				t.Fatalf("a separately classified new event did not reach synthesis: calls=%d empty=%s", calls.Load(), result.EmptyReason)
+			}
+		})
 	}
 }
 

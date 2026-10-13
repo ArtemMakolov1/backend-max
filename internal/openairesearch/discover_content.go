@@ -29,22 +29,23 @@ const (
 // Context fields are server-owned selections, kept out of the HTTP request.
 // Their text still remains untrusted editorial data in the model prompt.
 type DiscoverContentRequest struct {
-	PublishedMatcher     DiscoveryPublishedMatcher `json:"-"`
-	ChannelPosts         []ChannelPostStyle        `json:"-"`
-	ExamplePosts         []string                  `json:"-"`
-	ExamplePostsOverride bool                      `json:"-"`
-	CTA                  string                    `json:"-"`
-	VisualStyle          string                    `json:"-"`
-	Topic                string                    `json:"topic,omitempty"`
-	ContentKind          string                    `json:"content_kind,omitempty"`
-	Format               string                    `json:"format,omitempty"`
-	ChannelTitle         string                    `json:"-"`
-	ChannelDescription   string                    `json:"-"`
-	RecentPosts          []DiscoveryPublishedPost  `json:"-"`
-	Audience             string                    `json:"-"`
-	Tone                 string                    `json:"-"`
-	ForbiddenWords       []string                  `json:"-"`
-	MediaContext         string                    `json:"-"`
+	PublishedMatcher         DiscoveryPublishedMatcher         `json:"-"`
+	PublishedReferenceLookup DiscoveryPublishedReferenceLookup `json:"-"`
+	ChannelPosts             []ChannelPostStyle                `json:"-"`
+	ExamplePosts             []string                          `json:"-"`
+	ExamplePostsOverride     bool                              `json:"-"`
+	CTA                      string                            `json:"-"`
+	VisualStyle              string                            `json:"-"`
+	Topic                    string                            `json:"topic,omitempty"`
+	ContentKind              string                            `json:"content_kind,omitempty"`
+	Format                   string                            `json:"format,omitempty"`
+	ChannelTitle             string                            `json:"-"`
+	ChannelDescription       string                            `json:"-"`
+	RecentPosts              []DiscoveryPublishedPost          `json:"-"`
+	Audience                 string                            `json:"-"`
+	Tone                     string                            `json:"-"`
+	ForbiddenWords           []string                          `json:"-"`
+	MediaContext             string                            `json:"-"`
 }
 
 type DiscoveryPublishedPost struct {

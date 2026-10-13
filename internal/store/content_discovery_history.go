@@ -281,8 +281,9 @@ WHERE workspace_id=$1 AND post_id=$2 ORDER BY revision_number DESC`, current.Wor
 }
 
 // FindPublishedDiscoveryReferences reads a small, indexed shortlist. Russian
-// stemming and URL hashes select candidates; the caller's deterministic event
-// comparison makes the final duplicate decision, never the paid model.
+// stemming and URL hashes select proven snapshots. The caller checks all local
+// references deterministically, then projects at most three nearest snapshots
+// for bounded semantic comparisons; it never reads the whole channel history.
 func (s *Store) FindPublishedDiscoveryReferences(ctx context.Context, actorUserID, workspaceID string, channelID int64, title, text, sourceURL string) ([]PublishedDiscoveryReference, error) {
 	if _, err := s.GetChannelForWorkspace(ctx, actorUserID, workspaceID, channelID); err != nil {
 		return nil, err
@@ -293,13 +294,17 @@ func (s *Store) FindPublishedDiscoveryReferences(ctx context.Context, actorUserI
 		}
 		return ' '
 	}, boundedPublishedText(title+" "+text, 4200))
-	rows, err := s.db.QueryContext(ctx, `WITH candidate AS (
-SELECT to_tsquery('russian',array_to_string(tsvector_to_array(to_tsvector('russian',$3)),' | ')) AS query
+	rows, err := s.db.QueryContext(ctx, `WITH candidate_terms AS (
+SELECT tsvector_to_array(to_tsvector('russian',$3)) AS terms
+),candidate AS (
+SELECT terms,to_tsquery('russian',array_to_string(terms,' | ')) AS query FROM candidate_terms
 )
 SELECT title,content,source_urls FROM published_content_index,candidate
 WHERE workspace_id=$1 AND channel_id=$2
 AND (source_hashes @> ARRAY[$4]::text[] OR search_vector @@ candidate.query)
-ORDER BY (source_hashes @> ARRAY[$4]::text[]) DESC,ts_rank_cd(search_vector,candidate.query) DESC,post_id DESC
+ORDER BY (source_hashes @> ARRAY[$4]::text[]) DESC,
+cardinality(ARRAY(SELECT unnest(tsvector_to_array(search_vector)) INTERSECT SELECT unnest(candidate.terms))) DESC,
+ts_rank_cd(search_vector,candidate.query) DESC,post_id DESC
 LIMIT 50`, workspaceID, channelID, input, publishedSourceHash(sourceURL))
 	if err != nil {
 		return nil, fmt.Errorf("match indexed published content: %w", err)

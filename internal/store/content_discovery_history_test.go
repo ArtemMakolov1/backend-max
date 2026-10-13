@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -202,6 +203,52 @@ func TestPublishedDiscoveryIndexFindsShortPublishedCaptionWithoutOriginalSourceU
 	var unverified int
 	if err := s.db.QueryRowContext(ctx, `SELECT complete,unverified_posts FROM published_content_index_state WHERE workspace_id=$1 AND channel_id=$2`, workspace.ID, channel.ID).Scan(&complete, &unverified); err != nil || !complete || unverified != 0 {
 		t.Fatalf("confirmed caption was treated as unverified legacy history: complete=%t unverified=%d err=%v", complete, unverified, err)
+	}
+}
+
+func TestPublishedDiscoveryIndexRanksDistinctEventTermsBeforeRepetitionAndCapsLocalShortlist(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s, workspace, channel := openMAXHistoryStoreTest(t, "published-index-nearest", 4)
+	publish := func(content string) {
+		t.Helper()
+		post, err := s.CreatePostForWorkspace(ctx, "test-owner", workspace.ID, Post{ChannelID: &channel.ID,
+			Title: "Internal label", Content: content, Format: FormatMarkdown})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ClaimForPublishing(ctx, post.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.MarkPublished(ctx, post.ID, fmt.Sprintf("nearest-post-%d", post.ID), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	specific := "Учёные получили авиационный керосин из древесных опилок и подсолнечной лузги. Каталитическая переработка биомассы превращает растительные отходы в горючее для самолётов."
+	priority := "Независимый опубликованный прибор. https://example.com/priority-source?utm_source=old"
+	publish(specific)
+	publish(priority)
+	for index := 0; index < 55; index++ {
+		publish("Самолёт. " + strings.Repeat("Самолёт ", 250) + fmt.Sprint(index))
+	}
+	if err := s.EnsurePublishedContentIndexForWorkspace(ctx, "history-editor", workspace.ID, channel.ID); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := s.FindPublishedDiscoveryReferences(ctx, "history-editor", workspace.ID, channel.ID,
+		"Керосин из опилок и подсолнечной лузги", "Авиационное горючее для самолётов получили переработкой биомассы и растительных отходов. Самолёт.", "")
+	if err != nil || len(refs) != 50 || refs[0].Text != specific {
+		t.Fatalf("distinct event terms lost to generic repetition: count=%d err=%v", len(refs), err)
+	}
+	refs, err = s.FindPublishedDiscoveryReferences(ctx, "history-editor", workspace.ID, channel.ID,
+		"Самолёт", "Новая авиационная разработка", "https://example.com/priority-source?utm_campaign=next")
+	if err != nil || len(refs) != 50 || refs[0].Text != priority {
+		t.Fatalf("canonical source did not rank before text matches: count=%d err=%v", len(refs), err)
+	}
+	if err := s.RemoveWorkspaceMember(ctx, "test-owner", workspace.ID, "history-editor"); err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := s.FindPublishedDiscoveryReferences(ctx, "history-editor", workspace.ID, channel.ID, "керосин", "", ""); !errors.Is(err, ErrNotFound) || refs != nil {
+		t.Fatalf("revoked member received cached published references: count=%d err=%v", len(refs), err)
 	}
 }
 

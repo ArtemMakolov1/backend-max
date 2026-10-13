@@ -60,14 +60,14 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	for _, source := range found.Sources[:min(len(found.Sources), 20)] {
 		candidates = append(candidates, DiscoveryPublishedCandidate{Title: truncateRunes(source.Title, 200), Text: truncateRunes(source.Content, 4000), SourceURL: source.URL})
 	}
-	matched, err := c.matchPublishedCandidates(ctx, request, candidates)
+	publicationMatches, err := c.matchPublishedCandidatesDetailed(ctx, request, candidates)
 	if err != nil {
 		return DiscoverContentResult{}, err
 	}
 	unpublished := make([]contentsearch.Source, 0, len(candidates))
 	publishedRejected := false
 	for index, source := range found.Sources[:len(candidates)] {
-		if matched[index] {
+		if publicationMatches.Matched[index] {
 			publishedRejected = true
 			continue
 		}
@@ -75,6 +75,9 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	}
 	if len(unpublished) == 0 && publishedRejected {
 		result.EmptyReason = "already_published"
+		if publicationMatches.Unjudged {
+			result.EmptyReason = "no_matching_materials"
+		}
 		return result, nil
 	}
 	sources, previews, media, evidence := externalDiscoverySources(unpublished)
@@ -133,7 +136,7 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	result.Cards = cards
 	if len(cards) == 0 {
 		result.EmptyReason = "no_matching_materials"
-		if finalPublishedRejected {
+		if finalPublishedRejected && !publicationMatches.Unjudged {
 			result.EmptyReason = "already_published"
 		}
 	}

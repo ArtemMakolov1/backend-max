@@ -28,32 +28,41 @@ type DiscoveryPublishedReference struct {
 }
 
 type DiscoveryPublishedMatcher func(context.Context, []DiscoveryPublishedCandidate) ([]bool, error)
+type DiscoveryPublishedReferenceLookup func(context.Context, []DiscoveryPublishedCandidate) ([][]DiscoveryPublishedReference, error)
 
 func CanonicalDiscoverySourceURL(raw string) string {
 	return contentdedup.CanonicalSourceURL(raw)
 }
 
 func (c *Client) matchPublishedCandidates(ctx context.Context, request DiscoverContentRequest, candidates []DiscoveryPublishedCandidate) ([]bool, error) {
+	result, err := c.matchPublishedCandidatesDetailed(ctx, request, candidates)
+	return result.Matched, err
+}
+
+func (c *Client) matchPublishedCandidatesDetailed(ctx context.Context, request DiscoverContentRequest, candidates []DiscoveryPublishedCandidate) (publicationMatchResult, error) {
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return publicationMatchResult{}, ctx.Err()
 	}
-	if request.PublishedMatcher == nil || len(candidates) == 0 {
-		return make([]bool, len(candidates)), nil
+	if (request.PublishedMatcher == nil && request.PublishedReferenceLookup == nil) || len(candidates) == 0 {
+		return publicationMatchResult{Matched: make([]bool, len(candidates))}, nil
 	}
 	if len(candidates) > 20 {
-		return nil, &Error{Provider: c.provider, Code: "publication_history_unavailable", Message: "Publication identity check exceeds its candidate bound"}
+		return publicationMatchResult{}, &Error{Provider: c.provider, Code: "publication_history_unavailable", Message: "Publication identity check exceeds its candidate bound"}
+	}
+	if request.PublishedReferenceLookup != nil {
+		return c.matchPublishedReferences(ctx, request, candidates)
 	}
 	matched, err := request.PublishedMatcher(ctx, candidates)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, err
+			return publicationMatchResult{}, err
 		}
-		return nil, &Error{Provider: c.provider, Code: "publication_history_unavailable", Message: "Channel publication identity check is unavailable"}
+		return publicationMatchResult{}, &Error{Provider: c.provider, Code: "publication_history_unavailable", Message: "Channel publication identity check is unavailable"}
 	}
 	if len(matched) != len(candidates) {
-		return nil, &Error{Provider: c.provider, Code: "publication_history_unavailable", Message: "Channel publication identity check returned an invalid result"}
+		return publicationMatchResult{}, &Error{Provider: c.provider, Code: "publication_history_unavailable", Message: "Channel publication identity check returned an invalid result"}
 	}
-	return matched, nil
+	return publicationMatchResult{Matched: matched}, nil
 }
 
 func (c *Client) filterPublishedCards(ctx context.Context, request DiscoverContentRequest, cards []ContentCard) ([]ContentCard, bool, error) {
@@ -74,7 +83,7 @@ func (c *Client) filterPublishedCards(ctx context.Context, request DiscoverConte
 		}
 		duplicate := false
 		for _, accepted := range filtered {
-			if IsPublishedDiscoveryDuplicate(candidates[index], DiscoveryPublishedReference{Title: accepted.Title, Text: accepted.Summary + "\n" + accepted.Draft.Content, SourceURLs: []string{accepted.Source.URL}}) {
+			if IsDefinitivePublishedDiscoveryDuplicate(candidates[index], DiscoveryPublishedReference{Title: accepted.Title, Text: accepted.Summary + "\n" + accepted.Draft.Content, SourceURLs: []string{accepted.Source.URL}}) {
 				duplicate = true
 				break
 			}
@@ -86,11 +95,9 @@ func (c *Client) filterPublishedCards(ctx context.Context, request DiscoverConte
 	return filtered, publishedRejected, nil
 }
 
-// IsPublishedDiscoveryDuplicate compares indexed, proven publication snapshots
-// with one candidate. Its caller supplies a bounded database shortlist; channel
-// history is never loaded wholesale or sent to the model. Generic topic words
-// cannot establish event identity, while original source URLs remain decisive.
-func IsPublishedDiscoveryDuplicate(candidate DiscoveryPublishedCandidate, reference DiscoveryPublishedReference) bool {
+// IsDefinitivePublishedDiscoveryDuplicate identifies an already-used source or
+// the same visible prose. Shared topic/facts alone cannot exclude a new event.
+func IsDefinitivePublishedDiscoveryDuplicate(candidate DiscoveryPublishedCandidate, reference DiscoveryPublishedReference) bool {
 	if source := contentdedup.CanonicalSourceURL(candidate.SourceURL); source != "" {
 		for _, published := range reference.SourceURLs {
 			if source == contentdedup.CanonicalSourceURL(published) {
@@ -100,9 +107,18 @@ func IsPublishedDiscoveryDuplicate(candidate DiscoveryPublishedCandidate, refere
 	}
 	candidateText := publicationVisibleText(truncateRunes(candidate.Text, 5000))
 	publishedText := publicationVisibleText(truncateRunes(reference.Text, 4000))
-	if utf8.RuneCountInString(candidateText) >= 40 && candidateText == publishedText {
+	return utf8.RuneCountInString(candidateText) >= 40 && candidateText == publishedText
+}
+
+// IsPublishedDiscoveryDuplicate is a relevance hint for the bounded indexed
+// shortlist. Its non-definitive matches still require semantic judgment: a new
+// milestone can cite an old experiment's facts without repeating that event.
+func IsPublishedDiscoveryDuplicate(candidate DiscoveryPublishedCandidate, reference DiscoveryPublishedReference) bool {
+	if IsDefinitivePublishedDiscoveryDuplicate(candidate, reference) {
 		return true
 	}
+	candidateText := publicationVisibleText(truncateRunes(candidate.Text, 5000))
+	publishedText := publicationVisibleText(truncateRunes(reference.Text, 4000))
 	candidateTitle := candidate.Title
 	if strings.TrimSpace(candidateTitle) == "" {
 		candidateTitle = publicationLead(candidateText)

@@ -13,6 +13,9 @@ type ContentDiscoverer interface {
 	DiscoverContent(context.Context, openairesearch.DiscoverContentRequest) (openairesearch.DiscoverContentResult, error)
 }
 
+const maxDiscoveryPublicationCandidates = 20
+const maxDiscoveryPublicationComparisonReferences = 3
+
 func (a *App) ContentDiscoveryConfigured() bool {
 	_, ok := a.research.(ContentDiscoverer)
 	return a.research != nil && ok && a.ValidateResearchSources() == nil
@@ -52,6 +55,7 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 	request.Audience, request.Tone = "", ""
 	request.MediaContext = ""
 	request.PublishedMatcher = nil
+	request.PublishedReferenceLookup = nil
 	if channelID != nil {
 		channel, err := a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, *channelID)
 		if err != nil {
@@ -61,24 +65,47 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 			return openairesearch.DiscoverContentResult{}, err
 		}
 		ownedChannelID := *channelID
-		request.PublishedMatcher = func(matchCtx context.Context, candidates []openairesearch.DiscoveryPublishedCandidate) ([]bool, error) {
-			matches := make([]bool, len(candidates))
+		request.PublishedReferenceLookup = func(matchCtx context.Context, candidates []openairesearch.DiscoveryPublishedCandidate) ([][]openairesearch.DiscoveryPublishedReference, error) {
+			if len(candidates) > maxDiscoveryPublicationCandidates {
+				return nil, errors.New("publication identity candidates exceed the bounded lookup")
+			}
+			comparisons := make([][]openairesearch.DiscoveryPublishedReference, len(candidates))
 			for i, candidate := range candidates {
 				references, err := a.store.FindPublishedDiscoveryReferences(matchCtx, actorUserID, workspaceID, ownedChannelID,
 					candidate.Title, candidate.Text, candidate.SourceURL)
 				if err != nil {
 					return nil, err
 				}
+				strong := make([]openairesearch.DiscoveryPublishedReference, 0, maxDiscoveryPublicationComparisonReferences)
+				other := make([]openairesearch.DiscoveryPublishedReference, 0, maxDiscoveryPublicationComparisonReferences)
+				var definitive *openairesearch.DiscoveryPublishedReference
 				for _, reference := range references {
-					if openairesearch.IsPublishedDiscoveryDuplicate(candidate, openairesearch.DiscoveryPublishedReference{
+					published := openairesearch.DiscoveryPublishedReference{
 						Title: reference.Title, Text: reference.Text, SourceURLs: reference.SourceURLs,
-					}) {
-						matches[i] = true
+					}
+					// Check all local references before narrowing comparisons. A
+					// strong event-relevance hint must remain available even when
+					// it ranks below three less specific text matches; the service
+					// distinguishes exact copies from new related milestones.
+					if openairesearch.IsDefinitivePublishedDiscoveryDuplicate(candidate, published) {
+						definitive = &published
 						break
 					}
+					if openairesearch.IsPublishedDiscoveryDuplicate(candidate, published) {
+						if len(strong) < maxDiscoveryPublicationComparisonReferences {
+							strong = append(strong, published)
+						}
+					} else if len(other) < maxDiscoveryPublicationComparisonReferences {
+						other = append(other, published)
+					}
+				}
+				if definitive != nil {
+					comparisons[i] = []openairesearch.DiscoveryPublishedReference{*definitive}
+				} else {
+					comparisons[i] = append(strong, other[:min(len(other), maxDiscoveryPublicationComparisonReferences-len(strong))]...)
 				}
 			}
-			return matches, nil
+			return comparisons, nil
 		}
 		request.ChannelTitle = boundDiscoveryText(channel.Title, 200)
 		request.ChannelDescription = boundDiscoveryText(channel.Description, openairesearch.MaxDiscoveryDescriptionRunes)
