@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"maxpilot/backend/internal/contentsearch"
@@ -58,16 +59,21 @@ func TestResearchInvalidResultIsDistinctFromProviderFailure(t *testing.T) {
 	}
 }
 
-type researchFailureDiagnosticSearcher struct{}
+type researchFailureDiagnosticSearcher struct {
+	calls atomic.Int32
+}
 
-func (researchFailureDiagnosticSearcher) Search(context.Context, contentsearch.Request) (contentsearch.Result, error) {
+func (s *researchFailureDiagnosticSearcher) Search(context.Context, contentsearch.Request) (contentsearch.Result, error) {
+	s.calls.Add(1)
 	return contentsearch.Result{Provider: "fixture", Sources: []contentsearch.Source{
 		{Title: "Проверенный источник", URL: "https://example.com/source", Content: "Подробности нового научного события."},
 	}}, nil
 }
 
 func TestResearchDiscoveryFailureLogsTypedClosedStageWithoutPublicMetadata(t *testing.T) {
+	var providerCalls atomic.Int32
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		providerCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{
 			"finish_reason": "stop", "message": map[string]any{"role": "assistant", "content": "private-invalid-provider-payload"},
@@ -78,10 +84,14 @@ func TestResearchDiscoveryFailureLogsTypedClosedStageWithoutPublicMetadata(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = client.WithContentSearch(researchFailureDiagnosticSearcher{}).DiscoverContent(t.Context(),
+	searcher := &researchFailureDiagnosticSearcher{}
+	_, err = client.WithContentSearch(searcher).DiscoverContent(t.Context(),
 		openairesearch.DiscoverContentRequest{Topic: "Научные события", ContentKind: "idea", Format: "markdown"})
 	if err == nil {
 		t.Fatal("fixture did not produce a typed discovery validation failure")
+	}
+	if providerCalls.Load() != 2 || searcher.calls.Load() != 1 {
+		t.Fatalf("expected one bounded repair without repeated retrieval, got provider=%d search=%d", providerCalls.Load(), searcher.calls.Load())
 	}
 	var logs bytes.Buffer
 	server := &Server{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
@@ -97,8 +107,8 @@ func TestResearchDiscoveryFailureLogsTypedClosedStageWithoutPublicMetadata(t *te
 		ValidationReason string `json:"validation_reason"`
 	}
 	if json.Unmarshal(logs.Bytes(), &logged) != nil || logged.Code != "invalid_structured_output" ||
-		logged.DiscoveryStage != "discovery_synthesis" || logged.ValidationReason != "discovery_json_invalid" {
-		t.Fatal("typed discovery failure did not emit its closed synthesis diagnostic")
+		logged.DiscoveryStage != "discovery_synthesis_retry" || logged.ValidationReason != "discovery_json_invalid" {
+		t.Fatal("typed discovery failure did not emit its closed exhausted-repair diagnostic")
 	}
 	if strings.Contains(logs.String(), "private-invalid-provider-payload") {
 		t.Fatal("upstream provider payload escaped the source-owned validation boundary")
