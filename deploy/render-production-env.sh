@@ -82,6 +82,7 @@ if [[ "$deploy_stage" == "bootstrap" ]]; then
   rendered_deepseek_key=''
   rendered_qwen_key=''
   rendered_exa_key=''
+  rendered_exa_proxy=''
   rendered_tavily_key=''
   rendered_alertmanager_webhook_url=''
   rendered_smtp_host=''
@@ -133,6 +134,10 @@ else
     exit 1
   fi
   rendered_exa_key=${EXA_API_KEY:-}
+  rendered_exa_proxy=${EXA_PROXY_URL:-}
+  if [[ -n "$rendered_exa_proxy" ]]; then
+    printf '%s' "$rendered_exa_proxy" | python3 "$script_dir/validate-exa-proxy-url.py"
+  fi
   rendered_tavily_key=${TAVILY_API_KEY:-}
   for name in EXA_API_KEY TAVILY_API_KEY; do
     value=${!name:-}
@@ -221,6 +226,7 @@ fi
   printf 'QWEN_API_BASE_URL=%s\n' "${QWEN_API_BASE_URL:-https://dashscope-intl.aliyuncs.com}"
   printf 'QWEN_IMAGE_MODEL=%s\n' "${QWEN_IMAGE_MODEL:-qwen-image-3.0-pro}"
   printf 'EXA_API_KEY=%s\n' "$rendered_exa_key"
+  printf 'EXA_PROXY_URL=%s\n' "$rendered_exa_proxy"
   printf 'TAVILY_API_KEY=%s\n' "$rendered_tavily_key"
   printf 'OPENAI_API_BASE_URL=https://api.openai.com\n'
   # Welcome-email SMTP is optional: empty values disable it (NoopSender).

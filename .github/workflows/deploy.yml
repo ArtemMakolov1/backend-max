@@ -265,6 +265,7 @@ jobs:
           QWEN_API_BASE_URL: ${{ vars.QWEN_API_BASE_URL || 'https://dashscope-intl.aliyuncs.com' }}
           QWEN_IMAGE_MODEL: ${{ vars.QWEN_IMAGE_MODEL || 'qwen-image-3.0-pro' }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          EXA_PROXY_URL: ${{ secrets.EXA_PROXY_URL }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           OPENAI_RESEARCH_MODEL: ${{ vars.OPENAI_RESEARCH_MODEL || 'gpt-6-luna' }}
           OPENAI_IMAGE_MODEL: ${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}

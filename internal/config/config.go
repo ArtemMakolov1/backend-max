@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"maxpilot/backend/internal/contentsearch"
 )
 
 var (
@@ -117,6 +119,7 @@ type Config struct {
 	QwenImageModel            string
 	ExaAPIKey                 string
 	TavilyAPIKey              string
+	ExaProxyURL               string
 	OpenAIAPIBaseURL          string
 	OpenAIImageModel          string
 	OpenAIResearchModel       string
@@ -319,6 +322,7 @@ func Load() (Config, error) {
 		QwenImageModel:            env("QWEN_IMAGE_MODEL", defaultQwenImageModel),
 		ExaAPIKey:                 strings.TrimSpace(os.Getenv("EXA_API_KEY")),
 		TavilyAPIKey:              strings.TrimSpace(os.Getenv("TAVILY_API_KEY")),
+		ExaProxyURL:               strings.TrimSpace(os.Getenv("EXA_PROXY_URL")),
 		OpenAIAPIBaseURL:          env("OPENAI_API_BASE_URL", defaultOpenAIAPIBaseURL),
 		OpenAIImageModel:          env("OPENAI_IMAGE_MODEL", defaultOpenAIImageModel),
 		OpenAIResearchModel:       env("OPENAI_RESEARCH_MODEL", defaultOpenAIResearchModel),
@@ -431,6 +435,9 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("%s contains unsupported characters or exceeds its size bound", name)
 		}
 	}
+	if err := contentsearch.ValidateExaProxyURL(os.Getenv("EXA_PROXY_URL")); err != nil {
+		return Config{}, err
+	}
 	if !cfg.AuthBootstrapMode && (cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "") && !cfg.TextAIConfigured() {
 		return Config{}, fmt.Errorf("EXA_API_KEY or TAVILY_API_KEY requires the selected TEXT_AI_PROVIDER API key for grounded synthesis")
 	}
@@ -489,7 +496,7 @@ func Load() (Config, error) {
 			len(cfg.YandexAllowedUsers) != 0 || len(cfg.ObservabilityAdmins) != 0 {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires Yandex OAuth credentials and allowlist to be empty")
 		}
-		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.DeepSeekAPIKey != "" || cfg.QwenAPIKey != "" || cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "" || cfg.YooKassaConfigured() {
+		if cfg.MAXBotToken != "" || cfg.MAXWebhookSecret != "" || cfg.OpenAIAPIKey != "" || cfg.DeepSeekAPIKey != "" || cfg.QwenAPIKey != "" || cfg.ExaAPIKey != "" || cfg.TavilyAPIKey != "" || cfg.ExaProxyURL != "" || cfg.YooKassaConfigured() {
 			return Config{}, fmt.Errorf("AUTH_BOOTSTRAP_MODE requires MAX, AI and search integrations to be disabled")
 		}
 		if s3Parts != 0 || cfg.S3Bucket != "" || cfg.S3Region != "" {

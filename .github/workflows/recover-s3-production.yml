@@ -142,6 +142,7 @@ jobs:
           OPENAI_RESEARCH_MODEL: ${{ vars.OPENAI_RESEARCH_MODEL || 'gpt-6-luna' }}
           OPENAI_IMAGE_MODEL: ${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          EXA_PROXY_URL: ${{ secrets.EXA_PROXY_URL }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           YOOKASSA_SHOP_ID: ${{ secrets.YOOKASSA_SHOP_ID }}
           YOOKASSA_SECRET_KEY: ${{ secrets.YOOKASSA_SECRET_KEY }}
