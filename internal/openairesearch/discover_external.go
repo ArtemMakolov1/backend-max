@@ -15,6 +15,12 @@ type ContentSearcher interface {
 	Search(context.Context, contentsearch.Request) (contentsearch.Result, error)
 }
 
+const discoveryNoLinksRetryInstruction = "\nПовторно подготовь карточки по тем же найденным материалам и редакционному контексту. " +
+	"В draft.content не должно быть никаких ссылок: HTTP(S), Markdown-ссылок, HTML-якорей <a> или max://. " +
+	"Сохрани стиль канала, его длину текста и CTA, выражая призыв обычным текстом без ссылки. " +
+	"Проверенный адрес источника укажи только в отдельном source_url; приложение само добавит его к черновику. " +
+	"Соблюдай исходную JSON-схему и остальные ограничения."
+
 // WithContentSearch returns an independently configured client; an already
 // serving client is never mutated during request processing.
 func (c *Client) WithContentSearch(searcher ContentSearcher) *Client {
@@ -67,6 +73,24 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	// Crucially, neither message annotations nor hallucinated web-search output
 	// from this synthesis response can expand the retrieval authority map.
 	cards, err := decodeDiscoveryCardsFromSources(text, sources, previews, request)
+	if err != nil && c.provider == "deepseek" && err.Error() == "content discovery draft must not invent external links" {
+		if ctx.Err() != nil {
+			return DiscoverContentResult{}, ctx.Err()
+		}
+		// One fresh synthesis from the original evidence and style. The rejected
+		// model output never becomes context, and retrieval is not repeated.
+		payload.Input = append([]inputMessage(nil), payload.Input...)
+		payload.Input[0].Content = payload.Input[0].Content.(string) + discoveryNoLinksRetryInstruction
+		envelope, err = c.call(ctx, payload)
+		if err != nil {
+			return DiscoverContentResult{}, err
+		}
+		text, err = extractOutputText(envelope)
+		if err != nil {
+			return DiscoverContentResult{}, err
+		}
+		cards, err = decodeDiscoveryCardsFromSources(text, sources, previews, request)
+	}
 	if err != nil {
 		return DiscoverContentResult{}, responseError(envelope, "invalid_structured_output", err.Error())
 	}

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -213,6 +215,180 @@ func TestDeepSeekResearchEmptyFailedAndCancelledRetrievalSkipsSynthesis(t *testi
 			}
 		})
 	}
+}
+
+func TestDeepSeekDiscoveryRetriesExternalLinksOnceFromOriginalContext(t *testing.T) {
+	for _, test := range []struct{ name, format, rejected, valid string }{
+		{"verified HTTP address", "markdown", "invalid-generated-marker https://example.com/source", "**Проверенный факт.**"},
+		{"invented Markdown address", "markdown", "invalid-generated-marker [Подробности](https://example.com/invented)", "**Проверенный факт.**"},
+		{"MAX user link", "markdown", "invalid-generated-marker [Автор](max://user/123)", "**Проверенный факт.**"},
+		{"HTML anchor", "html", `invalid-generated-marker <a href="https://example.com/source">Источник</a>`, "<b>Проверенный факт.</b>"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			searcher := &fakeContentSearcher{result: contentsearch.Result{Sources: []contentsearch.Source{
+				{Title: "Источник", URL: "https://example.com/source", Content: "Проверенный материал для канала."},
+			}}}
+			var requests []responsePayload
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var payload responsePayload
+				if json.NewDecoder(r.Body).Decode(&payload) != nil {
+					t.Error("invalid discovery request")
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				requests = append(requests, payload)
+				content := test.rejected
+				if len(requests) > 1 {
+					content = test.valid
+				}
+				writeDeepSeekText(t, w, deepSeekDiscoveryJSON(t, content, test.format, "https://example.com/source"))
+			}))
+			defer server.Close()
+			request := DiscoverContentRequest{
+				Topic: "Новости изобретений", ContentKind: "idea", Format: test.format, ChannelTitle: "Наш канал",
+				Tone: "Разговорный", Audience: "Любопытные читатели", CTA: "Расскажите своё мнение",
+				ChannelPosts: []ChannelPostStyle{{Text: "Образец живого стиля канала.", Format: test.format, CharacterCount: 31}},
+				ExamplePosts: []string{"Еще один образец выбранного канала."}, ForbiddenWords: []string{"запрещённая фраза"},
+			}
+			result, err := mustDeepSeekClient(t, server).WithContentSearch(searcher).DiscoverContent(t.Context(), request)
+			if err != nil || searcher.calls != 1 || len(requests) != 2 || len(result.Cards) != 1 {
+				t.Fatalf("discovery retry failed: err=%v searches=%d calls=%d cards=%d", err, searcher.calls, len(requests), len(result.Cards))
+			}
+			if result.Cards[0].Source.URL != "https://example.com/source" || !strings.HasPrefix(result.Cards[0].Draft.Content, test.valid) {
+				t.Fatal("retry lost validated text or source authority")
+			}
+			signature, err := canonicalContentSignature(result.Cards[0].Draft.Content, test.format)
+			if err != nil || !reflect.DeepEqual(signature.HiddenLinkTargets, []string{"https://example.com/source"}) {
+				t.Fatal("retry did not leave attribution exclusively to the server")
+			}
+			if len(requests[0].Input) != 3 || !strings.Contains(requests[0].Input[1].Content.(string), request.ChannelPosts[0].Text) ||
+				!strings.Contains(requests[0].Input[1].Content.(string), request.CTA) || !strings.Contains(requests[0].Input[2].Content.(string), "Проверенный материал для канала.") {
+				t.Fatal("discovery omitted original channel context or retrieved evidence")
+			}
+			secondSystem := requests[1].Input[0].Content.(string)
+			if strings.Count(secondSystem, discoveryNoLinksRetryInstruction) != 1 {
+				t.Fatal("retry omitted the single explicit link correction")
+			}
+			requests[1].Input[0].Content = strings.Replace(secondSystem, discoveryNoLinksRetryInstruction, "", 1)
+			if !reflect.DeepEqual(requests[0], requests[1]) {
+				t.Fatal("retry changed original evidence, style, model, schema or token budget")
+			}
+			for _, input := range requests[1].Input {
+				if strings.Contains(input.Content.(string), "invalid-generated-marker") {
+					t.Fatal("retry fed rejected model output back into its context")
+				}
+			}
+		})
+	}
+}
+
+func TestDeepSeekDiscoveryLinkRetryStillRejectsInvalidResults(t *testing.T) {
+	searcher := &fakeContentSearcher{result: contentsearch.Result{Sources: []contentsearch.Source{
+		{Title: "Источник", URL: "https://example.com/source", Content: "Проверенный факт."},
+	}}}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		writeDeepSeekText(t, w, deepSeekDiscoveryJSON(t, "Читать: https://example.com/source", "markdown", "https://example.com/source"))
+	}))
+	defer server.Close()
+	result, err := mustDeepSeekClient(t, server).WithContentSearch(searcher).DiscoverContent(t.Context(), DiscoverContentRequest{Topic: "Тема канала", ContentKind: "idea", Format: "markdown"})
+	var providerErr *Error
+	if calls != 2 || searcher.calls != 1 || len(result.Cards) != 0 || !errors.As(err, &providerErr) ||
+		providerErr.Code != "invalid_structured_output" || providerErr.Message != "content discovery draft must not invent external links" {
+		t.Fatalf("invalid retry escaped validation or repeated: calls=%d searches=%d err=%v", calls, searcher.calls, err)
+	}
+}
+
+func TestDiscoveryLinkRetryDoesNotRepeatOtherFailuresOrOpenAI(t *testing.T) {
+	for _, test := range []struct {
+		name, output, provider string
+		status                 int
+	}{
+		{name: "invalid JSON", output: "not JSON", provider: "deepseek"},
+		{name: "invented source URL", output: deepSeekDiscoveryJSON(t, "Проверенный факт.", "markdown", "https://example.com/invented"), provider: "deepseek"},
+		{name: "wrong format", output: deepSeekDiscoveryJSON(t, "Проверенный факт.", "html", "https://example.com/source"), provider: "deepseek"},
+		{name: "provider rejection", status: http.StatusUnauthorized, provider: "deepseek"},
+		{name: "OpenAI link violation", output: deepSeekDiscoveryJSON(t, "Читать: https://example.com/source", "markdown", "https://example.com/source"), provider: "openai"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			searcher := &fakeContentSearcher{result: contentsearch.Result{Sources: []contentsearch.Source{
+				{Title: "Источник", URL: "https://example.com/source", Content: "Проверенный факт."},
+			}}}
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if test.status != 0 {
+					w.WriteHeader(test.status)
+					return
+				}
+				writeDeepSeekText(t, w, test.output)
+			}))
+			defer server.Close()
+			client := mustDeepSeekClient(t, server)
+			if test.provider == "openai" {
+				var err error
+				client, err = New(server.URL, "offline-openai-key", "gpt-6-luna", server.Client())
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err := client.WithContentSearch(searcher).DiscoverContent(t.Context(), DiscoverContentRequest{Topic: "Тема канала", ContentKind: "idea", Format: "markdown"})
+			if err == nil || calls != 1 || searcher.calls != 1 {
+				t.Fatalf("unrelated failure was retried: calls=%d searches=%d err=%v", calls, searcher.calls, err)
+			}
+		})
+	}
+}
+
+func TestDeepSeekDiscoveryCanceledLinkRepairMakesNoSecondCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	searcher := &fakeContentSearcher{result: contentsearch.Result{Sources: []contentsearch.Source{
+		{Title: "Источник", URL: "https://example.com/source", Content: "Проверенный факт."},
+	}}}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		writeDeepSeekText(t, w, deepSeekDiscoveryJSON(t, "Читать: https://example.com/source", "markdown", "https://example.com/source"))
+	}))
+	defer server.Close()
+	httpClient := server.Client()
+	transport := httpClient.Transport
+	httpClient.Transport = diagnosticRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		response, err := transport.RoundTrip(r)
+		if err != nil {
+			return nil, err
+		}
+		body, err := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		response.Body = io.NopCloser(strings.NewReader(string(body)))
+		cancel()
+		return response, nil
+	})
+	client, err := NewDeepSeek(server.URL, "synthetic-deepseek-key", "deepseek-flash", httpClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.WithContentSearch(searcher).DiscoverContent(ctx, DiscoverContentRequest{Topic: "Тема канала", ContentKind: "idea", Format: "markdown"})
+	if !errors.Is(err, context.Canceled) || calls != 1 || searcher.calls != 1 {
+		t.Fatalf("canceled repair made another paid call: calls=%d searches=%d err=%v", calls, searcher.calls, err)
+	}
+}
+
+func deepSeekDiscoveryJSON(t *testing.T, content, format, source string) string {
+	t.Helper()
+	card := discoveryFixtureCard(source, "idea")
+	draft := card["draft"].(map[string]any)
+	draft["content"], draft["format"] = content, format
+	encoded, err := json.Marshal(map[string]any{"cards": []any{card}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
 
 func TestDeepSeekDoesNotFollowCredentialRedirectsOrLogErrorBody(t *testing.T) {

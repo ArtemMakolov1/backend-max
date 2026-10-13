@@ -992,8 +992,14 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			if researchErr.Provider == "deepseek" {
 				logMessage = "DeepSeek text request failed"
 			}
-			s.logger.Warn(logMessage, "status", researchErr.StatusCode,
+			failureCode := safeResearchFailureCode(researchErr.Code)
+			s.logger.Warn(logMessage, "status", researchErr.StatusCode, "code", failureCode,
 				"request_id", researchErr.RequestID, "error", researchErr.Message)
+			if researchErr.StatusCode == 0 && failureCode == "invalid_structured_output" {
+				s.problem(w, http.StatusBadGateway, "ai_invalid_result",
+					"ИИ вернул некорректный результат. Попробуйте ещё раз.", nil)
+				return
+			}
 			s.problem(w, http.StatusBadGateway, "openai_research_error",
 				"Исследование с ИИ сейчас недоступно. Попробуйте позже.", nil)
 			return
@@ -1007,6 +1013,16 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 		s.logger.Error("request failed", "error", err)
 		s.problem(w, http.StatusInternalServerError, "internal_error",
 			"Не удалось выполнить операцию. Попробуйте ещё раз.", nil)
+	}
+}
+
+func safeResearchFailureCode(code string) string {
+	switch code {
+	case "invalid_structured_output", "missing_output_text", "missing_citations", "response_not_completed",
+		"response_incomplete", "response_failed", "response_refused", "content_changed":
+		return code
+	default:
+		return "unknown"
 	}
 }
 
