@@ -989,9 +989,10 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 				return
 			}
 			logMessage := "OpenAI research request failed"
-			if researchErr.Provider == "deepseek" {
+			switch researchErr.Provider {
+			case "deepseek":
 				logMessage = "DeepSeek text request failed"
-			} else if researchErr.Provider == "qwen" {
+			case "qwen":
 				logMessage = "Qwen text request failed"
 			}
 			failureCode := safeResearchFailureCode(researchErr.Code)
