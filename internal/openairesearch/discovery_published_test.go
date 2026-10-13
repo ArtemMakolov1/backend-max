@@ -90,6 +90,19 @@ func TestPublishedMeasuredFactExtractionBoundsRepetitionsAndRetainsSubjects(t *t
 	}
 }
 
+func TestPublishedEventDoesNotMatchDifferentMeasuredSubjectsWithSamePredicateAndValues(t *testing.T) {
+	reference := DiscoveryPublishedReference{Title: "Керосин из опилок", Text: "Керосин из опилок стал новым топливом. Уровень выбросов серы снизился на 90%. Уровень шума снизился на 10 дБ. Уровень тяги снизился на 10%."}
+	candidate := DiscoveryPublishedCandidate{Title: "Керосин из опилок для нового двигателя", Text: "Топливо из опилок использует новый керосиновый двигатель. Уровень износа насосов снизился на 90%. Уровень вибрации крепежа снизился на 10 дБ. Уровень расхода топлива снизился на 10%."}
+	if IsPublishedDiscoveryDuplicate(candidate, reference) {
+		t.Fatal("the same measurement predicate identified different subjects as one event")
+	}
+	for _, predicate := range []string{"снизился", "снизилась", "снижался", "сократилась", "уменьшились", "увеличился", "повысилась"} {
+		if !publicationMeasurementPredicate(publicationStem(predicate)) {
+			t.Fatalf("Russian measurement predicate %q became a measured subject", predicate)
+		}
+	}
+}
+
 func TestPublicationIndexMatcherRejectsOldMaterialBeforeAnySynthesis(t *testing.T) {
 	calls, matcherCalls := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(http.StatusInternalServerError) }))

@@ -180,7 +180,7 @@ func publicationMeasuredFacts(value string) []publicationMeasuredFact {
 			if len(runes) == 4 && strings.ContainsRune("ауыиея", runes[3]) {
 				stem = string(runes[:3])
 			}
-			if utf8.RuneCountInString(stem) >= 3 && !publicationStopWords[stem] && !publicationMeasuredFactStopWords[stem] {
+			if utf8.RuneCountInString(stem) >= 3 && !publicationStopWords[stem] && !publicationMeasuredFactStopWords[stem] && !publicationMeasurementPredicate(stem) {
 				seen[stem] = true
 			}
 		}
@@ -207,6 +207,18 @@ var publicationMeasuredFactStopWords = map[string]bool{
 	"децибел": true, "снизил": true, "сократил": true, "оказал": true, "показал": true,
 	"пока": true, "испытан": true, "испытани": true, "эксперимент": true, "результат": true,
 	"получил": true, "данн": true, "составил": true, "превысил": true, "достиг": true,
+}
+
+func publicationMeasurementPredicate(stem string) bool {
+	// Case stemming does not normalize Russian verb conjugations. Measurement
+	// predicates describe change, not its subject: "снизился" must not make
+	// sulfur, thrust, wear and fuel consumption look like the same property.
+	for _, prefix := range []string{"сниз", "сниж", "сократ", "уменьш", "повыс", "повыш", "пониз", "увелич", "достиг", "вырос", "возрос", "упал", "поднял", "оказал", "показал", "составил", "составля"} {
+		if strings.HasPrefix(stem, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func publicationMeasuredFactMatches(left, right string) int {
