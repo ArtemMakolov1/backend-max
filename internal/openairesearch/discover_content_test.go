@@ -268,11 +268,15 @@ func TestDiscoverContentAutoUsesMediaOnlyContextInOneCallAndReturnsGroundedMixed
 		if !strings.Contains(payload.Input[0].Content.(string), "Наличие фотографии само по себе не означает мем") || !strings.Contains(payload.Input[0].Content.(string), "ты не видел пиксели") {
 			t.Fatal("auto prompt claims visual analysis without media access")
 		}
-		envelope := discoveryFixtureEnvelope([]any{
-			discoveryFixtureCard("https://example.com/article", "article"),
-			discoveryFixtureCard("https://example.com/meme", "meme"),
-			discoveryFixtureCard("https://youtube.com/shorts/abcdefghijk", "video"),
-		})
+		fixtures := []any{discoveryFixtureCard("https://example.com/article", "article"), discoveryFixtureCard("https://example.com/meme", "meme"), discoveryFixtureCard("https://youtube.com/shorts/abcdefghijk", "video")}
+		// Different formats must represent different materials, rather than the
+		// same placeholder text copied into three source URLs.
+		for index, title := range []string{"Кот изучает снег", "Кот прячет клавиатуру", "Кот прыгает через обруч"} {
+			card := fixtures[index].(map[string]any)
+			card["title"] = title
+			card["draft"].(map[string]any)["content"] = title + ". Отдельный найденный момент для публикации."
+		}
+		envelope := discoveryFixtureEnvelope(fixtures)
 		envelope.Output[0].Action.Sources = []webSource{{Type: "url", URL: "https://example.com/article"}, {Type: "url", URL: "https://youtube.com/shorts/abcdefghijk"}}
 		envelope.Output[0].Results = []webResult{{Type: "image_result", SourceWebsiteURL: "https://example.com/meme", ImageURL: "https://cdn.example.com/meme.jpg"}}
 		_ = json.NewEncoder(w).Encode(envelope)

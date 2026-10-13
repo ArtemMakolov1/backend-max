@@ -56,7 +56,28 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 		return DiscoverContentResult{}, &Error{Provider: c.provider, Code: "content_search_failed", Message: "External source retrieval is unavailable",
 			SearchDiagnostics: diagnostic}
 	}
-	sources, previews, media, evidence := externalDiscoverySources(found.Sources)
+	candidates := make([]DiscoveryPublishedCandidate, 0, min(len(found.Sources), 20))
+	for _, source := range found.Sources[:min(len(found.Sources), 20)] {
+		candidates = append(candidates, DiscoveryPublishedCandidate{Title: truncateRunes(source.Title, 200), Text: truncateRunes(source.Content, 4000), SourceURL: source.URL})
+	}
+	matched, err := c.matchPublishedCandidates(ctx, request, candidates)
+	if err != nil {
+		return DiscoverContentResult{}, err
+	}
+	unpublished := make([]contentsearch.Source, 0, len(candidates))
+	publishedRejected := false
+	for index, source := range found.Sources[:len(candidates)] {
+		if matched[index] {
+			publishedRejected = true
+			continue
+		}
+		unpublished = append(unpublished, source)
+	}
+	if len(unpublished) == 0 && publishedRejected {
+		result.EmptyReason = "already_published"
+		return result, nil
+	}
+	sources, previews, media, evidence := externalDiscoverySources(unpublished)
 	if len(evidence) == 0 {
 		result.EmptyReason = "no_sources"
 		return result, nil
@@ -105,9 +126,16 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 			cards[i].MediaCandidates = []DiscoveryMediaCandidate{candidate}
 		}
 	}
+	cards, finalPublishedRejected, err := c.filterPublishedCards(ctx, request, cards)
+	if err != nil {
+		return DiscoverContentResult{}, err
+	}
 	result.Cards = cards
 	if len(cards) == 0 {
 		result.EmptyReason = "no_matching_materials"
+		if finalPublishedRejected {
+			result.EmptyReason = "already_published"
+		}
 	}
 	return result, nil
 }
@@ -193,21 +221,15 @@ func contentSearchQuery(request DiscoverContentRequest) string {
 		intent = "Короткие видеоролики на русском языке"
 	}
 	query := intent + " по теме: " + request.Topic
-	// When the optional topic was inferred from the channel title, include a
-	// small amount of genuine editorial context rather than searching its name.
+	// A channel-derived query uses broad editorial context. Specific recent
+	// publication facts and media summaries would bias search toward the very
+	// event that the publication index must reject as already covered.
 	if request.ChannelTitle != "" && request.Topic == request.ChannelTitle {
 		if request.ChannelDescription != "" {
 			query += ". Тематика канала: " + truncateRunes(request.ChannelDescription, 250)
 		}
-		if request.MediaContext != "" {
-			query += ". Содержание публикаций: " + truncateRunes(request.MediaContext, 400)
-		} else {
-			for _, sample := range request.RecentPosts {
-				if strings.TrimSpace(sample.Text) != "" {
-					query += ". Тема публикации: " + truncateRunes(sample.Text, 160)
-					break
-				}
-			}
+		if request.Audience != "" {
+			query += ". Для аудитории: " + truncateRunes(request.Audience, 250)
 		}
 	}
 	return query

@@ -483,6 +483,9 @@ WHERE workspace_id=$4 AND channel_id=$5 AND max_message_id=$6`, runID, string(it
 		if err != nil {
 			return 0, fmt.Errorf("refresh existing MAX history mapping: %w", err)
 		}
+		if err := recordImportedPublishedContentTx(ctx, tx, workspaceID, channelID, mappedPostID, item); err != nil {
+			return 0, err
+		}
 		return maxHistoryItemPriorRunMapping, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -599,7 +602,7 @@ VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)`, workspaceID, channelID, postID,
 	if err != nil {
 		return fmt.Errorf("create MAX history mapping: %w", err)
 	}
-	return nil
+	return recordImportedPublishedContentTx(ctx, tx, workspaceID, channelID, postID, item)
 }
 
 func maxHistoryChannelIDForGeneration(

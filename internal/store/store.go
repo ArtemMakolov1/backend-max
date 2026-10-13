@@ -53,7 +53,7 @@ func (db *postgresDB) QueryRowContext(ctx context.Context, query string, args ..
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const RequiredSchemaVersion = "042_content_analysis_cache.sql"
+const RequiredSchemaVersion = "043_published_content_index.sql"
 
 type schemaMigration struct {
 	version        string
@@ -1297,8 +1297,13 @@ WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
 // The claimed snapshot guards against releasing a different publishing
 // operation after a crash or operator intervention.
 func (s *Store) ReleasePublishedUpdate(ctx context.Context, claimed Post, lastError string) (Post, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Post{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	now := time.Now().UTC()
-	result, err := s.db.ExecContext(ctx, bindSQL(`UPDATE posts
+	result, err := tx.ExecContext(ctx, bindSQL(`UPDATE posts
 SET status=?, last_error=?, updated_at=?,
     max_published_fingerprint=CASE WHEN ? THEN ? ELSE max_published_fingerprint END
 WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
@@ -1309,6 +1314,15 @@ WHERE owner_id=? AND id=? AND status=? AND max_message_id=? AND updated_at=?`),
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return Post{}, s.postWriteMiss(ctx, claimed.ID, "MAX update claim changed before it could be released")
+	}
+	if lastError == "" {
+		claimed.MAXPublishedFingerprint = publicationFingerprint(claimed)
+		if err := recordPublishedContentTx(ctx, tx, claimed, "confirmed"); err != nil {
+			return Post{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return Post{}, err
 	}
 	return s.getPostForOwner(ctx, claimed.UserID, claimed.ID)
 }
@@ -1392,18 +1406,30 @@ func (s *Store) MarkPublished(ctx context.Context, id int64, messageID, messageU
 	if err != nil {
 		return Post{}, err
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Post{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
 	now := nowText()
-	result, err := s.db.ExecContext(ctx, `
+	result, err := tx.ExecContext(ctx, bindSQL(`
 UPDATE posts SET status = ?, max_message_id = ?, max_message_url = ?, max_views = NULL,
                  max_stats_synced_at = NULL, max_stats_attempted_at = NULL, max_is_pinned = FALSE,
                  last_error = '', scheduled_at = NULL, max_published_fingerprint = ?,
-                 published_at = ?, updated_at = ? WHERE id = ? AND status = ?`,
+                 published_at = ?, updated_at = ? WHERE id = ? AND status = ?`),
 		PostStatusPublished, messageID, messageURL, publicationFingerprint(claimed), now, now, id, PostStatusPublishing)
 	if err != nil {
 		return Post{}, fmt.Errorf("mark published: %w", err)
 	}
 	if n, _ := result.RowsAffected(); n == 0 {
 		return Post{}, s.postWriteMiss(ctx, id, "post is no longer publishing")
+	}
+	claimed.MAXPublishedFingerprint = publicationFingerprint(claimed)
+	if err := recordPublishedContentTx(ctx, tx, claimed, "confirmed"); err != nil {
+		return Post{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Post{}, err
 	}
 	return s.GetPost(ctx, id)
 }

@@ -191,8 +191,8 @@ func TestExternalDiscoverySourceMapBoundsAndMediaPrecedence(t *testing.T) {
 
 func TestContentSearchQueryUsesInferredContextAndPreservesExplicitTopic(t *testing.T) {
 	request := DiscoverContentRequest{Topic: "Название", ChannelTitle: "Название", ChannelDescription: "Канал о котах", MediaContext: "Смешные картинки с котами", ContentKind: "meme"}
-	if query := contentSearchQuery(request); !strings.Contains(query, "мемы") || !strings.Contains(query, "Смешные картинки с котами") {
-		t.Fatalf("inferred channel content was ignored: %q", query)
+	if query := contentSearchQuery(request); !strings.Contains(query, "мемы") || !strings.Contains(query, "Канал о котах") || strings.Contains(query, "Смешные картинки с котами") {
+		t.Fatalf("broad channel context was lost or old media event seeded query: %q", query)
 	}
 	request.Topic = "Лыжный спорт"
 	if query := contentSearchQuery(request); strings.Contains(query, "котами") || !strings.Contains(query, "Лыжный спорт") {

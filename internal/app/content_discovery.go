@@ -51,10 +51,34 @@ func (a *App) DiscoverContentForWorkspaceWithBeforeGenerate(
 	request.CTA, request.VisualStyle = "", ""
 	request.Audience, request.Tone = "", ""
 	request.MediaContext = ""
+	request.PublishedMatcher = nil
 	if channelID != nil {
 		channel, err := a.store.GetChannelForWorkspace(ctx, actorUserID, workspaceID, *channelID)
 		if err != nil {
 			return openairesearch.DiscoverContentResult{}, err
+		}
+		if err := a.store.EnsurePublishedContentIndexForWorkspace(ctx, actorUserID, workspaceID, *channelID); err != nil {
+			return openairesearch.DiscoverContentResult{}, err
+		}
+		ownedChannelID := *channelID
+		request.PublishedMatcher = func(matchCtx context.Context, candidates []openairesearch.DiscoveryPublishedCandidate) ([]bool, error) {
+			matches := make([]bool, len(candidates))
+			for i, candidate := range candidates {
+				references, err := a.store.FindPublishedDiscoveryReferences(matchCtx, actorUserID, workspaceID, ownedChannelID,
+					candidate.Title, candidate.Text, candidate.SourceURL)
+				if err != nil {
+					return nil, err
+				}
+				for _, reference := range references {
+					if openairesearch.IsPublishedDiscoveryDuplicate(candidate, openairesearch.DiscoveryPublishedReference{
+						Title: reference.Title, Text: reference.Text, SourceURLs: reference.SourceURLs,
+					}) {
+						matches[i] = true
+						break
+					}
+				}
+			}
+			return matches, nil
 		}
 		request.ChannelTitle = boundDiscoveryText(channel.Title, 200)
 		request.ChannelDescription = boundDiscoveryText(channel.Description, openairesearch.MaxDiscoveryDescriptionRunes)

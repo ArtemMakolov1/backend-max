@@ -18,6 +18,52 @@ type discoveryTestClient struct {
 	requests []openairesearch.DiscoverContentRequest
 }
 
+func TestContentDiscoveryPublishedMatcherIsServerOwnedAndSelectedChannelScoped(t *testing.T) {
+	fake := &discoveryTestClient{}
+	application, storage, workspace := newChannelDescriptionFixture(t, fake)
+	activatePaidWorkspaceForTest(t, storage, "description-owner", workspace.ID)
+	channel, err := storage.CreateChannel(t.Context(), store.Channel{UserID: "description-owner", WorkspaceID: workspace.ID,
+		VerifiedMAXOwnerID: "100", MAXChatID: "-70001", Title: "Изобретено в России", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := storage.CreateChannel(t.Context(), store.Channel{UserID: "description-owner", WorkspaceID: workspace.ID,
+		VerifiedMAXOwnerID: "100", MAXChatID: "-70002", Title: "Другой канал", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createDeliveredDiscoveryTestPost(t, storage, store.Post{UserID: "description-owner", WorkspaceID: workspace.ID,
+		ChannelID: &channel.ID, Title: "Керосиновый двигатель", Content: "Русский инженер создал керосиновый двигатель. https://example.com/engine?utm_source=channel", Format: store.FormatMarkdown})
+	createDeliveredDiscoveryTestPost(t, storage, store.Post{UserID: "description-owner", WorkspaceID: workspace.ID,
+		ChannelID: &other.ID, Title: "Подводная лодка", Content: "Создали новую подводную лодку. https://example.com/other-channel", Format: store.FormatMarkdown})
+	if _, err := storage.CreatePost(t.Context(), store.Post{UserID: "description-owner", WorkspaceID: workspace.ID,
+		ChannelID: &channel.ID, Title: "Черновик", Content: "Секретный неопубликованный черновик. https://example.com/draft", Format: store.FormatMarkdown}); err != nil {
+		t.Fatal(err)
+	}
+	injectedCalls := 0
+	_, err = application.DiscoverContentForWorkspaceWithBeforeGenerate(t.Context(), "description-owner", workspace.ID, &channel.ID,
+		openairesearch.DiscoverContentRequest{PublishedMatcher: func(context.Context, []openairesearch.DiscoveryPublishedCandidate) ([]bool, error) {
+			injectedCalls++
+			return []bool{true, true, true}, nil
+		}}, nil)
+	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedMatcher == nil {
+		t.Fatalf("server publication matcher unavailable: %v", err)
+	}
+	request := fake.requests[0]
+	matches, err := request.PublishedMatcher(t.Context(), []openairesearch.DiscoveryPublishedCandidate{
+		{SourceURL: "https://example.com/engine?utm_campaign=another", Title: "Другая подача уже опубликованного двигателя"},
+		{SourceURL: "https://example.com/other-channel", Title: "Подводная лодка"},
+		{SourceURL: "https://example.com/draft", Title: "Черновик"},
+	})
+	if err != nil || len(matches) != 3 || !matches[0] || matches[1] || matches[2] || injectedCalls != 0 {
+		t.Fatalf("matcher trusted caller, draft or foreign channel: matches=%v injected=%d err=%v", matches, injectedCalls, err)
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil || strings.Contains(string(encoded), "PublishedMatcher") || strings.Contains(string(encoded), "секретный") {
+		t.Fatal("local publication index leaked into serialized model/public request")
+	}
+}
+
 func (*discoveryTestClient) Generate(context.Context, openairesearch.Request) (openairesearch.Result, error) {
 	return openairesearch.Result{}, errors.New("advanced research was not expected")
 }

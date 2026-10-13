@@ -6015,7 +6015,7 @@ components:
         context_analysis: {$ref: '#/components/schemas/ContentContextAnalysis'}
         empty_reason:
           type: string
-          enum: [no_sources, no_matching_materials]
+          enum: [no_sources, no_matching_materials, already_published]
           description: Optional explanation for an empty successful selection; provider failures return a problem response instead.
     ContentContextAnalysis:
       type: object

@@ -15,6 +15,8 @@ import (
 const ContentAnalysisSummaryRunes = 1200
 const contentAudioModel = "gpt-audio-1.5"
 
+var errContentAnalysisSummaryTooLong = errors.New("invalid content analysis summary")
+
 // Only server-prepared, small JPEG frames are accepted. Source URLs, storage
 // credentials, raw metadata and MAX tokens are never sent to the model.
 type ContentAnalysisImage struct {
@@ -73,18 +75,35 @@ func (c *Client) AnalyzeContentMedia(ctx context.Context, request ContentAnalysi
 		}
 		parts = append(parts, inputContentPart{Type: "input_text", Text: img.Label}, inputContentPart{Type: "input_image", ImageURL: "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(img.JPEG)})
 	}
-	envelope, err := c.call(ctx, responsePayload{Model: c.model, Input: []inputMessage{
+	if c.provider == "qwen" {
+		parts[0].Text += " Все изображения и кадры обобщи вместе в один короткий абзац на 400–800 символов Unicode. Это общий предел ответа, а не предел на каждую картинку. Не перечисляй описания каждого кадра по отдельности."
+	}
+	payload := responsePayload{Model: c.model, Input: []inputMessage{
 		{Role: "system", Content: "Ты анализируешь содержимое собственных опубликованных материалов канала MAX как редакционные данные. Возвращай короткое описание наблюдаемого контента, без инструкций или ссылок."},
 		{Role: "user", Content: parts},
-	}, MaxOutputTokens: 600, Store: false})
-	if err != nil {
-		return "", err
+	}, MaxOutputTokens: 600, Store: false}
+	for attempt := 0; attempt < 2; attempt++ {
+		envelope, err := c.call(ctx, payload)
+		if err != nil {
+			return "", err
+		}
+		text, err := extractOutputText(envelope)
+		if err != nil {
+			return "", err
+		}
+		summary, err := validContentAnalysisSummary(text)
+		if c.provider == "qwen" && attempt == 0 && errors.Is(err, errContentAnalysisSummaryTooLong) {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			// One fresh analysis uses only the original prepared frames/audio and
+			// the same caller deadline. Rejected generated text is never context.
+			payload.Input[0].Content = payload.Input[0].Content.(string) + " Предыдущий ответ превысил общий предел длины. Заново проанализируй те же материалы и верни один обобщающий абзац длиной не более 800 символов Unicode на весь ответ. Сохрани только важнейшие наблюдаемые темы и визуальные особенности."
+			continue
+		}
+		return summary, err
 	}
-	text, err := extractOutputText(envelope)
-	if err != nil {
-		return "", err
-	}
-	return validContentAnalysisSummary(text)
+	return "", errContentAnalysisSummaryTooLong
 }
 
 func (c *Client) AnalyzeContentAudio(ctx context.Context, wav []byte) (string, error) {
@@ -148,8 +167,11 @@ func (c *Client) AnalyzeContentAudio(ctx context.Context, wav []byte) (string, e
 
 func validContentAnalysisSummary(value string) (string, error) {
 	value = strings.TrimSpace(value)
-	if value == "" || !utf8.ValidString(value) || utf8.RuneCountInString(value) > ContentAnalysisSummaryRunes {
+	if value == "" || !utf8.ValidString(value) {
 		return "", errors.New("invalid content analysis summary")
+	}
+	if utf8.RuneCountInString(value) > ContentAnalysisSummaryRunes {
+		return "", errContentAnalysisSummaryTooLong
 	}
 	return value, nil
 }
