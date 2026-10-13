@@ -138,6 +138,73 @@ WHERE i.indrelid='published_content_index'::regclass AND a.amname='gin'`).Scan(&
 	}
 }
 
+func TestPublishedDiscoveryIndexFindsShortPublishedCaptionWithoutOriginalSourceURL(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	s, workspace, channel := openMAXHistoryStoreTest(t, "published-index-short-caption", 4)
+	data, err := os.ReadFile("../contentdedup/testdata/published_aviation_rewrite.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Reference struct {
+			Text       string
+			SourceURLs []string
+		}
+		Candidate, Article struct {
+			Title, Text, SourceURL string
+		}
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	post, err := s.CreatePostForWorkspace(ctx, "test-owner", workspace.ID, Post{ChannelID: &channel.ID,
+		Title: "Новая публикация", Content: fixture.Reference.Text, Format: FormatMarkdown})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimForPublishing(ctx, post.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkPublished(ctx, post.ID, "published-short-caption", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Recreate a pre-index installation with a known, unchanged publication.
+	// The original article URL never appeared in the delivered channel caption.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM published_content_index WHERE workspace_id=$1 AND channel_id=$2`, workspace.ID, channel.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsurePublishedContentIndexForWorkspace(ctx, "test-owner", workspace.ID, channel.ID); err != nil {
+		t.Fatal(err)
+	}
+	for name, candidate := range map[string]struct{ Title, Text, SourceURL string }{
+		"short rewritten card": fixture.Candidate,
+		"long article": {Title: fixture.Article.Title,
+			Text:      fixture.Article.Text + strings.Repeat(" Научные исследования продолжаются, подробности описаны в публикации.", 80),
+			SourceURL: fixture.Article.SourceURL},
+	} {
+		t.Run(name, func(t *testing.T) {
+			refs, err := s.FindPublishedDiscoveryReferences(ctx, "test-owner", workspace.ID, channel.ID, candidate.Title, candidate.Text, candidate.SourceURL)
+			if err != nil || len(refs) != 1 {
+				t.Fatalf("known caption absent from indexed text shortlist: count=%d err=%v", len(refs), err)
+			}
+			if refs[0].Text != fixture.Reference.Text || refs[0].Title != publishedContentTitle(fixture.Reference.Text) {
+				t.Fatal("shortlist did not preserve the proven published body and visible title")
+			}
+			for _, source := range refs[0].SourceURLs {
+				if publishedSourceHash(source) == publishedSourceHash(candidate.SourceURL) {
+					t.Fatal("fixture unexpectedly supplied exact source URL authority")
+				}
+			}
+		})
+	}
+	var complete bool
+	var unverified int
+	if err := s.db.QueryRowContext(ctx, `SELECT complete,unverified_posts FROM published_content_index_state WHERE workspace_id=$1 AND channel_id=$2`, workspace.ID, channel.ID).Scan(&complete, &unverified); err != nil || !complete || unverified != 0 {
+		t.Fatalf("confirmed caption was treated as unverified legacy history: complete=%t unverified=%d err=%v", complete, unverified, err)
+	}
+}
+
 func TestPublishedDiscoveryIndexTracksOnlyConfirmedDeliveriesAndRetainsPriorVersions(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()

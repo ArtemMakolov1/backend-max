@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,50 @@ func TestContentDiscoveryPublishedMatcherIsServerOwnedAndSelectedChannelScoped(t
 	encoded, err := json.Marshal(request)
 	if err != nil || strings.Contains(string(encoded), "PublishedMatcher") || strings.Contains(string(encoded), "секретный") {
 		t.Fatal("local publication index leaked into serialized model/public request")
+	}
+}
+
+func TestContentDiscoveryPublishedMatcherRecognizesShortCaptionAndLongSourceRewrite(t *testing.T) {
+	fake := &discoveryTestClient{}
+	application, storage, workspace := newChannelDescriptionFixture(t, fake)
+	activatePaidWorkspaceForTest(t, storage, "description-owner", workspace.ID)
+	channel, err := storage.CreateChannel(t.Context(), store.Channel{UserID: "description-owner", WorkspaceID: workspace.ID,
+		VerifiedMAXOwnerID: "100", MAXChatID: "-70003", Title: "Изобретено в России", IsChannel: true, Active: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile("../contentdedup/testdata/published_aviation_rewrite.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Reference          openairesearch.DiscoveryPublishedReference
+		Candidate, Article openairesearch.DiscoveryPublishedCandidate
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	createDeliveredDiscoveryTestPost(t, storage, store.Post{UserID: "description-owner", WorkspaceID: workspace.ID,
+		ChannelID: &channel.ID, Title: "Новая публикация", Content: fixture.Reference.Text, Format: store.FormatMarkdown})
+	_, err = application.DiscoverContentForWorkspaceWithBeforeGenerate(t.Context(), "description-owner", workspace.ID, &channel.ID,
+		openairesearch.DiscoverContentRequest{Topic: "Керосин из опилок и подсолнечной лузги"}, nil)
+	if err != nil || len(fake.requests) != 1 || fake.requests[0].PublishedMatcher == nil {
+		t.Fatalf("server publication matcher unavailable: %v", err)
+	}
+	article := fixture.Article
+	article.Text += strings.Repeat(" Научные исследования продолжаются, подробности описаны в публикации.", 80)
+	matched, err := fake.requests[0].PublishedMatcher(t.Context(), []openairesearch.DiscoveryPublishedCandidate{
+		article,
+		fixture.Candidate,
+		{Title: "Керосиновый двигатель выдержал испытания на орбите",
+			Text:      "Новый двигатель спутника использует керосин и кислород. Вакуумные испытания подтвердили стабильное зажигание и тягу в условиях орбиты.",
+			SourceURL: "https://example.com/new-space-engine"},
+		{Title: "Опилки и лузга стали основой строительных панелей",
+			Text:      "Древесные опилки и подсолнечную лузгу прессуют в прочные строительные панели. Полученный утеплитель сохраняет тепло в стенах жилых домов.",
+			SourceURL: "https://example.com/new-construction-panels"},
+	})
+	if err != nil || len(matched) != 4 || !matched[0] || !matched[1] || matched[2] || matched[3] {
+		t.Fatalf("short published caption/rewrite event identity mismatch: matches=%v err=%v", matched, err)
 	}
 }
 

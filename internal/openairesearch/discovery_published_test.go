@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -38,6 +40,53 @@ func TestPublishedEventIdentityUsesSourceOrCorroboratingFactsNotCategory(t *test
 	}
 	if IsPublishedDiscoveryDuplicate(DiscoveryPublishedCandidate{Title: "Керосиновый двигатель", Text: "Провели вакуумные испытания кислородной камеры с новым соплом."}, DiscoveryPublishedReference{Title: "Керосиновый двигатель", Text: "Разработали охлаждение двигателя для запусков наземных ракет."}) {
 		t.Fatal("two shared topic words suppressed a different advance")
+	}
+}
+
+func TestPublishedShortCaptionMatchesActualRewrittenCardAndLongArticleFacts(t *testing.T) {
+	raw, err := os.ReadFile("../contentdedup/testdata/published_aviation_rewrite.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Reference DiscoveryPublishedReference `json:"reference"`
+		Candidate DiscoveryPublishedCandidate `json:"candidate"`
+		Article   DiscoveryPublishedCandidate `json:"article"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if !IsPublishedDiscoveryDuplicate(fixture.Candidate, fixture.Reference) {
+		t.Fatal("actual rewritten title and short three-measure caption resurfaced a published event")
+	}
+	// The source paragraph is a modest paraphrase of the public article, not
+	// a copyrighted full-text copy. Distinct synthetic background vocabulary
+	// reproduces a 4,000-character source versus a short channel publication.
+	for index := 0; len([]rune(fixture.Article.Text)) < 4000; index++ {
+		fixture.Article.Text += fmt.Sprintf(" contextword%d", index)
+	}
+	if !IsPublishedDiscoveryDuplicate(fixture.Article, fixture.Reference) {
+		t.Fatal("long article background diluted the same event's measured facts")
+	}
+	for _, candidate := range []DiscoveryPublishedCandidate{
+		{Title: "Испытали новый керосиновый двигатель самолета", Text: "В испытаниях двигателя экономичность достигла 90%, масса сократилась на 10%, вибрация уменьшилась на 10 дБ. Керосин используется в авиационном топливе."},
+		{Title: fixture.Candidate.Title, Text: "Древесные опилки пригодились для другого авиационного топлива. Выбросы диоксида серы снизились на 10%, тяга двигателя на 90%. Шум уменьшился на 10 дБ."},
+		{Title: "Российские ученые испытали новый аккумулятор", Text: "Заряд сохранился на 90%, масса уменьшилась на 10%, шум измерителя составил 10 дБ."},
+	} {
+		if IsPublishedDiscoveryDuplicate(candidate, fixture.Reference) {
+			t.Fatal("shared numbers, topic, or percentages assigned to different subjects established event identity")
+		}
+	}
+}
+
+func TestPublishedMeasuredFactExtractionBoundsRepetitionsAndRetainsSubjects(t *testing.T) {
+	input := strings.Repeat("Шум уменьшился на 10 дБ. ", 300)
+	facts := publicationMeasuredFacts(input)
+	if len(facts) != 1 || publicationMeasuredFactMatches(input, input) != 1 {
+		t.Fatal("one repeated measurement counted as three independent event facts")
+	}
+	if publicationMeasuredFactMatches("Шум уменьшился на 10 дБ, тяга снизилась на 90%, сера сократилась на 10%.", "Шум уменьшился на 10 дБ, тяга снизилась на 10%, сера сократилась на 90%.") != 1 {
+		t.Fatal("neighboring fact windows confused measured subjects")
 	}
 }
 

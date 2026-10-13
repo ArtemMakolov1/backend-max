@@ -114,7 +114,15 @@ func IsPublishedDiscoveryDuplicate(candidate DiscoveryPublishedCandidate, refere
 	candidateTitleTokens, publishedTitleTokens := publicationTokens(candidateTitle), publicationTokens(publicationTitle)
 	candidateBodyTokens, publishedBodyTokens := publicationTokens(candidateText), publicationTokens(publishedText)
 	if publicationTokenOverlap(candidateTitleTokens, publishedTitleTokens, 3, 0.66, 0.45) &&
-		publicationTokenOverlap(candidateBodyTokens, publishedBodyTokens, 4, 0.45, 0.3) {
+		publicationTokenOverlap(candidateBodyTokens, publishedBodyTokens, 4, 0.45, 0) {
+		return true
+	}
+	// A source article is often several times longer than a channel caption,
+	// and its title can name different details. Three matching measured facts
+	// (value + unit + nearby subject) corroborated by technical terms identify
+	// the same event without requiring a caption to cover the whole article.
+	if publicationTokenOverlap(publicationTokens(candidateTitle+" "+candidateText), publicationTokens(publicationTitle+" "+publishedText), 3, 0, 0) &&
+		publicationMeasuredFactMatches(candidateText, publishedText) >= 3 {
 		return true
 	}
 	// A shared category or two topic words cannot establish identity. Even
@@ -127,6 +135,107 @@ func IsPublishedDiscoveryDuplicate(candidate DiscoveryPublishedCandidate, refere
 
 var publicationURLPattern = regexp.MustCompile(`(?i)(?:https?://|www\.)[^\s<>]+`)
 var publicationMarkupPattern = regexp.MustCompile(`<[^>]*>|[*_~+#^\x60]`)
+var publicationMeasuredFactPattern = regexp.MustCompile(`(?i)([0-9]+(?:[.,][0-9]+)?)\s*(%|процент[\p{L}]*|д\s*б|db|децибел[\p{L}]*)`)
+
+type publicationMeasuredFact struct {
+	key     string
+	subject []string
+}
+
+func publicationMeasuredFacts(value string) []publicationMeasuredFact {
+	result := make([]publicationMeasuredFact, 0)
+	runes := []rune(value)
+	byteToRune := make([]int, len(value)+1)
+	runeIndex := 0
+	for byteIndex := range value {
+		byteToRune[byteIndex] = runeIndex
+		runeIndex++
+	}
+	byteToRune[len(value)] = runeIndex
+	seenFacts := make(map[string]bool)
+	for _, match := range publicationMeasuredFactPattern.FindAllStringSubmatchIndex(value, 32) {
+		unit := strings.ReplaceAll(strings.ToLower(value[match[4]:match[5]]), " ", "")
+		if unit == "%" || strings.HasPrefix(unit, "процент") {
+			unit = "%"
+		} else {
+			unit = "db"
+		}
+		start, end := byteToRune[match[0]], byteToRune[match[1]]
+		before := string(runes[max(0, start-40):start])
+		after := string(runes[end:min(len(runes), end+40)])
+		// Stop at a clause separator so neighboring percentage facts cannot
+		// lend each other their subjects (sulfur vs nitrogen vs engine thrust).
+		if separator := strings.LastIndexAny(before, ",;.!?\n"); separator >= 0 {
+			before = before[separator+1:]
+		}
+		if separator := strings.IndexAny(after, ",;.!?\n"); separator >= 0 {
+			after = after[:separator]
+		}
+		context := before + " " + after
+		words := strings.FieldsFunc(context, func(r rune) bool { return !unicode.IsLetter(r) })
+		seen := make(map[string]bool)
+		for _, word := range words {
+			stem := publicationStem(word)
+			runes := []rune(stem)
+			if len(runes) == 4 && strings.ContainsRune("ауыиея", runes[3]) {
+				stem = string(runes[:3])
+			}
+			if utf8.RuneCountInString(stem) >= 3 && !publicationStopWords[stem] && !publicationMeasuredFactStopWords[stem] {
+				seen[stem] = true
+			}
+		}
+		subject := make([]string, 0, len(seen))
+		for word := range seen {
+			subject = append(subject, word)
+		}
+		sort.Strings(subject)
+		key := strings.ReplaceAll(value[match[2]:match[3]], ",", ".") + unit
+		identity := key + "|" + strings.Join(subject, "|")
+		if len(subject) != 0 && !seenFacts[identity] {
+			seenFacts[identity] = true
+			result = append(result, publicationMeasuredFact{key: key, subject: subject})
+		}
+	}
+	return result
+}
+
+var publicationMeasuredFactStopWords = map[string]bool{
+	"при": true, "для": true, "над": true, "под": true, "как": true, "что": true,
+	"это": true, "чем": true, "все": true, "или": true, "про": true, "так": true,
+	"тем": true, "еще": true, "этом": true, "этой": true, "того": true,
+	"минус": true, "ниж": true, "выш": true, "уровень": true, "процент": true,
+	"децибел": true, "снизил": true, "сократил": true, "оказал": true, "показал": true,
+	"пока": true, "испытан": true, "испытани": true, "эксперимент": true, "результат": true,
+	"получил": true, "данн": true, "составил": true, "превысил": true, "достиг": true,
+}
+
+func publicationMeasuredFactMatches(left, right string) int {
+	matched := make(map[string]bool)
+	leftFacts, rightFacts := publicationMeasuredFacts(left), publicationMeasuredFacts(right)
+	for _, candidate := range leftFacts {
+		for _, published := range rightFacts {
+			if candidate.key == published.key && publicationMeasuredSubjectShared(candidate.subject, published.subject) {
+				matched[candidate.key] = true
+				break
+			}
+		}
+	}
+	return len(matched)
+}
+
+func publicationMeasuredSubjectShared(left, right []string) bool {
+	for i, j := 0, 0; i < len(left) && j < len(right); {
+		switch strings.Compare(left[i], right[j]) {
+		case -1:
+			i++
+		case 1:
+			j++
+		default:
+			return true
+		}
+	}
+	return false
+}
 
 func publicationVisibleText(value string) string {
 	value = publicationURLPattern.ReplaceAllString(html.UnescapeString(value), " ")
