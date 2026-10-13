@@ -74,13 +74,19 @@ Workflow принимает выбранного провайдера тольк
 ## Явный прокси для Exa
 
 `EXA_PROXY_URL` — необязательный секрет Environment `production` с полным
-authority URL HTTP(S) CONNECT-прокси. Значение применяется только к
+authority URL HTTP(S) CONNECT-прокси или TLS relay. Значение применяется только к
 `https://api.exa.ai/search`; Tavily и остальные интеграции сохраняют прямой маршрут.
 Оба deployment workflow передают значение через закрытый env-файл. Bootstrap
 очищает его вместе с ключами провайдеров. Старые env-файлы без поля остаются валидны.
 
 Username/password в URL должны быть URI-encoded, включая `$`, кавычки и `\`.
 Пример формы: `https://proxy-user:encoded-password@proxy.example:8443`.
+Для существующего ретранслятора TLS используйте `tls://relay.example:443`:
+порт обязателен, userinfo запрещён. Backend подключается к адресу relay,
+а SNI, HTTP Host и проверка сертификата сохраняют origin `api.exa.ai`.
+На relay разрешите точный Exa SNI только с backend-адреса; ключ Exa остаётся
+в зашифрованном потоке между backend и Exa.
+
 Неверная схема, host/port, path/query/fragment и переводы строк отклоняются без
 вывода URL или credentials. Сертификат Exa, SNI, ограничения ответа и redirects
 проверяются и при проксировании; ошибка прокси не вызывает прямой повтор Exa.
@@ -88,8 +94,10 @@ Username/password в URL должны быть URI-encoded, включая `$`, 
 На forward proxy разрешите только backend-адрес, отдельную аутентификацию и
 CONNECT к `api.exa.ai:443`. Для Basic proxy auth нужен HTTPS-прокси или
 зашифрованный туннель: этот заголовок передаётся до origin TLS.
-`validate-provider-host-post.yml` выполняет прямую хостовую пробу и пока
-не проверяет маршрут `EXA_PROXY_URL`; его 403 не оценивает подключённый прокси.
+`validate-provider-host-post.yml` использует явно заданный TLS relay при
+выбранном Exa и `EXA_PROXY_URL`. Без поля выполняется прямой запрос.
+Диагностическая Python-проба не поддерживает HTTP(S) CONNECT и отклоняет
+такой режим до сетевого запроса; приложение поддерживает все три схемы.
 
 Backend разворачивается из GitHub Actions в GHCR и затем на один VPS. Основной
 production-домен — `https://maxposty.ru`. Frontend-репозиторий владеет Caddy,

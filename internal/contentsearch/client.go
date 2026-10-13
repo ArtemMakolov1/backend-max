@@ -95,7 +95,7 @@ type Client struct {
 }
 
 func NewClient(config Config) (*Client, error) {
-	proxy, err := exaProxy(config.ExaProxyURL)
+	proxy, err := parseExaProxyURL(config.ExaProxyURL)
 	if err != nil {
 		return nil, err
 	}
@@ -108,9 +108,9 @@ func NewClient(config Config) (*Client, error) {
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 4,
 	}
-	// Only Exa may use the explicit deployment proxy. Global proxy environment
+	// Only Exa may use the explicit deployment route. Global proxy environment
 	// variables never select a route for Exa or Tavily.
-	transport.Proxy = proxy
+	configureExaRoute(transport, proxy)
 	transport.ResponseHeaderTimeout = providerTimeout
 	return newClient(config, &http.Client{Transport: transport})
 }

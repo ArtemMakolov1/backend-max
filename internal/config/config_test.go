@@ -889,7 +889,7 @@ func TestLoadSearchProvidersAreOptionalAndTrimmed(t *testing.T) {
 }
 
 func TestLoadExaProxyIsOptionalExplicitAndSanitized(t *testing.T) {
-	for _, value := range []string{"", "http://proxy.example:3128", "https://synthetic-user:synthetic-password@proxy.example:8443"} {
+	for _, value := range []string{"", "http://proxy.example:3128", "https://synthetic-user:synthetic-password@proxy.example:8443", "tls://relay.example:443"} {
 		clearAuthEnv(t)
 		setValidLocalYandexAuth(t)
 		t.Setenv("EXA_PROXY_URL", "  "+value+"  ")
@@ -906,6 +906,8 @@ func TestLoadExaProxyIsOptionalExplicitAndSanitized(t *testing.T) {
 		"socks5://synthetic-user:synthetic-password@proxy.example:1080",
 		"https://synthetic-user:synthetic-password@proxy.example:65536",
 		"https://synthetic-user:synthetic-password@proxy.example\n",
+		"tls://synthetic-user:synthetic-password@proxy.example:443",
+		"tls://proxy.example",
 	} {
 		clearAuthEnv(t)
 		setValidLocalYandexAuth(t)

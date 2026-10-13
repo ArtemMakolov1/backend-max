@@ -60,6 +60,7 @@ jobs:
         shell: bash
         env:
           EXA_API_KEY: ${{ inputs.provider == 'exa' && secrets.EXA_API_KEY || '' }}
+          EXA_PROXY_URL: ${{ inputs.provider == 'exa' && secrets.EXA_PROXY_URL || '' }}
           TAVILY_API_KEY: ${{ inputs.provider == 'tavily' && secrets.TAVILY_API_KEY || '' }}
         run: |
           set -euo pipefail

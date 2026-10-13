@@ -1,6 +1,7 @@
 package contentsearch
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
@@ -21,7 +22,7 @@ func ValidateExaProxyURL(raw string) error {
 
 func parseExaProxyURL(raw string) (*url.URL, error) {
 	invalid := func() (*url.URL, error) {
-		return nil, errors.New("EXA_PROXY_URL must be an authority-only HTTP(S) proxy URL")
+		return nil, errors.New("EXA_PROXY_URL must be an authority-only HTTP(S) proxy or unauthenticated TLS relay URL")
 	}
 	// Deployment env files must not interpolate or reinterpret proxy userinfo;
 	// reserved credential characters must be URI-encoded (for example %24).
@@ -38,7 +39,7 @@ func parseExaProxyURL(raw string) (*url.URL, error) {
 		}
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || strings.Contains(raw, "#") || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+	if err != nil || strings.Contains(raw, "#") || (parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "tls") ||
 		parsed.Host == "" || parsed.Opaque != "" || parsed.Path != "" || parsed.RawPath != "" ||
 		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
 		return invalid()
@@ -52,6 +53,9 @@ func parseExaProxyURL(raw string) (*url.URL, error) {
 		if err != nil || value < 1 || value > 65535 {
 			return invalid()
 		}
+	}
+	if parsed.Scheme == "tls" && (parsed.User != nil || parsed.Port() == "") {
+		return invalid()
 	}
 	if parsed.User != nil {
 		if parsed.User.Username() == "" {
@@ -69,17 +73,31 @@ func parseExaProxyURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
-func exaProxy(raw string) (func(*http.Request) (*url.URL, error), error) {
-	proxy, err := parseExaProxyURL(raw)
-	if err != nil || proxy == nil {
-		return nil, err
+func configureExaRoute(transport *http.Transport, proxy *url.URL) {
+	if proxy == nil {
+		return
 	}
-	return func(request *http.Request) (*url.URL, error) {
+	if proxy.Scheme == "tls" {
+		transport.DialContext = exaRelayDialContext(proxy.Host, transport.DialContext)
+		return
+	}
+	transport.Proxy = func(request *http.Request) (*url.URL, error) {
 		if request == nil || request.URL == nil || request.URL.String() != exaEndpoint {
 			return nil, nil
 		}
 		// net/http puts URL userinfo in Proxy-Authorization for CONNECT, outside
 		// the end-to-end HTTPS stream. Exa's API key remains inside that stream.
 		return proxy, nil
-	}, nil
+	}
+}
+
+func exaRelayDialContext(relay string, dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if address == "api.exa.ai:443" {
+			address = relay
+		}
+		// Change only the TCP destination. net/http still performs end-to-end
+		// TLS using the original Exa hostname for SNI and certificate validation.
+		return dial(ctx, network, address)
+	}
 }

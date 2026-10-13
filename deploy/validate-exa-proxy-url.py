@@ -1,4 +1,4 @@
-"""Validate a deployment-owned Exa CONNECT proxy without disclosing userinfo."""
+"""Validate an Exa CONNECT proxy or TLS relay without disclosing userinfo."""
 import ipaddress
 import re
 import sys
@@ -18,7 +18,7 @@ def valid(raw):
     # env-file syntax. Encode those credential bytes in URL userinfo instead.
     if any(ord(c) <= 32 or ord(c) > 126 for c in raw) or any(c in raw for c in "$\\\"'"):
         return False
-    if not re.fullmatch(r"https?://[^/?#]+", raw) or re.search(r"%(?![0-9A-Fa-f]{2})", raw):
+    if not re.fullmatch(r"(?:https?|tls)://[^/?#]+", raw) or re.search(r"%(?![0-9A-Fa-f]{2})", raw):
         return False
     try:
         url = urllib.parse.urlsplit(raw)
@@ -36,6 +36,8 @@ def valid(raw):
             if not HOSTNAME.fullmatch(host):
                 return False
         if url.port is not None and not 1 <= url.port <= 65535:
+            return False
+        if url.scheme == 'tls' and (url.username is not None or url.port is None):
             return False
         if url.username is not None:
             userinfo = url.netloc.rsplit('@', 1)[0]
@@ -57,7 +59,7 @@ def main():
     except UnicodeError:
         accepted = False
     if not accepted:
-        print("EXA_PROXY_URL must be an authority-only HTTP(S) proxy URL with URI-encoded userinfo", file=sys.stderr)
+        print("EXA_PROXY_URL must be an HTTP(S) proxy authority or a tls://host:port relay without userinfo", file=sys.stderr)
         return 1
     return 0
 

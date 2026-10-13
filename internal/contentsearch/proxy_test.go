@@ -28,7 +28,7 @@ const proxyTestPassword = "synthetic-proxy-password"
 func TestExaProxyValidationAndExactRouting(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://unexpected-global-proxy.invalid:9999")
 	t.Setenv("HTTPS_PROXY", "http://unexpected-global-proxy.invalid:9999")
-	for _, value := range []string{"", "  ", "http://proxy.example", "https://proxy.example:8443", "http://127.0.0.1:3128", "http://[::1]:3128", "https://user:p%40ss%23word@proxy.example:8443", "https://user:p%24ss%27word%22%5C@proxy.example:8443"} {
+	for _, value := range []string{"", "  ", "http://proxy.example", "https://proxy.example:8443", "http://127.0.0.1:3128", "http://[::1]:3128", "https://user:p%40ss%23word@proxy.example:8443", "https://user:p%24ss%27word%22%5C@proxy.example:8443", "tls://relay.example:443", "tls://127.0.0.1:8443", "tls://[::1]:443"} {
 		if err := ValidateExaProxyURL(value); err != nil {
 			t.Fatal("valid authority-only proxy rejected")
 		}
@@ -41,6 +41,9 @@ func TestExaProxyValidationAndExactRouting(t *testing.T) {
 		"http://user:password@proxy.example\n", "http://user:password@proxy.example\t", "http://user:%ZZ@proxy.example",
 		"http://user:pass$word@proxy.example", "http://user:pass'word@proxy.example", "http://user:pass\"word@proxy.example", "http://user:pass\\word@proxy.example",
 		"http://user:пароль@proxy.example", strings.Repeat("s", 4097),
+		"tls://proxy.example", "tls://user@proxy.example:443", "tls://user:password@proxy.example:443", "tls://@proxy.example:443",
+		"tls://proxy.example:443/", "tls://proxy.example:443?", "tls://proxy.example:443#", "tls://proxy.example:0", "tls://proxy.example:65536",
+		"tls://[::1]suffix:443", "tls://[::1]:",
 	} {
 		if err := ValidateExaProxyURL(value); err == nil || strings.Contains(err.Error(), "proxy.example") || strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "secret") {
 			t.Fatal("invalid proxy accepted or echoed private URL components")
@@ -148,8 +151,8 @@ func TestExaHTTPAndHTTPSConnectKeepAPIAndProxyCredentialsIsolated(t *testing.T) 
 					t.Error("local CONNECT fixture could not hijack")
 					return
 				}
-				defer connection.Close()
-				defer upstream.Close()
+				defer func() { _ = connection.Close() }()
+				defer func() { _ = upstream.Close() }()
 				_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 				_ = buffered.Flush()
 				go func() { _, _ = io.Copy(upstream, buffered); _ = upstream.Close() }()
@@ -245,8 +248,8 @@ func TestExaProxyCannotDisableUpstreamCertificateVerification(t *testing.T) {
 			_ = upstream.Close()
 			return
 		}
-		defer connection.Close()
-		defer upstream.Close()
+		defer func() { _ = connection.Close() }()
+		defer func() { _ = upstream.Close() }()
 		_, _ = buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 		_ = buffered.Flush()
 		go func() { _, _ = io.Copy(upstream, buffered); _ = upstream.Close() }()

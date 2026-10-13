@@ -14,6 +14,7 @@ class ProxyURLPolicyTest(unittest.TestCase):
     def test_explicit_authorities_and_encoded_userinfo(self):
         for value in ["", "http://proxy.example:3128", "https://proxy.example",
                       "http://127.0.0.1:8080", "https://[2001:db8::1]:8443",
+                      "tls://relay.example:443", "tls://127.0.0.1:8443", "tls://[2001:db8::1]:443",
                       "http://user:synthetic%24proxy%27password@proxy.example:3128"]:
             with self.subTest(value=value):
                 self.assertTrue(module.valid(value))
@@ -28,6 +29,12 @@ class ProxyURLPolicyTest(unittest.TestCase):
                       "http://user:p$secret@proxy.example", r"http://user:p\\secret@proxy.example",
                       "http://user^:secret@proxy.example", "http://user:secret`value@proxy.example",
                       "http://bad_label.example", "http://user:synthetic-secret@proxy.example\nINJECTED=secret"]:
+            with self.subTest(value=value):
+                self.assertFalse(module.valid(value))
+        for value in ["tls://relay.example", "tls://relay.example:", "tls://relay.example:0",
+                      "tls://relay.example:65536", "tls://user:secret@relay.example:443",
+                      "tls://@relay.example:443", "tls://relay.example:443/", "tls://relay.example:443?",
+                      "tls://relay.example:443#", "tls://[::1]suffix:443", "tls://[::1]:443\nSECRET=value"]:
             with self.subTest(value=value):
                 self.assertFalse(module.valid(value))
         for value in ["http://user:secret@[::1]suffix", "http://user:secret@[::1]suffix:3128"]:

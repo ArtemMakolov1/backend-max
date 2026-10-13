@@ -172,6 +172,11 @@ render_production "$sandbox/exa-proxy.env" DEEPSEEK_API_KEY=synthetic-deepseek-s
   EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$proxy_url"
 grep -Fx "EXA_PROXY_URL=$proxy_url" "$sandbox/exa-proxy.env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$sandbox/exa-proxy.env"
+relay_url='tls://relay.example.test:443'
+render_production "$sandbox/exa-relay.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+  EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$relay_url"
+grep -Fx "EXA_PROXY_URL=$relay_url" "$sandbox/exa-relay.env" >/dev/null
+"$repo_root/deploy/validate-production-env.sh" "$sandbox/exa-relay.env"
 for bad_proxy in 'socks5://proxy.example.test:1080' 'http://proxy.example.test:0' \
   'http://proxy.example.test:3128/path' 'http://user:synthetic$proxy-password@proxy.example.test:3128' \
   $'http://synthetic-proxy-user:synthetic-proxy-password@proxy.example.test:3128\nINJECTED=secret'; do
