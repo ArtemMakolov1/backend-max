@@ -217,7 +217,7 @@ fi
   printf 'MEDIA_CLEANUP_INTERVAL=%s\n' "${MEDIA_CLEANUP_INTERVAL:-15m}"
   printf 'MEDIA_CLEANUP_BATCH_SIZE=%s\n' "${MEDIA_CLEANUP_BATCH_SIZE:-50}"
   printf 'OPENAI_API_KEY=%s\n' "$rendered_openai_key"
-  printf 'TEXT_AI_PROVIDER=%s\n' "${TEXT_AI_PROVIDER:-deepseek}"
+  printf 'TEXT_AI_PROVIDER=%s\n' "${TEXT_AI_PROVIDER:-qwen}"
   printf 'DEEPSEEK_API_KEY=%s\n' "$rendered_deepseek_key"
   printf 'DEEPSEEK_API_BASE_URL=https://api.deepseek.com\n'
   printf 'DEEPSEEK_TEXT_MODEL=%s\n' "${DEEPSEEK_TEXT_MODEL:-deepseek-flash}"
@@ -225,6 +225,7 @@ fi
   printf 'QWEN_API_KEY=%s\n' "$rendered_qwen_key"
   printf 'QWEN_API_BASE_URL=%s\n' "${QWEN_API_BASE_URL:-https://dashscope-intl.aliyuncs.com}"
   printf 'QWEN_IMAGE_MODEL=%s\n' "${QWEN_IMAGE_MODEL:-qwen-image-3.0-pro}"
+  printf 'QWEN_TEXT_MODEL=%s\n' "${QWEN_TEXT_MODEL:-qwen3.6-plus}"
   printf 'EXA_API_KEY=%s\n' "$rendered_exa_key"
   printf 'EXA_PROXY_URL=%s\n' "$rendered_exa_proxy"
   printf 'TAVILY_API_KEY=%s\n' "$rendered_tavily_key"

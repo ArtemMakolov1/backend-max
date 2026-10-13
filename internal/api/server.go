@@ -991,6 +991,8 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 			logMessage := "OpenAI research request failed"
 			if researchErr.Provider == "deepseek" {
 				logMessage = "DeepSeek text request failed"
+			} else if researchErr.Provider == "qwen" {
+				logMessage = "Qwen text request failed"
 			}
 			failureCode := safeResearchFailureCode(researchErr.Code)
 			s.logger.Warn(logMessage, "status", researchErr.StatusCode, "code", failureCode,
@@ -1019,7 +1021,8 @@ func (s *Server) writeError(w http.ResponseWriter, err error) {
 func safeResearchFailureCode(code string) string {
 	switch code {
 	case "invalid_structured_output", "missing_output_text", "missing_citations", "response_not_completed",
-		"response_incomplete", "response_failed", "response_refused", "content_changed":
+		"response_incomplete", "response_failed", "response_refused", "content_changed",
+		"provider_transport_error", "provider_http_error", "invalid_provider_response":
 		return code
 	default:
 		return "unknown"

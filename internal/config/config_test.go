@@ -785,7 +785,7 @@ func clearAuthEnv(t *testing.T) {
 		"MAX_API_BASE_URL", "MAX_BOT_TOKEN", "MAX_WEBHOOK_SECRET", "MAX_CA_CERT_FILE",
 		"OPENAI_API_KEY", "OPENAI_API_BASE_URL", "OPENAI_IMAGE_MODEL", "OPENAI_RESEARCH_MODEL", "EXA_API_KEY", "TAVILY_API_KEY", "EXA_PROXY_URL",
 		"TEXT_AI_PROVIDER", "DEEPSEEK_API_KEY", "DEEPSEEK_API_BASE_URL", "DEEPSEEK_TEXT_MODEL",
-		"IMAGE_AI_PROVIDER", "QWEN_API_KEY", "QWEN_API_BASE_URL", "QWEN_IMAGE_MODEL",
+		"IMAGE_AI_PROVIDER", "QWEN_API_KEY", "QWEN_API_BASE_URL", "QWEN_IMAGE_MODEL", "QWEN_TEXT_MODEL",
 		"S3_HOST", "S3_ACCESS_KEY", "S3_SECRET_KEY", "S3_BUCKET", "S3_REGION",
 		"MEDIA_USER_MAX_FILES", "MEDIA_USER_MAX_BYTES", "MEDIA_ORPHAN_GRACE_PERIOD", "MEDIA_CLEANUP_INTERVAL", "MEDIA_CLEANUP_BATCH_SIZE",
 		"BILLING_ENFORCEMENT_ENABLED", "BILLING_LIVE_ENABLED", "YOOKASSA_RECEIPTS_CONFIRMED",
@@ -873,7 +873,7 @@ func TestLoadSearchProvidersAreOptionalAndTrimmed(t *testing.T) {
 			clearAuthEnv(t)
 			setValidLocalYandexAuth(t)
 			if test.exa != "" || test.tavily != "" {
-				t.Setenv("DEEPSEEK_API_KEY", "synthetic-deepseek-key")
+				t.Setenv("QWEN_API_KEY", "synthetic-qwen-key")
 			}
 			t.Setenv("EXA_API_KEY", "  "+test.exa+"  ")
 			t.Setenv("TAVILY_API_KEY", "  "+test.tavily+"  ")
@@ -945,38 +945,40 @@ func TestLoadSearchProvidersRequireSelectedTextProviderWithoutLeakingKeys(t *tes
 	}
 }
 
-func TestLoadDefaultsTextToDeepSeekIndependentlyOfOpenAI(t *testing.T) {
+func TestLoadDefaultsTextToQwenWithoutOtherProviderFallback(t *testing.T) {
 	clearAuthEnv(t)
 	setValidLocalYandexAuth(t)
-	t.Setenv("OPENAI_API_KEY", "synthetic-image-key")
+	t.Setenv("OPENAI_API_KEY", "synthetic-openai-key")
+	t.Setenv("DEEPSEEK_API_KEY", "synthetic-deepseek-key")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TextAIProvider != "deepseek" || cfg.DeepSeekAPIBaseURL != "https://api.deepseek.com" || cfg.DeepSeekTextModel != "deepseek-flash" || cfg.TextAIConfigured() {
-		t.Fatal("DeepSeek defaults or independent text configuration were not preserved")
+	if cfg.TextAIProvider != "qwen" || cfg.QwenAPIBaseURL != "https://dashscope-intl.aliyuncs.com" || cfg.QwenTextModel != "qwen3.6-plus" || cfg.TextAIConfigured() {
+		t.Fatal("Qwen defaults or text provider isolation were not preserved")
 	}
-	t.Setenv("DEEPSEEK_API_KEY", "  synthetic-deepseek-key  ")
+	t.Setenv("QWEN_API_KEY", "  synthetic-qwen-key  ")
 	cfg, err = Load()
-	if err != nil || !cfg.TextAIConfigured() || cfg.DeepSeekAPIKey != "synthetic-deepseek-key" {
-		t.Fatalf("DeepSeek-only text key was not enabled: %v", err)
+	if err != nil || !cfg.TextAIConfigured() || cfg.QwenAPIKey != "synthetic-qwen-key" {
+		t.Fatalf("Qwen-only text key was not enabled: %v", err)
 	}
 }
 
 func TestLoadSearchUsesOnlySelectedProviderCredentials(t *testing.T) {
-	for _, provider := range []string{"deepseek", "openai"} {
+	providers := map[string]string{"qwen": "QWEN_API_KEY", "deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY"}
+	for provider, selectedKey := range providers {
 		t.Run(provider, func(t *testing.T) {
 			clearAuthEnv(t)
 			setValidLocalYandexAuth(t)
 			t.Setenv("TEXT_AI_PROVIDER", provider)
 			t.Setenv("EXA_API_KEY", "synthetic-exa-key")
-			selectedKey, otherKey := "DEEPSEEK_API_KEY", "OPENAI_API_KEY"
-			if provider == "openai" {
-				selectedKey, otherKey = otherKey, selectedKey
+			for other, key := range providers {
+				if other != provider {
+					t.Setenv(key, "synthetic-other-provider-key")
+				}
 			}
-			t.Setenv(otherKey, "synthetic-other-provider-key")
 			if _, err := Load(); err == nil {
-				t.Fatal("unselected provider key unexpectedly enabled grounded text")
+				t.Fatal("unselected provider keys unexpectedly enabled grounded text")
 			}
 			t.Setenv(selectedKey, "synthetic-selected-provider-key")
 			cfg, err := Load()
@@ -984,6 +986,17 @@ func TestLoadSearchUsesOnlySelectedProviderCredentials(t *testing.T) {
 				t.Fatalf("selected provider rejected: %v", err)
 			}
 		})
+	}
+}
+
+func TestLoadRejectsUnsafeQwenTextModels(t *testing.T) {
+	for _, value := range []string{"qwen3.6-plus\ninjection", "qwen model", strings.Repeat("m", 129)} {
+		clearAuthEnv(t)
+		setValidLocalYandexAuth(t)
+		t.Setenv("QWEN_TEXT_MODEL", value)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "QWEN_TEXT_MODEL") || strings.Contains(err.Error(), value) {
+			t.Fatal("unsafe Qwen text model was accepted or echoed")
+		}
 	}
 }
 

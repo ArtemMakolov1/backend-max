@@ -4582,10 +4582,10 @@ components:
           description: The configured MAX client supports the provider comments API. Current workspace, publication and MAX rights still gate each endpoint.
         openai_configured:
           type: boolean
-          description: An OpenAI image client or explicitly selected OpenAI text client is configured. A DeepSeek-only text client does not enable image generation.
+          description: An OpenAI image client or explicitly selected OpenAI text client is configured. Qwen and DeepSeek text clients do not enable this OpenAI flag.
         text_ai_provider:
           type: string
-          enum: ['', deepseek, openai]
+          enum: ['', qwen, deepseek, openai]
           description: Selected text AI provider; empty when no text client is configured. Credentials are never returned.
         image_generation_configured:
           type: boolean
@@ -4600,7 +4600,7 @@ components:
           type: boolean
         content_search_configured:
           type: boolean
-          description: Server-side Exa or Tavily retrieval is configured for grounded content discovery and DeepSeek detailed research. Credentials are never returned.
+          description: Server-side Exa or Tavily retrieval is configured for grounded content discovery and Qwen/DeepSeek research. Credentials are never returned.
         content_formatting_configured:
           type: boolean
         observability_access:

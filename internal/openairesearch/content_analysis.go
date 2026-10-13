@@ -39,18 +39,18 @@ type ContentContextAnalysis struct {
 }
 
 func (c *Client) ContentAnalysisModelKey() string {
-	if c.provider == "deepseek" {
+	if usesExternalResearch(c.provider) {
 		audio := "audio-unavailable"
 		if c.audioAnalysis != nil && c.audioAnalysis.provider == "openai" {
 			audio = "openai:" + contentAudioModel
 		}
-		return "deepseek:" + c.model + "|" + audio + "|frames-v1"
+		return c.provider + ":" + c.model + "|" + audio + "|frames-v1"
 	}
 	return c.model + "|" + contentAudioModel + "|frames-v1"
 }
 
 // WithAudioAnalysis keeps audio on its explicitly configured provider. The
-// DeepSeek key and OpenAI audio model must never be sent to the same endpoint.
+// Text provider keys and the OpenAI audio model must never share an endpoint.
 func (c *Client) WithAudioAnalysis(analyzer *Client) *Client {
 	clone := *c
 	clone.audioAnalysis = analyzer
@@ -91,7 +91,7 @@ func (c *Client) AnalyzeContentAudio(ctx context.Context, wav []byte) (string, e
 	if len(wav) < 44 || len(wav) > 2<<20 || string(wav[:4]) != "RIFF" || string(wav[8:12]) != "WAVE" {
 		return "", errors.New("invalid prepared audio")
 	}
-	if c.provider == "deepseek" {
+	if usesExternalResearch(c.provider) {
 		if c.audioAnalysis == nil || c.audioAnalysis.provider != "openai" {
 			return "", errors.New("content audio analysis provider is not configured")
 		}

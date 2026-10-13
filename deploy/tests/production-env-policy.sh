@@ -15,11 +15,13 @@ for search_key in EXA_API_KEY EXA_PROXY_URL TAVILY_API_KEY DEEPSEEK_API_KEY; do
   grep -F "      $search_key: \${$search_key:-}" "$repo_root/deploy/compose.production.yaml" >/dev/null
 done
 for workflow in deploy.yml recover-s3-production.yml; do
-  grep -F "          TEXT_AI_PROVIDER: \${{ vars.TEXT_AI_PROVIDER || 'deepseek' }}" "$repo_root/.github/workflows/$workflow" >/dev/null
+  grep -F "          TEXT_AI_PROVIDER: \${{ vars.TEXT_AI_PROVIDER || 'qwen' }}" "$repo_root/.github/workflows/$workflow" >/dev/null
+  grep -F "          QWEN_TEXT_MODEL: \${{ vars.QWEN_TEXT_MODEL || 'qwen3.6-plus' }}" "$repo_root/.github/workflows/$workflow" >/dev/null
   grep -F "          DEEPSEEK_TEXT_MODEL: \${{ vars.DEEPSEEK_TEXT_MODEL || 'deepseek-flash' }}" "$repo_root/.github/workflows/$workflow" >/dev/null
 done
 for compose_file in compose.yaml deploy/compose.production.yaml; do
-  grep -F '      TEXT_AI_PROVIDER: ${TEXT_AI_PROVIDER:-deepseek}' "$repo_root/$compose_file" >/dev/null
+  grep -F '      TEXT_AI_PROVIDER: ${TEXT_AI_PROVIDER:-qwen}' "$repo_root/$compose_file" >/dev/null
+  grep -F '      QWEN_TEXT_MODEL: ${QWEN_TEXT_MODEL:-qwen3.6-plus}' "$repo_root/$compose_file" >/dev/null
   grep -F '      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}' "$repo_root/$compose_file" >/dev/null
   grep -F '      DEEPSEEK_API_BASE_URL: ${DEEPSEEK_API_BASE_URL:-https://api.deepseek.com}' "$repo_root/$compose_file" >/dev/null
   grep -F '      DEEPSEEK_TEXT_MODEL: ${DEEPSEEK_TEXT_MODEL:-deepseek-flash}' "$repo_root/$compose_file" >/dev/null
@@ -81,7 +83,8 @@ render_production() {
     YOOKASSA_RECEIPTS_CONFIRMED=false \
     OPENAI_API_KEY= \
     QWEN_API_KEY= \
-    TEXT_AI_PROVIDER=deepseek \
+    TEXT_AI_PROVIDER=qwen \
+    QWEN_TEXT_MODEL=qwen3.6-plus \
     DEEPSEEK_API_KEY= \
     DEEPSEEK_TEXT_MODEL=deepseek-flash \
     EXA_API_KEY= \
@@ -95,7 +98,8 @@ production_env="$sandbox/production.env"
 render_production "$production_env"
 grep -Fx 'AUTH_BOOTSTRAP_MODE=false' "$production_env" >/dev/null
 grep -Fx 'OPENAI_API_KEY=' "$production_env" >/dev/null
-grep -Fx 'TEXT_AI_PROVIDER=deepseek' "$production_env" >/dev/null
+grep -Fx 'TEXT_AI_PROVIDER=qwen' "$production_env" >/dev/null
+grep -Fx 'QWEN_TEXT_MODEL=qwen3.6-plus' "$production_env" >/dev/null
 grep -Fx 'DEEPSEEK_API_KEY=' "$production_env" >/dev/null
 grep -Fx 'DEEPSEEK_API_BASE_URL=https://api.deepseek.com' "$production_env" >/dev/null
 grep -Fx 'DEEPSEEK_TEXT_MODEL=deepseek-flash' "$production_env" >/dev/null
@@ -158,7 +162,7 @@ for search_mode in exa tavily both; do
   [[ "$search_mode" == tavily ]] || exa_key=synthetic-exa-secret
   [[ "$search_mode" == exa ]] || tavily_key=synthetic-tavily-secret
   configured_search_env="$sandbox/search-$search_mode.env"
-  render_production "$configured_search_env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+  render_production "$configured_search_env" QWEN_API_KEY=synthetic-qwen-secret \
     EXA_API_KEY="$exa_key" TAVILY_API_KEY="$tavily_key"
   grep -Fx "EXA_API_KEY=$exa_key" "$configured_search_env" >/dev/null
   grep -Fx "TAVILY_API_KEY=$tavily_key" "$configured_search_env" >/dev/null
@@ -168,19 +172,19 @@ done
 # Old env files remain valid when optional provider keys are entirely absent.
 # Proxy credentials remain server-owned, isolated and encoded in rendered env.
 proxy_url='http://synthetic-proxy-user:synthetic%24proxy%27password@proxy.example.test:3128'
-render_production "$sandbox/exa-proxy.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+render_production "$sandbox/exa-proxy.env" QWEN_API_KEY=synthetic-qwen-secret \
   EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$proxy_url"
 grep -Fx "EXA_PROXY_URL=$proxy_url" "$sandbox/exa-proxy.env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$sandbox/exa-proxy.env"
 relay_url='tls://relay.example.test:443'
-render_production "$sandbox/exa-relay.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+render_production "$sandbox/exa-relay.env" QWEN_API_KEY=synthetic-qwen-secret \
   EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$relay_url"
 grep -Fx "EXA_PROXY_URL=$relay_url" "$sandbox/exa-relay.env" >/dev/null
 "$repo_root/deploy/validate-production-env.sh" "$sandbox/exa-relay.env"
 for bad_proxy in 'socks5://proxy.example.test:1080' 'http://proxy.example.test:0' \
   'http://proxy.example.test:3128/path' 'http://user:synthetic$proxy-password@proxy.example.test:3128' \
   $'http://synthetic-proxy-user:synthetic-proxy-password@proxy.example.test:3128\nINJECTED=secret'; do
-  if render_production "$sandbox/invalid-proxy.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret \
+  if render_production "$sandbox/invalid-proxy.env" QWEN_API_KEY=synthetic-qwen-secret \
     EXA_API_KEY=synthetic-exa-secret EXA_PROXY_URL="$bad_proxy" >"$sandbox/proxy-error.log" 2>&1; then
     echo "Production render accepted an invalid Exa proxy" >&2
     exit 1
@@ -220,15 +224,15 @@ for search_key in EXA_API_KEY TAVILY_API_KEY; do
   done
 done
 
-# Search may synthesize on either explicitly selected provider, but an image key
-# must not accidentally enable DeepSeek text or silently choose OpenAI text.
-for provider in deepseek openai; do
-  selected_key=DEEPSEEK_API_KEY
+# Grounded synthesis requires the explicitly selected provider key; other
+# configured providers must never enable an automatic fallback.
+for provider in qwen deepseek openai; do
+  selected_key=QWEN_API_KEY
   other_key=OPENAI_API_KEY
-  if [[ "$provider" == openai ]]; then
-    selected_key=OPENAI_API_KEY
-    other_key=DEEPSEEK_API_KEY
-  fi
+  case "$provider" in
+    deepseek) selected_key=DEEPSEEK_API_KEY; other_key=QWEN_API_KEY ;;
+    openai) selected_key=OPENAI_API_KEY; other_key=DEEPSEEK_API_KEY ;;
+  esac
   render_production "$sandbox/selected-$provider.env" TEXT_AI_PROVIDER="$provider" \
     "$selected_key=synthetic-selected-secret" EXA_API_KEY=synthetic-exa-secret
   "$repo_root/deploy/validate-production-env.sh" "$sandbox/selected-$provider.env"
@@ -243,11 +247,22 @@ for provider in deepseek openai; do
   fi
 done
 
-render_production "$sandbox/deepseek-model.env" DEEPSEEK_API_KEY=synthetic-deepseek-secret DEEPSEEK_TEXT_MODEL=deepseek-custom
+render_production "$sandbox/deepseek-model.env" TEXT_AI_PROVIDER=deepseek DEEPSEEK_API_KEY=synthetic-deepseek-secret DEEPSEEK_TEXT_MODEL=deepseek-custom
+grep -Fx 'TEXT_AI_PROVIDER=deepseek' "$sandbox/deepseek-model.env" >/dev/null
 grep -Fx 'DEEPSEEK_TEXT_MODEL=deepseek-custom' "$sandbox/deepseek-model.env" >/dev/null
+render_production "$sandbox/qwen-text-model.env" QWEN_API_KEY=synthetic-qwen-secret QWEN_TEXT_MODEL=qwen-custom
+"$repo_root/deploy/validate-production-env.sh" "$sandbox/qwen-text-model.env"
+grep -Fx 'QWEN_TEXT_MODEL=qwen-custom' "$sandbox/qwen-text-model.env" >/dev/null
+for unsafe_model in 'qwen model' 'qwen$unsafe' "$(printf 'm%.0s' {1..129})"; do
+  if render_production "$sandbox/unsafe-qwen-text-model.env" QWEN_TEXT_MODEL="$unsafe_model" >"$sandbox/model-error.log" 2>&1; then
+    echo "Production render accepted an unsafe Qwen text model" >&2
+    exit 1
+  fi
+  grep -F 'QWEN_TEXT_MODEL' "$sandbox/model-error.log" >/dev/null
+done
 render_production "$sandbox/images-only.env" OPENAI_API_KEY=synthetic-openai-secret
-grep -Fx 'TEXT_AI_PROVIDER=deepseek' "$sandbox/images-only.env" >/dev/null
-grep -Fx 'DEEPSEEK_API_KEY=' "$sandbox/images-only.env" >/dev/null
+grep -Fx 'TEXT_AI_PROVIDER=qwen' "$sandbox/images-only.env" >/dev/null
+grep -Fx 'QWEN_API_KEY=' "$sandbox/images-only.env" >/dev/null
 
 for unsafe_key in $'synthetic-deepseek-secret\ninjection' $'synthetic-deepseek-secret\r' $'\nsynthetic-deepseek-secret' 'synthetic-deepseek-secret$unsafe'; do
   if render_production "$sandbox/deepseek-unsafe.env" DEEPSEEK_API_KEY="$unsafe_key" >"$sandbox/provider-error.log" 2>&1; then

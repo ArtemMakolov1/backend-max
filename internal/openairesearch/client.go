@@ -95,10 +95,14 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	if e.Code != "" {
-		return fmt.Sprintf("%s Responses API error (%s): %s", providerName(e.Provider), e.Code, e.Message)
+	apiName := "Responses API"
+	if e.Provider == "qwen" {
+		apiName = "Chat Completions API"
 	}
-	return fmt.Sprintf("%s Responses API error (status %d): %s", providerName(e.Provider), e.StatusCode, e.Message)
+	if e.Code != "" {
+		return fmt.Sprintf("%s %s error (%s): %s", providerName(e.Provider), apiName, e.Code, e.Message)
+	}
+	return fmt.Sprintf("%s %s error (status %d): %s", providerName(e.Provider), apiName, e.StatusCode, e.Message)
 }
 
 func New(baseURL, apiKey, model string, httpClient *http.Client) (*Client, error) {
@@ -133,6 +137,9 @@ func newClient(provider, responsePath, baseURL, apiKey, model string, httpClient
 func providerName(provider string) string {
 	if provider == "deepseek" {
 		return "DeepSeek"
+	}
+	if provider == "qwen" {
+		return "Qwen"
 	}
 	return "OpenAI"
 }
@@ -217,7 +224,7 @@ func (c *Client) generatePostDraft(ctx context.Context, request Request, report 
 	modelReport := report
 	var modelSources any = sources
 	sourceLimit := 0
-	if c.provider == "deepseek" {
+	if usesExternalResearch(c.provider) {
 		if request.IncludeSources {
 			sourceLimit = min(len(sources), draftSourceCount(styleTarget))
 			if sourceLimit == 0 {
@@ -231,7 +238,7 @@ func (c *Client) generatePostDraft(ctx context.Context, request Request, report 
 		modelSources = draftSourceEvidence(sources)
 	}
 	payload := draftPayload(c.model, request, modelReport, modelSources)
-	if c.provider == "deepseek" {
+	if usesExternalResearch(c.provider) {
 		instruction := payload.Input[0].Content.(string)
 		instruction = strings.Replace(instruction, "Цель — около 3600 символов;", "Следуй характерной длине и манере канала по образцам;", 1)
 		instruction = strings.Replace(instruction, "Если include_sources=true, добавь в content компактный блок источников с кликабельными ссылками; если false, не добавляй блок источников.", "Если include_sources=true, верни в source_ids идентификаторы только тех источников, факты из которых использованы в content; если false, верни source_ids:[].", 1)
@@ -256,21 +263,21 @@ func (c *Client) generatePostDraft(ctx context.Context, request Request, report 
 		}
 		var draft Draft
 		var selectedSources []Source
-		if c.provider == "deepseek" {
+		if usesExternalResearch(c.provider) {
 			draft, selectedSources, err = decodeGroundedDraft(text, request.Format, sources, sourceLimit)
 		} else {
 			draft, err = decodeDraft(text, request.Format)
 		}
-		if err == nil && c.provider == "deepseek" && hasStyleLength && utf8.RuneCountInString(draft.Content) > styleTarget*3/2 {
+		if err == nil && usesExternalResearch(c.provider) && hasStyleLength && utf8.RuneCountInString(draft.Content) > styleTarget*3/2 {
 			// Check authored prose before server attribution. Channel examples
 			// establish a useful upper length bound, but never force extra facts.
 			err = errDraftStyleTooLong
 		}
-		if err == nil && c.provider == "deepseek" && request.IncludeSources {
+		if err == nil && usesExternalResearch(c.provider) && request.IncludeSources {
 			draft, err = appendResearchSources(draft, selectedSources)
 		}
 		if err != nil {
-			if c.provider == "deepseek" && attempt == 0 && (errors.Is(err, errDraftContentTooLong) || errors.Is(err, errDraftStyleTooLong)) {
+			if usesExternalResearch(c.provider) && attempt == 0 && (errors.Is(err, errDraftContentTooLong) || errors.Is(err, errDraftStyleTooLong)) {
 				// Retry the drafting step once from the verified report, never
 				// truncating markup or feeding invalid generated text back in.
 				payload.Input[0].Content = payload.Input[0].Content.(string) + " Предыдущая попытка превысила предел длины. Создай новый черновик по тому же проверенному отчету, сохрани стиль и все бренд-правила." +
@@ -575,6 +582,9 @@ type annotation struct {
 }
 
 func (c *Client) call(ctx context.Context, payload responsePayload) (responseEnvelope, error) {
+	if c.provider == "qwen" {
+		return c.callQwen(ctx, payload)
+	}
 	name := providerName(c.provider)
 	// DeepSeek ignores built-in web_search tools. Never submit a request that
 	// appears grounded but can only produce unsupported model assertions.
@@ -780,7 +790,7 @@ func extractOutputText(envelope responseEnvelope) (string, error) {
 }
 
 func normalizeStructuredText(envelope responseEnvelope, value string) string {
-	if envelope.provider != "deepseek" || !envelope.structuredJSON {
+	if !usesExternalResearch(envelope.provider) || !envelope.structuredJSON {
 		return value
 	}
 	trimmed := strings.TrimSpace(value)
@@ -988,5 +998,9 @@ func truncateRunes(value string, limit int) string {
 }
 
 func responseError(envelope responseEnvelope, code, message string) *Error {
+	if envelope.provider == "qwen" && code == "invalid_structured_output" {
+		// JSON decoder errors can contain provider-authored field names.
+		message = "Qwen output does not meet the requested format and validation rules"
+	}
 	return &Error{Provider: envelope.provider, Code: code, Message: message, RequestID: envelope.RequestID}
 }

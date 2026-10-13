@@ -248,14 +248,19 @@ release не входят: штатный attachment API должен откло
 оба Environment используются для одного PostgreSQL volume. Подробная схема
 доступа и список дашбордов описаны в `monitoring/README.md`.
 
-Текстовые операции по умолчанию используют DeepSeek. Добавьте protected secret
-`DEEPSEEK_API_KEY` в Environment `production`; переменные `TEXT_AI_PROVIDER=deepseek`
-и `DEEPSEEK_TEXT_MODEL=deepseek-flash` имеют эти значения по умолчанию.
-Origin закреплён на `https://api.deepseek.com`.
-Для возврата текстовых операций на OpenAI задайте `TEXT_AI_PROVIDER=openai`
-и secret `OPENAI_API_KEY`; `OPENAI_RESEARCH_MODEL` управляет его текстовой моделью.
+Текстовые операции по умолчанию используют Qwen. Для текста и изображений
+используется protected secret `QWEN_API_KEY` в Environment `production`;
+defaults: `TEXT_AI_PROVIDER=qwen`, `QWEN_TEXT_MODEL=qwen3.6-plus`.
+Текстовый клиент вызывает `/compatible-mode/v1/chat/completions` на origin
+`QWEN_API_BASE_URL`, с отключённым thinking и JSON mode для структурированных ответов.
+Ключ, origin и доступность обеих моделей должны относиться к одному региону/workspace.
+Для явного DeepSeek задайте `TEXT_AI_PROVIDER=deepseek`, protected secret
+`DEEPSEEK_API_KEY` и при необходимости `DEEPSEEK_TEXT_MODEL` (default `deepseek-flash`).
+Его origin закреплён на `https://api.deepseek.com`.
+Для OpenAI задайте `TEXT_AI_PROVIDER=openai` и secret `OPENAI_API_KEY`;
+`OPENAI_RESEARCH_MODEL` управляет его текстовой моделью.
 Оба workflow, обычный deploy и восстановление S3, передают выбор провайдера,
-ключ DeepSeek и модель через renderer в backend.
+ключи и модели через renderer в backend.
 
 Генерация изображений по умолчанию использует Qwen Image 3.0 Pro. Добавьте
 protected secret `QWEN_API_KEY`; defaults: `IMAGE_AI_PROVIDER=qwen`,
@@ -278,7 +283,7 @@ origin и доступность модели должны относиться 
 `EXA_API_KEY` и/или `TAVILY_API_KEY` в Environment `production`. Они передаются
 через renderer в backend, не являются repository variables и не выводятся в логи.
 Для синтеза карточек нужен ключ выбранного `TEXT_AI_PROVIDER`; отдельный поисковый
-ключ без него отклоняется валидатором. DeepSeek не поддерживает встроенный
+ключ без него отклоняется валидатором. Qwen-клиент и DeepSeek не выполняют встроенный
 веб-поиск: без Exa/Tavily исследования и поиск материалов отвечают
 `content_search_not_configured`. Остальные текстовые операции продолжают работать.
 При явном выборе OpenAI сохраняется его встроенный веб-поиск.

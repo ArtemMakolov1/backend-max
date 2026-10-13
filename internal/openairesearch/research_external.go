@@ -13,7 +13,7 @@ import (
 )
 
 func (c *Client) research(ctx context.Context, request Request) (string, []Source, error) {
-	if c.provider == "deepseek" {
+	if usesExternalResearch(c.provider) {
 		if c.contentSearch == nil {
 			return "", nil, c.contentSearchNotConfigured()
 		}
@@ -34,7 +34,7 @@ func (c *Client) contentSearchNotConfigured() *Error {
 // ValidateResearchSources is a local readiness check so handlers can reject
 // unavailable grounded workflows before reserving quota or analyzing media.
 func (c *Client) ValidateResearchSources() error {
-	if c.provider == "deepseek" && c.contentSearch == nil {
+	if usesExternalResearch(c.provider) && c.contentSearch == nil {
 		return c.contentSearchNotConfigured()
 	}
 	return nil

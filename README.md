@@ -355,12 +355,17 @@ three flags and the complete YooKassa credential set are present. See
 `AI_LEASE_TTL` должен быть больше таймаута AI-обработчика `3m`. Нулевые,
 отрицательные и чрезмерные значения отклоняются при запуске.
 
-Текстовые операции по умолчанию используют `TEXT_AI_PROVIDER=deepseek`,
-`DEEPSEEK_TEXT_MODEL=deepseek-flash` и серверный `DEEPSEEK_API_KEY`.
-`DEEPSEEK_API_BASE_URL` закреплён на `https://api.deepseek.com`.
-Для возврата текстовых операций на OpenAI укажите `TEXT_AI_PROVIDER=openai`
-и `OPENAI_API_KEY`; тогда используется `OPENAI_RESEARCH_MODEL`.
-Наличие одного OpenAI-ключа не включает текст при выборе DeepSeek.
+Текстовые операции по умолчанию используют `TEXT_AI_PROVIDER=qwen`,
+`QWEN_TEXT_MODEL=qwen3.6-plus` и серверный `QWEN_API_KEY`.
+Регион и workspace задаёт `QWEN_API_BASE_URL` — тот же официальный Alibaba
+Cloud Model Studio origin, который используется для изображений.
+Текстовый клиент вызывает `/compatible-mode/v1/chat/completions`, отключает
+thinking и получает структурированные ответы через JSON mode.
+При явном `TEXT_AI_PROVIDER=deepseek` используется `DEEPSEEK_API_KEY`,
+`DEEPSEEK_TEXT_MODEL=deepseek-flash` и закреплённый origin `https://api.deepseek.com`.
+При `TEXT_AI_PROVIDER=openai` нужен `OPENAI_API_KEY`;
+тогда используется `OPENAI_RESEARCH_MODEL`.
+Ключ другого провайдера не включает текст через автоматический fallback.
 
 Изображения по умолчанию создаёт Qwen Image 3.0 Pro: `IMAGE_AI_PROVIDER=qwen`,
 `QWEN_IMAGE_MODEL=qwen-image-3.0-pro`, `QWEN_API_KEY` и Singapore origin
@@ -379,9 +384,9 @@ Health показывает `research_configured` для текстового к
 смысл наличия OpenAI-клиента; DeepSeek и Qwen не включают этот флаг.
 Отключённые маршруты отвечают `503` с прежними кодами `*_not_configured`.
 
-DeepSeek не предоставляет встроенный веб-поиск. Для исследования и поиска
+Qwen-клиент и DeepSeek не выполняют встроенный веб-поиск. Для исследования и поиска
 материалов нужны `EXA_API_KEY` и/или `TAVILY_API_KEY` вместе с ключом выбранного
-текстового провайдера. Без поисковых ключей эти операции на DeepSeek отвечают
+текстового провайдера. Без поисковых ключей эти операции на Qwen и DeepSeek отвечают
 `content_search_not_configured`; форматирование, подсказки и другие текстовые
 операции продолжают работать. При явном выборе OpenAI сохраняется его прежний
 встроенный веб-поиск. В `AUTH_BOOTSTRAP_MODE` все AI- и поисковые ключи запрещены.

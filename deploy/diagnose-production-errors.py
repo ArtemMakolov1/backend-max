@@ -158,13 +158,18 @@ PROVIDER_CODES = {
         "missing_citations", "invalid_structured_output", "response_not_completed",
         "response_incomplete", "response_failed", "response_refused",
         "missing_output_text", "content_changed",
+        "provider_transport_error", "provider_http_error", "invalid_provider_response",
     )
 }
 
-# Exact messages produced by our DeepSeek response/discovery validators only.
+# Exact messages produced by our text response/discovery validators only.
 # This also classifies older records whose logger did not include a code. No
 # substring, provider-body fragment or dynamically formatted value is accepted.
 SOURCE_OWNED_RESULT_REASONS = {
+    "Qwen could not complete the response": "response_failed",
+    "Qwen completion was not completed": "response_not_completed",
+    "Qwen refused the request": "response_refused",
+    "Qwen completion does not contain text": "response_text_missing",
     "DeepSeek could not complete the response": "response_failed",
     "DeepSeek response was not completed": "response_not_completed",
     "DeepSeek response was not completed: failed": "response_failed",
@@ -268,7 +273,7 @@ def sanitize_record(record):
             "transport_kind": (kind if isinstance(kind, str) and kind in CONTENT_SEARCH_TRANSPORTS else "unknown")
                               if code in ("request_failed", "response_unreadable") else None,
         }
-    if record.get("msg") in ("OpenAI research request failed", "DeepSeek text request failed"):
+    if record.get("msg") in ("OpenAI research request failed", "DeepSeek text request failed", "Qwen text request failed"):
         status = record.get("status")
         code = record.get("code")
         error = record.get("error")
@@ -279,7 +284,7 @@ def sanitize_record(record):
             http_status == 403 and isinstance(error, str)
             and error.strip().casefold() == "country, region, or territory not supported"
         ) else None
-        if record.get("msg") == "DeepSeek text request failed" and type(status) is int and status == 0:
+        if record.get("msg") in ("DeepSeek text request failed", "Qwen text request failed") and type(status) is int and status == 0:
             reason = SOURCE_OWNED_RESULT_REASONS.get(error) if isinstance(error, str) else None
         return {
             "time": safe_time(record.get("time")),
@@ -395,7 +400,7 @@ class BoundedDiagnostics:
         if isinstance(record, dict) and record.get("level") == "WARN":
             if record.get("msg") == "content source retrieval failed":
                 self.warning_counts["content_source_retrieval_failed"] += 1
-            elif record.get("msg") in ("OpenAI research request failed", "DeepSeek text request failed"):
+            elif record.get("msg") in ("OpenAI research request failed", "DeepSeek text request failed", "Qwen text request failed"):
                 self.warning_counts["openai_research_request_failed"] += 1
                 status = record.get("status")
                 if type(status) is int and 100 <= status <= 599:

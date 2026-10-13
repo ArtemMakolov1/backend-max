@@ -53,7 +53,7 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 		if errors.As(err, &sourceErr) {
 			diagnostic = sourceErr.SafeDiagnostics()
 		}
-		return DiscoverContentResult{}, &Error{Code: "content_search_failed", Message: "External source retrieval is unavailable",
+		return DiscoverContentResult{}, &Error{Provider: c.provider, Code: "content_search_failed", Message: "External source retrieval is unavailable",
 			SearchDiagnostics: diagnostic}
 	}
 	sources, previews, media, evidence := externalDiscoverySources(found.Sources)
@@ -73,7 +73,7 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	// Crucially, neither message annotations nor hallucinated web-search output
 	// from this synthesis response can expand the retrieval authority map.
 	cards, err := decodeDiscoveryCardsFromSources(text, sources, previews, request)
-	if err != nil && c.provider == "deepseek" && err.Error() == "content discovery draft must not invent external links" {
+	if err != nil && usesExternalResearch(c.provider) && err.Error() == "content discovery draft must not invent external links" {
 		if ctx.Err() != nil {
 			return DiscoverContentResult{}, ctx.Err()
 		}

@@ -35,10 +35,11 @@ const (
 	defaultOpenAIAPIBaseURL          = "https://api.openai.com"
 	defaultDeepSeekAPIBaseURL        = "https://api.deepseek.com"
 	defaultDeepSeekTextModel         = "deepseek-flash"
-	defaultTextAIProvider            = "deepseek"
+	defaultTextAIProvider            = "qwen"
 	defaultImageAIProvider           = "qwen"
 	defaultQwenAPIBaseURL            = "https://dashscope-intl.aliyuncs.com"
 	defaultQwenImageModel            = "qwen-image-3.0-pro"
+	defaultQwenTextModel             = "qwen3.6-plus"
 	defaultDirectAPIBaseURL          = "https://api.direct.yandex.com/json/v501"
 	defaultDirectSandboxAPIBaseURL   = "https://api-sandbox.direct.yandex.com/json/v5"
 	defaultWordstatAPIBaseURL        = "https://searchapi.api.cloud.yandex.net"
@@ -117,6 +118,7 @@ type Config struct {
 	QwenAPIKey                string
 	QwenAPIBaseURL            string
 	QwenImageModel            string
+	QwenTextModel             string
 	ExaAPIKey                 string
 	TavilyAPIKey              string
 	ExaProxyURL               string
@@ -320,6 +322,7 @@ func Load() (Config, error) {
 		QwenAPIKey:                strings.TrimSpace(os.Getenv("QWEN_API_KEY")),
 		QwenAPIBaseURL:            env("QWEN_API_BASE_URL", defaultQwenAPIBaseURL),
 		QwenImageModel:            env("QWEN_IMAGE_MODEL", defaultQwenImageModel),
+		QwenTextModel:             env("QWEN_TEXT_MODEL", defaultQwenTextModel),
 		ExaAPIKey:                 strings.TrimSpace(os.Getenv("EXA_API_KEY")),
 		TavilyAPIKey:              strings.TrimSpace(os.Getenv("TAVILY_API_KEY")),
 		ExaProxyURL:               strings.TrimSpace(os.Getenv("EXA_PROXY_URL")),
@@ -400,8 +403,8 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.OpenAIAPIBaseURL = strings.TrimSuffix(cfg.OpenAIAPIBaseURL, "/")
-	if cfg.TextAIProvider != "deepseek" && cfg.TextAIProvider != "openai" {
-		return Config{}, fmt.Errorf("TEXT_AI_PROVIDER must be deepseek or openai")
+	if cfg.TextAIProvider != "qwen" && cfg.TextAIProvider != "deepseek" && cfg.TextAIProvider != "openai" {
+		return Config{}, fmt.Errorf("TEXT_AI_PROVIDER must be qwen, deepseek or openai")
 	}
 	if err := validateDeepSeekAPIBaseURL(cfg.DeepSeekAPIBaseURL); err != nil {
 		return Config{}, err
@@ -427,6 +430,9 @@ func Load() (Config, error) {
 	}
 	if len(cfg.QwenImageModel) > 128 || !regexp.MustCompile(`^[A-Za-z0-9._:-]+$`).MatchString(cfg.QwenImageModel) {
 		return Config{}, fmt.Errorf("QWEN_IMAGE_MODEL contains unsupported characters or exceeds its size bound")
+	}
+	if len(cfg.QwenTextModel) > 128 || !regexp.MustCompile(`^[A-Za-z0-9._:-]+$`).MatchString(cfg.QwenTextModel) {
+		return Config{}, fmt.Errorf("QWEN_TEXT_MODEL contains unsupported characters or exceeds its size bound")
 	}
 	for _, name := range []string{"EXA_API_KEY", "TAVILY_API_KEY"} {
 		raw := os.Getenv(name)
@@ -576,9 +582,11 @@ func (c Config) YandexAuthEnabled() bool {
 }
 
 // TextAIConfigured reports whether the explicitly selected text provider has a
-// key. An OpenAI image key never enables DeepSeek text through an implicit fallback.
+// key. Credentials for other providers never enable an implicit text fallback.
 func (c Config) TextAIConfigured() bool {
 	switch c.TextAIProvider {
+	case "qwen":
+		return c.QwenAPIKey != ""
 	case "deepseek":
 		return c.DeepSeekAPIKey != ""
 	case "openai":

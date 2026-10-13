@@ -36,7 +36,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     AUTH_SESSION_TTL|WORKSPACE_MAX_OWNED_TEAM_WORKSPACES|OAUTH_TRUST_X_REAL_IP|OAUTH_RATE_LIMIT_AT_EDGE|MAX_API_BASE_URL|MAX_BOT_TOKEN|\
     MAX_WEBHOOK_SECRET|MAX_WEBHOOK_URL|MAX_CA_CERT_FILE|S3_HOST|S3_ACCESS_KEY|S3_SECRET_KEY|S3_BUCKET|S3_REGION|\
     MEDIA_USER_MAX_FILES|MEDIA_USER_MAX_BYTES|MEDIA_ORPHAN_GRACE_PERIOD|MEDIA_CLEANUP_INTERVAL|MEDIA_CLEANUP_BATCH_SIZE|\
-    TEXT_AI_PROVIDER|DEEPSEEK_API_KEY|DEEPSEEK_API_BASE_URL|DEEPSEEK_TEXT_MODEL|IMAGE_AI_PROVIDER|QWEN_API_KEY|QWEN_API_BASE_URL|QWEN_IMAGE_MODEL|\
+    TEXT_AI_PROVIDER|DEEPSEEK_API_KEY|DEEPSEEK_API_BASE_URL|DEEPSEEK_TEXT_MODEL|IMAGE_AI_PROVIDER|QWEN_API_KEY|QWEN_API_BASE_URL|QWEN_IMAGE_MODEL|QWEN_TEXT_MODEL|\
     EXA_API_KEY|EXA_PROXY_URL|TAVILY_API_KEY|OPENAI_API_KEY|OPENAI_API_BASE_URL|OPENAI_IMAGE_MODEL|\
     OPENAI_RESEARCH_MODEL|AI_GLOBAL_MAX_CONCURRENT|AI_USER_MAX_CONCURRENT|AI_IMAGE_PER_MINUTE|AI_IMAGE_PER_DAY|\
     AI_RESEARCH_PER_MINUTE|AI_RESEARCH_PER_DAY|AI_LEASE_TTL|BILLING_ENFORCEMENT_ENABLED|BILLING_LIVE_ENABLED|YOOKASSA_RECEIPTS_CONFIRMED|YOOKASSA_SHOP_ID|YOOKASSA_SECRET_KEY|YOOKASSA_DATA_KEY|YOOKASSA_RETURN_URL|SCHEDULER_INTERVAL|BACKUP_RETENTION_DAYS|PITR_RETENTION_DAYS|\
@@ -117,11 +117,12 @@ if [[ -n "$exa_proxy_url" ]]; then
     exit 1
   fi
 fi
-text_ai_provider=${text_ai_provider:-deepseek}
+text_ai_provider=${text_ai_provider:-qwen}
 case "$text_ai_provider" in
+  qwen) text_api_key=$(env_value QWEN_API_KEY) ;;
   deepseek) text_api_key=$(env_value DEEPSEEK_API_KEY) ;;
   openai) text_api_key=$(env_value OPENAI_API_KEY) ;;
-  *) echo "TEXT_AI_PROVIDER must be deepseek or openai" >&2; exit 1 ;;
+  *) echo "TEXT_AI_PROVIDER must be qwen, deepseek or openai" >&2; exit 1 ;;
 esac
 deepseek_api_base_url=$(env_value DEEPSEEK_API_BASE_URL)
 if [[ -n "$deepseek_api_base_url" && "$deepseek_api_base_url" != "https://api.deepseek.com" ]]; then
@@ -159,6 +160,11 @@ fi
 qwen_image_model=$(env_value QWEN_IMAGE_MODEL)
 if [[ -n "$qwen_image_model" && ( ${#qwen_image_model} -gt 128 || ! "$qwen_image_model" =~ ^[A-Za-z0-9._:-]+$ ) ]]; then
   echo "Production environment key contains unsupported characters: QWEN_IMAGE_MODEL" >&2
+  exit 1
+fi
+qwen_text_model=$(env_value QWEN_TEXT_MODEL)
+if [[ -n "$qwen_text_model" && ( ${#qwen_text_model} -gt 128 || ! "$qwen_text_model" =~ ^[A-Za-z0-9._:-]+$ ) ]]; then
+  echo "Production environment key contains unsupported characters: QWEN_TEXT_MODEL" >&2
   exit 1
 fi
 if [[ -n "$(env_value EXA_API_KEY)" || -n "$(env_value TAVILY_API_KEY)" ]] && [[ -z "$text_api_key" ]]; then

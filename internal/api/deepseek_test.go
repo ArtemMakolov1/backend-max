@@ -55,6 +55,47 @@ func TestDeepSeekHealthAndUnconfiguredSearchDoNotEnableImagesOrConsumeQuota(t *t
 	}
 }
 
+func TestQwenHealthAndUnconfiguredSearchDoNotEnableImagesOrConsumeQuota(t *testing.T) {
+	calls := 0
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+	client, err := openairesearch.NewQwen(provider.URL, "synthetic-qwen-key", "qwen3.6-plus", provider.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := testAILimitOptions()
+	options.MonthlyPlanEnforcement, options.ResearchPerMinute = true, 1
+	server, storage, raw := newAIQuotaTestServer(t, nil, client, options, "qwen-only")
+	server.now = func() time.Time { return time.Now().UTC() }
+	handler := withTestSession(t, storage, raw, "qwen-only")
+	workspaceID := personalWorkspaceIDForTest(t, storage, "qwen-only")
+
+	healthResponse := performJSONRequest(handler, http.MethodGet, "/api/v1/health", "")
+	var health map[string]any
+	if healthResponse.Code != http.StatusOK || json.Unmarshal(healthResponse.Body.Bytes(), &health) != nil {
+		t.Fatal("could not read provider health")
+	}
+	if health["text_ai_provider"] != "qwen" || health["openai_configured"] != false || health["research_configured"] != true || health["content_formatting_configured"] != true || health["content_discovery_configured"] != false || health["content_search_configured"] != false {
+		t.Fatalf("Qwen-only health misrepresented provider features: %#v", health)
+	}
+	for i := 0; i < 2; i++ {
+		for _, path := range []string{"/api/v1/research/generate", "/api/v1/workspaces/" + workspaceID + "/research/generate"} {
+			response := performJSONRequest(handler, http.MethodPost, path,
+				`{"topic":"Домашние коты","tone":"Простой","format":"markdown","include_sources":true}`)
+			assertProblemCode(t, response, http.StatusServiceUnavailable, "content_search_not_configured")
+		}
+		response := performJSONRequest(handler, http.MethodPost, "/api/v1/workspaces/"+workspaceID+"/research/discover", `{"topic":"Домашние коты"}`)
+		assertProblemCode(t, response, http.StatusServiceUnavailable, "content_search_not_configured")
+	}
+	billing := readWorkspaceBillingForTest(t, handler, workspaceID)
+	if calls != 0 || billingUsageQuantity(t, billing.Usage, store.UsageMetricAIResearchRequests) != 0 {
+		t.Fatal("unconfigured source retrieval reached provider or consumed quota")
+	}
+}
+
 func TestQwenProviderErrorUsesImageAPIFailureContract(t *testing.T) {
 	server := &Server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	response := httptest.NewRecorder()
@@ -67,7 +108,7 @@ func TestHealthAdvertisesQwenImageGenerationSeparatelyFromOpenAI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	text, err := openairesearch.NewDeepSeek("https://api.deepseek.com", "synthetic-deepseek-key", "deepseek-flash", &http.Client{})
+	text, err := openairesearch.NewQwen("https://dashscope-intl.aliyuncs.com", "synthetic-qwen-key", "qwen3.6-plus", &http.Client{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +116,7 @@ func TestHealthAdvertisesQwenImageGenerationSeparatelyFromOpenAI(t *testing.T) {
 	handler := withTestSession(t, storage, raw, "qwen-health")
 	response := performJSONRequest(handler, http.MethodGet, "/api/v1/health", "")
 	var health map[string]any
-	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &health) != nil || health["image_generation_configured"] != true || health["image_ai_provider"] != "qwen" || health["text_ai_provider"] != "deepseek" || health["openai_configured"] != false {
+	if response.Code != 200 || json.Unmarshal(response.Body.Bytes(), &health) != nil || health["image_generation_configured"] != true || health["image_ai_provider"] != "qwen" || health["text_ai_provider"] != "qwen" || health["openai_configured"] != false {
 		t.Fatalf("Qwen health represented legacy OpenAI capabilities: %#v", health)
 	}
 }

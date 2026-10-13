@@ -40,17 +40,23 @@ func newAIClients(cfg config.Config, imageHTTP, textHTTP *http.Client) (app.Imag
 
 	var research *openairesearch.Client
 	switch cfg.TextAIProvider {
+	case "qwen":
+		client, err := openairesearch.NewQwen(cfg.QwenAPIBaseURL, cfg.QwenAPIKey, cfg.QwenTextModel, textHTTP)
+		if err != nil {
+			return nil, nil, fmt.Errorf("initialize Qwen text: %w", err)
+		}
+		research = client
 	case "deepseek":
 		client, err := openairesearch.NewDeepSeek(cfg.DeepSeekAPIBaseURL, cfg.DeepSeekAPIKey, cfg.DeepSeekTextModel, textHTTP)
 		if err != nil {
 			return nil, nil, fmt.Errorf("initialize DeepSeek text: %w", err)
 		}
 		research = client
-		if openAIText != nil {
-			research = research.WithAudioAnalysis(openAIText)
-		}
 	case "openai":
 		research = openAIText
+	}
+	if cfg.TextAIProvider != "openai" && openAIText != nil {
+		research = research.WithAudioAnalysis(openAIText)
 	}
 	searchClient, err := contentsearch.NewClient(contentsearch.Config{ExaAPIKey: cfg.ExaAPIKey, TavilyAPIKey: cfg.TavilyAPIKey, ExaProxyURL: cfg.ExaProxyURL})
 	if err != nil {

@@ -20,17 +20,22 @@ func (f aiRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { re
 func testAIConfig() config.Config {
 	return config.Config{
 		TextAIProvider: "deepseek", DeepSeekAPIBaseURL: "https://api.deepseek.com", DeepSeekTextModel: "deepseek-flash",
-		ImageAIProvider: "openai", QwenAPIBaseURL: "https://dashscope-intl.aliyuncs.com", QwenImageModel: "qwen-image-3.0-pro",
+		ImageAIProvider: "openai", QwenAPIBaseURL: "https://dashscope-intl.aliyuncs.com", QwenImageModel: "qwen-image-3.0-pro", QwenTextModel: "qwen3.6-plus",
 		OpenAIAPIBaseURL: "https://api.openai.com", OpenAIImageModel: "gpt-image-2", OpenAIResearchModel: "gpt-6-luna",
 	}
 }
 
 func TestAIClientsKeepImageAndTextProvidersIndependent(t *testing.T) {
 	for _, test := range []struct {
-		name, provider, deepseekKey, openaiKey string
-		wantImages, wantText                   bool
+		name, provider, deepseekKey, openaiKey, qwenKey string
+		wantImages, wantText                            bool
 	}{
-		{name: "disabled", provider: "deepseek"},
+		{name: "disabled", provider: "qwen"},
+		{name: "Qwen text only", provider: "qwen", qwenKey: "synthetic-qwen-key", wantText: true},
+		{name: "Qwen text and OpenAI images", provider: "qwen", qwenKey: "synthetic-qwen-key", openaiKey: "synthetic-openai-key", wantImages: true, wantText: true},
+		{name: "Qwen selection without key ignores other providers", provider: "qwen", deepseekKey: "synthetic-deepseek-key", openaiKey: "synthetic-openai-key", wantImages: true},
+		{name: "DeepSeek selection ignores Qwen key", provider: "deepseek", qwenKey: "synthetic-qwen-key"},
+		{name: "OpenAI selection ignores Qwen key", provider: "openai", qwenKey: "synthetic-qwen-key"},
 		{name: "DeepSeek text only", provider: "deepseek", deepseekKey: "synthetic-deepseek-key", wantText: true},
 		{name: "OpenAI images only", provider: "deepseek", openaiKey: "synthetic-openai-key", wantImages: true},
 		{name: "DeepSeek text and OpenAI images", provider: "deepseek", deepseekKey: "synthetic-deepseek-key", openaiKey: "synthetic-openai-key", wantImages: true, wantText: true},
@@ -39,11 +44,14 @@ func TestAIClientsKeepImageAndTextProvidersIndependent(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cfg := testAIConfig()
-			cfg.TextAIProvider, cfg.DeepSeekAPIKey, cfg.OpenAIAPIKey = test.provider, test.deepseekKey, test.openaiKey
+			cfg.TextAIProvider, cfg.DeepSeekAPIKey, cfg.OpenAIAPIKey, cfg.QwenAPIKey = test.provider, test.deepseekKey, test.openaiKey, test.qwenKey
 			requests := 0
 			client := &http.Client{Transport: aiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 				requests++
 				wantHost, wantPath, wantKey, wantModel := "api.deepseek.com", "/responses", cfg.DeepSeekAPIKey, cfg.DeepSeekTextModel
+				if test.provider == "qwen" {
+					wantHost, wantPath, wantKey, wantModel = "dashscope-intl.aliyuncs.com", "/compatible-mode/v1/chat/completions", cfg.QwenAPIKey, cfg.QwenTextModel
+				}
 				if test.provider == "openai" {
 					wantHost, wantPath, wantKey, wantModel = "api.openai.com", "/v1/responses", cfg.OpenAIAPIKey, cfg.OpenAIResearchModel
 				}
@@ -53,6 +61,12 @@ func TestAIClientsKeepImageAndTextProvidersIndependent(t *testing.T) {
 				var payload map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload["model"] != wantModel {
 					t.Fatalf("text request used the wrong model: %v", err)
+				}
+				if test.provider == "qwen" {
+					if payload["enable_thinking"] != false || payload["stream"] != false {
+						t.Fatal("Qwen text did not use nonthinking, nonstreaming mode")
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"{\"content\":\"**Hello world**\"}"}}]}`))}, nil
 				}
 				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"content\":\"**Hello world**\"}"}]}]}`))}, nil
 			})}
@@ -80,38 +94,43 @@ func TestAIClientsKeepImageAndTextProvidersIndependent(t *testing.T) {
 	}
 }
 
-func TestAIClientsKeepAudioOnOpenAIWhenTextUsesDeepSeek(t *testing.T) {
-	cfg := testAIConfig()
-	cfg.DeepSeekAPIKey, cfg.OpenAIAPIKey = "synthetic-deepseek-key", "synthetic-openai-key"
-	client := &http.Client{Transport: aiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Host != "api.openai.com" || r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer "+cfg.OpenAIAPIKey {
-			t.Fatal("audio analysis left the OpenAI provider")
-		}
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Тихая музыка."}}]}`))}, nil
-	})}
-	_, research, err := newAIClients(cfg, client, client)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wav := make([]byte, 44)
-	copy(wav[:4], "RIFF")
-	copy(wav[8:12], "WAVE")
-	analyzer := research.(interface {
-		AnalyzeContentAudio(context.Context, []byte) (string, error)
-	})
-	summary, err := analyzer.AnalyzeContentAudio(context.Background(), wav)
-	if err != nil || summary != "Тихая музыка." {
-		t.Fatalf("OpenAI audio analysis failed: %v", err)
+func TestAIClientsKeepAudioOnOpenAIWhenTextUsesAnotherProvider(t *testing.T) {
+	for _, provider := range []string{"qwen", "deepseek"} {
+		t.Run(provider, func(t *testing.T) {
+			cfg := testAIConfig()
+			cfg.TextAIProvider, cfg.QwenAPIKey = provider, "synthetic-qwen-key"
+			cfg.DeepSeekAPIKey, cfg.OpenAIAPIKey = "synthetic-deepseek-key", "synthetic-openai-key"
+			client := &http.Client{Transport: aiRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Host != "api.openai.com" || r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer "+cfg.OpenAIAPIKey {
+					t.Fatal("audio analysis left the OpenAI provider")
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"Тихая музыка."}}]}`))}, nil
+			})}
+			_, research, err := newAIClients(cfg, client, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wav := make([]byte, 44)
+			copy(wav[:4], "RIFF")
+			copy(wav[8:12], "WAVE")
+			analyzer := research.(interface {
+				AnalyzeContentAudio(context.Context, []byte) (string, error)
+			})
+			summary, err := analyzer.AnalyzeContentAudio(context.Background(), wav)
+			if err != nil || summary != "Тихая музыка." {
+				t.Fatalf("OpenAI audio analysis failed: %v", err)
+			}
+		})
 	}
 }
 
 func TestAIClientsAttachExternalSearchToSelectedProvider(t *testing.T) {
-	for _, provider := range []string{"deepseek", "openai"} {
+	for _, provider := range []string{"qwen", "deepseek", "openai"} {
 		t.Run(provider, func(t *testing.T) {
 			cfg := testAIConfig()
 			cfg.TextAIProvider = provider
 			cfg.DeepSeekAPIKey, cfg.OpenAIAPIKey = "synthetic-deepseek-key", "synthetic-openai-key"
-			cfg.ExaAPIKey = "synthetic-exa-key"
+			cfg.QwenAPIKey, cfg.ExaAPIKey = "synthetic-qwen-key", "synthetic-exa-key"
 			client := &http.Client{Transport: aiRoundTripFunc(func(*http.Request) (*http.Response, error) {
 				t.Fatal("initializing search made an outbound request")
 				return nil, nil

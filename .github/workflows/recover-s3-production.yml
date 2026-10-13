@@ -132,13 +132,14 @@ jobs:
           BILLING_LIVE_ENABLED: ${{ vars.BILLING_LIVE_ENABLED || 'false' }}
           YOOKASSA_RECEIPTS_CONFIRMED: ${{ vars.YOOKASSA_RECEIPTS_CONFIRMED || 'false' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          TEXT_AI_PROVIDER: ${{ vars.TEXT_AI_PROVIDER || 'deepseek' }}
+          TEXT_AI_PROVIDER: ${{ vars.TEXT_AI_PROVIDER || 'qwen' }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_TEXT_MODEL: ${{ vars.DEEPSEEK_TEXT_MODEL || 'deepseek-flash' }}
           IMAGE_AI_PROVIDER: ${{ vars.IMAGE_AI_PROVIDER || 'qwen' }}
           QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
           QWEN_API_BASE_URL: ${{ vars.QWEN_API_BASE_URL || 'https://dashscope-intl.aliyuncs.com' }}
           QWEN_IMAGE_MODEL: ${{ vars.QWEN_IMAGE_MODEL || 'qwen-image-3.0-pro' }}
+          QWEN_TEXT_MODEL: ${{ vars.QWEN_TEXT_MODEL || 'qwen3.6-plus' }}
           OPENAI_RESEARCH_MODEL: ${{ vars.OPENAI_RESEARCH_MODEL || 'gpt-6-luna' }}
           OPENAI_IMAGE_MODEL: ${{ vars.OPENAI_IMAGE_MODEL || 'gpt-image-2' }}
           EXA_API_KEY: ${{ secrets.EXA_API_KEY }}

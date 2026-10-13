@@ -50,6 +50,23 @@ class SanitizerTests(unittest.TestCase):
         self.assertEqual(wrapped["prefix_chain"], ["call DeepSeek Responses API"])
         self.assert_safe(wrapped)
 
+    def test_qwen_failures_keep_secret_safe_status_and_source_owned_result_classification(self):
+        for status in (401, 402, 403, 429, 500):
+            safe = diagnostic.sanitize_record(record("; ".join(SECRETS), msg="Qwen text request failed", status=status))
+            self.assertEqual((safe["category"], safe["provider_status"]), ("provider_http", status))
+            self.assertIsNone(safe["provider_reason"])
+            self.assert_safe(safe)
+        for message, reason in diagnostic.SOURCE_OWNED_RESULT_REASONS.items():
+            safe = diagnostic.sanitize_record(record(message, msg="Qwen text request failed", status=0))
+            self.assertEqual((safe["category"], safe["provider_reason"]), ("provider_result", reason))
+            self.assert_safe(safe)
+            for private in (message + " " + SECRETS[0], " " + message, message + "\n" + SECRETS[4]):
+                safe = diagnostic.sanitize_record(record(private, msg="Qwen text request failed", status=0))
+                self.assertIsNone(safe["provider_reason"])
+                self.assert_safe(safe)
+        for msg in ("Qwen text request failed ", "Qwen text request failed\n" + SECRETS[0], "Qwen image request failed"):
+            self.assertIsNone(diagnostic.sanitize_record(record(SECRETS[0], msg=msg, status=402)))
+
     def assert_safe(self, value):
         rendered = json.dumps(value)
         for secret in SECRETS:
@@ -441,6 +458,24 @@ class NetworkDiagnosticsTests(unittest.TestCase):
         self.assertEqual(summary['warning_counts'], {
             'content_source_retrieval_failed': 1, 'openai_research_request_failed': 10,
             'openai_research_http_status_counts': {'100': 1, '599': 1, '403': 1}})
+        for secret in SECRETS:
+            self.assertNotIn(secret, json.dumps([summary, output]))
+
+    def test_qwen_warning_counter_tracks_only_exact_warn_logger(self):
+        output = []
+        reader = diagnostic.BoundedDiagnostics(output.append)
+        records = [
+            record(SECRETS[0], level='WARN', msg='Qwen text request failed', status=402, code='provider_http_error'),
+            record(SECRETS[0], level='WARN', msg='Qwen text request failed', status=0, code='invalid_provider_response'),
+            record(SECRETS[0], level='WARN', msg='Qwen text request failed ', status=402),
+            record(SECRETS[0], level='INFO', msg='Qwen text request failed', status=429),
+        ]
+        reader.feed(b''.join(json.dumps(item).encode() + b'\n' for item in records))
+        summary = reader.finish()
+        self.assertEqual(summary['warning_counts']['openai_research_request_failed'], 2)
+        self.assertEqual(summary['warning_counts']['openai_research_http_status_counts'], {'402': 1})
+        self.assertEqual(output[0]['provider_code'], 'provider_http_error')
+        self.assertEqual(output[1]['provider_code'], 'invalid_provider_response')
         for secret in SECRETS:
             self.assertNotIn(secret, json.dumps([summary, output]))
 
