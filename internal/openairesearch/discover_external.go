@@ -21,6 +21,28 @@ const discoveryNoLinksRetryInstruction = "\nПовторно подготовь 
 	"Проверенный адрес источника укажи только в отдельном source_url; приложение само добавит его к черновику. " +
 	"Соблюдай исходную JSON-схему и остальные ограничения."
 
+const discoveryJSONRetryInstruction = "\nПовторно подготовь карточки по тем же найденным материалам и редакционному контексту. " +
+	"Верни ровно один объект JSON по исходной схеме, без Markdown-блоков кода, пояснений или текста до и после JSON. " +
+	"Единственное верхнее поле — cards: массив максимум из трёх объектов, либо пустой массив, если подходящих материалов нет. " +
+	"В каждой карточке должны быть только content_kind, title, summary, source_url и draft. Первые четыре поля — строки. " +
+	"draft — объект только с полями title, content, format и image_prompt, каждое из которых является строкой. " +
+	"Не добавляй поля reason, rationale, sources или другие поля; не используй null, числа, массивы или объекты вместо строк. " +
+	"Кавычки и переносы строк внутри текстов корректно экранируй по правилам JSON. " +
+	"Сохрани исходные формат, стиль, длину текста, CTA и ограничения; source_url должен точно совпадать с одним исходным search_sources.url. " +
+	"В draft.content не добавляй внешних ссылок: источник добавит приложение."
+
+func discoveryRetryInstruction(provider string, err error) string {
+	switch discoveryValidationReason(err) {
+	case "discovery_json_invalid":
+		if provider == "qwen" {
+			return discoveryJSONRetryInstruction
+		}
+	case "discovery_external_links":
+		return discoveryNoLinksRetryInstruction
+	}
+	return ""
+}
+
 // WithContentSearch returns an independently configured client; an already
 // serving client is never mutated during request processing.
 func (c *Client) WithContentSearch(searcher ContentSearcher) *Client {
@@ -98,14 +120,16 @@ func (c *Client) discoverContentFromSearch(ctx context.Context, request Discover
 	// Crucially, neither message annotations nor hallucinated web-search output
 	// from this synthesis response can expand the retrieval authority map.
 	cards, err := decodeDiscoveryCardsFromSources(text, sources, previews, request)
-	if err != nil && usesExternalResearch(c.provider) && err.Error() == "content discovery draft must not invent external links" {
+	retryInstruction := discoveryRetryInstruction(c.provider, err)
+	if err != nil && usesExternalResearch(c.provider) && retryInstruction != "" {
 		if ctx.Err() != nil {
 			return DiscoverContentResult{}, ctx.Err()
 		}
 		// One fresh synthesis from the original evidence and style. The rejected
 		// model output never becomes context, and retrieval is not repeated.
+		// JSON and links share this single retry; a second invalid result is final.
 		payload.Input = append([]inputMessage(nil), payload.Input...)
-		payload.Input[0].Content = payload.Input[0].Content.(string) + discoveryNoLinksRetryInstruction
+		payload.Input[0].Content = payload.Input[0].Content.(string) + retryInstruction
 		stage = discoverySynthesisRetry
 		envelope, err = c.call(ctx, payload)
 		if err != nil {
