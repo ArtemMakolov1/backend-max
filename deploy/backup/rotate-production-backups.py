@@ -430,7 +430,10 @@ done
 '''
         # Integrity checks stream decompressed bytes inside the container;
         # neither WAL content nor an unbounded payload enters this process.
-        output = self.execute(["sh", "-ec", script], 180)
+        # A timed 16 MiB segment every five minutes means tens of GiB must be
+        # decompressed even when the stored archive is small. Allow a bounded
+        # integrity-check budget distinct from short metadata probes.
+        output = self.execute(["sh", "-ec", script], 900)
         records, roots = [], {}
         for line in output.splitlines():
             fields = line.split("\t")
