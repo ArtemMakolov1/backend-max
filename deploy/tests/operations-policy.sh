@@ -71,7 +71,9 @@ done
 for contract in \
   'archive_mode=on' \
   'archive_timeout=300s' \
-  'archive_command=if [ -f /var/lib/postgresql/wal-archive/%f ]; then cmp -s %p /var/lib/postgresql/wal-archive/%f; else cp %p /var/lib/postgresql/wal-archive/%f.tmp && sync && mv /var/lib/postgresql/wal-archive/%f.tmp /var/lib/postgresql/wal-archive/%f && sync; fi' \
+  'archive_command=/usr/local/bin/maxposty-archive-wal %p %f' \
+  '../docker/postgres/archive-wal.sh:/usr/local/bin/maxposty-archive-wal:ro' \
+  '../docker/postgres/restore-wal.sh:/usr/local/bin/maxposty-restore-wal:ro' \
   'postgres-wal-archive:/var/lib/postgresql/wal-archive' \
   'postgres-base-backups:/var/lib/postgresql/base-backups' \
   'alertmanager-config:/etc/alertmanager:ro' \
@@ -81,6 +83,9 @@ for contract in \
     exit 1
   }
 done
+
+grep -F 'maxposty-restore-wal --verify "$archived_wal"' "$backup_script" >/dev/null
+python3 -m unittest discover -s "$repo_root/deploy/tests" -p 'test_wal_archiving.py'
 
 # Alert delivery is rendered on the server into a private file. The actual
 # receiver URL must stay exclusively in the protected production secret.
@@ -187,6 +192,19 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     --volume "$sandbox:/config:ro" \
     "$alertmanager_image" \
     check-config /config/alertmanager.yml >/dev/null
+  postgres_image=$(awk '
+    $0 == "  postgres:" { inside=1; next }
+    inside && /^    image:/ { print $2; exit }
+  ' "$compose_file")
+  [[ "$postgres_image" =~ ^postgres:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]] || {
+    echo "WAL recovery validation requires the deployed immutable PostgreSQL image" >&2
+    exit 1
+  }
+  docker run --rm --network none --read-only --user postgres \
+    --tmpfs /tmp:rw,size=512m,mode=1777 \
+    --volume "$repo_root/docker/postgres:/helpers:ro" \
+    --volume "$repo_root/deploy/tests/wal-postgres-recovery-fixture.sh:/fixture.sh:ro" \
+    --entrypoint sh "$postgres_image" /fixture.sh
 fi
 
 bootstrap_env="$sandbox/bootstrap.env"

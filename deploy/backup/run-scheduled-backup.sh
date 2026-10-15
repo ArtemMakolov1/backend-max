@@ -211,6 +211,8 @@ for _ in {1..30}; do
   sleep 2
 done
 [[ "$wal_archived" == true ]] || { echo "PostgreSQL did not archive the forced WAL segment" >&2; exit 1; }
+# Verify the stored raw/gzip copy as well as the archiver acknowledgement.
+compose exec -T postgres /usr/local/bin/maxposty-restore-wal --verify "$archived_wal"
 
 compose exec -T postgres sh -ec \
   'rm -rf "/var/lib/postgresql/base-backups/$1" && PGPASSWORD="$POSTGRES_PASSWORD" pg_basebackup --dbname="host=127.0.0.1 port=5432 user=$POSTGRES_USER dbname=$POSTGRES_DB" --no-password --pgdata="/var/lib/postgresql/base-backups/$1" --format=plain --wal-method=stream --checkpoint=fast --manifest-checksums=SHA256' \

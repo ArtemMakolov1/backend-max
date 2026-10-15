@@ -28,6 +28,7 @@ LOGICAL = re.compile(rf"(postgres|media|backup)-({STAMP})(\.dump|\.tar\.gz|\.sha
 LOGICAL_TEMPORARY = re.compile(rf"(postgres|media|backup)-({STAMP})(\.dump|\.tar\.gz|\.sha256)\.tmp\Z")
 BASE = re.compile(rf"base-({STAMP})\Z")
 WAL = re.compile(r"[0-9A-F]{24}\Z")
+WAL_ARCHIVE = re.compile(r"([0-9A-F]{24})(?:\.gz)?\Z")
 
 
 class RetentionError(Exception):
@@ -268,7 +269,11 @@ def physical_plan(records, now, retention_days, start_times=None, protected_gene
         raise RetentionError("invalid_pitr_anchor")
     boundary = [name for name in bases if start_times[name] <= cutoff]
     anchor = max(boundary, key=lambda name: start_times[name]) if boundary else min(bases, key=lambda name: start_times[name])
-    keep = set(bases[-2:]) | {anchor}
+    # Keep the stepping stones inside the recovery window. Keeping only the
+    # current boundary and latest two makes tomorrow's boundary unavailable,
+    # pinning the WAL archive to an increasingly old base until a full window
+    # has passed. A failed or repeated same-day backup must not create that gap.
+    keep = {name for name in bases if start_times[name] >= cutoff} | set(bases[-2:]) | {anchor}
     if protected_generation and "base-" + protected_generation in bases:
         keep.add("base-" + protected_generation)
     oldest = min(keep, key=lambda name: start_times[name])
@@ -278,8 +283,17 @@ def physical_plan(records, now, retention_days, start_times=None, protected_gene
 def wal_plan(records, anchor_segment):
     if not WAL.fullmatch(anchor_segment):
         raise RetentionError("invalid_pitr_anchor")
-    return [record for record in records if record.kind == "wal"
-            and record.name[:8] == anchor_segment[:8] and record.name[8:] < anchor_segment[8:]]
+    obsolete = []
+    for record in records:
+        if record.kind != "wal":
+            continue
+        matched = WAL_ARCHIVE.fullmatch(record.name)
+        if not matched:
+            raise RetentionError("invalid_rotation_plan")
+        segment = matched[1]
+        if segment[:8] == anchor_segment[:8] and segment[8:] < anchor_segment[8:]:
+            obsolete.append(record)
+    return obsolete
 
 
 def wal_anchor(records, obsolete_bases, labels, chronological_anchor):
@@ -384,13 +398,39 @@ done
 for path in /var/lib/postgresql/wal-archive/*; do
   test -f "$path" && test ! -L "$path" || continue
   name=${path##*/}
-  printf '%s\n' "$name" | grep -Eq '^[0-9A-F]{24}$' || continue
+  printf '%s\n' "$name" | grep -Eq '^[0-9A-F]{24}(\.gz)?$' || continue
   count=$((count + 1)); test "$count" -le 10000
+  before=$(stat -c '%d:%i:%s' "$path")
+  case "$name" in
+    *.gz)
+      # Published archives are immutable. Test the complete gzip stream before
+      # using its canonical segment; a partial/corrupt gzip cannot hide a WAL
+      # conflict or allow any physical cleanup to proceed.
+      gzip -t "$path"
+      raw=${path%.gz}
+      if test -e "$raw" || test -L "$raw"; then
+        test -f "$raw" && test ! -L "$raw"
+        raw_before=$(stat -c '%d:%i:%s' "$raw")
+        gzip -dc "$path" | cmp -s "$raw" -
+        test "$(stat -c '%d:%i:%s' "$raw")" = "$raw_before"
+      fi
+      test ! -L "$path" && test "$(stat -c '%d:%i:%s' "$path")" = "$before"
+      ;;
+    *)
+      # Do not silently accept a canonical raw/gzip pair when the gzip entry
+      # is a symlink or a directory that the regular-file scan would ignore.
+      if test -e "$path.gz" || test -L "$path.gz"; then
+        test -f "$path.gz" && test ! -L "$path.gz"
+      fi
+      ;;
+  esac
   printf 'wal\t%s\t' "$name"
-  stat -c '%d:%i:%s' "$path" | tr ':' '\t'
+  printf '%s\n' "$before" | tr ':' '\t'
 done
 '''
-        output = self.execute(["sh", "-ec", script], 45)
+        # Integrity checks stream decompressed bytes inside the container;
+        # neither WAL content nor an unbounded payload enters this process.
+        output = self.execute(["sh", "-ec", script], 180)
         records, roots = [], {}
         for line in output.splitlines():
             fields = line.split("\t")
@@ -406,7 +446,7 @@ done
                     instant = timestamp(match[1]) if match else None
                     if instant is None:
                         continue
-                elif not WAL.fullmatch(name):
+                elif not WAL_ARCHIVE.fullmatch(name):
                     raise RetentionError("invalid_container_inventory")
                 records.append(Record(name, int(fields[2]), int(fields[3]), int(fields[4]), kind))
             else:
@@ -437,7 +477,7 @@ done
         # The database's live data/pg_wal trees cannot enter this fixed program.
         lines = []
         for record in records:
-            matcher = BASE if record.kind == "base" else WAL
+            matcher = BASE if record.kind == "base" else WAL_ARCHIVE
             if record.kind not in {"base", "wal"} or not matcher.fullmatch(record.name):
                 raise RetentionError("invalid_rotation_plan")
             lines.append(f"{record.kind}\t{record.name}\t{record.device}\t{record.inode}\t{record.size}\n")
@@ -460,7 +500,7 @@ while IFS="$tab" read -r kind name device inode bytes; do
       rm -rf -- "$path"
       ;;
     wal)
-      printf '%s\n' "$name" | grep -Eq '^[0-9A-F]{24}$'
+      printf '%s\n' "$name" | grep -Eq '^[0-9A-F]{24}(\.gz)?$'
       path=/var/lib/postgresql/wal-archive/$name
       test -f "$path" && test ! -L "$path"
       test "$(stat -c '%d:%i:%s' "$path")" = "$device:$inode:$bytes"
@@ -514,7 +554,8 @@ def run(arguments):
             emit("inventory", scope="pitr", bases=sum(r.kind == "base" for r in physical),
                  archived_segments=sum(r.kind == "wal" for r in physical), bytes=sum(r.size for r in physical),
                  removable_bases=len(obsolete_bases), removable_archived_segments=len(obsolete_wal),
-                 configured_retention_days=pitr_days, retained_base_limit=3, anchor_available=anchor is not None,
+                 configured_retention_days=pitr_days, retained_bases=sum(r.kind == "base" for r in physical) - len(obsolete_bases),
+                 anchor_available=anchor is not None,
                  physical_clock_skew=clock_skew)
             if arguments.mode == "cleanup":
                 if anchor:

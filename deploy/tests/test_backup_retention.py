@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import gzip
 import hashlib
 import importlib.util
 import io
@@ -32,8 +33,10 @@ def base(day, index=None):
     return retention.Record(f"base-202610{day:02}T120000Z", 1, index or day, 1024, "base")
 
 
-def wal(segment, timeline=1):
-    return retention.Record(f"{timeline:08X}00000000{segment:08X}", 2, segment, 16, "wal")
+def wal(segment, timeline=1, compressed=False):
+    suffix = ".gz" if compressed else ""
+    return retention.Record(f"{timeline:08X}00000000{segment:08X}" + suffix,
+                            2, segment + (10000 if compressed else 0), 16, "wal")
 
 
 class Fixture:
@@ -304,18 +307,47 @@ class EmptyDocker:
 
 
 class RecoveryTests(unittest.TestCase):
-    def test_keeps_latest_two_and_cutoff_anchor_with_at_most_three_bases(self):
+    def test_keeps_every_base_inside_window_and_nearest_cutoff_anchor(self):
         records = [base(day) for day in range(1, 14)]
         obsolete, anchor = retention.physical_plan(records, NOW, 7)
         kept = {r.name for r in records} - {r.name for r in obsolete}
-        self.assertEqual(kept, {base(6).name, base(12).name, base(13).name})
+        self.assertEqual(kept, {base(day).name for day in range(6, 14)})
         self.assertEqual(anchor, base(6).name)
 
     def test_keeps_oldest_available_when_full_window_does_not_yet_exist(self):
         records = [base(day) for day in range(8, 14)]
         obsolete, anchor = retention.physical_plan(records, NOW, 7)
-        self.assertEqual(len(records) - len(obsolete), 3)
+        self.assertEqual(obsolete, [])
         self.assertEqual(anchor, base(8).name)
+
+    def test_daily_cleanup_advances_boundary_without_pinning_an_old_base(self):
+        records = [base(day) for day in range(1, 14)]
+        for elapsed in range(10):
+            if elapsed:
+                records.append(base(13 + elapsed))
+            now = NOW + dt.timedelta(days=elapsed)
+            obsolete, anchor = retention.physical_plan(records, now, 7)
+            self.assertEqual(anchor, base(6 + elapsed).name)
+            removed = {record.name for record in obsolete}
+            records = [record for record in records if record.name not in removed]
+            self.assertEqual({record.name for record in records},
+                             {base(day).name for day in range(6 + elapsed, 14 + elapsed)})
+
+    def test_repeated_same_day_backups_keep_tomorrows_boundary_base(self):
+        records = [base(day) for day in range(1, 14)]
+        for minute in [10, 20, 30]:
+            records.append(retention.Record(f"base-20261013T12{minute:02}00Z", 1, 100 + minute, 1024, "base"))
+            obsolete, _ = retention.physical_plan(records, NOW + dt.timedelta(minutes=minute), 7)
+            records = [record for record in records if record not in obsolete]
+        obsolete, anchor = retention.physical_plan(records, NOW + dt.timedelta(days=1), 7)
+        self.assertEqual(anchor, base(7).name)
+        self.assertEqual({record.name for record in obsolete}, {base(6).name})
+
+    def test_latest_two_survive_sparse_recovery_window(self):
+        records = [base(day) for day in [1, 2, 3]]
+        obsolete, anchor = retention.physical_plan(records, NOW, 7)
+        self.assertEqual([record.name for record in obsolete], [base(1).name])
+        self.assertEqual(anchor, base(2).name)
 
     def test_actual_start_after_cutoff_uses_earlier_base(self):
         records = [base(day) for day in range(1, 14)]
@@ -337,6 +369,15 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual([r.name for r in obsolete], [wal(1).name, wal(9).name])
         with self.assertRaises(retention.RetentionError):
             retention.wal_plan(records, "../../pg_wal")
+
+    def test_mixed_gzip_wal_uses_canonical_segment_for_boundary_and_timeline(self):
+        records = [wal(9), wal(9, compressed=True), wal(10), wal(10, compressed=True),
+                   wal(11, compressed=True), wal(1, timeline=2, compressed=True)]
+        obsolete = retention.wal_plan(records, wal(10).name)
+        self.assertEqual([record.name for record in obsolete], [wal(9).name, wal(9, compressed=True).name])
+        for invalid in [wal(10).name + ".gz.tmp", "../" + wal(9).name + ".gz", wal(9).name.lower() + ".gz.gz"]:
+            with self.subTest(invalid=invalid), self.assertRaises(retention.RetentionError):
+                retention.wal_plan([retention.Record(invalid, 1, 2, 3, "wal")], wal(10).name)
 
     def test_clock_rollback_wal_bound_preserves_every_retained_base_start(self):
         records = [base(day) for day in [1, 6, 12, 13]] + [wal(10), wal(15), wal(20), wal(30)]
@@ -402,6 +443,117 @@ class RecoveryTests(unittest.TestCase):
 
 
 class OrchestrationTests(Fixture, unittest.TestCase):
+    def container_shell(self):
+        """Run the actual fixed container shell against disposable local paths."""
+        base_root = self.directory / "container/base-backups"
+        wal_root = self.directory / "container/wal-archive"
+        for directory in [base_root, wal_root]:
+            directory.mkdir(parents=True)
+        binary = self.directory / "shell-bin"
+        binary.mkdir()
+        stat_binary = binary / "stat"
+        stat_binary.write_text("#!" + sys.executable + "\nimport os,sys\nf=sys.argv[2];s=os.stat(sys.argv[3]);"
+                               "print(f.replace('%d',str(s.st_dev)).replace('%i',str(s.st_ino)).replace('%s',str(s.st_size)))\n")
+        stat_binary.chmod(0o755)
+        docker = retention.DockerBackups.__new__(retention.DockerBackups)
+
+        def execute(arguments, timeout=30, input_data=None):
+            relocated = [argument.replace(retention.BASE_ROOT, str(base_root)).replace(retention.WAL_ROOT, str(wal_root))
+                         for argument in arguments]
+            result = subprocess.run(relocated, input=input_data, capture_output=True, timeout=timeout, check=False,
+                                    env=dict(os.environ, PATH=str(binary) + os.pathsep + os.environ["PATH"]))
+            if result.returncode:
+                raise retention.RetentionError("docker_operation_failed")
+            return result.stdout.decode("ascii").replace(str(base_root), retention.BASE_ROOT).replace(str(wal_root), retention.WAL_ROOT)
+
+        return docker, execute, base_root, wal_root
+
+    def test_actual_shell_mixed_archives_preserve_anchor_and_remove_only_expired_copies(self):
+        docker, execute, _, wal_root = self.container_shell()
+        data = b"completed WAL archive fixture" * 100
+        for segment, compressed in [(9, False), (9, True), (10, False), (10, True), (11, True)]:
+            target = wal_root / wal(segment, compressed=compressed).name
+            target.write_bytes(gzip.compress(data) if compressed else data)
+        other_timeline = wal_root / wal(1, timeline=2, compressed=True).name
+        other_timeline.write_bytes(gzip.compress(data))
+        temporary = wal_root / (wal(8, compressed=True).name + ".tmp")
+        temporary.write_bytes(b"incomplete gzip")
+        history = wal_root / "00000002.history.gz"
+        history.write_bytes(b"unknown files are never interpreted or removed")
+        with mock.patch.object(docker, "execute", side_effect=execute):
+            records = docker.inventory(NOW)
+            self.assertEqual(len(records), 6)
+            obsolete = retention.wal_plan(records, wal(10).name)
+            self.assertEqual({record.name for record in obsolete}, {wal(9).name, wal(9, compressed=True).name})
+            count, reclaimed = docker.remove(obsolete)
+            self.assertEqual(count, 2)
+            self.assertEqual(reclaimed, len(data) + len(gzip.compress(data)))
+        self.assertEqual({path.name for path in wal_root.iterdir()},
+                         {wal(10).name, wal(10, compressed=True).name, wal(11, compressed=True).name,
+                          other_timeline.name, temporary.name, history.name})
+
+    def test_actual_shell_rejects_corrupt_gzip_before_any_cleanup(self):
+        for corruption in [b"not gzip", gzip.compress(b"WAL fixture")[:-4]]:
+            with self.subTest(corruption=corruption):
+                # Each subcase has a separate fixture but exercises the real
+                # gzip parser and CRC/trailer checks, not a mocked validator.
+                with tempfile.TemporaryDirectory(dir=self.directory) as case:
+                    original = self.directory
+                    self.directory = Path(case)
+                    try:
+                        docker, execute, base_root, wal_root = self.container_shell()
+                        retained = base_root / base(6).name
+                        retained.mkdir()
+                        archive = wal_root / wal(9, compressed=True).name
+                        archive.write_bytes(corruption)
+                        with mock.patch.object(docker, "execute", side_effect=execute):
+                            with self.assertRaises(retention.RetentionError):
+                                docker.inventory(NOW)
+                        self.assertTrue(retained.is_dir())
+                        self.assertEqual(archive.read_bytes(), corruption)
+                    finally:
+                        self.directory = original
+
+    def test_actual_shell_rejects_divergent_raw_and_compressed_same_segment(self):
+        docker, execute, _, wal_root = self.container_shell()
+        raw = wal_root / wal(9).name
+        compressed = wal_root / wal(9, compressed=True).name
+        raw.write_bytes(b"first cluster WAL")
+        compressed.write_bytes(gzip.compress(b"different cluster WAL"))
+        with mock.patch.object(docker, "execute", side_effect=execute):
+            with self.assertRaises(retention.RetentionError):
+                docker.inventory(NOW)
+        self.assertTrue(raw.is_file())
+        self.assertTrue(compressed.is_file())
+
+    def test_actual_shell_does_not_follow_same_segment_symlink(self):
+        docker, execute, _, wal_root = self.container_shell()
+        outside = self.directory / "operator-file"
+        outside.write_bytes(b"must not enter the archive inventory")
+        raw = wal_root / wal(9).name
+        raw.symlink_to(outside)
+        (wal_root / wal(9, compressed=True).name).write_bytes(gzip.compress(outside.read_bytes()))
+        with mock.patch.object(docker, "execute", side_effect=execute):
+            with self.assertRaises(retention.RetentionError):
+                docker.inventory(NOW)
+        self.assertTrue(raw.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"must not enter the archive inventory")
+
+    def test_actual_shell_rejects_raw_pair_with_symlinked_gzip_counterpart(self):
+        docker, execute, _, wal_root = self.container_shell()
+        outside = self.directory / "operator-file.gz"
+        outside.write_bytes(gzip.compress(b"WAL fixture"))
+        raw = wal_root / wal(9).name
+        raw.write_bytes(b"WAL fixture")
+        packed = wal_root / wal(9, compressed=True).name
+        packed.symlink_to(outside)
+        with mock.patch.object(docker, "execute", side_effect=execute):
+            with self.assertRaises(retention.RetentionError):
+                docker.inventory(NOW)
+        self.assertTrue(raw.is_file())
+        self.assertTrue(packed.is_symlink())
+        self.assertEqual(gzip.decompress(outside.read_bytes()), b"WAL fixture")
+
     def test_future_native_base_after_clock_rollback_blocks_physical_and_wal_deletion(self):
         calls = []
 
